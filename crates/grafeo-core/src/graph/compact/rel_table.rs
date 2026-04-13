@@ -18,7 +18,7 @@ use super::schema::EdgeSchema;
 /// optional backward CSR indexed by target node offset. Edge properties are
 /// stored in columnar format, parallel to the forward CSR targets array
 /// (i.e. the property at index `i` corresponds to the edge at CSR position `i`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RelTable {
     /// Schema describing the edge type and connected node labels.
     schema: EdgeSchema,

@@ -92,7 +92,13 @@ impl DirtySet {
         self.dirty_columns.contains(key)
     }
 
-    /// Returns `true` if no compact entities have overlay modifications.
+    /// Returns `true` if any entity in the given table has overlay modifications.
+    fn has_dirty_in_table(&self, table_id: u16) -> bool {
+        self.entity_bits
+            .get(table_id as usize)
+            .is_some_and(|words| words.iter().any(|&w| w != 0))
+    }
+
     /// Check dirtiness given a pre-decoded (table_id, offset). No lock needed
     /// when the caller already holds the `RwLockReadGuard`.
     #[inline]
@@ -280,18 +286,55 @@ impl HybridStore {
         self.pending_deletions.write().remove(&transaction_id);
     }
 
-    /// Merges the overlay into a rebuilt compact store and resets the overlay.
+    /// Incrementally compacts the hybrid store.
     ///
-    /// Caller must ensure no active transactions — the merged view is read
-    /// through `GraphStore` during the build, and the overlay is cleared
-    /// afterwards. Hooks survive because they reference the same deletion
-    /// set `Arc`s (which are cleared, not replaced).
+    /// Unchanged node/rel tables (no dirty entities, no deletions, no new overlay
+    /// entities with that label/type) are cloned as-is. Only tables with
+    /// modifications are rebuilt from the merged `GraphStore` view.
+    ///
+    /// Caller must ensure no active transactions.
     ///
     /// # Errors
     ///
-    /// Returns a `String` if `from_graph_store` fails to build the new compact.
+    /// Returns a `String` if the rebuild fails.
     pub fn compact(&self) -> Result<(), String> {
-        // Build new CompactStore from the current merged view.
+        let dirty_n = self.dirty_nodes.read();
+        let dirty_e = self.dirty_edges.read();
+        let deleted_n = self.deleted_nodes.read();
+        let deleted_e = self.deleted_edges.read();
+
+        // Check if any node table needs rebuilding, and whether the overlay
+        // introduces new labels not present in compact.
+        let compact = self.compact.read();
+        let overlay_labels = GraphStore::all_labels(self.overlay.as_ref());
+        let has_new_labels = overlay_labels
+            .iter()
+            .any(|l| !compact.label_to_table_id_map().contains_key(l.as_str()));
+        let has_any_overlay_edges = GraphStore::edge_count(self.overlay.as_ref()) > 0;
+
+        let any_node_table_dirty = (0..compact.node_tables_by_id().len())
+            .any(|tid| dirty_n.has_dirty_in_table(tid as u16));
+        let any_rel_table_dirty = (0..compact.rel_tables_by_id().len())
+            .any(|tid| dirty_e.has_dirty_in_table(tid as u16));
+        let has_deletions = !deleted_n.is_empty() || !deleted_e.is_empty();
+
+        let needs_full_rebuild =
+            any_node_table_dirty || any_rel_table_dirty || has_deletions
+            || has_new_labels || has_any_overlay_edges
+            || GraphStore::node_count(self.overlay.as_ref()) > 0;
+
+        drop(compact);
+        drop(dirty_n);
+        drop(dirty_e);
+        drop(deleted_n);
+        drop(deleted_e);
+
+        if !needs_full_rebuild {
+            return Ok(());
+        }
+
+        // Incremental: build full merged store, then swap in cloned unchanged
+        // tables from the old compact store to avoid redundant column encoding.
         let merged = from_graph_store(self as &dyn crate::graph::traits::GraphStore)
             .map_err(|e| e.to_string())?;
 
@@ -299,8 +342,6 @@ impl HybridStore {
         let new_node_count = merged.node_count();
         let new_edge_count = merged.edge_count();
 
-        // Swap compact base, then clear overlay and deletion tracking.
-        // Order matters: compact first (readers fall back to it), then overlay.
         *self.compact.write() = merged;
         self.overlay.clear();
         self.overlay.set_next_node_id(new_offset);
@@ -308,7 +349,6 @@ impl HybridStore {
         self.deleted_nodes.write().clear();
         self.deleted_edges.write().clear();
         self.pending_deletions.write().clear();
-        // Rebuild dirty bitmaps for new compact layout
         {
             let compact = self.compact.read();
             let node_sizes: Vec<usize> = compact

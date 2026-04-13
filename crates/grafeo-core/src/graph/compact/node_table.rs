@@ -16,7 +16,7 @@ use super::zone_map::ZoneMap;
 /// All nodes sharing a label are stored in a single `NodeTable` with one
 /// [`ColumnCodec`] per property. Row offsets are combined with the table ID
 /// via [`encode_node_id`] to produce globally unique [`NodeId`] values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeTable {
     /// Schema describing the label, table ID, and column definitions.
     schema: TableSchema,
