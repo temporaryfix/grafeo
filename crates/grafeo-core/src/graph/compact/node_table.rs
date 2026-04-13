@@ -149,6 +149,24 @@ impl NodeTable {
     pub fn memory_bytes(&self) -> usize {
         self.columns.values().map(|c| c.heap_bytes()).sum()
     }
+
+    /// Returns the schema for this table.
+    #[must_use]
+    pub(crate) fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    /// Returns the columns map for this table.
+    #[must_use]
+    pub(crate) fn columns(&self) -> &FxHashMap<PropertyKey, ColumnCodec> {
+        &self.columns
+    }
+
+    /// Returns the zone maps for this table.
+    #[must_use]
+    pub(crate) fn zone_maps(&self) -> &FxHashMap<PropertyKey, ZoneMap> {
+        &self.zone_maps
+    }
 }
 
 #[cfg(test)]

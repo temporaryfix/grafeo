@@ -206,6 +206,30 @@ impl RelTable {
         self.bwd.as_ref().map(|b| b.degree(dst_offset))
     }
 
+    /// Returns the schema for this relationship table.
+    #[must_use]
+    pub(crate) fn schema_ref(&self) -> &EdgeSchema {
+        &self.schema
+    }
+
+    /// Returns the forward CSR adjacency.
+    #[must_use]
+    pub(crate) fn fwd(&self) -> &CsrAdjacency {
+        &self.fwd
+    }
+
+    /// Returns the optional backward CSR adjacency.
+    #[must_use]
+    pub(crate) fn bwd(&self) -> &Option<CsrAdjacency> {
+        &self.bwd
+    }
+
+    /// Returns the edge properties map.
+    #[must_use]
+    pub(crate) fn edge_properties(&self) -> &FxHashMap<PropertyKey, ColumnCodec> {
+        &self.properties
+    }
+
     /// Returns an estimate of heap memory used by the CSR structures and
     /// edge property columns in bytes.
     #[must_use]
