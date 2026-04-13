@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 
 use grafeo_common::types::PropertyKey;
 
-use crate::graph::compact::from_graph_store;
+use crate::graph::compact::from_graph_store_incremental;
 use crate::graph::compact::id::{decode_edge_id, decode_node_id};
 use crate::graph::compact::CompactStore;
 use crate::graph::lpg::LpgStore;
@@ -303,14 +303,14 @@ impl HybridStore {
         let deleted_n = self.deleted_nodes.read();
         let deleted_e = self.deleted_edges.read();
 
-        // Check if any node table needs rebuilding, and whether the overlay
-        // introduces new labels not present in compact.
+        // Check if anything has changed at all (fast no-op path).
         let compact = self.compact.read();
         let overlay_labels = GraphStore::all_labels(self.overlay.as_ref());
         let has_new_labels = overlay_labels
             .iter()
             .any(|l| !compact.label_to_table_id_map().contains_key(l.as_str()));
         let has_any_overlay_edges = GraphStore::edge_count(self.overlay.as_ref()) > 0;
+        let has_overlay_nodes = GraphStore::node_count(self.overlay.as_ref()) > 0;
 
         let any_node_table_dirty = (0..compact.node_tables_by_id().len())
             .any(|tid| dirty_n.has_dirty_in_table(tid as u16));
@@ -318,10 +318,61 @@ impl HybridStore {
             .any(|tid| dirty_e.has_dirty_in_table(tid as u16));
         let has_deletions = !deleted_n.is_empty() || !deleted_e.is_empty();
 
-        let needs_full_rebuild =
+        let needs_rebuild =
             any_node_table_dirty || any_rel_table_dirty || has_deletions
-            || has_new_labels || has_any_overlay_edges
-            || GraphStore::node_count(self.overlay.as_ref()) > 0;
+            || has_new_labels || has_any_overlay_edges || has_overlay_nodes;
+
+        if !needs_rebuild {
+            return Ok(());
+        }
+
+        // Compute which node tables are unchanged:
+        //   - no dirty entities in the table
+        //   - no deleted nodes in the table
+        //   - no overlay nodes with that label
+        let overlay_label_set: FxHashSet<String> = overlay_labels.into_iter().collect();
+        let mut unchanged_node_tables: FxHashSet<u16> = FxHashSet::default();
+        for (tid, label) in compact.table_id_to_label().iter().enumerate() {
+            let tid = tid as u16;
+            let table_dirty = dirty_n.has_dirty_in_table(tid);
+            let has_deleted = deleted_n.iter().any(|&nid| {
+                let (t, _) = crate::graph::compact::id::decode_node_id(nid);
+                t == tid
+            });
+            let has_overlay_label = overlay_label_set.contains(label.as_str());
+            if !table_dirty && !has_deleted && !has_overlay_label {
+                unchanged_node_tables.insert(tid);
+            }
+        }
+
+        // Compute which rel tables are unchanged:
+        //   - no dirty edges in the table
+        //   - no deleted edges in the table
+        //   - no overlay edges of that edge type
+        //   - both src and dst node tables are unchanged
+        let overlay_edge_types: FxHashSet<String> =
+            GraphStore::all_edge_types(self.overlay.as_ref())
+                .into_iter()
+                .collect();
+        let mut unchanged_rel_tables: FxHashSet<u16> = FxHashSet::default();
+        for (rid, rt) in compact.rel_tables_by_id().iter().enumerate() {
+            let rid = rid as u16;
+            let rel_dirty = dirty_e.has_dirty_in_table(rid);
+            let has_deleted_edge = deleted_e.iter().any(|&eid| {
+                let (r, _) = crate::graph::compact::id::decode_edge_id(eid);
+                r == rid
+            });
+            let edge_type = compact
+                .edge_type_for_rel_table_id(rid)
+                .map_or("", |s| s.as_str());
+            let has_overlay_type = overlay_edge_types.contains(edge_type);
+            let src_unchanged = unchanged_node_tables.contains(&rt.src_table_id());
+            let dst_unchanged = unchanged_node_tables.contains(&rt.dst_table_id());
+            if !rel_dirty && !has_deleted_edge && !has_overlay_type && src_unchanged && dst_unchanged
+            {
+                unchanged_rel_tables.insert(rid);
+            }
+        }
 
         drop(compact);
         drop(dirty_n);
@@ -329,14 +380,15 @@ impl HybridStore {
         drop(deleted_n);
         drop(deleted_e);
 
-        if !needs_full_rebuild {
-            return Ok(());
-        }
-
-        // Incremental: build full merged store, then swap in cloned unchanged
-        // tables from the old compact store to avoid redundant column encoding.
-        let merged = from_graph_store(self as &dyn crate::graph::traits::GraphStore)
-            .map_err(|e| e.to_string())?;
+        let old_compact = self.compact.read();
+        let merged = from_graph_store_incremental(
+            self as &dyn crate::graph::traits::GraphStore,
+            &old_compact,
+            &unchanged_node_tables,
+            &unchanged_rel_tables,
+        )
+        .map_err(|e| e.to_string())?;
+        drop(old_compact);
 
         let new_offset = compute_id_offset(&merged);
         let new_node_count = merged.node_count();

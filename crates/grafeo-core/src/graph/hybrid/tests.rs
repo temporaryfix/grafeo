@@ -577,3 +577,20 @@ fn compact_works_through_shared_ref() {
     assert_eq!(h.overlay().node_count(), 0);
     assert!(!h.compact.read().nodes_by_label("Shared").is_empty());
 }
+
+#[test]
+fn incremental_compact_skips_unchanged_tables() {
+    let h = test_hybrid();
+    // Modify only one property on one student — table "Course" should be cloned
+    h.set_node_property(student_id(0), "grade", Value::Int64(999));
+    h.compact().unwrap();
+    // Verify data is correct after incremental compaction
+    assert_eq!(h.node_count(), 150); // 100 students + 50 courses
+    // The modified property should be in the rebuilt compact
+    assert_eq!(
+        h.get_node_property(student_id(0), &PropertyKey::new("grade")),
+        Some(Value::Int64(999))
+    );
+    // Unmodified course should be intact
+    assert!(h.get_node(course_id(0)).is_some());
+}

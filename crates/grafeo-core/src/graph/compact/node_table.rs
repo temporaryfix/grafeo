@@ -150,6 +150,14 @@ impl NodeTable {
         self.columns.values().map(|c| c.heap_bytes()).sum()
     }
 
+    /// Updates the table ID embedded in the schema.
+    ///
+    /// Used by incremental compaction when tables are re-indexed after
+    /// cloning from an old compact store.
+    pub(crate) fn set_table_id(&mut self, table_id: u16) {
+        self.schema.table_id = table_id;
+    }
+
     /// Returns the schema for this table.
     #[must_use]
     pub(crate) fn schema(&self) -> &TableSchema {

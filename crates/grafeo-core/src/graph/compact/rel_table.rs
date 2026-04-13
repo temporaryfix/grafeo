@@ -92,6 +92,28 @@ impl RelTable {
         self.dst_table_id
     }
 
+    /// Updates the relationship table ID embedded in the schema.
+    ///
+    /// Used by incremental compaction when tables are re-indexed after
+    /// cloning from an old compact store.
+    pub(crate) fn set_rel_table_id(&mut self, rel_table_id: u16) {
+        self.schema.rel_table_id = rel_table_id;
+    }
+
+    /// Updates the source node table ID.
+    ///
+    /// Used by incremental compaction when node tables are re-indexed.
+    pub(crate) fn set_src_table_id(&mut self, src_table_id: u16) {
+        self.src_table_id = src_table_id;
+    }
+
+    /// Updates the destination node table ID.
+    ///
+    /// Used by incremental compaction when node tables are re-indexed.
+    pub(crate) fn set_dst_table_id(&mut self, dst_table_id: u16) {
+        self.dst_table_id = dst_table_id;
+    }
+
     /// Returns the total number of edges in this table.
     #[must_use]
     pub fn num_edges(&self) -> usize {
