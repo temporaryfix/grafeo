@@ -165,6 +165,10 @@ pub struct GrafeoDB {
     /// internal store so that auto-committed writes become visible across sessions.
     #[cfg(all(feature = "lpg", feature = "compact-store"))]
     pub(super) hybrid_overlay: Option<Arc<LpgStore>>,
+    /// The concrete HybridStore reference, retained so callers can invoke
+    /// `compact()` and access the internal CompactStore without downcasting.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(super) hybrid_store: Option<Arc<grafeo_core::graph::hybrid::HybridStore>>,
     /// Metrics registry shared across all sessions.
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Option<Arc<crate::metrics::MetricsRegistry>>,
@@ -198,6 +202,21 @@ impl GrafeoDB {
             "no built-in LpgStore: this GrafeoDB was created with an external store \
              (with_store / with_read_store). Use session() or graph_store() instead.",
         )
+    }
+
+    /// Returns the LpgStore to use for index storage.
+    ///
+    /// For hybrid databases (created via [`with_hybrid()`](Self::with_hybrid)),
+    /// returns the overlay LpgStore. For regular databases, returns the built-in
+    /// LpgStore. Indexes are stored on the overlay so they auto-update when new
+    /// nodes are added via the HybridStore write path.
+    #[cfg(feature = "lpg")]
+    fn index_store(&self) -> &Arc<LpgStore> {
+        #[cfg(all(feature = "lpg", feature = "compact-store"))]
+        if let Some(ref overlay) = self.hybrid_overlay {
+            return overlay;
+        }
+        self.lpg_store()
     }
 
     /// Returns whether CDC is active (runtime check).
@@ -577,6 +596,8 @@ impl GrafeoDB {
             external_write_store: None,
             #[cfg(all(feature = "lpg", feature = "compact-store"))]
             hybrid_overlay: None,
+            #[cfg(all(feature = "lpg", feature = "compact-store"))]
+            hybrid_store: None,
             #[cfg(feature = "metrics")]
             metrics: Some(Arc::new(crate::metrics::MetricsRegistry::new())),
             current_graph: RwLock::new(None),
@@ -713,6 +734,8 @@ impl GrafeoDB {
             external_write_store: Some(store),
             #[cfg(all(feature = "lpg", feature = "compact-store"))]
             hybrid_overlay: None,
+            #[cfg(all(feature = "lpg", feature = "compact-store"))]
+            hybrid_store: None,
             #[cfg(feature = "metrics")]
             metrics: Some(Arc::new(crate::metrics::MetricsRegistry::new())),
             current_graph: RwLock::new(None),
@@ -799,6 +822,8 @@ impl GrafeoDB {
             external_write_store: None,
             #[cfg(all(feature = "lpg", feature = "compact-store"))]
             hybrid_overlay: None,
+            #[cfg(all(feature = "lpg", feature = "compact-store"))]
+            hybrid_store: None,
             #[cfg(feature = "metrics")]
             metrics: Some(Arc::new(crate::metrics::MetricsRegistry::new())),
             current_graph: RwLock::new(None),
@@ -847,6 +872,7 @@ impl GrafeoDB {
         #[cfg(all(feature = "lpg", feature = "compact-store"))]
         {
             self.hybrid_overlay = None;
+            self.hybrid_store = None;
         }
         self.read_only = true;
         self.query_cache = Arc::new(QueryCache::default());
@@ -2717,6 +2743,10 @@ impl GrafeoDB {
 
         let hybrid = Arc::new(hybrid_store);
 
+        // Retain the concrete Arc<HybridStore> so callers can call compact()
+        // and access the internal CompactStore for serialization.
+        let hybrid_ref = Arc::clone(&hybrid);
+
         // HybridStore implements both GraphStore and GraphStoreMut, so we can
         // delegate directly to with_store().
         let mut db = Self::with_store(hybrid, config)?;
@@ -2724,6 +2754,7 @@ impl GrafeoDB {
         // Store the overlay so sessions can call finalize_version_epochs on
         // commit, making auto-committed writes visible across sessions.
         db.hybrid_overlay = Some(overlay);
+        db.hybrid_store = Some(hybrid_ref);
 
         Ok(db)
     }
@@ -2762,6 +2793,7 @@ impl GrafeoDB {
         let overlay = Arc::clone(hybrid_store.overlay());
         let hybrid = Arc::new(hybrid_store);
 
+        self.hybrid_store = Some(Arc::clone(&hybrid));
         self.external_read_store = Some(Arc::clone(&hybrid) as Arc<dyn GraphStore>);
         self.external_write_store = Some(hybrid as Arc<dyn GraphStoreMut>);
         self.hybrid_overlay = Some(overlay);
@@ -2776,6 +2808,49 @@ impl GrafeoDB {
         self.projections.write().clear();
 
         Ok(())
+    }
+
+    /// Incrementally compact the HybridStore's overlay into its columnar base.
+    ///
+    /// Only tables with dirty entities, deletions, or new overlay data are
+    /// rebuilt. Unchanged tables are cloned in O(1). After compaction the
+    /// overlay is empty and new writes go to a fresh overlay.
+    ///
+    /// No-op if the database is not in hybrid mode.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub fn compact_hybrid(&self) -> Result<()> {
+        if let Some(ref hybrid) = self.hybrid_store {
+            hybrid
+                .compact()
+                .map_err(grafeo_common::utils::error::Error::Internal)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize the HybridStore's internal CompactStore to bytes.
+    ///
+    /// Call after [`compact_hybrid()`] to export a snapshot that includes
+    /// all compacted data. The returned bytes can be loaded with
+    /// [`CompactStore::from_bytes()`] or passed to [`with_hybrid()`].
+    ///
+    /// Falls back to building a fresh CompactStore from the full graph
+    /// state if the database is not in hybrid mode.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub fn export_compact_bytes(&self) -> Result<Vec<u8>> {
+        if let Some(ref hybrid) = self.hybrid_store {
+            let compact = hybrid.compact_store();
+            return compact
+                .to_bytes()
+                .map_err(grafeo_common::utils::error::Error::Internal);
+        }
+        // Fallback for non-hybrid databases: build CompactStore from graph state.
+        use grafeo_core::graph::compact::from_graph_store;
+        let store = self.graph_store();
+        let compact = from_graph_store(store.as_ref())
+            .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))?;
+        compact
+            .to_bytes()
+            .map_err(grafeo_common::utils::error::Error::Internal)
     }
 }
 

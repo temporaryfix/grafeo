@@ -594,3 +594,35 @@ fn incremental_compact_skips_unchanged_tables() {
     // Unmodified course should be intact
     assert!(h.get_node(course_id(0)).is_some());
 }
+
+// ---------------------------------------------------------------
+// Task 1 verification tests
+// ---------------------------------------------------------------
+
+// Verify cross-layer edge creation with bidirectional traversal
+#[test]
+fn create_edge_from_overlay_to_compact_node() {
+    let h = test_hybrid();
+    // Create a new overlay node
+    let review_node = h.create_node(&["Review"]);
+    // Create an edge from the overlay node to a compact (Course) node
+    let eid = h.create_edge(review_node, course_id(0), "REVIEW_OF");
+    assert!(h.get_edge(eid).is_some());
+    // Outgoing neighbors of the overlay node should include the compact node
+    let outgoing = h.neighbors(review_node, Direction::Outgoing);
+    assert!(outgoing.contains(&course_id(0)));
+    // Incoming neighbors of the compact node should include the overlay node
+    let incoming = h.neighbors(course_id(0), Direction::Incoming);
+    assert!(incoming.contains(&review_node));
+}
+
+// Verify CompactStore bytes round-trip in isolation (without HybridStore)
+#[test]
+fn compact_store_bytes_round_trip() {
+    use crate::graph::compact::CompactStore;
+    let compact = test_compact();
+    let bytes = compact.to_bytes().unwrap();
+    let restored = CompactStore::from_bytes(&bytes).unwrap();
+    assert_eq!(GraphStore::node_count(&restored), 150); // 100 students + 50 courses
+    assert_eq!(GraphStore::edge_count(&restored), 150);
+}

@@ -202,6 +202,14 @@ impl HybridStore {
         &self.overlay
     }
 
+    /// Returns a read guard to the internal CompactStore.
+    ///
+    /// Call after [`compact()`] to access the merged columnar data for
+    /// serialization via [`CompactStore::to_bytes()`].
+    pub fn compact_store(&self) -> parking_lot::RwLockReadGuard<'_, CompactStore> {
+        self.compact.read()
+    }
+
     /// Returns the ID boundary value.
     ///
     /// Compact IDs are strictly below this value; overlay IDs are at or above it.
