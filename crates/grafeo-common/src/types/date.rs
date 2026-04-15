@@ -124,11 +124,11 @@ impl Date {
         // Add months
         if dur.months() != 0 {
             let total_months = y as i64 * 12 + (m as i64 - 1) + dur.months();
-            // reason: total_months / 12 stays within i32 range for any representable date
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                y = (total_months.div_euclid(12)) as i32;
-            }
+            y = i32::try_from(total_months.div_euclid(12)).unwrap_or(if total_months < 0 {
+                i32::MIN
+            } else {
+                i32::MAX
+            });
             // reason: rem_euclid(12) + 1 is in [1, 12], always fits u32
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -143,9 +143,7 @@ impl Date {
 
         // Add days
         let days = days_from_civil(y, m, d) as i64 + dur.days();
-        // reason: days_from_civil returns i32, extending to i64 and back stays in range
-        #[allow(clippy::cast_possible_truncation)]
-        Self(days as i32)
+        Self(i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX }))
     }
 
     /// Subtracts a duration from this date.
@@ -203,10 +201,8 @@ pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
     let m = month;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1; // day of year [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era [0, 146096]
-    // reason: result is bounded by representable civil dates, fits i32
-    #[allow(clippy::cast_possible_truncation)]
-    let result = (era * 146097 + doe as i64 - 719468) as i32;
-    result
+    let days = era * 146097 + doe as i64 - 719468;
+    i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX })
 }
 
 /// Converts days since Unix epoch to (year, month, day).

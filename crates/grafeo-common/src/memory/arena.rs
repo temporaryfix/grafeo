@@ -86,6 +86,9 @@ impl Chunk {
     ///
     /// Returns `AllocError::OutOfMemory` if the system allocator fails.
     fn new(capacity: usize) -> Result<Self, AllocError> {
+        if capacity > u32::MAX as usize {
+            return Err(AllocError::OutOfMemory);
+        }
         let layout = Layout::from_size_align(capacity, 16).map_err(|_| AllocError::OutOfMemory)?;
         // SAFETY: We're allocating a valid layout
         let ptr = unsafe { alloc(layout) };

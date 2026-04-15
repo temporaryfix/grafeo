@@ -819,8 +819,28 @@ impl_algorithm! {
     description: "Stochastic Block Model community detection (MDL minimization)",
     params: sbp_params,
     execute(store, params) {
-        let num_blocks = params.get_int("num_blocks").map(|v| usize::try_from(v).unwrap_or(0));
-        let max_iter = usize::try_from(params.get_int("max_iterations").unwrap_or(100)).unwrap_or(0);
+        let num_blocks = match params.get_int("num_blocks") {
+            Some(v) if v < 0 => {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    format!("num_blocks must be non-negative, got {v}"),
+                ));
+            }
+            // reason: negative values rejected above, i64 fits usize on 64-bit
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Some(v) => Some(v as usize),
+            None => None,
+        };
+        let max_iter = match params.get_int("max_iterations") {
+            Some(v) if v < 0 => {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    format!("max_iterations must be non-negative, got {v}"),
+                ));
+            }
+            // reason: negative values rejected above, i64 fits usize on 64-bit
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Some(v) => v as usize,
+            None => 100,
+        };
 
         let result = stochastic_block_partition(store, num_blocks, max_iter);
 

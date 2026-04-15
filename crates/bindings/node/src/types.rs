@@ -50,17 +50,32 @@ pub fn js_to_value(env: &Env, val: Unknown<'_>) -> Result<Value> {
         ValueType::BigInt => {
             // SAFETY: type was checked as BigInt by the match arm, so cast is valid
             let bigint: BigInt = unsafe { val.cast()? };
+            if bigint.words.len() > 1 {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "BigInt value too large for i64",
+                ));
+            }
             let word = if bigint.words.is_empty() {
                 0u64
             } else {
                 bigint.words[0]
             };
-            // reason: BigInt word represents a value that fits i64 (single u64 word)
-            #[allow(clippy::cast_possible_wrap)]
             let signed = if bigint.sign_bit {
-                -(word as i64)
+                if word == i64::MIN.unsigned_abs() {
+                    i64::MIN
+                } else if let Ok(v) = i64::try_from(word) {
+                    -v
+                } else {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        "BigInt value too large for i64",
+                    ));
+                }
             } else {
-                word as i64
+                i64::try_from(word).map_err(|_| {
+                    napi::Error::new(napi::Status::InvalidArg, "BigInt value too large for i64")
+                })?
             };
             Ok(Value::Int64(signed))
         }

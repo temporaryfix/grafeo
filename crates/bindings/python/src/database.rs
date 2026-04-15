@@ -4061,8 +4061,12 @@ fn value_to_node_id(value: &Value, col_name: &str) -> PyResult<NodeId> {
                 Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "invalid node ID {f} in column '{col_name}' (must be a non-negative integer)"
                 )))
+            } else if *f > u64::MAX as f64 {
+                Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "node ID {f} in column '{col_name}' exceeds u64 range"
+                )))
             } else {
-                // reason: negative and fractional values rejected above, cast is safe
+                // reason: negative, fractional, and out-of-range values rejected above
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Ok(NodeId(*f as u64))
             }

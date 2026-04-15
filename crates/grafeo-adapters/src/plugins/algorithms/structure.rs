@@ -742,8 +742,14 @@ impl GraphAlgorithm for KCoreAlgorithm {
         let decomposition = kcore_decomposition(store);
 
         if let Some(k) = params.get_int("k") {
-            // Return nodes in the k-core
-            let k_core_nodes = decomposition.k_core(usize::try_from(k).unwrap_or(0));
+            if k < 0 {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(format!(
+                    "k-core requires a non-negative k value, got {k}"
+                )));
+            }
+            // reason: negative values rejected above, i64 fits usize on 64-bit
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let k_core_nodes = decomposition.k_core(k as usize);
 
             let mut result =
                 AlgorithmResult::new(vec!["node_id".to_string(), "in_k_core".to_string()]);
@@ -813,8 +819,14 @@ impl GraphAlgorithm for KTrussAlgorithm {
         let decomposition = ktruss_decomposition(store);
 
         if let Some(k) = params.get_int("k") {
-            // Return edges in the k-truss
-            let edges = decomposition.k_truss(usize::try_from(k).unwrap_or(0));
+            if k < 0 {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(format!(
+                    "k-truss requires a non-negative k value, got {k}"
+                )));
+            }
+            // reason: negative values rejected above, i64 fits usize on 64-bit
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let edges = decomposition.k_truss(k as usize);
 
             let mut result = AlgorithmResult::new(vec!["source".to_string(), "target".to_string()]);
 

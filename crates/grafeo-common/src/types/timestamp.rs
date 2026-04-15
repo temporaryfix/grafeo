@@ -87,9 +87,7 @@ impl Timestamp {
             #[allow(clippy::cast_sign_loss)]
             Some(UNIX_EPOCH + StdDuration::from_micros(self.0 as u64))
         } else {
-            // reason: -self.0 is positive because self.0 < 0
-            #[allow(clippy::cast_sign_loss)]
-            UNIX_EPOCH.checked_sub(StdDuration::from_micros((-self.0) as u64))
+            UNIX_EPOCH.checked_sub(StdDuration::from_micros(self.0.unsigned_abs()))
         }
     }
 
@@ -252,12 +250,14 @@ impl TryFrom<SystemTime> for Timestamp {
 
     fn try_from(time: SystemTime) -> Result<Self, Self::Error> {
         match time.duration_since(UNIX_EPOCH) {
-            // reason: SystemTime micros since epoch fit i64 for ~292,000 years
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(duration) => Ok(Self::from_micros(duration.as_micros() as i64)),
-            // reason: pre-epoch SystemTime durations are bounded, fit i64 for ~292,000 years
-            #[allow(clippy::cast_possible_truncation)]
-            Err(e) => Ok(Self::from_micros(-(e.duration().as_micros() as i64))),
+            Ok(duration) => {
+                let micros = i64::try_from(duration.as_micros()).map_err(|_| ())?;
+                Ok(Self::from_micros(micros))
+            }
+            Err(e) => {
+                let micros = i64::try_from(e.duration().as_micros()).map_err(|_| ())?;
+                Ok(Self::from_micros(micros.checked_neg().ok_or(())?))
+            }
         }
     }
 }
