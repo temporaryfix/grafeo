@@ -17,10 +17,14 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **Property value size limits**: `max_property_size` config (default 16 MiB) rejects oversized values at the session level. `Value::estimated_size_bytes()` for heap size estimation.
 - **HNSW max_elements bound**: `HnswConfig::with_max_elements(n)` caps index size, preventing unbounded memory growth on large vector workloads.
 - **WAL benchmarks**: Criterion benchmarks for write throughput (sync, batch, nosync), batch commit, and recovery replay.
+- **Layered store** (`compact-store` feature): `compact()` now produces a writable two-layer store (columnar base + LpgStore overlay) instead of a read-only snapshot. Writes go to the overlay, reads merge both layers transparently. `recompact()` merges the overlay back into the columnar base.
+- **CompactStore ID preservation**: `from_graph_store_preserving_ids()` builds a CompactStore that retains original `NodeId`/`EdgeId` values, eliminating the need for ID translation in layered storage.
+- **CompactStore section format**: versioned binary serialization (`GCST` magic, CRC32 integrity) for the `.grafeo` container, with `SectionType::CompactStore` (data section, mmap-able). Column codecs, CSR adjacency, zone maps, and ID maps all round-trip through the format.
 
 ### Changed
 
 - **Cast clippy lints re-enabled**: `cast_possible_truncation`, `cast_sign_loss`, and `cast_possible_wrap` promoted from `allow` to `warn` at workspace level. All sites annotated with per-site `#[allow]` and safety justifications.
+- **`compact()` is now non-destructive**: previously converted the database to read-only mode, dropping the original store. Now creates a `LayeredStore` that remains writable: the columnar base serves cold reads, and a fresh LpgStore overlay captures mutations.
 - **WASM binary size**: 650 KB gzipped (competitive with sql.js). CI threshold: 660 KB warn, 700 KB fail.
 - **Leaner WASM builds**: `grafeo-storage`, `crc32fast`, and `anyhow` are no longer compiled into WASM targets.
 - **Expand locality optimization**: expand operators sort input chunks by source node ID (>1024 rows) before adjacency lookups, improving cache locality on large traversals.

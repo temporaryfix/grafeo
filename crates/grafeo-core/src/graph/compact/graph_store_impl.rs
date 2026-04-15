@@ -11,7 +11,7 @@ use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, 
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 
 use super::CompactStore;
-use super::id::{decode_edge_id, decode_node_id, encode_node_id};
+use super::id::encode_node_id;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 use crate::graph::lpg::{Edge, Node};
@@ -20,7 +20,7 @@ use crate::statistics::Statistics;
 
 impl GraphStore for CompactStore {
     fn get_node(&self, id: NodeId) -> Option<Node> {
-        let (table_id, offset) = decode_node_id(id);
+        let (table_id, offset) = self.resolve_node(id)?;
         let nt = self.resolve_node_table(table_id)?;
         let row = usize::try_from(offset).ok()?;
         if row >= nt.len() {
@@ -37,12 +37,14 @@ impl GraphStore for CompactStore {
     }
 
     fn get_edge(&self, id: EdgeId) -> Option<Edge> {
-        let (rel_table_id, csr_position) = decode_edge_id(id);
+        let (rel_table_id, csr_position) = self.resolve_edge(id)?;
         let rt = self.resolve_rel_table(rel_table_id)?;
         let pos = u32::try_from(csr_position).ok()?;
 
-        let src = rt.source_node_id(pos)?;
-        let dst = rt.dest_node_id(pos)?;
+        let src_compact = rt.source_node_id(pos)?;
+        let dst_compact = rt.dest_node_id(pos)?;
+        let src = self.to_original_node_id(src_compact);
+        let dst = self.to_original_node_id(dst_compact);
         let edge_type = rt.edge_type().clone();
 
         let mut edge = Edge::new(id, src, dst, edge_type);
@@ -80,14 +82,14 @@ impl GraphStore for CompactStore {
     }
 
     fn get_node_property(&self, id: NodeId, key: &PropertyKey) -> Option<Value> {
-        let (table_id, offset) = decode_node_id(id);
+        let (table_id, offset) = self.resolve_node(id)?;
         let nt = self.resolve_node_table(table_id)?;
         let row = usize::try_from(offset).ok()?;
         nt.get_property(row, key)
     }
 
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {
-        let (rel_table_id, csr_position) = decode_edge_id(id);
+        let (rel_table_id, csr_position) = self.resolve_edge(id)?;
         let rt = self.resolve_rel_table(rel_table_id)?;
         let row = usize::try_from(csr_position).ok()?;
         rt.get_edge_property(row, key)
@@ -151,7 +153,9 @@ impl GraphStore for CompactStore {
     }
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
-        let (node_table_id, node_offset) = decode_node_id(node);
+        let Some((node_table_id, node_offset)) = self.resolve_node(node) else {
+            return Vec::new();
+        };
         let Ok(offset) = u32::try_from(node_offset) else {
             return Vec::new();
         };
@@ -162,7 +166,9 @@ impl GraphStore for CompactStore {
     }
 
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
-        let (node_table_id, node_offset) = decode_node_id(node);
+        let Some((node_table_id, node_offset)) = self.resolve_node(node) else {
+            return Vec::new();
+        };
         let Ok(offset) = u32::try_from(node_offset) else {
             return Vec::new();
         };
@@ -170,7 +176,9 @@ impl GraphStore for CompactStore {
     }
 
     fn out_degree(&self, node: NodeId) -> usize {
-        let (node_table_id, node_offset) = decode_node_id(node);
+        let Some((node_table_id, node_offset)) = self.resolve_node(node) else {
+            return 0;
+        };
         let Ok(offset) = u32::try_from(node_offset) else {
             return 0;
         };
@@ -185,7 +193,9 @@ impl GraphStore for CompactStore {
     }
 
     fn in_degree(&self, node: NodeId) -> usize {
-        let (node_table_id, node_offset) = decode_node_id(node);
+        let Some((node_table_id, node_offset)) = self.resolve_node(node) else {
+            return 0;
+        };
         let Ok(offset) = u32::try_from(node_offset) else {
             return 0;
         };
@@ -206,19 +216,34 @@ impl GraphStore for CompactStore {
     }
 
     fn node_ids(&self) -> Vec<NodeId> {
-        let mut ids = Vec::new();
-        for nt in &self.node_tables_by_id {
-            ids.extend(nt.node_ids());
+        if let Some(ref map) = self.node_id_map {
+            let mut ids: Vec<NodeId> = map.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        } else {
+            let mut ids = Vec::new();
+            for nt in &self.node_tables_by_id {
+                ids.extend(nt.node_ids());
+            }
+            ids.sort_unstable();
+            ids
         }
-        ids.sort_unstable();
-        ids
     }
 
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
-        self.label_to_table_id
+        let compact_ids = self
+            .label_to_table_id
             .get(label)
             .map(|&tid| self.node_tables_by_id[tid as usize].node_ids())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if self.preserves_ids() {
+            compact_ids
+                .into_iter()
+                .map(|cid| self.to_original_node_id(cid))
+                .collect()
+        } else {
+            compact_ids
+        }
     }
 
     fn node_count(&self) -> usize {
@@ -230,7 +255,7 @@ impl GraphStore for CompactStore {
     }
 
     fn edge_type(&self, id: EdgeId) -> Option<ArcStr> {
-        let (rel_table_id, _) = decode_edge_id(id);
+        let (rel_table_id, _) = self.resolve_edge(id)?;
         self.rel_table_id_to_type
             .get(rel_table_id as usize)
             .cloned()
@@ -248,7 +273,8 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_eq(value) {
-                    results.push(encode_node_id(table_id, offset as u64));
+                    let compact_id = encode_node_id(table_id, offset as u64);
+                    results.push(self.to_original_node_id(compact_id));
                 }
             }
         }
@@ -319,7 +345,8 @@ impl GraphStore for CompactStore {
             if let Some(col) = nt.column(&key) {
                 let table_id = nt.table_id();
                 for offset in col.find_in_range(min, max, min_inclusive, max_inclusive) {
-                    results.push(encode_node_id(table_id, offset as u64));
+                    let compact_id = encode_node_id(table_id, offset as u64);
+                    results.push(self.to_original_node_id(compact_id));
                 }
             }
         }
