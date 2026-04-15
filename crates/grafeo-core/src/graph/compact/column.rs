@@ -630,6 +630,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_find_eq_int8_vector_uses_fallback() {
+        // Int8Vector has no specialised find_eq path, so it uses the fallback.
+        let data = vec![1i8, 2, 3, 4, 5, 6];
+        let col = ColumnCodec::Int8Vector {
+            data,
+            dimensions: 3,
+        };
+        let target_vec: Vec<Value> = vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)];
+        let target = Value::List(Arc::from(target_vec));
+        let matches = col.find_eq(&target);
+        assert_eq!(matches, vec![0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Int8Vector zero-dimension edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_int8_vector_zero_dimensions_get() {
+        let col = ColumnCodec::Int8Vector {
+            data: vec![1, 2, 3],
+            dimensions: 0,
+        };
+        // Zero dimensions: get() should return None.
+        assert_eq!(col.get(0), None);
+    }
+
+    #[test]
+    fn test_int8_vector_zero_dimensions_get_int8_vector() {
+        let col = ColumnCodec::Int8Vector {
+            data: vec![1, 2, 3],
+            dimensions: 0,
+        };
+        // Zero dimensions: get_int8_vector() should return None.
+        assert_eq!(col.get_int8_vector(0), None);
+    }
+
+    #[test]
+    fn test_int8_vector_zero_dimensions_len_and_is_empty() {
+        let col = ColumnCodec::Int8Vector {
+            data: vec![1, 2, 3],
+            dimensions: 0,
+        };
+        assert_eq!(col.len(), 0);
+        assert!(col.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // heap_bytes tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_heap_bytes_bitpacked() {
+        let values = vec![0u64, 5, 10, 15];
+        let bp = BitPackedInts::pack(&values);
+        let col = ColumnCodec::BitPacked(bp);
+        // Should report nonzero heap usage.
+        assert!(col.heap_bytes() > 0);
+    }
+
+    #[test]
+    fn test_heap_bytes_dict() {
+        let mut builder = DictionaryBuilder::new();
+        builder.add("Amsterdam");
+        builder.add("Berlin");
+        builder.add("Paris");
+        let dict = builder.build();
+        let col = ColumnCodec::Dict(dict);
+        assert!(col.heap_bytes() > 0);
+    }
+
+    #[test]
+    fn test_heap_bytes_bitmap() {
+        let bools = vec![true, false, true, true, false];
+        let bv = BitVector::from_bools(&bools);
+        let col = ColumnCodec::Bitmap(bv);
+        assert!(col.heap_bytes() > 0);
+    }
+
+    #[test]
+    fn test_heap_bytes_int8_vector() {
+        let data = vec![1i8, 2, 3, 4, 5, 6];
+        let col = ColumnCodec::Int8Vector {
+            data,
+            dimensions: 3,
+        };
+        // Heap usage equals data length (1 byte per i8).
+        assert_eq!(col.heap_bytes(), 6);
+    }
+
     // -----------------------------------------------------------------------
     // find_in_range tests
     // -----------------------------------------------------------------------
@@ -686,5 +777,84 @@ mod tests {
             true,
         );
         assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_find_in_range_negative_max() {
+        // All values are unsigned (>= 0), so a negative max should yield no results.
+        let values: Vec<u64> = (0..10).collect();
+        let col = ColumnCodec::BitPacked(BitPackedInts::pack(&values));
+
+        let result = col.find_in_range(None, Some(&Value::Int64(-1)), false, true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_in_range_negative_min() {
+        // Negative min is clamped to 0 internally: all values (0..10) should pass.
+        let values: Vec<u64> = (0..5).collect();
+        let col = ColumnCodec::BitPacked(BitPackedInts::pack(&values));
+
+        let result = col.find_in_range(Some(&Value::Int64(-10)), None, true, true);
+        assert_eq!(result, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_find_in_range_type_mismatch_uses_fallback() {
+        let values = vec![1u64, 2, 3];
+        let col = ColumnCodec::BitPacked(BitPackedInts::pack(&values));
+
+        // String bounds on a BitPacked column: type mismatch, falls back.
+        let result = col.find_in_range(
+            Some(&Value::String("a".into())),
+            Some(&Value::String("z".into())),
+            true,
+            true,
+        );
+        // Fallback uses compare_values which returns None for Int vs String,
+        // so no rows match.
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_in_range_int8_vector_uses_fallback() {
+        let data = vec![1i8, 2, 3, 4, 5, 6];
+        let col = ColumnCodec::Int8Vector {
+            data,
+            dimensions: 3,
+        };
+
+        // Int8Vector is not BitPacked, so it goes through the fallback path.
+        // Range scan on list values uses compare_values, which returns None
+        // for lists, so nothing matches.
+        let result = col.find_in_range(Some(&Value::Int64(0)), Some(&Value::Int64(10)), true, true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_out_of_bounds_all_codecs() {
+        // BitPacked
+        let bp = BitPackedInts::pack(&[1u64, 2, 3]);
+        let col = ColumnCodec::BitPacked(bp);
+        assert_eq!(col.get(3), None);
+
+        // Dict
+        let mut builder = DictionaryBuilder::new();
+        builder.add("Alix");
+        let col = ColumnCodec::Dict(builder.build());
+        assert_eq!(col.get(1), None);
+
+        // Bitmap
+        let bv = BitVector::from_bools(&[true]);
+        let col = ColumnCodec::Bitmap(bv);
+        assert_eq!(col.get(1), None);
+
+        // Int8Vector
+        let col = ColumnCodec::Int8Vector {
+            data: vec![1, 2, 3],
+            dimensions: 3,
+        };
+        assert_eq!(col.get(1), None);
+        assert_eq!(col.get_int8_vector(1), None);
     }
 }

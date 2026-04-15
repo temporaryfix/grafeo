@@ -1134,4 +1134,655 @@ mod tests {
         assert!(labels.contains(&"City".to_string()));
         assert!(labels.contains(&"NewLabel".to_string()));
     }
+
+    // ── Helper that includes edge properties in the base ──────────
+
+    /// Builds a richer layered store with edge properties and node properties
+    /// to support tests that need edge property read-through.
+    fn build_test_layered_with_edge_props() -> LayeredStore {
+        let store = LpgStore::new().unwrap();
+
+        let alix = store.create_node(&["Person"]);
+        store.set_node_property(alix, "name", Value::from("Alix"));
+        store.set_node_property(alix, "age", Value::Int64(30));
+
+        let gus = store.create_node(&["Person"]);
+        store.set_node_property(gus, "name", Value::from("Gus"));
+        store.set_node_property(gus, "age", Value::Int64(25));
+
+        let amsterdam = store.create_node(&["City"]);
+        store.set_node_property(amsterdam, "name", Value::from("Amsterdam"));
+
+        let e1 = store.create_edge(alix, amsterdam, "LIVES_IN");
+        store.set_edge_property(e1, "since", Value::Int64(2020));
+
+        let e2 = store.create_edge(gus, amsterdam, "LIVES_IN");
+        store.set_edge_property(e2, "since", Value::Int64(2022));
+
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let max_nid = store
+            .node_ids()
+            .into_iter()
+            .map(|id| id.as_u64())
+            .max()
+            .unwrap_or(0);
+        let max_eid = 10u64;
+        LayeredStore::new(compact, max_nid, max_eid).unwrap()
+    }
+
+    // ── A. Read-through operations ────────────────────────────────
+
+    #[test]
+    fn test_get_edge_from_base() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        assert_eq!(edges.len(), 1);
+
+        let (_, eid) = edges[0];
+        let edge = layered.get_edge(eid);
+        assert!(edge.is_some(), "edge should be readable from base");
+        let edge = edge.unwrap();
+        assert_eq!(edge.edge_type.as_str(), "LIVES_IN");
+    }
+
+    #[test]
+    fn test_get_node_property_overlay_first() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // Promote the node by setting a property.
+        layered.set_node_property(first, "age", Value::Int64(99));
+
+        // Overlay value should take precedence over base.
+        let age = layered
+            .get_node_property(first, &PropertyKey::new("age"))
+            .unwrap();
+        assert_eq!(age, Value::Int64(99));
+    }
+
+    #[test]
+    fn test_get_edge_property_from_base() {
+        let layered = build_test_layered_with_edge_props();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        assert_eq!(edges.len(), 1);
+
+        let (_, eid) = edges[0];
+        let since = layered.get_edge_property(eid, &PropertyKey::new("since"));
+        assert!(
+            since.is_some(),
+            "edge property should be readable from base"
+        );
+    }
+
+    #[test]
+    fn test_get_node_property_batch_across_layers() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+
+        // Create an overlay-only node.
+        let vincent = layered.create_node(&["Person"]);
+        layered.set_node_property(vincent, "name", Value::from("Vincent"));
+
+        let all_ids: Vec<NodeId> = persons
+            .iter()
+            .copied()
+            .chain(std::iter::once(vincent))
+            .collect();
+        let names = layered.get_node_property_batch(&all_ids, &PropertyKey::new("name"));
+
+        // All should have a name.
+        for name in &names {
+            assert!(name.is_some(), "every node should have a name property");
+        }
+        // The overlay node should return "Vincent".
+        assert_eq!(
+            names.last().unwrap().as_ref().unwrap(),
+            &Value::String(ArcStr::from("Vincent"))
+        );
+    }
+
+    #[test]
+    fn test_out_degree_both_layers() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first_person = persons[0];
+
+        // Base has 1 outgoing edge (LIVES_IN) for an unmodified node.
+        assert_eq!(layered.out_degree(first_person), 1);
+
+        // Add an edge purely in the overlay (between overlay-only nodes).
+        let vincent = layered.create_node(&["Person"]);
+        let berlin = layered.create_node(&["City"]);
+        layered.create_edge(vincent, berlin, "VISITS");
+
+        // Overlay-only node should have 1 outgoing edge.
+        assert_eq!(layered.out_degree(vincent), 1);
+
+        // Base node remains unmodified, still sees its base edge.
+        assert_eq!(layered.out_degree(first_person), 1);
+    }
+
+    #[test]
+    fn test_in_degree_both_layers() {
+        let layered = build_test_layered();
+        let cities = layered.nodes_by_label("City");
+        let amsterdam = cities[0];
+
+        // Base has 2 incoming LIVES_IN edges.
+        assert_eq!(layered.in_degree(amsterdam), 2);
+
+        // Create overlay-only edges between overlay-only nodes.
+        let jules = layered.create_node(&["Person"]);
+        let berlin = layered.create_node(&["City"]);
+        layered.create_edge(jules, berlin, "LIVES_IN");
+
+        // Berlin (overlay-only) should have 1 incoming edge.
+        assert_eq!(layered.in_degree(berlin), 1);
+
+        // Amsterdam (base, not dirty) should still have 2 incoming edges.
+        assert_eq!(layered.in_degree(amsterdam), 2);
+    }
+
+    #[test]
+    fn test_edge_type_from_base() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, eid) = edges[0];
+
+        let edge_type = layered.edge_type(eid);
+        assert_eq!(edge_type.as_deref(), Some("LIVES_IN"));
+    }
+
+    // ── B. Mutation operations ────────────────────────────────────
+
+    #[test]
+    fn test_set_node_property_promotes_base_node() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        assert_eq!(layered.overlay_mutation_count(), 0);
+
+        // Setting a property on a base node should promote it.
+        layered.set_node_property(first, "city", Value::from("Amsterdam"));
+
+        // Node should now be dirty (in overlay).
+        assert!(layered.overlay_mutation_count() > 0);
+
+        // Property should be readable.
+        let city = layered
+            .get_node_property(first, &PropertyKey::new("city"))
+            .unwrap();
+        assert_eq!(city, Value::String(ArcStr::from("Amsterdam")));
+    }
+
+    #[test]
+    fn test_set_edge_property_promotes_base_edge() {
+        let layered = build_test_layered_with_edge_props();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, eid) = edges[0];
+
+        assert_eq!(layered.overlay_mutation_count(), 0);
+
+        // Setting a property on a base edge should promote it and its endpoints.
+        layered.set_edge_property(eid, "weight", Value::Float64(1.5));
+
+        assert!(layered.overlay_mutation_count() > 0);
+
+        let weight = layered
+            .get_edge_property(eid, &PropertyKey::new("weight"))
+            .unwrap();
+        assert_eq!(weight, Value::Float64(1.5));
+    }
+
+    #[test]
+    fn test_remove_node_property() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // Node has "age" property in the base.
+        assert!(
+            layered
+                .get_node_property(first, &PropertyKey::new("age"))
+                .is_some()
+        );
+
+        // Remove it (promotes to overlay first).
+        let removed = layered.remove_node_property(first, "age");
+        assert!(removed.is_some());
+
+        // Should be gone now.
+        assert!(
+            layered
+                .get_node_property(first, &PropertyKey::new("age"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_remove_edge_property() {
+        let layered = build_test_layered_with_edge_props();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, eid) = edges[0];
+
+        // Remove edge property (promotes edge and endpoints).
+        let removed = layered.remove_edge_property(eid, "since");
+        assert!(removed.is_some());
+
+        // Should be gone now.
+        assert!(
+            layered
+                .get_edge_property(eid, &PropertyKey::new("since"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_add_label_to_base_node() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // Add a new label (promotes the node).
+        let added = layered.add_label(first, "Employee");
+        assert!(added);
+
+        // Node should now have both labels.
+        let node = layered.get_node(first).unwrap();
+        let label_strs: Vec<&str> = node.labels.iter().map(|l| l.as_str()).collect();
+        assert!(label_strs.contains(&"Person"));
+        assert!(label_strs.contains(&"Employee"));
+    }
+
+    #[test]
+    fn test_remove_label_from_base_node() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // Remove the "Person" label (promotes first).
+        let removed = layered.remove_label(first, "Person");
+        assert!(removed);
+
+        // Should no longer appear in nodes_by_label("Person").
+        let after_persons = layered.nodes_by_label("Person");
+        assert!(!after_persons.contains(&first));
+
+        // But node should still exist.
+        assert!(layered.get_node(first).is_some());
+    }
+
+    #[test]
+    fn test_delete_node_edges_cascade() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first_person = persons[0];
+
+        // First person has 1 outgoing edge.
+        let edges_before = layered.edges_from(first_person, Direction::Outgoing);
+        assert_eq!(edges_before.len(), 1);
+
+        // Delete all edges connected to this node.
+        layered.delete_node_edges(first_person);
+
+        // The base edges should now be marked as deleted.
+        let edges_after = layered.edges_from(first_person, Direction::Outgoing);
+        assert_eq!(edges_after.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_create_edges_cross_layer() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let base_person = persons[0];
+
+        // Create overlay-only cities.
+        let berlin = layered.create_node(&["City"]);
+        let paris = layered.create_node(&["City"]);
+
+        // Batch create edges with a mix of base and overlay endpoints.
+        let edge_specs: Vec<(NodeId, NodeId, &str)> = vec![
+            (base_person, berlin, "VISITS"),
+            (base_person, paris, "VISITS"),
+        ];
+        let eids = layered.batch_create_edges(&edge_specs);
+        assert_eq!(eids.len(), 2);
+
+        for eid in &eids {
+            let edge = layered.get_edge(*eid);
+            assert!(edge.is_some());
+            assert_eq!(edge.unwrap().edge_type.as_str(), "VISITS");
+        }
+    }
+
+    // ── C. Promotion logic ────────────────────────────────────────
+
+    #[test]
+    fn test_promotion_copies_all_properties() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // Before promotion, read the base node properties.
+        let original_name = layered
+            .get_node_property(first, &PropertyKey::new("name"))
+            .unwrap();
+        let original_age = layered
+            .get_node_property(first, &PropertyKey::new("age"))
+            .unwrap();
+
+        // Promote by setting a new property.
+        layered.set_node_property(first, "city", Value::from("Berlin"));
+
+        // All original properties should still be present.
+        let after_name = layered
+            .get_node_property(first, &PropertyKey::new("name"))
+            .unwrap();
+        let after_age = layered
+            .get_node_property(first, &PropertyKey::new("age"))
+            .unwrap();
+
+        assert_eq!(original_name, after_name);
+        assert_eq!(original_age, after_age);
+
+        // New property also present.
+        let city = layered
+            .get_node_property(first, &PropertyKey::new("city"))
+            .unwrap();
+        assert_eq!(city, Value::String(ArcStr::from("Berlin")));
+    }
+
+    #[test]
+    fn test_promotion_is_idempotent() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // First promotion.
+        layered.set_node_property(first, "x", Value::Int64(1));
+        let count_after_first = layered.node_count();
+
+        // Second promotion attempt (node already in overlay).
+        layered.set_node_property(first, "y", Value::Int64(2));
+        let count_after_second = layered.node_count();
+
+        // Node count should not change.
+        assert_eq!(count_after_first, count_after_second);
+
+        // Both properties should exist.
+        assert_eq!(
+            layered
+                .get_node_property(first, &PropertyKey::new("x"))
+                .unwrap(),
+            Value::Int64(1)
+        );
+        assert_eq!(
+            layered
+                .get_node_property(first, &PropertyKey::new("y"))
+                .unwrap(),
+            Value::Int64(2)
+        );
+    }
+
+    #[test]
+    fn test_edge_promotion_promotes_endpoints() {
+        let layered = build_test_layered_with_edge_props();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, eid) = edges[0];
+
+        // Promote the edge by setting a property on it.
+        layered.set_edge_property(eid, "weight", Value::Float64(0.5));
+
+        // The edge's source and destination nodes should now be in the overlay.
+        let edge = layered.get_edge(eid).unwrap();
+        let src_node = layered.get_node(edge.src);
+        let dst_node = layered.get_node(edge.dst);
+        assert!(
+            src_node.is_some(),
+            "source node should be accessible after edge promotion"
+        );
+        assert!(
+            dst_node.is_some(),
+            "destination node should be accessible after edge promotion"
+        );
+    }
+
+    // ── D. Deleted entity tracking ────────────────────────────────
+
+    #[test]
+    fn test_deleted_base_node_invisible() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+
+        let deleted = layered.delete_node(target);
+        assert!(deleted);
+
+        // get_node should return None.
+        assert!(layered.get_node(target).is_none());
+
+        // get_node_property should also return None.
+        assert!(
+            layered
+                .get_node_property(target, &PropertyKey::new("name"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_deleted_node_excluded_from_nodes_by_label() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        assert_eq!(persons.len(), 2);
+
+        let target = persons[0];
+        layered.delete_node(target);
+
+        let after = layered.nodes_by_label("Person");
+        assert_eq!(after.len(), 1);
+        assert!(!after.contains(&target));
+    }
+
+    #[test]
+    fn test_deleted_node_excluded_from_node_ids() {
+        let layered = build_test_layered();
+        let all_before = layered.node_ids();
+        assert_eq!(all_before.len(), 3);
+
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+        layered.delete_node(target);
+
+        let all_after = layered.node_ids();
+        assert_eq!(all_after.len(), 2);
+        assert!(!all_after.contains(&target));
+    }
+
+    #[test]
+    fn test_deleted_edge_excluded_from_edges_from() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        let edges = layered.edges_from(first, Direction::Outgoing);
+        assert_eq!(edges.len(), 1);
+        let (_, eid) = edges[0];
+
+        layered.delete_edge(eid);
+
+        let after = layered.edges_from(first, Direction::Outgoing);
+        assert_eq!(after.len(), 0);
+    }
+
+    #[test]
+    fn test_deleted_edge_excluded_from_neighbors() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let first = persons[0];
+
+        // Deleting the target NODE should remove it from neighbors.
+        let neighbors_before = layered.neighbors(first, Direction::Outgoing);
+        assert_eq!(neighbors_before.len(), 1);
+
+        let target_node = neighbors_before[0];
+        layered.delete_node(target_node);
+
+        let neighbors_after = layered.neighbors(first, Direction::Outgoing);
+        assert_eq!(
+            neighbors_after.len(),
+            0,
+            "deleted node should not appear in neighbors"
+        );
+    }
+
+    #[test]
+    fn test_node_count_reflects_deletions() {
+        let layered = build_test_layered();
+        assert_eq!(layered.node_count(), 3);
+
+        let persons = layered.nodes_by_label("Person");
+        layered.delete_node(persons[0]);
+        assert_eq!(layered.node_count(), 2);
+
+        layered.delete_node(persons[1]);
+        assert_eq!(layered.node_count(), 1);
+    }
+
+    #[test]
+    fn test_edge_count_reflects_deletions() {
+        let layered = build_test_layered();
+        assert_eq!(layered.edge_count(), 2);
+
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, eid) = edges[0];
+
+        layered.delete_edge(eid);
+        assert_eq!(layered.edge_count(), 1);
+    }
+
+    // ── E. Search & statistics ────────────────────────────────────
+
+    #[test]
+    fn test_find_nodes_by_property_across_layers() {
+        let layered = build_test_layered();
+
+        // Base has Alix (age=30) and Gus (age=25).
+        let age_30 = layered.find_nodes_by_property("age", &Value::Int64(30));
+        assert_eq!(age_30.len(), 1);
+
+        // Add an overlay node with the same property value.
+        let vincent = layered.create_node(&["Person"]);
+        layered.set_node_property(vincent, "age", Value::Int64(30));
+
+        let age_30_after = layered.find_nodes_by_property("age", &Value::Int64(30));
+        assert_eq!(age_30_after.len(), 2);
+        assert!(age_30_after.contains(&vincent));
+    }
+
+    #[test]
+    fn test_find_nodes_in_range_across_layers() {
+        let layered = build_test_layered();
+
+        // Add an overlay node with age=35.
+        let mia = layered.create_node(&["Person"]);
+        layered.set_node_property(mia, "age", Value::Int64(35));
+
+        // Range query: age in [25, 35].
+        let in_range = layered.find_nodes_in_range(
+            "age",
+            Some(&Value::Int64(25)),
+            Some(&Value::Int64(35)),
+            true,
+            true,
+        );
+
+        // Should find Gus (25), Alix (30), and Mia (35).
+        assert!(
+            in_range.len() >= 3,
+            "expected at least 3 nodes in range, got {}",
+            in_range.len()
+        );
+        assert!(in_range.contains(&mia));
+    }
+
+    #[test]
+    fn test_statistics_reflects_overlay() {
+        let layered = build_test_layered();
+        let stats_before = layered.statistics();
+        let nodes_before = stats_before.total_nodes;
+
+        // Add overlay nodes.
+        layered.create_node(&["Person"]);
+        layered.create_node(&["City"]);
+
+        let stats_after = layered.statistics();
+        assert_eq!(stats_after.total_nodes, nodes_before + 2);
+    }
+
+    #[test]
+    fn test_all_edge_types_combines_layers() {
+        let layered = build_test_layered();
+        let types_before = layered.all_edge_types();
+        assert!(types_before.contains(&"LIVES_IN".to_string()));
+
+        // Add a new edge type in the overlay.
+        let persons = layered.nodes_by_label("Person");
+        let butch = layered.create_node(&["Person"]);
+        layered.create_edge(persons[0], butch, "KNOWS");
+
+        let types_after = layered.all_edge_types();
+        assert!(types_after.contains(&"LIVES_IN".to_string()));
+        assert!(types_after.contains(&"KNOWS".to_string()));
+    }
+
+    #[test]
+    fn test_all_property_keys_combines_layers() {
+        let layered = build_test_layered();
+        let keys_before = layered.all_property_keys();
+        assert!(keys_before.contains(&"name".to_string()));
+        assert!(keys_before.contains(&"age".to_string()));
+
+        // Add a new property key in the overlay.
+        let mia = layered.create_node(&["Person"]);
+        layered.set_node_property(mia, "email", Value::from("mia@example.com"));
+
+        let keys_after = layered.all_property_keys();
+        assert!(keys_after.contains(&"email".to_string()));
+        assert!(keys_after.contains(&"name".to_string()));
+    }
+
+    // ── F. Visibility ─────────────────────────────────────────────
+
+    #[test]
+    fn test_overlay_mutation_count() {
+        let layered = build_test_layered();
+        assert_eq!(layered.overlay_mutation_count(), 0);
+
+        // Create a node: 1 dirty node.
+        layered.create_node(&["Person"]);
+        assert_eq!(layered.overlay_mutation_count(), 1);
+
+        // Delete a base node: 1 dirty node + 1 deleted base node.
+        let persons = layered.nodes_by_label("Person");
+        layered.delete_node(persons[0]);
+        assert_eq!(layered.overlay_mutation_count(), 2);
+    }
+
+    #[test]
+    fn test_memory_bytes_nonzero() {
+        let layered = build_test_layered();
+        assert!(
+            layered.memory_bytes() > 0,
+            "memory_bytes should be positive for a non-empty store"
+        );
+    }
 }

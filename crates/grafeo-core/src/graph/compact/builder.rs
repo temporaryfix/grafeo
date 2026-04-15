@@ -1713,4 +1713,172 @@ mod tests {
             "Unknown edge type should return 0.0 avg degree"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Zone map helper tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_zone_map_u64_values_exceeding_i64_max() {
+        // Values that exceed i64::MAX should produce a zone map without
+        // min/max bounds (conservative, no pruning).
+        let values = vec![0u64, i64::MAX as u64 + 1, u64::MAX];
+        let zm = compute_zone_map_u64(&values);
+        assert!(
+            zm.min.is_none(),
+            "min should be None when values overflow i64"
+        );
+        assert!(
+            zm.max.is_none(),
+            "max should be None when values overflow i64"
+        );
+        assert_eq!(zm.row_count, 3);
+    }
+
+    #[test]
+    fn test_zone_map_u64_within_i64_range() {
+        let values = vec![10u64, 20, 30];
+        let zm = compute_zone_map_u64(&values);
+        assert_eq!(zm.min, Some(Value::Int64(10)));
+        assert_eq!(zm.max, Some(Value::Int64(30)));
+        assert_eq!(zm.null_count, 0);
+        assert_eq!(zm.row_count, 3);
+    }
+
+    #[test]
+    fn test_zone_map_u64_empty_slice() {
+        let zm = compute_zone_map_u64(&[]);
+        assert!(zm.min.is_none());
+        assert!(zm.max.is_none());
+        assert_eq!(zm.row_count, 0);
+    }
+
+    #[test]
+    fn test_zone_map_strings_empty_slice() {
+        let zm = compute_zone_map_strings(&[]);
+        assert!(zm.min.is_none());
+        assert!(zm.max.is_none());
+        assert_eq!(zm.row_count, 0);
+    }
+
+    #[test]
+    fn test_zone_map_strings_sorted() {
+        let values = &["Paris", "Amsterdam", "Berlin"];
+        let zm = compute_zone_map_strings(values);
+        assert_eq!(zm.min, Some(Value::from("Amsterdam")));
+        assert_eq!(zm.max, Some(Value::from("Paris")));
+        assert_eq!(zm.row_count, 3);
+    }
+
+    #[test]
+    fn test_zone_map_bool_all_true() {
+        let values = &[true, true, true];
+        let zm = compute_zone_map_bool(values);
+        // All true: min = true, max = true.
+        assert_eq!(zm.min, Some(Value::Bool(true)));
+        assert_eq!(zm.max, Some(Value::Bool(true)));
+        assert_eq!(zm.row_count, 3);
+    }
+
+    #[test]
+    fn test_zone_map_bool_all_false() {
+        let values = &[false, false];
+        let zm = compute_zone_map_bool(values);
+        // All false: min = false, max = false.
+        assert_eq!(zm.min, Some(Value::Bool(false)));
+        assert_eq!(zm.max, Some(Value::Bool(false)));
+        assert_eq!(zm.row_count, 2);
+    }
+
+    #[test]
+    fn test_zone_map_bool_mixed() {
+        let values = &[false, true, false];
+        let zm = compute_zone_map_bool(values);
+        assert_eq!(zm.min, Some(Value::Bool(false)));
+        assert_eq!(zm.max, Some(Value::Bool(true)));
+        assert_eq!(zm.row_count, 3);
+    }
+
+    #[test]
+    fn test_zone_map_bool_empty() {
+        let zm = compute_zone_map_bool(&[]);
+        assert!(zm.min.is_none());
+        assert!(zm.max.is_none());
+        assert_eq!(zm.row_count, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Type inference edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_infer_type_string_values() {
+        assert_eq!(
+            infer_type_from_values(&[Value::from("Alix"), Value::from("Gus")]),
+            InferredType::Dict
+        );
+    }
+
+    #[test]
+    fn test_infer_type_int_and_null() {
+        // Nulls are skipped, so pure Int64 with nulls remains BitPacked.
+        assert_eq!(
+            infer_type_from_values(&[Value::Int64(0), Value::Null, Value::Int64(5)]),
+            InferredType::BitPacked
+        );
+    }
+
+    #[test]
+    fn test_infer_type_bool_and_null() {
+        // Nulls are skipped, so pure Bool with nulls remains Bitmap.
+        assert_eq!(
+            infer_type_from_values(&[Value::Bool(true), Value::Null]),
+            InferredType::Bitmap
+        );
+    }
+
+    #[test]
+    fn test_infer_type_empty_values() {
+        // Empty slice: no non-null values seen, defaults to Dict.
+        assert_eq!(infer_type_from_values(&[]), InferredType::Dict);
+    }
+
+    // -------------------------------------------------------------------
+    // from_graph_store: null properties and multi-label nodes
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_from_graph_store_nodes_with_no_properties() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+
+        // Nodes with no properties at all.
+        store.create_node(&["Marker"]);
+        store.create_node(&["Marker"]);
+
+        let compact = from_graph_store(&store).unwrap();
+        let ids = compact.nodes_by_label("Marker");
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn test_from_graph_store_multi_label_sorted_key() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+
+        // Labels "Zebra" and "Alpha" should be sorted to "Alpha|Zebra".
+        let a = store.create_node(&["Zebra", "Alpha"]);
+        store.set_node_property(a, "name", Value::from("Butch"));
+
+        let compact = from_graph_store(&store).unwrap();
+        let ids = compact.nodes_by_label("Alpha|Zebra");
+        assert_eq!(ids.len(), 1);
+
+        let val = compact
+            .get_node_property(ids[0], &PropertyKey::new("name"))
+            .unwrap();
+        assert_eq!(val, Value::String(ArcStr::from("Butch")));
+    }
 }

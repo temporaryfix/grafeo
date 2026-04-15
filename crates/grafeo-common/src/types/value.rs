@@ -1871,4 +1871,130 @@ mod tests {
         let v = Value::List(Arc::from(vec![Value::from("abc"), Value::Int64(1)]));
         assert!(v.estimated_size_bytes() >= 3);
     }
+
+    // --- Accessor tests for temporal and counter types ---
+
+    #[test]
+    fn test_as_date_matching() {
+        let date = Date::from_ymd(2024, 6, 15).unwrap();
+        let v = Value::Date(date);
+        assert_eq!(v.as_date(), Some(date));
+    }
+
+    #[test]
+    fn test_as_date_non_matching() {
+        let v = Value::Int64(42);
+        assert_eq!(v.as_date(), None);
+    }
+
+    #[test]
+    fn test_as_time_matching() {
+        let time = Time::from_hms(14, 30, 0).unwrap();
+        let v = Value::Time(time);
+        assert_eq!(v.as_time(), Some(time));
+    }
+
+    #[test]
+    fn test_as_time_non_matching() {
+        let v = Value::String("x".into());
+        assert_eq!(v.as_time(), None);
+    }
+
+    #[test]
+    fn test_as_duration_matching() {
+        let dur = Duration::new(1, 2, 3_000_000_000);
+        let v = Value::Duration(dur);
+        assert_eq!(v.as_duration(), Some(dur));
+    }
+
+    #[test]
+    fn test_as_duration_non_matching() {
+        let v = Value::Bool(true);
+        assert_eq!(v.as_duration(), None);
+    }
+
+    #[test]
+    fn test_as_zoned_datetime_matching() {
+        let zdt = ZonedDatetime::parse("2024-06-15T10:30:00+01:00").unwrap();
+        let v = Value::ZonedDatetime(zdt);
+        assert_eq!(v.as_zoned_datetime(), Some(zdt));
+    }
+
+    #[test]
+    fn test_as_zoned_datetime_non_matching() {
+        let v = Value::Null;
+        assert_eq!(v.as_zoned_datetime(), None);
+    }
+
+    #[test]
+    fn test_as_zoned_datetime_from_conversion() {
+        let zdt = ZonedDatetime::parse("2025-01-01T00:00:00+02:00").unwrap();
+        let v: Value = zdt.into();
+        assert_eq!(v.as_zoned_datetime(), Some(zdt));
+        assert_eq!(v.type_name(), "ZONED DATETIME");
+    }
+
+    #[test]
+    fn test_as_date_wrong_temporal_type() {
+        // A Time value should not be returned by as_date
+        let time = Time::from_hms(12, 0, 0).unwrap();
+        let v = Value::Time(time);
+        assert_eq!(v.as_date(), None);
+    }
+
+    #[test]
+    fn test_as_time_wrong_temporal_type() {
+        // A Date value should not be returned by as_time
+        let date = Date::from_ymd(2024, 3, 15).unwrap();
+        let v = Value::Date(date);
+        assert_eq!(v.as_time(), None);
+    }
+
+    #[test]
+    fn test_as_duration_wrong_temporal_type() {
+        // A Timestamp should not be returned by as_duration
+        let ts = Timestamp::from_secs(1_000_000);
+        let v = Value::Timestamp(ts);
+        assert_eq!(v.as_duration(), None);
+    }
+
+    #[test]
+    fn test_as_zoned_datetime_wrong_temporal_type() {
+        // A plain Timestamp should not be returned by as_zoned_datetime
+        let ts = Timestamp::from_secs(1_000_000);
+        let v = Value::Timestamp(ts);
+        assert_eq!(v.as_zoned_datetime(), None);
+    }
+
+    #[test]
+    fn test_zoned_datetime_serialization_roundtrip() {
+        let zdt = ZonedDatetime::parse("2024-12-25T18:00:00+05:30").unwrap();
+        let v = Value::ZonedDatetime(zdt);
+        let bytes = v.serialize().unwrap();
+        let decoded = Value::deserialize(&bytes).unwrap();
+        assert_eq!(v, decoded);
+        assert_eq!(decoded.as_zoned_datetime(), Some(zdt));
+    }
+
+    #[test]
+    fn test_zoned_datetime_type_name() {
+        let zdt = ZonedDatetime::parse("2024-06-15T10:30:00+02:00").unwrap();
+        let v = Value::ZonedDatetime(zdt);
+        assert_eq!(v.type_name(), "ZONED DATETIME");
+    }
+
+    #[test]
+    fn test_zoned_datetime_display() {
+        let zdt = ZonedDatetime::parse("2024-06-15T10:30:00+02:00").unwrap();
+        let v = Value::ZonedDatetime(zdt);
+        let displayed = format!("{v}");
+        assert!(
+            displayed.contains("2024-06-15"),
+            "Display should contain the date"
+        );
+        assert!(
+            displayed.contains("10:30:00"),
+            "Display should contain the time"
+        );
+    }
 }

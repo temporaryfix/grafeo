@@ -1867,4 +1867,249 @@ mod tests {
 
         assert_eq!(restored.accumulators[0].finalize(), expected);
     }
+
+    // ---------------------------------------------------------------
+    // Serialization roundtrip: end-to-end through push operator
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_serialize_deserialize_sum_state() {
+        // Sum with float values to exercise SumFloat serialization path
+        let state = GroupState {
+            key_values: vec![Value::String("Alix".into())],
+            accumulators: vec![
+                AggregateState::SumInt(42, 3),
+                AggregateState::SumFloat(2.72, 0.001, 2),
+            ],
+        };
+        let mut buf = Vec::new();
+        serialize_group_state(&state, &mut buf).unwrap();
+        let restored = deserialize_group_state(&mut &buf[..]).unwrap();
+
+        assert_eq!(restored.key_values, vec![Value::String("Alix".into())]);
+        assert_eq!(restored.accumulators[0].finalize(), Value::Int64(42));
+        assert_eq!(restored.accumulators[1].finalize(), Value::Float64(2.72));
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_serialize_deserialize_avg_state() {
+        // Avg with sum=30.0, count=6 => finalize should produce 5.0
+        let state = GroupState {
+            key_values: vec![Value::String("Gus".into())],
+            accumulators: vec![AggregateState::Avg(30.0, 6)],
+        };
+        let mut buf = Vec::new();
+        serialize_group_state(&state, &mut buf).unwrap();
+        let restored = deserialize_group_state(&mut &buf[..]).unwrap();
+
+        assert_eq!(restored.key_values, vec![Value::String("Gus".into())]);
+        assert_eq!(restored.accumulators[0].finalize(), Value::Float64(5.0));
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_serialize_deserialize_count_state() {
+        let state = GroupState {
+            key_values: vec![Value::String("Vincent".into())],
+            accumulators: vec![AggregateState::Count(17)],
+        };
+        let mut buf = Vec::new();
+        serialize_group_state(&state, &mut buf).unwrap();
+        let restored = deserialize_group_state(&mut &buf[..]).unwrap();
+
+        assert_eq!(restored.key_values, vec![Value::String("Vincent".into())]);
+        assert_eq!(restored.accumulators[0].finalize(), Value::Int64(17));
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_serialize_deserialize_min_max_state() {
+        // Test with String values (not just Int64) to cover different value types
+        let state = GroupState {
+            key_values: vec![Value::String("Jules".into())],
+            accumulators: vec![
+                AggregateState::Min(Some(Value::String("Amsterdam".into()))),
+                AggregateState::Max(Some(Value::Float64(99.9))),
+                AggregateState::Min(None),
+                AggregateState::Max(None),
+            ],
+        };
+        let mut buf = Vec::new();
+        serialize_group_state(&state, &mut buf).unwrap();
+        let restored = deserialize_group_state(&mut &buf[..]).unwrap();
+
+        assert_eq!(
+            restored.accumulators[0].finalize(),
+            Value::String("Amsterdam".into())
+        );
+        assert_eq!(restored.accumulators[1].finalize(), Value::Float64(99.9));
+        // None values serialize as Null and deserialize as Min(None)
+        assert_eq!(restored.accumulators[2].finalize(), Value::Null);
+        assert_eq!(restored.accumulators[3].finalize(), Value::Null);
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_serialize_deserialize_collect_state() {
+        // Collect with mixed value types
+        let state = GroupState {
+            key_values: vec![Value::String("Mia".into())],
+            accumulators: vec![AggregateState::Collect(vec![
+                Value::Int64(1),
+                Value::String("Berlin".into()),
+                Value::Float64(2.5),
+                Value::Bool(true),
+            ])],
+        };
+        let mut buf = Vec::new();
+        serialize_group_state(&state, &mut buf).unwrap();
+        let restored = deserialize_group_state(&mut &buf[..]).unwrap();
+
+        let result = restored.accumulators[0].finalize();
+        if let Value::List(list) = result {
+            assert_eq!(list.len(), 4);
+            assert_eq!(list[0], Value::Int64(1));
+            assert_eq!(list[1], Value::String("Berlin".into()));
+            assert_eq!(list[2], Value::Float64(2.5));
+            assert_eq!(list[3], Value::Bool(true));
+        } else {
+            panic!("expected List, got {result:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_serialize_deserialize_count_distinct() {
+        use crate::execution::operators::accumulator::HashableValue;
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        seen.insert(HashableValue::from(Value::String("Paris".into())));
+        seen.insert(HashableValue::from(Value::String("Prague".into())));
+        seen.insert(HashableValue::from(Value::String("Barcelona".into())));
+        let state = GroupState {
+            key_values: vec![Value::String("Butch".into())],
+            accumulators: vec![AggregateState::CountDistinct(3, seen)],
+        };
+        let mut buf = Vec::new();
+        serialize_group_state(&state, &mut buf).unwrap();
+        let restored = deserialize_group_state(&mut &buf[..]).unwrap();
+
+        // CountDistinct serializes as FINALIZED, so deserialized as Frozen(Int64(3))
+        assert_eq!(restored.accumulators[0].finalize(), Value::Int64(3));
+        assert!(
+            matches!(restored.accumulators[0], AggregateState::Frozen(_)),
+            "DISTINCT should be deserialized as Frozen"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Push operator with empty chunks and empty input
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_push_empty_chunk() {
+        // Push an empty chunk, then push a real chunk, and verify finalize is correct
+        let mut agg = AggregatePushOperator::global(vec![AggregateExpr::sum(0)]);
+        let mut sink = CollectorSink::new();
+
+        // Push an empty chunk (zero rows)
+        let empty = DataChunk::new(vec![ValueVector::new()]);
+        let continued = agg.push(empty, &mut sink).unwrap();
+        assert!(continued, "push of empty chunk should return true");
+
+        // Push real data
+        agg.push(create_test_chunk(&[10, 20, 30]), &mut sink)
+            .unwrap();
+        agg.finalize(&mut sink).unwrap();
+
+        let chunks = sink.into_chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].column(0).unwrap().get_value(0),
+            Some(Value::Int64(60))
+        );
+    }
+
+    #[test]
+    fn test_global_aggregate_empty_input() {
+        // Global aggregate with no input at all should produce correct defaults
+        let mut agg = AggregatePushOperator::global(vec![
+            AggregateExpr::count_star(),
+            AggregateExpr::sum(0),
+            AggregateExpr::min(0),
+            AggregateExpr::max(0),
+        ]);
+        let mut sink = CollectorSink::new();
+
+        // No push calls at all, directly finalize
+        agg.finalize(&mut sink).unwrap();
+
+        let chunks = sink.into_chunks();
+        assert_eq!(chunks.len(), 1);
+        // COUNT(*) with no input should be 0
+        assert_eq!(
+            chunks[0].column(0).unwrap().get_value(0),
+            Some(Value::Int64(0))
+        );
+        // SUM with no input should be Null
+        assert_eq!(chunks[0].column(1).unwrap().get_value(0), Some(Value::Null));
+        // MIN with no input should be Null
+        assert_eq!(chunks[0].column(2).unwrap().get_value(0), Some(Value::Null));
+        // MAX with no input should be Null
+        assert_eq!(chunks[0].column(3).unwrap().get_value(0), Some(Value::Null));
+    }
+
+    // ---------------------------------------------------------------
+    // Spillable aggregate: memory pressure triggers spilling
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn test_spillable_aggregate_memory_pressure() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let manager = Arc::new(SpillManager::new(temp_dir.path()).unwrap());
+
+        // Extremely low threshold of 2 to force spilling quickly
+        let mut agg = SpillableAggregatePushOperator::with_spilling(
+            vec![0],
+            vec![AggregateExpr::sum(1)],
+            Arc::clone(&manager),
+            2,
+        );
+        let mut sink = CollectorSink::new();
+
+        // Push many distinct groups to trigger memory pressure and spilling
+        for i in 0..20 {
+            let chunk = create_two_column_chunk(&[i], &[i * 5]);
+            agg.push(chunk, &mut sink).unwrap();
+        }
+
+        // Verify spilling happened (manager should have active spill files)
+        assert!(
+            manager.active_file_count() > 0,
+            "expected spill files to be created under memory pressure"
+        );
+
+        agg.finalize(&mut sink).unwrap();
+
+        let chunks = sink.into_chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 20);
+
+        // Verify all sums are correct
+        let mut sums: Vec<i64> = Vec::new();
+        for i in 0..chunks[0].len() {
+            if let Some(Value::Int64(sum)) = chunks[0].column(1).unwrap().get_value(i) {
+                sums.push(sum);
+            }
+        }
+        sums.sort_unstable();
+        let expected: Vec<i64> = (0..20).map(|i| i * 5).collect();
+        assert_eq!(sums, expected);
+    }
 }

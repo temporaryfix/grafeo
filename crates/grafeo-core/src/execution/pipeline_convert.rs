@@ -501,4 +501,64 @@ mod tests {
         assert_eq!(desc.direction, PushSortDirection::Descending);
         assert_eq!(desc.null_order, PushNullOrder::Last);
     }
+
+    #[test]
+    fn test_distinct_on_columns_pipeline_execution() {
+        use crate::execution::pipeline::Pipeline;
+        use crate::execution::sink::CollectorSink;
+
+        // Build: Scan -> Distinct(on column 0)
+        let scan: Box<dyn Operator> = Box::new(TestScanOperator::new());
+        let distinct: Box<dyn Operator> = Box::new(DistinctOperator::on_columns(
+            scan,
+            vec![0],
+            vec![LogicalType::Int64],
+        ));
+
+        let (source, push_ops) = convert_to_pipeline(distinct);
+        assert_eq!(push_ops.len(), 1);
+        assert!(push_ops[0].name().contains("Distinct"));
+
+        // Execute the pipeline and verify results
+        let source = Box::new(crate::execution::source::OperatorSource::new(source));
+        let collector = CollectorSink::new();
+        let mut pipeline = Pipeline::new(source, push_ops, Box::new(collector));
+        pipeline.execute().unwrap();
+
+        let sink_box = pipeline.into_sink();
+        let any_sink: Box<dyn std::any::Any> = sink_box.into_any();
+        let collector = any_sink.downcast::<CollectorSink>().unwrap();
+        // TestScan produces [1, 2, 3], all distinct, so 3 rows
+        assert_eq!(collector.row_count(), 3);
+    }
+
+    #[test]
+    fn test_unrecognized_operator_stays_as_source() {
+        /// A custom operator with an unrecognized name.
+        struct CustomJoinOperator;
+
+        impl Operator for CustomJoinOperator {
+            fn next(&mut self) -> OperatorResult {
+                Ok(None)
+            }
+
+            fn reset(&mut self) {}
+
+            fn name(&self) -> &'static str {
+                "CustomNestedLoopJoin"
+            }
+
+            fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+                self
+            }
+        }
+
+        let join: Box<dyn Operator> = Box::new(CustomJoinOperator);
+        let (source, push_ops) = convert_to_pipeline(join);
+        assert_eq!(source.name(), "CustomNestedLoopJoin");
+        assert!(
+            push_ops.is_empty(),
+            "unrecognized operator should produce no push ops"
+        );
+    }
 }
