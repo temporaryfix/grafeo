@@ -422,6 +422,20 @@ impl QueryError {
         Self::new(QueryErrorKind::Execution, "Query exceeded timeout")
     }
 
+    /// Creates a query timeout error that includes the configured limit.
+    #[must_use]
+    pub fn timeout_with_limit(limit: std::time::Duration) -> Self {
+        let secs = limit.as_secs();
+        Self::new(
+            QueryErrorKind::Execution,
+            format!("Query exceeded the {secs}s timeout"),
+        )
+        .with_hint(
+            "Increase with Config::with_query_timeout() or disable with Config::without_query_timeout()"
+                .to_string(),
+        )
+    }
+
     /// Returns the machine-readable error code for this query error.
     #[must_use]
     pub const fn error_code(&self) -> ErrorCode {

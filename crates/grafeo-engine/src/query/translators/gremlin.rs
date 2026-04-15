@@ -858,6 +858,12 @@ impl GremlinTranslator {
                 Ok((plan, None))
             }
             ast::Step::Range(start, end) => {
+                if end < start {
+                    return Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        format!("range() end ({end}) must be >= start ({start})"),
+                    )));
+                }
                 let plan = wrap_skip(input, *start);
                 let plan = wrap_limit(plan, end - start);
                 Ok((plan, None))

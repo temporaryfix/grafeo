@@ -13,6 +13,9 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **Push-based pipeline execution**: queries with filter, sort, aggregate, limit, or distinct now execute through a push-based pipeline instead of the Volcano pull loop, reducing per-row overhead on analytical workloads.
 - **Runtime metrics**: query, transaction, session, cache, and GC counters with Prometheus text export. Python `db.metrics()` / `db.metrics_prometheus()` and Node.js equivalents (requires `metrics` feature).
 - **C# enterprise APIs**: `SetSchema` / `ResetSchema` / `CurrentSchema`, backup/restore, compact, projections, CDC toggle, `ClearPlanCache`. `IGrafeoDB` and `ITransaction` interfaces for dependency injection and mocking.
+- **Default query timeout**: 30-second default for all queries (previously no limit). Override with `Config::with_query_timeout()` or disable with `Config::without_query_timeout()`. Timeout errors now include the configured limit and a hint.
+- **Property value size limits**: `max_property_size` config (default 16 MiB) rejects oversized values at the session level. `Value::estimated_size_bytes()` for heap size estimation.
+- **HNSW max_elements bound**: `HnswConfig::with_max_elements(n)` caps index size, preventing unbounded memory growth on large vector workloads.
 
 ### Changed
 
@@ -51,6 +54,7 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **SHACL SPARQL injection via crafted IRIs**: the `$this` substitution in SHACL constraint queries embedded IRIs via string concatenation. A crafted IRI containing `>` could break out of the `<...>` wrapper and inject SPARQL. Now validates all IRIs and graph names against a strict character allowlist before embedding.
 - **DPccp join optimizer unbounded enumeration**: the DPccp algorithm enumerated O(2^n) subset pairs with no iteration limit. For 20+ join nodes this could stall query planning. Now enforces a 100K iteration budget, returning the best plan found so far.
 - **Windows memory detection fallback**: `BufferManager` always fell back to 1 GB on Windows instead of detecting actual physical memory. Now calls `GlobalMemoryStatusEx` to read the real system memory size.
+- **Gremlin `range()` overflow**: `range(5, 2)` caused a subtraction overflow panic. Now returns a semantic error when end < start.
 
 ## [0.5.38] - 2026-04-13
 

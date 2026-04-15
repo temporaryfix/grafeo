@@ -261,6 +261,14 @@ impl HnswIndex {
             vector.len()
         );
 
+        if let Some(max) = self.config.max_elements {
+            let count = self.nodes.read().len();
+            assert!(
+                count < max,
+                "HNSW index is full: max_elements={max}, current={count}"
+            );
+        }
+
         let level = self.random_level();
 
         // Create the new node (topology only)
@@ -1333,6 +1341,38 @@ mod tests {
         let accessor = make_accessor(&map);
 
         index.insert(NodeId::new(1), &[0.1, 0.2, 0.3], &accessor); // Wrong dimension
+    }
+
+    #[test]
+    fn test_hnsw_max_elements_accepts_within_limit() {
+        let config = HnswConfig::new(3, DistanceMetric::Euclidean).with_max_elements(3);
+        let index = HnswIndex::new(config);
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        map.insert(NodeId::new(0), Arc::from([1.0f32, 0.0, 0.0].as_slice()));
+        map.insert(NodeId::new(1), Arc::from([0.0f32, 1.0, 0.0].as_slice()));
+        map.insert(NodeId::new(2), Arc::from([0.0f32, 0.0, 1.0].as_slice()));
+        let accessor = make_accessor(&map);
+
+        index.insert(NodeId::new(0), &[1.0, 0.0, 0.0], &accessor);
+        index.insert(NodeId::new(1), &[0.0, 1.0, 0.0], &accessor);
+        index.insert(NodeId::new(2), &[0.0, 0.0, 1.0], &accessor);
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "HNSW index is full")]
+    fn test_hnsw_rejects_above_max_elements() {
+        let config = HnswConfig::new(3, DistanceMetric::Euclidean).with_max_elements(2);
+        let index = HnswIndex::new(config);
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        map.insert(NodeId::new(0), Arc::from([1.0f32, 0.0, 0.0].as_slice()));
+        map.insert(NodeId::new(1), Arc::from([0.0f32, 1.0, 0.0].as_slice()));
+        map.insert(NodeId::new(2), Arc::from([0.0f32, 0.0, 1.0].as_slice()));
+        let accessor = make_accessor(&map);
+
+        index.insert(NodeId::new(0), &[1.0, 0.0, 0.0], &accessor);
+        index.insert(NodeId::new(1), &[0.0, 1.0, 0.0], &accessor);
+        index.insert(NodeId::new(2), &[0.0, 0.0, 1.0], &accessor); // Should panic
     }
 
     #[test]

@@ -33,6 +33,7 @@ use grafeo_core::graph::{GraphStore, GraphStoreMut};
 use crate::catalog::{Catalog, CatalogConstraintValidator};
 use crate::config::{AdaptiveConfig, GraphModel};
 use crate::database::QueryResult;
+use crate::query::Executor;
 use crate::query::cache::QueryCache;
 use crate::transaction::TransactionManager;
 
@@ -83,6 +84,7 @@ pub(crate) struct SessionConfig {
     pub factorized_execution: bool,
     pub graph_model: GraphModel,
     pub query_timeout: Option<Duration>,
+    pub max_property_size: Option<usize>,
     pub commit_counter: Arc<AtomicUsize>,
     pub gc_interval: usize,
     /// When true, the session permanently blocks all mutations.
@@ -142,6 +144,8 @@ pub struct Session {
     graph_model: GraphModel,
     /// Maximum time a query may run before being cancelled.
     query_timeout: Option<Duration>,
+    /// Maximum size in bytes for a single property value.
+    max_property_size: Option<usize>,
     /// Shared commit counter for triggering auto-GC.
     commit_counter: Arc<AtomicUsize>,
     /// GC every N commits (0 = disabled).
@@ -249,6 +253,7 @@ impl Session {
             factorized_execution: cfg.factorized_execution,
             graph_model: cfg.graph_model,
             query_timeout: cfg.query_timeout,
+            max_property_size: cfg.max_property_size,
             commit_counter: cfg.commit_counter,
             gc_interval: cfg.gc_interval,
             transaction_start_node_count: AtomicUsize::new(0),
@@ -358,6 +363,7 @@ impl Session {
             factorized_execution: cfg.factorized_execution,
             graph_model: cfg.graph_model,
             query_timeout: cfg.query_timeout,
+            max_property_size: cfg.max_property_size,
             commit_counter: cfg.commit_counter,
             gc_interval: cfg.gc_interval,
             transaction_start_node_count: AtomicUsize::new(0),
@@ -2509,8 +2515,8 @@ impl Session {
         self.require_lpg("GQL")?;
 
         use crate::query::{
-            Executor, binder::Binder, cache::CacheKey, optimizer::Optimizer,
-            processor::QueryLanguage, translators::gql,
+            binder::Binder, cache::CacheKey, optimizer::Optimizer, processor::QueryLanguage,
+            translators::gql,
         };
 
         let _span = grafeo_info_span!(
@@ -2610,8 +2616,7 @@ impl Session {
                 );
                 let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
 
-                let executor = Executor::with_columns(physical_plan.columns.clone())
-                    .with_deadline(self.query_deadline());
+                let executor = self.make_executor(physical_plan.columns.clone());
                 let _result = executor.execute(physical_plan.operator.as_mut())?;
 
                 let total_time_ms;
@@ -2656,8 +2661,7 @@ impl Session {
             let physical_plan = planner.plan(&optimized_plan)?;
 
             // Execute the plan via push-based pipeline when possible
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             let (mut source, push_ops) =
                 grafeo_core::execution::pipeline_convert::convert_to_pipeline(
                     physical_plan.into_operator(),
@@ -2829,8 +2833,8 @@ impl Session {
     #[cfg(feature = "cypher")]
     pub fn execute_cypher(&self, query: &str) -> Result<QueryResult> {
         use crate::query::{
-            Executor, binder::Binder, cache::CacheKey, optimizer::Optimizer,
-            processor::QueryLanguage, translators::cypher,
+            binder::Binder, cache::CacheKey, optimizer::Optimizer, processor::QueryLanguage,
+            translators::cypher,
         };
 
         // Handle schema DDL and SHOW commands before the normal query path
@@ -2926,8 +2930,7 @@ impl Session {
                 );
                 let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
 
-                let executor = Executor::with_columns(physical_plan.columns.clone())
-                    .with_deadline(self.query_deadline());
+                let executor = self.make_executor(physical_plan.columns.clone());
                 let _result = executor.execute(physical_plan.operator.as_mut())?;
 
                 let total_time_ms;
@@ -2963,8 +2966,7 @@ impl Session {
             let mut physical_plan = planner.plan(&optimized_plan)?;
 
             // Execute the plan
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             executor.execute(physical_plan.operator.as_mut())
         });
 
@@ -3005,7 +3007,7 @@ impl Session {
     /// ```
     #[cfg(feature = "gremlin")]
     pub fn execute_gremlin(&self, query: &str) -> Result<QueryResult> {
-        use crate::query::{Executor, binder::Binder, optimizer::Optimizer, translators::gremlin};
+        use crate::query::{binder::Binder, optimizer::Optimizer, translators::gremlin};
 
         #[cfg(all(feature = "metrics", not(target_arch = "wasm32")))]
         let start_time = Instant::now();
@@ -3037,8 +3039,7 @@ impl Session {
             let mut physical_plan = planner.plan(&optimized_plan)?;
 
             // Execute the plan
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             executor.execute(physical_plan.operator.as_mut())
         });
 
@@ -3066,7 +3067,7 @@ impl Session {
         params: std::collections::HashMap<String, Value>,
     ) -> Result<QueryResult> {
         use crate::query::{
-            Executor, binder::Binder, optimizer::Optimizer, processor::substitute_params,
+            binder::Binder, optimizer::Optimizer, processor::substitute_params,
             translators::gremlin,
         };
 
@@ -3098,8 +3099,7 @@ impl Session {
             let planner =
                 self.create_planner_for_store(Arc::clone(&active), viewing_epoch, transaction_id);
             let mut physical_plan = planner.plan(&optimized_plan)?;
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             executor.execute(physical_plan.operator.as_mut())
         });
 
@@ -3141,7 +3141,7 @@ impl Session {
     #[cfg(feature = "graphql")]
     pub fn execute_graphql(&self, query: &str) -> Result<QueryResult> {
         use crate::query::{
-            Executor, binder::Binder, optimizer::Optimizer, processor::substitute_params,
+            binder::Binder, optimizer::Optimizer, processor::substitute_params,
             translators::graphql,
         };
 
@@ -3172,8 +3172,7 @@ impl Session {
             let planner =
                 self.create_planner_for_store(Arc::clone(&active), viewing_epoch, transaction_id);
             let mut physical_plan = planner.plan(&optimized_plan)?;
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             executor.execute(physical_plan.operator.as_mut())
         });
 
@@ -3201,7 +3200,7 @@ impl Session {
         params: std::collections::HashMap<String, Value>,
     ) -> Result<QueryResult> {
         use crate::query::{
-            Executor, binder::Binder, optimizer::Optimizer, processor::substitute_params,
+            binder::Binder, optimizer::Optimizer, processor::substitute_params,
             translators::graphql,
         };
 
@@ -3239,8 +3238,7 @@ impl Session {
             let planner =
                 self.create_planner_for_store(Arc::clone(&active), viewing_epoch, transaction_id);
             let mut physical_plan = planner.plan(&optimized_plan)?;
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             executor.execute(physical_plan.operator.as_mut())
         });
 
@@ -3283,7 +3281,7 @@ impl Session {
     #[cfg(feature = "sql-pgq")]
     pub fn execute_sql(&self, query: &str) -> Result<QueryResult> {
         use crate::query::{
-            Executor, binder::Binder, cache::CacheKey, optimizer::Optimizer, plan::LogicalOperator,
+            binder::Binder, cache::CacheKey, optimizer::Optimizer, plan::LogicalOperator,
             processor::QueryLanguage, translators::sql_pgq,
         };
 
@@ -3337,8 +3335,7 @@ impl Session {
             let planner =
                 self.create_planner_for_store(Arc::clone(&active), viewing_epoch, transaction_id);
             let mut physical_plan = planner.plan(&optimized_plan)?;
-            let executor = Executor::with_columns(physical_plan.columns.clone())
-                .with_deadline(self.query_deadline());
+            let executor = self.make_executor(physical_plan.columns.clone());
             executor.execute(physical_plan.operator.as_mut())
         });
 
@@ -4246,6 +4243,35 @@ impl Session {
         }
     }
 
+    /// Creates an executor with deadline and timeout duration configured.
+    fn make_executor(&self, columns: Vec<String>) -> Executor {
+        Executor::with_columns(columns)
+            .with_deadline(self.query_deadline())
+            .with_timeout_duration(self.query_timeout)
+    }
+
+    /// Checks that a property value does not exceed the configured size limit.
+    fn check_property_size(&self, key: &str, value: &Value) -> Result<()> {
+        if let Some(limit) = self.max_property_size {
+            let size = value.estimated_size_bytes();
+            if size > limit {
+                let limit_mb = limit / (1024 * 1024);
+                return Err(grafeo_common::utils::error::Error::Query(
+                    grafeo_common::utils::error::QueryError::new(
+                        grafeo_common::utils::error::QueryErrorKind::Execution,
+                        format!(
+                            "Property '{key}' value exceeds maximum size of {limit_mb} MiB ({size} bytes)"
+                        ),
+                    )
+                    .with_hint(
+                        "Increase with Config::with_max_property_size() or disable with Config::without_max_property_size()".to_string(),
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Records query metrics for any language.
     ///
     /// Called after query execution to update counters, latency histogram,
@@ -4506,8 +4532,13 @@ impl Session {
     }
 
     /// Sets a node property within the active transaction context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value exceeds the configured `max_property_size`.
     #[cfg(feature = "lpg")]
-    pub fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
+    pub fn set_node_property(&self, id: NodeId, key: &str, value: Value) -> Result<()> {
+        self.check_property_size(key, &value)?;
         let (_, transaction_id) = self.get_transaction_context();
         if let Some(tid) = transaction_id {
             self.active_lpg_store()
@@ -4515,11 +4546,22 @@ impl Session {
         } else {
             self.active_lpg_store().set_node_property(id, key, value);
         }
+        Ok(())
     }
 
     /// Sets an edge property within the active transaction context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value exceeds the configured `max_property_size`.
     #[cfg(feature = "lpg")]
-    pub fn set_edge_property(&self, id: grafeo_common::types::EdgeId, key: &str, value: Value) {
+    pub fn set_edge_property(
+        &self,
+        id: grafeo_common::types::EdgeId,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        self.check_property_size(key, &value)?;
         let (_, transaction_id) = self.get_transaction_context();
         if let Some(tid) = transaction_id {
             self.active_lpg_store()
@@ -4527,6 +4569,7 @@ impl Session {
         } else {
             self.active_lpg_store().set_edge_property(id, key, value);
         }
+        Ok(())
     }
 
     /// Deletes a node within the active transaction context.
@@ -5716,11 +5759,22 @@ mod tests {
     }
 
     #[test]
-    fn test_no_query_timeout_returns_no_deadline() {
+    fn test_default_query_timeout_returns_deadline() {
         let db = GrafeoDB::new_in_memory();
         let session = db.session();
 
-        // Default config has no timeout
+        // Default config has 30s timeout
+        assert!(session.query_deadline().is_some());
+    }
+
+    #[test]
+    fn test_no_query_timeout_returns_no_deadline() {
+        use crate::config::Config;
+
+        let config = Config::in_memory().without_query_timeout();
+        let db = GrafeoDB::with_config(config).unwrap();
+        let session = db.session();
+
         assert!(session.query_deadline().is_none());
     }
 
@@ -5732,6 +5786,49 @@ mod tests {
         let session = db.session();
 
         assert_eq!(session.graph_model(), GraphModel::Lpg);
+    }
+
+    #[test]
+    fn test_reject_oversized_property() {
+        use crate::config::Config;
+
+        let config = Config::in_memory().with_max_property_size(100);
+        let db = GrafeoDB::with_config(config).unwrap();
+        let session = db.session();
+
+        let node = session.create_node(&["Test"]);
+
+        // Small property should succeed
+        session
+            .set_node_property(node, "small", Value::from("hello"))
+            .unwrap();
+
+        // Large property should be rejected
+        let big = "x".repeat(200);
+        let result = session.set_node_property(node, "big", Value::from(big.as_str()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum size"),
+            "Expected size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_no_property_size_limit() {
+        use crate::config::Config;
+
+        let config = Config::in_memory().without_max_property_size();
+        let db = GrafeoDB::with_config(config).unwrap();
+        let session = db.session();
+
+        let node = session.create_node(&["Test"]);
+
+        // Even large properties should succeed with no limit
+        let big = "x".repeat(10_000);
+        session
+            .set_node_property(node, "big", Value::from(big.as_str()))
+            .unwrap();
     }
 
     #[cfg(feature = "gql")]

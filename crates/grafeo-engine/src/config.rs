@@ -243,7 +243,20 @@ pub struct Config {
     /// When set, the executor checks the deadline between operator batches and
     /// returns `QueryError::timeout()` if the wall-clock limit is exceeded.
     /// `None` means no timeout (queries may run indefinitely).
+    ///
+    /// Default: 30 seconds. Use `with_query_timeout()` to change or
+    /// `without_query_timeout()` to disable.
     pub query_timeout: Option<Duration>,
+
+    /// Maximum size in bytes for a single property value.
+    ///
+    /// When set, `set_node_property()` and `set_edge_property()` reject
+    /// values whose `estimated_size_bytes()` exceeds this limit.
+    /// `None` means no limit (any size is accepted).
+    ///
+    /// Default: 16 MiB. Use `with_max_property_size()` to change or
+    /// `without_max_property_size()` to disable.
+    pub max_property_size: Option<usize>,
 
     /// Run MVCC version garbage collection every N commits.
     ///
@@ -391,7 +404,8 @@ impl Default for Config {
             wal_durability: DurabilityMode::default(),
             storage_format: StorageFormat::default(),
             schema_constraints: false,
-            query_timeout: None,
+            query_timeout: Some(Duration::from_secs(30)),
+            max_property_size: Some(16 * 1024 * 1024), // 16 MiB
             gc_interval: 100,
             access_mode: AccessMode::default(),
             cdc_enabled: false,
@@ -527,6 +541,27 @@ impl Config {
     #[must_use]
     pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables the query timeout, allowing queries to run indefinitely.
+    #[must_use]
+    pub fn without_query_timeout(mut self) -> Self {
+        self.query_timeout = None;
+        self
+    }
+
+    /// Sets the maximum size in bytes for a single property value.
+    #[must_use]
+    pub fn with_max_property_size(mut self, size: usize) -> Self {
+        self.max_property_size = Some(size);
+        self
+    }
+
+    /// Disables the property value size limit.
+    #[must_use]
+    pub fn without_max_property_size(mut self) -> Self {
+        self.max_property_size = None;
         self
     }
 
@@ -675,7 +710,7 @@ mod tests {
         assert!(config.factorized_execution);
         assert_eq!(config.wal_durability, DurabilityMode::default());
         assert!(!config.schema_constraints);
-        assert!(config.query_timeout.is_none());
+        assert_eq!(config.query_timeout, Some(Duration::from_secs(30)));
         assert_eq!(config.gc_interval, 100);
     }
 
@@ -875,6 +910,26 @@ mod tests {
         );
     }
 
+    // --- max_property_size tests ---
+
+    #[test]
+    fn test_config_default_max_property_size() {
+        let config = Config::in_memory();
+        assert_eq!(config.max_property_size, Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_config_with_max_property_size() {
+        let config = Config::in_memory().with_max_property_size(1024);
+        assert_eq!(config.max_property_size, Some(1024));
+    }
+
+    #[test]
+    fn test_config_without_max_property_size() {
+        let config = Config::in_memory().without_max_property_size();
+        assert!(config.max_property_size.is_none());
+    }
+
     // --- schema_constraints tests ---
 
     #[test]
@@ -887,7 +942,19 @@ mod tests {
 
     #[test]
     fn test_config_with_query_timeout() {
-        let config = Config::in_memory().with_query_timeout(Duration::from_secs(30));
+        let config = Config::in_memory().with_query_timeout(Duration::from_secs(60));
+        assert_eq!(config.query_timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_config_without_query_timeout() {
+        let config = Config::in_memory().without_query_timeout();
+        assert!(config.query_timeout.is_none());
+    }
+
+    #[test]
+    fn test_config_default_query_timeout() {
+        let config = Config::in_memory();
         assert_eq!(config.query_timeout, Some(Duration::from_secs(30)));
     }
 

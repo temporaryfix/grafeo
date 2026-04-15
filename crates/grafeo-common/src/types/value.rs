@@ -381,6 +381,50 @@ impl Value {
         let (value, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
         Ok(value)
     }
+
+    /// Returns an estimate of the heap memory used by this value in bytes.
+    ///
+    /// This is a best-effort approximation used for enforcing property size
+    /// limits. Fixed-size types return 0 (only the enum discriminant, which
+    /// is already accounted for on the stack).
+    #[must_use]
+    pub fn estimated_size_bytes(&self) -> usize {
+        match self {
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int64(_)
+            | Value::Float64(_)
+            | Value::Timestamp(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::Duration(_)
+            | Value::ZonedDatetime(_) => 0,
+            Value::String(s) => s.len(),
+            Value::Bytes(b) => b.len(),
+            Value::Vector(v) => v.len() * size_of::<f32>(),
+            Value::List(items) => {
+                items.iter().map(Value::estimated_size_bytes).sum::<usize>()
+                    + items.len() * size_of::<Value>()
+            }
+            Value::Map(m) => m
+                .iter()
+                .map(|(k, v)| k.as_ref().len() + v.estimated_size_bytes() + size_of::<Value>())
+                .sum(),
+            Value::Path { nodes, edges } => {
+                let n: usize = nodes.iter().map(Value::estimated_size_bytes).sum::<usize>()
+                    + nodes.len() * size_of::<Value>();
+                let e: usize = edges.iter().map(Value::estimated_size_bytes).sum::<usize>()
+                    + edges.len() * size_of::<Value>();
+                n + e
+            }
+            Value::GCounter(m) => m.keys().map(|k| k.len() + size_of::<u64>()).sum(),
+            Value::OnCounter { pos, neg } => {
+                let p: usize = pos.keys().map(|k| k.len() + size_of::<u64>()).sum();
+                let n: usize = neg.keys().map(|k| k.len() + size_of::<u64>()).sum();
+                p + n
+            }
+        }
+    }
 }
 
 impl fmt::Debug for Value {
@@ -1786,5 +1830,38 @@ mod tests {
             neg: Arc::new(neg),
         };
         assert_eq!(format!("{v}"), "OnCounter(0)");
+    }
+
+    #[test]
+    fn test_estimated_size_bytes_fixed_types() {
+        assert_eq!(Value::Null.estimated_size_bytes(), 0);
+        assert_eq!(Value::Bool(true).estimated_size_bytes(), 0);
+        assert_eq!(Value::Int64(42).estimated_size_bytes(), 0);
+        assert_eq!(Value::Float64(3.14).estimated_size_bytes(), 0);
+    }
+
+    #[test]
+    fn test_estimated_size_bytes_string() {
+        let v = Value::from("hello");
+        assert_eq!(v.estimated_size_bytes(), 5);
+    }
+
+    #[test]
+    fn test_estimated_size_bytes_bytes() {
+        let v = Value::Bytes(Arc::from(vec![0u8; 100].as_slice()));
+        assert_eq!(v.estimated_size_bytes(), 100);
+    }
+
+    #[test]
+    fn test_estimated_size_bytes_vector() {
+        let v = Value::Vector(Arc::from(vec![1.0f32; 384].as_slice()));
+        assert_eq!(v.estimated_size_bytes(), 384 * 4);
+    }
+
+    #[test]
+    fn test_estimated_size_bytes_list() {
+        let v = Value::List(Arc::from(vec![Value::from("abc"), Value::Int64(1)]));
+        // 3 bytes for "abc" + 0 for Int64 + 2 * size_of::<Value>()
+        assert!(v.estimated_size_bytes() >= 3);
     }
 }
