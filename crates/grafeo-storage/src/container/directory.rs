@@ -100,6 +100,8 @@ impl SectionDirectory {
         let mut buf = vec![0u8; DIRECTORY_PAGE_SIZE];
 
         // Header: entry count
+        // reason: MAX_SECTIONS is 127, so entries.len() always fits in u32
+        #[allow(clippy::cast_possible_truncation)]
         let count = self.entries.len() as u32;
         buf[0..4].copy_from_slice(&count.to_le_bytes());
         // Bytes 4-7: reserved

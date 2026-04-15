@@ -22,12 +22,16 @@ impl GraphStore for CompactStore {
     fn get_node(&self, id: NodeId) -> Option<Node> {
         let (table_id, offset) = decode_node_id(id);
         let nt = self.resolve_node_table(table_id)?;
+        // reason: decoded offset is bounded by table size, fits usize
+        #[allow(clippy::cast_possible_truncation)]
         if offset as usize >= nt.len() {
             return None;
         }
 
         let mut node = Node::new(id);
         node.add_label(nt.label());
+        // reason: decoded offset is bounded by table size, fits usize
+        #[allow(clippy::cast_possible_truncation)]
         let props = nt.get_all_properties(offset as usize);
         for (k, v) in props {
             node.set_property(k, v);
@@ -38,6 +42,8 @@ impl GraphStore for CompactStore {
     fn get_edge(&self, id: EdgeId) -> Option<Edge> {
         let (rel_table_id, csr_position) = decode_edge_id(id);
         let rt = self.resolve_rel_table(rel_table_id)?;
+        // reason: decoded CSR position fits u32
+        #[allow(clippy::cast_possible_truncation)]
         let pos = csr_position as u32;
 
         let src = rt.source_node_id(pos)?;
@@ -45,6 +51,8 @@ impl GraphStore for CompactStore {
         let edge_type = rt.edge_type().clone();
 
         let mut edge = Edge::new(id, src, dst, edge_type);
+        // reason: decoded CSR position fits usize
+        #[allow(clippy::cast_possible_truncation)]
         let props = rt.get_all_edge_properties(csr_position as usize);
         for (k, v) in props {
             edge.set_property(k, v);
@@ -81,12 +89,16 @@ impl GraphStore for CompactStore {
     fn get_node_property(&self, id: NodeId, key: &PropertyKey) -> Option<Value> {
         let (table_id, offset) = decode_node_id(id);
         let nt = self.resolve_node_table(table_id)?;
+        // reason: decoded offset is bounded by table size, fits usize
+        #[allow(clippy::cast_possible_truncation)]
         nt.get_property(offset as usize, key)
     }
 
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value> {
         let (rel_table_id, csr_position) = decode_edge_id(id);
         let rt = self.resolve_rel_table(rel_table_id)?;
+        // reason: decoded CSR position fits usize
+        #[allow(clippy::cast_possible_truncation)]
         rt.get_edge_property(csr_position as usize, key)
     }
 
@@ -149,6 +161,8 @@ impl GraphStore for CompactStore {
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
         let (node_table_id, node_offset) = decode_node_id(node);
+        // reason: decoded node offset fits u32 (upper 48 bits of ID)
+        #[allow(clippy::cast_possible_truncation)]
         self.collect_edges(node_table_id, node_offset as u32, direction)
             .into_iter()
             .map(|(target, _)| target)
@@ -157,6 +171,8 @@ impl GraphStore for CompactStore {
 
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
         let (node_table_id, node_offset) = decode_node_id(node);
+        // reason: decoded node offset fits u32 (upper 48 bits of ID)
+        #[allow(clippy::cast_possible_truncation)]
         self.collect_edges(node_table_id, node_offset as u32, direction)
     }
 
@@ -166,7 +182,11 @@ impl GraphStore for CompactStore {
         if let Some(rel_ids) = self.src_rel_table_ids.get(node_table_id as usize) {
             for &rel_id in rel_ids {
                 let rt = &self.rel_tables_by_id[rel_id as usize];
-                degree += rt.out_degree(node_offset as u32);
+                // reason: decoded node offset fits u32
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    degree += rt.out_degree(node_offset as u32);
+                }
             }
         }
         degree
@@ -178,6 +198,8 @@ impl GraphStore for CompactStore {
         if let Some(rel_ids) = self.dst_rel_table_ids.get(node_table_id as usize) {
             for &rel_id in rel_ids {
                 let rt = &self.rel_tables_by_id[rel_id as usize];
+                // reason: decoded node offset fits u32
+                #[allow(clippy::cast_possible_truncation)]
                 if let Some(d) = rt.in_degree(node_offset as u32) {
                     degree += d;
                 }

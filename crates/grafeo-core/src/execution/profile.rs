@@ -57,6 +57,8 @@ impl Operator for ProfiledOperator {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // reason: per-call elapsed nanos fits u64 for any practical duration
+            #[allow(clippy::cast_possible_truncation)]
             let elapsed = start.elapsed().as_nanos() as u64;
             self.stats.lock().time_ns += elapsed;
         }

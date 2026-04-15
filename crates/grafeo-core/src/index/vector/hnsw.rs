@@ -486,6 +486,8 @@ impl HnswIndex {
         } else {
             (allowlist.len() as f64 / total as f64).max(0.01)
         };
+        // reason: ef scaled by selectivity is non-negative and bounded by .min(total)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ef_scaled = ((self.config.ef as f64 / selectivity).ceil() as usize)
             .min(total)
             .max(k);
@@ -588,7 +590,10 @@ impl HnswIndex {
     fn random_level(&self) -> usize {
         let mut rng = self.rng.write();
         let r: f64 = rng.random();
-        (-r.ln() * self.config.ml).floor() as usize
+        // reason: HNSW level is non-negative (r in [0,1), -ln(r) >= 0), fits usize
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let level = (-r.ln() * self.config.ml).floor() as usize;
+        level
     }
 
     /// Single-element greedy search at a layer.

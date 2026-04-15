@@ -180,6 +180,8 @@ impl ExternalSort {
         let spill_file = &self.sorted_runs[run_index];
         let mut reader = spill_file.reader()?;
 
+        // reason: deserialized row counts are bounded by available data
+        #[allow(clippy::cast_possible_truncation)]
         let row_count = reader.read_u64_le()? as usize;
         let mut rows = Vec::with_capacity(row_count);
 
@@ -209,6 +211,8 @@ impl ExternalSort {
         let mut run_readers: Vec<RunReader> = Vec::with_capacity(self.sorted_runs.len());
         for (idx, spill_file) in self.sorted_runs.iter().enumerate() {
             let mut reader = spill_file.reader()?;
+            // reason: deserialized row counts are bounded by available data
+            #[allow(clippy::cast_possible_truncation)]
             let row_count = reader.read_u64_le()? as usize;
 
             if row_count > 0 {

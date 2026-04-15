@@ -388,6 +388,8 @@ impl OptionalEpochId {
             epoch.as_u64(),
             u32::MAX as u64 - 1
         );
+        // reason: the assert above guarantees epoch < u32::MAX
+        #[allow(clippy::cast_possible_truncation)]
         Self(epoch.as_u64() as u32)
     }
 

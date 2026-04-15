@@ -145,6 +145,9 @@ impl SuccinctBitVector {
 
             // Store relative rank within superblock
             let relative_rank = cumulative_ones - superblock_start_ones;
+            // reason: relative rank within a superblock (max 448) may exceed u8; see block_ranks field comment
+            // TODO: consider upgrading block_ranks to Vec<u16> for correctness with dense superblocks
+            #[allow(clippy::cast_possible_truncation)]
             block_ranks.push(relative_rank as u8);
 
             // Count bits in this word
@@ -165,13 +168,19 @@ impl SuccinctBitVector {
             // Sample for select1
             let next_ones = cumulative_ones + word_ones;
             while select1_samples.len() * SELECT_SAMPLE_RATE < next_ones as usize {
+                // reason: bit positions in bitvectors are bounded by practical sizes, fit u32
+                #[allow(clippy::cast_possible_truncation)]
                 select1_samples.push(bit_pos as u32);
             }
 
             // Sample for select0
+            // reason: bits_in_word is at most BLOCK_BITS (64), fits u32
+            #[allow(clippy::cast_possible_truncation)]
             let word_zeros = bits_in_word as u32 - word_ones;
             let next_zeros = cumulative_zeros + word_zeros;
             while select0_samples.len() * SELECT_SAMPLE_RATE < next_zeros as usize {
+                // reason: bit positions in bitvectors are bounded by practical sizes, fit u32
+                #[allow(clippy::cast_possible_truncation)]
                 select0_samples.push(bit_pos as u32);
             }
 

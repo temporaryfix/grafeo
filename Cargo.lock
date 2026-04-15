@@ -1520,6 +1520,7 @@ dependencies = [
 name = "grafeo-node"
 version = "0.5.39"
 dependencies = [
+ "grafeo-adapters",
  "grafeo-bindings-common",
  "grafeo-common",
  "grafeo-core",

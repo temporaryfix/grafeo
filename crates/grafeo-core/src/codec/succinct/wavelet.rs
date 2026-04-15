@@ -221,6 +221,8 @@ impl WaveletTree {
         }
 
         // Map code back to original symbol
+        // reason: code is bounded by sigma (alphabet size), fits usize
+        #[allow(clippy::cast_possible_truncation)]
         self.symbols.get(code as usize).copied().unwrap_or(0)
     }
 
@@ -391,6 +393,8 @@ impl WaveletTree {
             ));
         }
 
+        // reason: sigma (alphabet size) fits usize for practical data sizes
+        #[allow(clippy::cast_possible_truncation)]
         if self.symbols.len() != self.sigma as usize {
             return Err(format!(
                 "symbols count {} != sigma {}",

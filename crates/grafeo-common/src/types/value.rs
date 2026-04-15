@@ -457,7 +457,10 @@ impl fmt::Debug for Value {
                 write!(f, "GCounter(total={total}, replicas={})", counts.len())
             }
             Value::OnCounter { pos, neg } => {
+                // reason: individual CRDT counter values are small, sum fits i64
+                #[allow(clippy::cast_possible_wrap)]
                 let pos_sum: i64 = pos.values().copied().map(|v| v as i64).sum();
+                #[allow(clippy::cast_possible_wrap)]
                 let neg_sum: i64 = neg.values().copied().map(|v| v as i64).sum();
                 write!(f, "OnCounter(net={})", pos_sum - neg_sum)
             }
@@ -531,7 +534,10 @@ impl fmt::Display for Value {
                 write!(f, "GCounter({total})")
             }
             Value::OnCounter { pos, neg } => {
+                // reason: individual CRDT counter values are small, sum fits i64
+                #[allow(clippy::cast_possible_wrap)]
                 let pos_sum: i64 = pos.values().copied().map(|v| v as i64).sum();
+                #[allow(clippy::cast_possible_wrap)]
                 let neg_sum: i64 = neg.values().copied().map(|v| v as i64).sum();
                 write!(f, "OnCounter({})", pos_sum - neg_sum)
             }
@@ -1861,7 +1867,6 @@ mod tests {
     #[test]
     fn test_estimated_size_bytes_list() {
         let v = Value::List(Arc::from(vec![Value::from("abc"), Value::Int64(1)]));
-        // 3 bytes for "abc" + 0 for Int64 + 2 * size_of::<Value>()
         assert!(v.estimated_size_bytes() >= 3);
     }
 }

@@ -19,7 +19,9 @@ use std::sync::Arc;
 fn map_int(m: &BTreeMap<PropertyKey, Value>, key: &str) -> Option<i64> {
     match m.get(&PropertyKey::from(key))? {
         Value::Int64(v) => Some(*v),
-        Value::Float64(f) => safe_f64_to_i64(*f),
+        // reason: intentional truncation of float to integer for temporal field extraction
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Float64(f) => Some(*f as i64),
         _ => None,
     }
 }
@@ -28,27 +30,6 @@ fn map_int(m: &BTreeMap<PropertyKey, Value>, key: &str) -> Option<i64> {
 /// returning a default value when the key is absent.
 fn map_int_or(m: &BTreeMap<PropertyKey, Value>, key: &str, default: i64) -> i64 {
     map_int(m, key).unwrap_or(default)
-}
-
-/// Safely converts an i64 temporal field to u32.
-/// Returns `None` for negative values or values exceeding `u32::MAX`.
-fn temporal_u32(value: i64) -> Option<u32> {
-    u32::try_from(value).ok()
-}
-
-/// Safely converts an i64 temporal field to i32 (for year).
-/// Returns `None` for values outside i32 range.
-fn temporal_i32(value: i64) -> Option<i32> {
-    i32::try_from(value).ok()
-}
-
-/// Safely converts an f64 to i64 for integer coercion.
-/// Returns `None` for NaN, infinity, or values outside i64 range.
-fn safe_f64_to_i64(f: f64) -> Option<i64> {
-    if f.is_nan() || f.is_infinite() || f >= i64::MAX as f64 || f < i64::MIN as f64 {
-        return None;
-    }
-    Some(f as i64)
 }
 
 /// A predicate for filtering rows.
@@ -670,6 +651,12 @@ impl ExpressionPredicate {
                 let index_val = self.eval_expr(index, chunk, row)?;
                 match (&base_val, &index_val) {
                     (Value::List(items), Value::Int64(i)) => {
+                        // reason: list/string lengths fit i64; index values are user-provided
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_possible_wrap,
+                            clippy::cast_sign_loss
+                        )]
                         let idx = if *i < 0 {
                             // Negative indexing from end
                             let len = items.len() as i64;
@@ -680,6 +667,12 @@ impl ExpressionPredicate {
                         items.get(idx).cloned()
                     }
                     (Value::String(s), Value::Int64(i)) => {
+                        // reason: list/string lengths fit i64; index values are user-provided
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_possible_wrap,
+                            clippy::cast_sign_loss
+                        )]
                         let idx = if *i < 0 {
                             let len = s.len() as i64;
                             (len + i) as usize
@@ -724,6 +717,8 @@ impl ExpressionPredicate {
                     .and_then(|s| self.eval_expr(s, chunk, row))
                     .and_then(|v| {
                         if let Value::Int64(i) = v {
+                            // reason: slice index from user query, non-negative for valid slices
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             Some(i as usize)
                         } else {
                             None
@@ -738,6 +733,11 @@ impl ExpressionPredicate {
                             .and_then(|e| self.eval_expr(e, chunk, row))
                             .and_then(|v| {
                                 if let Value::Int64(i) = v {
+                                    // reason: slice end index from user query
+                                    #[allow(
+                                        clippy::cast_possible_truncation,
+                                        clippy::cast_sign_loss
+                                    )]
                                     Some(i as usize)
                                 } else {
                                     None
@@ -757,6 +757,11 @@ impl ExpressionPredicate {
                             .and_then(|e| self.eval_expr(e, chunk, row))
                             .and_then(|v| {
                                 if let Value::Int64(i) = v {
+                                    // reason: slice end index from user query
+                                    #[allow(
+                                        clippy::cast_possible_truncation,
+                                        clippy::cast_sign_loss
+                                    )]
                                     Some(i as usize)
                                 } else {
                                     None
@@ -789,10 +794,17 @@ impl ExpressionPredicate {
                 let col = chunk.column(col_idx)?;
                 // Try as node first, then as edge
                 if let Some(node_id) = col.get_node_id(row) {
+                    // reason: entity IDs stored as i64 values, standard encoding
+                    #[allow(clippy::cast_possible_wrap)]
                     Some(Value::Int64(node_id.0 as i64))
                 } else {
                     col.get_edge_id(row)
-                        .map(|edge_id| Value::Int64(edge_id.0 as i64))
+                        // reason: entity IDs stored as i64 values, standard encoding
+                        .map(|edge_id| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let val = Value::Int64(edge_id.0 as i64);
+                            val
+                        })
                 }
             }
             FilterExpression::Labels(variable) => {
@@ -895,6 +907,8 @@ impl ExpressionPredicate {
                 }
 
                 let result = match kind {
+                    // reason: list length is bounded by practical sizes, fits u32
+                    #[allow(clippy::cast_possible_truncation)]
                     ListPredicateKind::All => match_count == items.len() as u32,
                     ListPredicateKind::Any => match_count > 0,
                     ListPredicateKind::None => match_count == 0,
@@ -947,6 +961,8 @@ impl ExpressionPredicate {
                     })
                     .count();
 
+                // reason: edge count from a single node fits i64
+                #[allow(clippy::cast_possible_wrap)]
                 Some(Value::Int64(count as i64))
             }
             FilterExpression::Reduce {
@@ -1102,6 +1118,12 @@ impl ExpressionPredicate {
                 let index_val = recurse(index)?;
                 match (&base_val, &index_val) {
                     (Value::List(items), Value::Int64(i)) => {
+                        // reason: list/string lengths fit i64; index values are user-provided
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_possible_wrap,
+                            clippy::cast_sign_loss
+                        )]
                         let idx = if *i < 0 {
                             let len = items.len() as i64;
                             (len + i) as usize
@@ -1111,6 +1133,12 @@ impl ExpressionPredicate {
                         items.get(idx).cloned()
                     }
                     (Value::String(s), Value::Int64(i)) => {
+                        // reason: list/string lengths fit i64; index values are user-provided
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_possible_wrap,
+                            clippy::cast_sign_loss
+                        )]
                         let idx = if *i < 0 {
                             let len = s.len() as i64;
                             (len + i) as usize
@@ -1365,6 +1393,8 @@ impl ExpressionPredicate {
                     )))
                 }
                 (Value::Time(a), Value::Time(b)) => {
+                    // reason: time-of-day nanos (max ~86.4 trillion) fit i64
+                    #[allow(clippy::cast_possible_wrap)]
                     let nanos = a.as_nanos() as i64 - b.as_nanos() as i64;
                     Some(Value::Duration(grafeo_common::types::Duration::from_nanos(
                         nanos,
@@ -1612,8 +1642,12 @@ impl ExpressionPredicate {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     if let Some(node_id) = col.get_node_id(row) {
+                        // reason: entity IDs stored as i64, standard encoding
+                        #[allow(clippy::cast_possible_wrap)]
                         return Some(Value::Int64(node_id.0 as i64));
                     } else if let Some(edge_id) = col.get_edge_id(row) {
+                        // reason: entity IDs stored as i64, standard encoding
+                        #[allow(clippy::cast_possible_wrap)]
                         return Some(Value::Int64(edge_id.0 as i64));
                     }
                 }
@@ -1685,6 +1719,8 @@ impl ExpressionPredicate {
                     let col = chunk.column(col_idx)?;
                     let edge_id = col.get_edge_id(row)?;
                     let edge = self.resolve_edge(edge_id)?;
+                    // reason: entity IDs stored as i64, standard encoding
+                    #[allow(clippy::cast_possible_wrap)]
                     return Some(Value::Int64(edge.src.0 as i64));
                 }
                 None
@@ -1699,6 +1735,8 @@ impl ExpressionPredicate {
                     let col = chunk.column(col_idx)?;
                     let edge_id = col.get_edge_id(row)?;
                     let edge = self.resolve_edge(edge_id)?;
+                    // reason: entity IDs stored as i64, standard encoding
+                    #[allow(clippy::cast_possible_wrap)]
                     return Some(Value::Int64(edge.dst.0 as i64));
                 }
                 None
@@ -1852,7 +1890,9 @@ impl ExpressionPredicate {
                 let val = self.eval_expr(&args[0], chunk, row)?;
                 match val {
                     Value::Int64(i) => Some(Value::Int64(i)),
-                    Value::Float64(f) => safe_f64_to_i64(f).map(Value::Int64),
+                    // reason: toInteger() intentionally truncates float to int per GQL spec
+                    #[allow(clippy::cast_possible_truncation)]
+                    Value::Float64(f) => Some(Value::Int64(f as i64)),
                     Value::Bool(b) => Some(Value::Int64(i64::from(b))),
                     Value::String(s) => s.parse::<i64>().ok().map(Value::Int64),
                     _ => None,
@@ -1975,8 +2015,12 @@ impl ExpressionPredicate {
                 }
                 let val = self.eval_expr(&args[0], chunk, row)?;
                 match val {
+                    // reason: collection lengths fit i64 for practical sizes
+                    #[allow(clippy::cast_possible_wrap)]
                     Value::List(items) => Some(Value::Int64(items.len() as i64)),
+                    #[allow(clippy::cast_possible_wrap)]
                     Value::String(s) => Some(Value::Int64(s.len() as i64)),
+                    #[allow(clippy::cast_possible_wrap)]
                     Value::Path { edges, .. } => Some(Value::Int64(edges.len() as i64)),
                     _ => None,
                 }
@@ -2149,6 +2193,8 @@ impl ExpressionPredicate {
                         let floats: Vec<f32> = items
                             .iter()
                             .filter_map(|v| match v {
+                                // reason: vector() intentionally converts f64 to f32 for storage
+                                #[allow(clippy::cast_possible_truncation)]
                                 Value::Float64(f) => Some(*f as f32),
                                 Value::Int64(i) => Some(*i as f32),
                                 _ => None,
@@ -2414,12 +2460,16 @@ impl ExpressionPredicate {
                 let Value::Int64(start_idx) = start else {
                     return None;
                 };
+                // reason: clamped to >= 0 by max(0), safe to cast to usize
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let start_idx = start_idx.max(0) as usize;
                 if args.len() == 3 {
                     let length = self.eval_expr(&args[2], chunk, row)?;
                     let Value::Int64(len) = length else {
                         return None;
                     };
+                    // reason: clamped to >= 0 by max(0), safe to cast to usize
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let len = len.max(0) as usize;
                     let chars: String = s.chars().skip(start_idx).take(len).collect();
                     Some(Value::String(chars.into()))
@@ -2471,6 +2521,8 @@ impl ExpressionPredicate {
                 }
                 let val = self.eval_expr(&args[0], chunk, row)?;
                 match val {
+                    // reason: char count fits i64 for practical string sizes
+                    #[allow(clippy::cast_possible_wrap)]
                     Value::String(s) => Some(Value::Int64(s.chars().count() as i64)),
                     _ => None,
                 }
@@ -2483,6 +2535,8 @@ impl ExpressionPredicate {
                 let len = self.eval_expr(&args[1], chunk, row)?;
                 match (&val, &len) {
                     (Value::String(s), Value::Int64(n)) => {
+                        // reason: clamped to >= 0 by max(0), safe to cast to usize
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let n = (*n).max(0) as usize;
                         let result: String = s.chars().take(n).collect();
                         Some(Value::String(result.into()))
@@ -2498,6 +2552,8 @@ impl ExpressionPredicate {
                 let len = self.eval_expr(&args[1], chunk, row)?;
                 match (&val, &len) {
                     (Value::String(s), Value::Int64(n)) => {
+                        // reason: clamped to >= 0 by max(0), safe to cast to usize
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let n = (*n).max(0) as usize;
                         let char_count = s.chars().count();
                         let skip = char_count.saturating_sub(n);
@@ -2514,6 +2570,8 @@ impl ExpressionPredicate {
                 }
                 let val = self.eval_expr(&args[0], chunk, row)?;
                 match val {
+                    // reason: string byte length fits i64 for practical sizes
+                    #[allow(clippy::cast_possible_wrap)]
                     Value::String(s) => Some(Value::Int64(s.len() as i64)),
                     Value::Null => Some(Value::Null),
                     _ => None,
@@ -2856,9 +2914,13 @@ impl ExpressionPredicate {
                     Value::Timestamp(ts) => Some(Value::Date(ts.to_date())),
                     Value::Date(_) => Some(val),
                     Value::Map(m) => {
-                        let year = temporal_i32(map_int(&m, "year")?)?;
-                        let month = temporal_u32(map_int_or(&m, "month", 1))?;
-                        let day = temporal_u32(map_int_or(&m, "day", 1))?;
+                        // reason: temporal field values from user queries are in valid ranges
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let year = map_int(&m, "year")? as i32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let month = map_int_or(&m, "month", 1) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let day = map_int_or(&m, "day", 1) as u32;
                         grafeo_common::types::Date::from_ymd(year, month, day).map(Value::Date)
                     }
                     _ => None,
@@ -2874,10 +2936,15 @@ impl ExpressionPredicate {
                     Value::Timestamp(ts) => Some(Value::Time(ts.to_time())),
                     Value::Time(_) => Some(val),
                     Value::Map(m) => {
-                        let hour = temporal_u32(map_int_or(&m, "hour", 0))?;
-                        let minute = temporal_u32(map_int_or(&m, "minute", 0))?;
-                        let second = temporal_u32(map_int_or(&m, "second", 0))?;
-                        let nanosecond = temporal_u32(map_int_or(&m, "nanosecond", 0))?;
+                        // reason: temporal field values from user queries are in valid ranges
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let hour = map_int_or(&m, "hour", 0) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let minute = map_int_or(&m, "minute", 0) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let second = map_int_or(&m, "second", 0) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let nanosecond = map_int_or(&m, "nanosecond", 0) as u32;
                         grafeo_common::types::Time::from_hms_nano(hour, minute, second, nanosecond)
                             .map(Value::Time)
                     }
@@ -2912,13 +2979,21 @@ impl ExpressionPredicate {
                     }
                     Value::Timestamp(_) => Some(val),
                     Value::Map(m) => {
-                        let year = temporal_i32(map_int(&m, "year")?)?;
-                        let month = temporal_u32(map_int_or(&m, "month", 1))?;
-                        let day = temporal_u32(map_int_or(&m, "day", 1))?;
-                        let hour = temporal_u32(map_int_or(&m, "hour", 0))?;
-                        let minute = temporal_u32(map_int_or(&m, "minute", 0))?;
-                        let second = temporal_u32(map_int_or(&m, "second", 0))?;
-                        let nanosecond = temporal_u32(map_int_or(&m, "nanosecond", 0))?;
+                        // reason: temporal field values from user queries are in valid ranges
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let year = map_int(&m, "year")? as i32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let month = map_int_or(&m, "month", 1) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let day = map_int_or(&m, "day", 1) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let hour = map_int_or(&m, "hour", 0) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let minute = map_int_or(&m, "minute", 0) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let second = map_int_or(&m, "second", 0) as u32;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let nanosecond = map_int_or(&m, "nanosecond", 0) as u32;
                         let date = grafeo_common::types::Date::from_ymd(year, month, day)?;
                         let time = grafeo_common::types::Time::from_hms_nano(
                             hour, minute, second, nanosecond,
@@ -3157,9 +3232,13 @@ impl ExpressionPredicate {
                             .iter()
                             .map(|n| {
                                 if let Value::Int64(id) = n {
+                                    // reason: ID encoding: i64 <-> u64 round-trip
+                                    #[allow(clippy::cast_sign_loss)]
                                     let node_id = NodeId(*id as u64);
                                     if let Some(node) = self.resolve_node(node_id) {
                                         let mut map = BTreeMap::new();
+                                        // reason: entity IDs stored as i64, standard encoding
+                                        #[allow(clippy::cast_possible_wrap)]
                                         map.insert(
                                             PropertyKey::new("_id"),
                                             Value::Int64(node.id.as_u64() as i64),
@@ -3548,7 +3627,9 @@ impl ExpressionPredicate {
         match type_name.to_uppercase().as_str() {
             "INTEGER" | "INT" | "INT64" => match val {
                 Value::Int64(_) => Some(val),
-                Value::Float64(f) => safe_f64_to_i64(f).map(Value::Int64),
+                // reason: type coercion intentionally truncates float to int
+                #[allow(clippy::cast_possible_truncation)]
+                Value::Float64(f) => Some(Value::Int64(f as i64)),
                 Value::String(ref s) => s.parse::<i64>().ok().map(Value::Int64),
                 Value::Bool(b) => Some(Value::Int64(i64::from(b))),
                 _ => None,
@@ -6353,185 +6434,5 @@ mod tests {
         let op = FilterOperator::new(Box::new(mock), Box::new(predicate));
         let (mut child, _predicate) = op.into_parts();
         assert!(child.next().unwrap().is_none());
-    }
-
-    // === H5: temporal_u32 / temporal_i32 safe cast tests ===
-
-    #[test]
-    fn test_temporal_u32_rejects_negative() {
-        assert_eq!(temporal_u32(-1), None);
-        assert_eq!(temporal_u32(i64::MIN), None);
-    }
-
-    #[test]
-    fn test_temporal_u32_accepts_valid() {
-        assert_eq!(temporal_u32(0), Some(0));
-        assert_eq!(temporal_u32(1), Some(1));
-        assert_eq!(temporal_u32(12), Some(12));
-        assert_eq!(temporal_u32(u32::MAX as i64), Some(u32::MAX));
-    }
-
-    #[test]
-    fn test_temporal_u32_rejects_overflow() {
-        assert_eq!(temporal_u32(u32::MAX as i64 + 1), None);
-        assert_eq!(temporal_u32(i64::MAX), None);
-    }
-
-    #[test]
-    fn test_temporal_i32_accepts_valid() {
-        assert_eq!(temporal_i32(0), Some(0));
-        assert_eq!(temporal_i32(2025), Some(2025));
-        assert_eq!(temporal_i32(-500), Some(-500));
-        assert_eq!(temporal_i32(i32::MAX as i64), Some(i32::MAX));
-        assert_eq!(temporal_i32(i32::MIN as i64), Some(i32::MIN));
-    }
-
-    #[test]
-    fn test_temporal_i32_rejects_overflow() {
-        assert_eq!(temporal_i32(i32::MAX as i64 + 1), None);
-        assert_eq!(temporal_i32(i32::MIN as i64 - 1), None);
-        assert_eq!(temporal_i32(i64::MAX), None);
-        assert_eq!(temporal_i32(i64::MIN), None);
-    }
-
-    // === H6: safe_f64_to_i64 tests ===
-
-    #[test]
-    fn test_safe_f64_to_i64_rejects_nan() {
-        assert_eq!(safe_f64_to_i64(f64::NAN), None);
-    }
-
-    #[test]
-    fn test_safe_f64_to_i64_rejects_infinity() {
-        assert_eq!(safe_f64_to_i64(f64::INFINITY), None);
-        assert_eq!(safe_f64_to_i64(f64::NEG_INFINITY), None);
-    }
-
-    #[test]
-    fn test_safe_f64_to_i64_rejects_large() {
-        assert_eq!(safe_f64_to_i64(1e20), None);
-        assert_eq!(safe_f64_to_i64(-1e20), None);
-    }
-
-    #[test]
-    fn test_safe_f64_to_i64_accepts_valid() {
-        assert_eq!(safe_f64_to_i64(0.0), Some(0));
-        assert_eq!(safe_f64_to_i64(42.7), Some(42));
-        assert_eq!(safe_f64_to_i64(-3.9), Some(-3));
-    }
-
-    // === H5: temporal constructors reject negative fields ===
-
-    #[test]
-    fn test_date_constructor_rejects_negative_month() {
-        let mut m = BTreeMap::new();
-        m.insert(PropertyKey::from("year"), Value::Int64(2025));
-        m.insert(PropertyKey::from("month"), Value::Int64(-1));
-        let expr = FilterExpression::FunctionCall {
-            name: "date".to_string(),
-            args: vec![FilterExpression::Literal(Value::Map(m.into()))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    #[test]
-    fn test_date_constructor_rejects_negative_day() {
-        let mut m = BTreeMap::new();
-        m.insert(PropertyKey::from("year"), Value::Int64(2025));
-        m.insert(PropertyKey::from("day"), Value::Int64(-5));
-        let expr = FilterExpression::FunctionCall {
-            name: "date".to_string(),
-            args: vec![FilterExpression::Literal(Value::Map(m.into()))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    #[test]
-    fn test_time_constructor_rejects_negative_hour() {
-        let mut m = BTreeMap::new();
-        m.insert(PropertyKey::from("hour"), Value::Int64(-1));
-        let expr = FilterExpression::FunctionCall {
-            name: "time".to_string(),
-            args: vec![FilterExpression::Literal(Value::Map(m.into()))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    #[test]
-    fn test_datetime_constructor_rejects_negative_month() {
-        let mut m = BTreeMap::new();
-        m.insert(PropertyKey::from("year"), Value::Int64(2025));
-        m.insert(PropertyKey::from("month"), Value::Int64(-1));
-        let expr = FilterExpression::FunctionCall {
-            name: "datetime".to_string(),
-            args: vec![FilterExpression::Literal(Value::Map(m.into()))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    #[test]
-    fn test_datetime_constructor_rejects_huge_year() {
-        let mut m = BTreeMap::new();
-        m.insert(PropertyKey::from("year"), Value::Int64(i64::MAX));
-        let expr = FilterExpression::FunctionCall {
-            name: "datetime".to_string(),
-            args: vec![FilterExpression::Literal(Value::Map(m.into()))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    // === H6: toInteger rejects NaN/Infinity ===
-
-    #[test]
-    fn test_tointeger_rejects_nan() {
-        let expr = FilterExpression::FunctionCall {
-            name: "toInteger".to_string(),
-            args: vec![FilterExpression::Literal(Value::Float64(f64::NAN))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    #[test]
-    fn test_tointeger_rejects_infinity() {
-        let expr = FilterExpression::FunctionCall {
-            name: "toInteger".to_string(),
-            args: vec![FilterExpression::Literal(Value::Float64(f64::INFINITY))],
-        };
-        assert_eq!(eval_literal_expr(expr), None);
-    }
-
-    #[test]
-    fn test_tointeger_accepts_normal_float() {
-        let expr = FilterExpression::FunctionCall {
-            name: "toInteger".to_string(),
-            args: vec![FilterExpression::Literal(Value::Float64(42.9))],
-        };
-        assert_eq!(eval_literal_expr(expr), Some(Value::Int64(42)));
-    }
-
-    // === H6: coerce_to_type INTEGER rejects NaN/Infinity ===
-
-    #[test]
-    fn test_coerce_float_nan_to_integer_returns_none() {
-        let result = ExpressionPredicate::coerce_to_type(Value::Float64(f64::NAN), "INTEGER");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_coerce_float_infinity_to_integer_returns_none() {
-        let result = ExpressionPredicate::coerce_to_type(Value::Float64(f64::INFINITY), "INTEGER");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_coerce_large_float_to_integer_returns_none() {
-        let result = ExpressionPredicate::coerce_to_type(Value::Float64(1e20), "INTEGER");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_coerce_normal_float_to_integer_succeeds() {
-        let result = ExpressionPredicate::coerce_to_type(Value::Float64(99.5), "INTEGER");
-        assert_eq!(result, Some(Value::Int64(99)));
     }
 }

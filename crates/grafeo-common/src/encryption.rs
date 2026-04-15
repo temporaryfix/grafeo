@@ -160,7 +160,7 @@ impl KeyChain {
     /// SHA-256, which supports up to 255 * 32 = 8160 bytes).
     #[must_use]
     pub fn derive_dek(&self, context: &str, id: &[u8]) -> Zeroizing<[u8; KEY_SIZE]> {
-        let hk = Hkdf::<Sha256>::new(Some(b"grafeo-v1"), &*self.me);
+        let hk = Hkdf::<Sha256>::new(None, &*self.me);
         let mut info = Vec::with_capacity(context.len() + id.len());
         info.extend_from_slice(context.as_bytes());
         info.extend_from_slice(id);

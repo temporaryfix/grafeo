@@ -68,7 +68,12 @@ impl VectorSource {
     pub fn from_node_ids(ids: Vec<NodeId>) -> Self {
         let values: Vec<Value> = ids
             .into_iter()
-            .map(|id| Value::Int64(id.0 as i64))
+            // reason: NodeId stored as i64 value, standard ID encoding pattern
+            .map(|id| {
+                #[allow(clippy::cast_possible_wrap)]
+                let val = Value::Int64(id.0 as i64);
+                val
+            })
             .collect();
         Self::single_column(values)
     }

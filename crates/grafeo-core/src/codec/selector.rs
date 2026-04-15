@@ -290,6 +290,8 @@ impl TypeSpecificCompressor {
                     uncompressed_size: values.len() * 8,
                     data: encoded.to_bytes(),
                     metadata: CompressionMetadata::DeltaBitPacked {
+                        // reason: base value stored as i64 metadata, wrap is acceptable
+                        #[allow(clippy::cast_possible_wrap)]
                         base: encoded.base() as i64,
                         count: values.len(),
                     },

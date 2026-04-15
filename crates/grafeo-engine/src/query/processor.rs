@@ -1002,6 +1002,8 @@ fn resolve_count_param(
             ))
         })?;
         let n = match value {
+            // reason: guard ensures *i >= 0
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             Value::Int64(i) if *i >= 0 => *i as usize,
             Value::Int64(i) => {
                 return Err(Error::Query(QueryError::new(

@@ -16,9 +16,11 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **Default query timeout**: 30-second default for all queries (previously no limit). Override with `Config::with_query_timeout()` or disable with `Config::without_query_timeout()`. Timeout errors now include the configured limit and a hint.
 - **Property value size limits**: `max_property_size` config (default 16 MiB) rejects oversized values at the session level. `Value::estimated_size_bytes()` for heap size estimation.
 - **HNSW max_elements bound**: `HnswConfig::with_max_elements(n)` caps index size, preventing unbounded memory growth on large vector workloads.
+- **WAL benchmarks**: Criterion benchmarks for write throughput (sync, batch, nosync), batch commit, and recovery replay.
 
 ### Changed
 
+- **Cast clippy lints re-enabled**: `cast_possible_truncation`, `cast_sign_loss`, and `cast_possible_wrap` promoted from `allow` to `warn` at workspace level. All sites annotated with per-site `#[allow]` and safety justifications.
 - **WASM binary size**: 650 KB gzipped (competitive with sql.js). CI threshold: 660 KB warn, 700 KB fail.
 - **Leaner WASM builds**: `grafeo-storage`, `crc32fast`, and `anyhow` are no longer compiled into WASM targets.
 - **Expand locality optimization**: expand operators sort input chunks by source node ID (>1024 rows) before adjacency lookups, improving cache locality on large traversals.

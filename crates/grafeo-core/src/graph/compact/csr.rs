@@ -150,6 +150,8 @@ impl CsrAdjacency {
             }
         }
 
+        // reason: CSR position index fits u32
+        #[allow(clippy::cast_possible_truncation)]
         Some(lo as u32)
     }
 

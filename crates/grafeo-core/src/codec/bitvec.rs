@@ -399,6 +399,8 @@ impl BitVector {
     /// Serializes to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(4 + self.data.len() * 8);
+        // reason: bitvec length is bounded by practical data sizes, fits u32
+        #[allow(clippy::cast_possible_truncation)]
         buf.extend_from_slice(&(self.len as u32).to_le_bytes());
         for &word in &self.data {
             buf.extend_from_slice(&word.to_le_bytes());

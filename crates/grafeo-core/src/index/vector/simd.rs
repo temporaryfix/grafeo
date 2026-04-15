@@ -102,7 +102,7 @@ pub fn simd_support() -> &'static str {
 /// Computes distance using the best available SIMD implementation.
 #[inline]
 pub fn compute_distance_simd(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
-    assert_eq!(a.len(), b.len(), "Vector dimensions must match");
+    debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
 
     match metric {
         DistanceMetric::Cosine => cosine_distance_simd(a, b),

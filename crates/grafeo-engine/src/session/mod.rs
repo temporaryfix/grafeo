@@ -970,7 +970,10 @@ impl Session {
                 if key.eq_ignore_ascii_case("viewing_epoch") {
                     match Self::eval_integer_literal(&expr) {
                         Some(n) if n >= 0 => {
-                            self.set_viewing_epoch(EpochId::new(n as u64));
+                            // reason: guard ensures n >= 0
+                            #[allow(clippy::cast_sign_loss)]
+                            let epoch = n as u64;
+                            self.set_viewing_epoch(EpochId::new(epoch));
                             Ok(QueryResult::status(format!("Set viewing_epoch to {n}")))
                         }
                         _ => Err(Error::Query(QueryError::new(
@@ -4410,14 +4413,13 @@ impl Session {
 
         let mut map = BTreeMap::new();
         map.insert(PropertyKey::from("mode"), Value::String("lpg".into()));
-        map.insert(
-            PropertyKey::from("node_count"),
-            Value::Int64(store.node_count() as i64),
-        );
-        map.insert(
-            PropertyKey::from("edge_count"),
-            Value::Int64(store.edge_count() as i64),
-        );
+        // reason: node/edge counts will not exceed i64::MAX
+        #[allow(clippy::cast_possible_wrap)]
+        let node_count = store.node_count() as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let edge_count = store.edge_count() as i64;
+        map.insert(PropertyKey::from("node_count"), Value::Int64(node_count));
+        map.insert(PropertyKey::from("edge_count"), Value::Int64(edge_count));
         map.insert(
             PropertyKey::from("version"),
             Value::String(env!("CARGO_PKG_VERSION").into()),

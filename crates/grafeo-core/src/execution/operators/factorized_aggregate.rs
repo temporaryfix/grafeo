@@ -148,6 +148,8 @@ impl FactorizedAggregate {
         multiplicities: Option<&[usize]>,
     ) -> Value {
         match self {
+            // reason: row count fits i64 for practical sizes
+            #[allow(clippy::cast_possible_wrap)]
             Self::Count => Value::Int64(chunk.count_rows() as i64),
 
             Self::CountColumn { column_idx } => {
@@ -180,7 +182,11 @@ impl FactorizedAggregate {
                     if let Some(value) = col.get_physical(phys_idx)
                         && !matches!(value, Value::Null)
                     {
-                        count += *mult as i64;
+                        // reason: multiplicity values fit i64
+                        #[allow(clippy::cast_possible_wrap)]
+                        {
+                            count += *mult as i64;
+                        }
                     }
                 }
 

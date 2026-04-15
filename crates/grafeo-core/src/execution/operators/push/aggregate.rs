@@ -445,6 +445,8 @@ fn deserialize_group_state(r: &mut dyn Read) -> std::io::Result<GroupState> {
     // Read key values
     let mut len_buf = [0u8; 8];
     r.read_exact(&mut len_buf)?;
+    // reason: deserialized counts are bounded by available data
+    #[allow(clippy::cast_possible_truncation)]
     let num_keys = u64::from_le_bytes(len_buf) as usize;
 
     let mut key_values = Vec::with_capacity(num_keys);
@@ -454,6 +456,8 @@ fn deserialize_group_state(r: &mut dyn Read) -> std::io::Result<GroupState> {
 
     // Read accumulators with tag-based reconstruction
     r.read_exact(&mut len_buf)?;
+    // reason: deserialized counts are bounded by available data
+    #[allow(clippy::cast_possible_truncation)]
     let num_accumulators = u64::from_le_bytes(len_buf) as usize;
 
     let mut accumulators = Vec::with_capacity(num_accumulators);
@@ -531,6 +535,8 @@ fn deserialize_group_state(r: &mut dyn Read) -> std::io::Result<GroupState> {
             spill_tag::COLLECT => {
                 let mut buf = [0u8; 8];
                 r.read_exact(&mut buf)?;
+                // reason: deserialized lengths are bounded by available data
+                #[allow(clippy::cast_possible_truncation)]
                 let len = u64::from_le_bytes(buf) as usize;
                 let mut list = Vec::with_capacity(len);
                 for _ in 0..len {

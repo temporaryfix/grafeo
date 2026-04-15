@@ -317,7 +317,10 @@ impl GrafeoDB {
         // Create buffer manager with configured limits
         let buffer_config = BufferManagerConfig {
             budget: config.memory_limit.unwrap_or_else(|| {
-                (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize
+                // reason: product of system RAM and 0.75 is always a valid positive usize
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let b = (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                b
             }),
             spill_path: config.spill_path.clone().or_else(|| {
                 config.path.as_ref().and_then(|p| {
@@ -662,7 +665,10 @@ impl GrafeoDB {
 
         let buffer_config = BufferManagerConfig {
             budget: config.memory_limit.unwrap_or_else(|| {
-                (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize
+                // reason: product of system RAM and 0.75 is always a valid positive usize
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let b = (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                b
             }),
             spill_path: None,
             ..BufferManagerConfig::default()
@@ -746,7 +752,10 @@ impl GrafeoDB {
 
         let buffer_config = BufferManagerConfig {
             budget: config.memory_limit.unwrap_or_else(|| {
-                (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize
+                // reason: product of system RAM and 0.75 is always a valid positive usize
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let b = (BufferManagerConfig::detect_system_memory() as f64 * 0.75) as usize;
+                b
             }),
             spill_path: None,
             ..BufferManagerConfig::default()

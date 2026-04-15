@@ -49,7 +49,12 @@ impl ColumnCodec {
     pub fn get(&self, index: usize) -> Option<Value> {
         match self {
             // The builder validates all values <= i64::MAX, so this cast is lossless.
-            Self::BitPacked(bp) => bp.get(index).map(|v| Value::Int64(v as i64)),
+            // reason: values validated <= i64::MAX during build
+            Self::BitPacked(bp) => bp.get(index).map(|v| {
+                #[allow(clippy::cast_possible_wrap)]
+                let val = Value::Int64(v as i64);
+                val
+            }),
             Self::Dict(dict) => dict.get(index).map(|s| Value::String(ArcStr::from(s))),
             Self::Bitmap(bv) => bv.get(index).map(Value::Bool),
             Self::Int8Vector { data, dimensions } => {
@@ -145,6 +150,8 @@ impl ColumnCodec {
                 if v < 0 {
                     return Vec::new();
                 }
+                // reason: v >= 0 checked above
+                #[allow(clippy::cast_sign_loss)]
                 let target_u64 = v as u64;
                 (0..bp.len())
                     .filter(|&i| bp.get(i) == Some(target_u64))
@@ -176,12 +183,16 @@ impl ColumnCodec {
     ) -> Vec<usize> {
         if let Self::BitPacked(bp) = self {
             let min_u64 = match min {
+                // reason: v >= 0 guard ensures no sign loss
+                #[allow(clippy::cast_sign_loss)]
                 Some(&Value::Int64(v)) if v >= 0 => Some(v as u64),
                 Some(&Value::Int64(_)) => Some(0),
                 None => None,
                 _ => return self.find_in_range_fallback(min, max, min_inclusive, max_inclusive),
             };
             let max_u64 = match max {
+                // reason: v >= 0 guard ensures no sign loss
+                #[allow(clippy::cast_sign_loss)]
                 Some(&Value::Int64(v)) if v >= 0 => Some(v as u64),
                 Some(&Value::Int64(v)) if v < 0 => return Vec::new(),
                 None => None,

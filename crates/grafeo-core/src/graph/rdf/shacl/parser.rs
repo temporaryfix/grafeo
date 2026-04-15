@@ -356,9 +356,13 @@ fn parse_constraints(
 
     // Cardinality
     if let Some(n) = parse_integer_property(graph, shape_id, SH::MIN_COUNT) {
+        // reason: SHACL cardinality values are non-negative and small
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         constraints.push(Constraint::MinCount(n as usize));
     }
     if let Some(n) = parse_integer_property(graph, shape_id, SH::MAX_COUNT) {
+        // reason: SHACL cardinality values are non-negative and small
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         constraints.push(Constraint::MaxCount(n as usize));
     }
 
@@ -394,9 +398,13 @@ fn parse_constraints(
 
     // String constraints
     if let Some(n) = parse_integer_property(graph, shape_id, SH::MIN_LENGTH) {
+        // reason: SHACL string length values are non-negative and small
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         constraints.push(Constraint::MinLength(n as usize));
     }
     if let Some(n) = parse_integer_property(graph, shape_id, SH::MAX_LENGTH) {
+        // reason: SHACL string length values are non-negative and small
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         constraints.push(Constraint::MaxLength(n as usize));
     }
     parse_pattern_constraint(graph, shape_id, &mut constraints);
@@ -605,10 +613,18 @@ fn parse_qualified_value_shape(
     let qvs_pred = Term::iri(SH::QUALIFIED_VALUE_SHAPE);
     for triple in graph.find(&pat(Some(shape_id), Some(&qvs_pred), None)) {
         let inner = parse_inline_shape(graph, triple.object(), all_shape_ids, visiting)?;
-        let min_count =
-            parse_integer_property(graph, shape_id, SH::QUALIFIED_MIN_COUNT).map(|n| n as usize);
-        let max_count =
-            parse_integer_property(graph, shape_id, SH::QUALIFIED_MAX_COUNT).map(|n| n as usize);
+        let min_count = parse_integer_property(graph, shape_id, SH::QUALIFIED_MIN_COUNT) // reason: SHACL count values are non-negative and small
+            .map(|n| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let v = n as usize;
+                v
+            });
+        let max_count = parse_integer_property(graph, shape_id, SH::QUALIFIED_MAX_COUNT) // reason: SHACL count values are non-negative and small
+            .map(|n| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let v = n as usize;
+                v
+            });
         let disjoint = parse_boolean_property(graph, shape_id, SH::QUALIFIED_VALUE_SHAPES_DISJOINT);
 
         constraints.push(Constraint::QualifiedValueShape {

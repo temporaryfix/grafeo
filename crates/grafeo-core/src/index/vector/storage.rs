@@ -325,11 +325,14 @@ impl MmapStorage {
             ));
         }
 
+        // reason: deserialized dimensions and count are bounded by available data
+        #[allow(clippy::cast_possible_truncation)]
         let dimensions = u64::from_le_bytes(
             header[8..16]
                 .try_into()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
         ) as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let count = u64::from_le_bytes(
             header[16..24]
                 .try_into()

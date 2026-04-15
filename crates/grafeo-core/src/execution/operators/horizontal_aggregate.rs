@@ -78,6 +78,8 @@ impl HorizontalAggregateOperator {
         match self.entity_kind {
             EntityKind::Edge => {
                 let id = match entity_value {
+                    // reason: ID encoding: i64 <-> u64 round-trip
+                    #[allow(clippy::cast_sign_loss)]
                     Value::Int64(i) => EdgeId(*i as u64),
                     _ => return None,
                 };
@@ -85,6 +87,8 @@ impl HorizontalAggregateOperator {
             }
             EntityKind::Node => {
                 let id = match entity_value {
+                    // reason: ID encoding: i64 <-> u64 round-trip
+                    #[allow(clippy::cast_sign_loss)]
                     Value::Int64(i) => NodeId(*i as u64),
                     _ => return None,
                 };

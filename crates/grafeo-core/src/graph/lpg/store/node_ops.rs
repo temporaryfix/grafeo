@@ -144,6 +144,8 @@ impl LpgStore {
         let id = NodeId::new(self.next_node_id.fetch_add(1, Ordering::Relaxed));
 
         let mut record = NodeRecord::new(id, epoch);
+        // reason: label count per node is bounded by practical limits, fits u16
+        #[allow(clippy::cast_possible_truncation)]
         record.set_label_count(labels.len() as u16);
 
         // Uncommitted transactional versions use PENDING epoch so they are
@@ -178,6 +180,8 @@ impl LpgStore {
         let id = NodeId::new(self.next_node_id.fetch_add(1, Ordering::Relaxed));
 
         let mut record = NodeRecord::new(id, epoch);
+        // reason: label count per node is bounded by practical limits, fits u16
+        #[allow(clippy::cast_possible_truncation)]
         record.set_label_count(labels.len() as u16);
 
         // Uncommitted transactional versions use PENDING epoch so they are

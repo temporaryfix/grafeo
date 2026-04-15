@@ -599,7 +599,12 @@ impl Operator for VariableLengthExpandOperator {
                         .as_deref()
                         .unwrap_or(&[])
                         .iter()
-                        .map(|id| grafeo_common::types::Value::Int64(id.0 as i64))
+                        // reason: entity IDs stored as i64, standard encoding
+                        .map(|id| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let val = grafeo_common::types::Value::Int64(id.0 as i64);
+                            val
+                        })
                         .collect();
                     col.push_value(grafeo_common::types::Value::List(nodes_list.into()));
                 }
@@ -611,7 +616,12 @@ impl Operator for VariableLengthExpandOperator {
                         .as_deref()
                         .unwrap_or(&[])
                         .iter()
-                        .map(|id| grafeo_common::types::Value::Int64(id.0 as i64))
+                        // reason: entity IDs stored as i64, standard encoding
+                        .map(|id| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let val = grafeo_common::types::Value::Int64(id.0 as i64);
+                            val
+                        })
                         .collect();
                     col.push_value(grafeo_common::types::Value::List(edges_list.into()));
                 }
@@ -623,14 +633,24 @@ impl Operator for VariableLengthExpandOperator {
                         .as_deref()
                         .unwrap_or(&[])
                         .iter()
-                        .map(|id| grafeo_common::types::Value::Int64(id.0 as i64))
+                        // reason: entity IDs stored as i64, standard encoding
+                        .map(|id| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let val = grafeo_common::types::Value::Int64(id.0 as i64);
+                            val
+                        })
                         .collect();
                     let edges: Vec<grafeo_common::types::Value> = out_row
                         .path_edges
                         .as_deref()
                         .unwrap_or(&[])
                         .iter()
-                        .map(|id| grafeo_common::types::Value::Int64(id.0 as i64))
+                        // reason: entity IDs stored as i64, standard encoding
+                        .map(|id| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let val = grafeo_common::types::Value::Int64(id.0 as i64);
+                            val
+                        })
                         .collect();
                     col.push_value(grafeo_common::types::Value::Path {
                         nodes: nodes.into(),

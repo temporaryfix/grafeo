@@ -211,7 +211,11 @@ impl BitPackedInts {
         if value == 0 {
             1 // Need at least 1 bit to represent 0
         } else {
-            64 - value.leading_zeros() as u8
+            // reason: leading_zeros() returns [0, 64], 64 - n fits u8
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                64 - value.leading_zeros() as u8
+            }
         }
     }
 
@@ -219,6 +223,8 @@ impl BitPackedInts {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + 4 + self.data.len() * 8);
         buf.push(self.bits_per_value);
+        // reason: bit-packed value count is bounded by practical data sizes, fits u32
+        #[allow(clippy::cast_possible_truncation)]
         buf.extend_from_slice(&(self.count as u32).to_le_bytes());
         for &word in &self.data {
             buf.extend_from_slice(&word.to_le_bytes());

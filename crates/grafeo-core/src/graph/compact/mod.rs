@@ -98,6 +98,8 @@ impl CompactStore {
         let mut dst_rel_table_ids = vec![Vec::new(); node_table_count];
 
         for (rel_idx, rt) in rel_tables_by_id.iter().enumerate() {
+            // reason: rel table count bounded by compact store limits, fits u16
+            #[allow(clippy::cast_possible_truncation)]
             let rel_id = rel_idx as u16;
             let src_tid = rt.src_table_id() as usize;
             let dst_tid = rt.dst_table_id() as usize;

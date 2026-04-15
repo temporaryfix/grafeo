@@ -244,6 +244,8 @@ impl GrafeoFileManager {
         use grafeo_common::testing::crash::maybe_crash;
 
         let checksum = crc32fast::hash(data);
+        // reason: millis since UNIX epoch fits in u64 for ~585 million years
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -313,6 +315,9 @@ impl GrafeoFileManager {
             return Ok(Vec::new());
         }
 
+        // reason: snapshot_length is the size of serialized in-memory data, fits in usize on 64-bit targets;
+        // on 32-bit targets the database would OOM long before reaching 4 GiB
+        #[allow(clippy::cast_possible_truncation)]
         let length = active_header.snapshot_length as usize;
         let expected_checksum = active_header.checksum;
         drop(active_header);
@@ -449,6 +454,8 @@ impl GrafeoFileManager {
         // the same (section_type, offset) pair produces a different nonce across
         // checkpoints. Without this, identical section layouts would reuse nonces.
         #[cfg(feature = "encryption")]
+        // reason: iteration wraps at u32::MAX which takes billions of checkpoints (~100+ years at 1/s)
+        #[allow(clippy::cast_possible_truncation)]
         let nonce_iteration = (active_header.iteration + 1) as u32;
 
         for (section_type, data) in sections {
@@ -514,6 +521,8 @@ impl GrafeoFileManager {
         // Build and write new DbHeader to inactive slot
         let new_iteration = active_header.iteration + 1;
         let target_slot = u8::from(*active_slot == 0);
+        // reason: millis since UNIX epoch fits in u64 for ~585 million years
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -606,6 +615,9 @@ impl GrafeoFileManager {
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(entry.offset))?;
 
+        // reason: section length is bounded by file size, which fits in usize on 64-bit targets;
+        // on 32-bit targets sections would OOM long before reaching 4 GiB
+        #[allow(clippy::cast_possible_truncation)]
         let mut data = vec![0u8; entry.length as usize];
         std::io::Read::read_exact(&mut *file, &mut data)?;
 
@@ -679,10 +691,13 @@ impl GrafeoFileManager {
         // The section region [offset .. offset+length] was written by
         // write_sections() and its CRC is verified below before the mmap
         // is exposed to callers.
+        // reason: section length is bounded by file size, fits in usize on 64-bit targets
+        #[allow(clippy::cast_possible_truncation)]
+        let section_len = entry.length as usize;
         let mmap = unsafe {
             memmap2::MmapOptions::new()
                 .offset(entry.offset)
-                .len(entry.length as usize)
+                .len(section_len)
                 .map(&*file)
         }
         .map_err(Error::Io)?;

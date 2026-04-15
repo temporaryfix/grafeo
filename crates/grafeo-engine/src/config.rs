@@ -473,7 +473,10 @@ impl Config {
     pub fn with_memory_fraction(mut self, fraction: f64) -> Self {
         use grafeo_common::memory::buffer::BufferManagerConfig;
         let system_memory = BufferManagerConfig::detect_system_memory();
-        self.memory_limit = Some((system_memory as f64 * fraction) as usize);
+        // reason: product of system RAM and a 0..1 fraction is always a valid positive usize
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let budget = (system_memory as f64 * fraction) as usize;
+        self.memory_limit = Some(budget);
         self
     }
 

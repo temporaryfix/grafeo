@@ -154,7 +154,12 @@ impl DictionaryEncoding {
         self.dictionary
             .iter()
             .position(|s| s.as_ref() == value)
-            .map(|i| i as u32)
+            // reason: dictionary size is bounded by u32 (codes are u32)
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let code = i as u32;
+                code
+            })
     }
 
     /// Filters the encoding to only include rows matching a predicate code.
@@ -218,6 +223,8 @@ impl DictionaryBuilder {
             self.codes.push(code);
             code
         } else {
+            // reason: dictionary size is bounded by u32 (codes are u32)
+            #[allow(clippy::cast_possible_truncation)]
             let code = self.dictionary.len() as u32;
             let arc_value: Arc<str> = value.into();
             self.string_to_code.insert(arc_value.clone(), code);

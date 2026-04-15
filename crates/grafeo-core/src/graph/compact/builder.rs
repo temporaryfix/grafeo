@@ -353,6 +353,8 @@ impl CompactStoreBuilder {
         let mut table_id_to_label: Vec<ArcStr> = Vec::new();
 
         for (idx, ntb) in self.node_table_builders.iter().enumerate() {
+            // reason: table ID count bounded by compact store limits, fits u16
+            #[allow(clippy::cast_possible_truncation)]
             let table_id = idx as u16;
             label_to_table_id.insert(ntb.label.clone(), table_id);
             table_id_to_label.push(ntb.label.clone());
@@ -363,6 +365,8 @@ impl CompactStoreBuilder {
             Vec::with_capacity(self.node_table_builders.len());
 
         for (idx, ntb) in self.node_table_builders.into_iter().enumerate() {
+            // reason: table ID count bounded by compact store limits, fits u16
+            #[allow(clippy::cast_possible_truncation)]
             let table_id = idx as u16;
             let row_count = ntb.len.unwrap_or(0);
 
@@ -392,6 +396,8 @@ impl CompactStoreBuilder {
         let mut rel_table_id_to_type: Vec<ArcStr> = Vec::new();
 
         for (idx, rtb) in self.rel_table_builders.into_iter().enumerate() {
+            // reason: rel table ID count bounded by compact store limits, fits u16
+            #[allow(clippy::cast_possible_truncation)]
             let rel_table_id = idx as u16;
             rel_table_id_to_type.push(rtb.edge_type.clone());
 
@@ -438,6 +444,8 @@ impl CompactStoreBuilder {
                                 ))
                             },
                         )?;
+                        // reason: local index within CSR neighbors fits u32
+                        #[allow(clippy::cast_possible_truncation)]
                         mapping.push(fwd_start + local_idx as u32);
                     }
                     bwd_csr.set_edge_data(mapping);
@@ -551,6 +559,8 @@ fn compute_zone_map_u64(values: &[u64]) -> ZoneMap {
             ..ZoneMap::default()
         };
     }
+    // reason: max <= i64::MAX checked above, min <= max
+    #[allow(clippy::cast_possible_wrap)]
     ZoneMap {
         min: Some(Value::Int64(min as i64)),
         max: Some(Value::Int64(max as i64)),
@@ -684,6 +694,8 @@ pub fn from_graph_store(
             };
 
             let (_, ref mut node_ids_vec, ref mut props_map) = label_data[entry_idx];
+            // reason: node offset within a table fits u32
+            #[allow(clippy::cast_possible_truncation)]
             let offset = node_ids_vec.len() as u32;
             node_ids_vec.push(nid);
             id_map.insert(nid, (label_key, offset));
@@ -725,6 +737,8 @@ pub fn from_graph_store(
                         let u64_values: Vec<u64> = values
                             .iter()
                             .map(|v| match v {
+                                // reason: ID encoding: i64 <-> u64 for bit-packed storage
+                                #[allow(clippy::cast_sign_loss)]
                                 Value::Int64(n) => *n as u64,
                                 _ => 0,
                             })
@@ -846,6 +860,8 @@ pub fn from_graph_store(
                                 let u64_values: Vec<u64> = values
                                     .iter()
                                     .map(|v| match v {
+                                        // reason: ID encoding: i64 <-> u64 for bit-packed storage
+                                        #[allow(clippy::cast_sign_loss)]
                                         Value::Int64(n) => *n as u64,
                                         _ => 0,
                                     })
