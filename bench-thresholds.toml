@@ -15,7 +15,7 @@ fail_ci = false
 
 [categories.core]
 threshold_pct = 8
-fail_ci = false
+fail_ci = true
 benchmarks = [
     "epoch_arena_*",
     "bump_*",

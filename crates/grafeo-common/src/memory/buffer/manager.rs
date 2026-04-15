@@ -47,8 +47,31 @@ impl BufferManagerConfig {
         {
             #[cfg(target_os = "windows")]
             {
-                // Windows: Use GetPhysicallyInstalledSystemMemory or GlobalMemoryStatusEx
-                // For now, use a fallback
+                // Windows: detect physical memory via GlobalMemoryStatusEx
+                #[repr(C)]
+                struct MemoryStatusEx {
+                    length: u32,
+                    memory_load: u32,
+                    total_phys: u64,
+                    avail_phys: u64,
+                    total_page_file: u64,
+                    avail_page_file: u64,
+                    total_virtual: u64,
+                    avail_virtual: u64,
+                    avail_extended_virtual: u64,
+                }
+
+                #[allow(unsafe_code)]
+                unsafe {
+                    unsafe extern "system" {
+                        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+                    }
+                    let mut status = std::mem::zeroed::<MemoryStatusEx>();
+                    status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+                    if GlobalMemoryStatusEx(&raw mut status) != 0 && status.total_phys > 0 {
+                        return status.total_phys as usize;
+                    }
+                }
                 Self::fallback_system_memory()
             }
 

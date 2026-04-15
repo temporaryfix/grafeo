@@ -23,6 +23,8 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **Release pipeline hardening**: `publish_crate()` now fails explicitly on publish errors instead of silently continuing. Added a pre-publish version consistency gate that compares the tag version against `Cargo.toml`.
 - **CI hardening**: added MSRV verification job (Rust 1.91.1), typos check via `crate-ci/typos`, and made the `supply-chain` audit a required status check (blocks PRs on advisory/license/ban failures).
 - **deny.toml cleanup**: removed stale skips for `windows-sys@0.59` and `windows-targets@0.52` that are no longer in the dependency tree. Updated `rustls-webpki` 0.103.10 to 0.103.12 (RUSTSEC-2026-0098).
+- **Benchmark regression gating**: `core` category benchmarks (allocators, indexes, distance computations) now fail CI on regression, enforcing performance baselines for hot paths.
+- **Dead dependency removed**: `grafeo-adapters` removed from `grafeo-node` Cargo.toml (listed but never imported).
 
 ### Fixed
 
@@ -47,6 +49,8 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **CDC history readable without permission**: `Session::history()`, `history_since()`, and `changes_between()` did not check RBAC permissions. Now requires read permission, preventing unauthorized access to mutation history.
 - **SIMD dimension mismatch in release builds**: `compute_distance_simd()` used `debug_assert_eq!` for vector length validation, which is elided in release builds. Promoted to `assert_eq!` to prevent out-of-bounds reads.
 - **SHACL SPARQL injection via crafted IRIs**: the `$this` substitution in SHACL constraint queries embedded IRIs via string concatenation. A crafted IRI containing `>` could break out of the `<...>` wrapper and inject SPARQL. Now validates all IRIs and graph names against a strict character allowlist before embedding.
+- **DPccp join optimizer unbounded enumeration**: the DPccp algorithm enumerated O(2^n) subset pairs with no iteration limit. For 20+ join nodes this could stall query planning. Now enforces a 100K iteration budget, returning the best plan found so far.
+- **Windows memory detection fallback**: `BufferManager` always fell back to 1 GB on Windows instead of detecting actual physical memory. Now calls `GlobalMemoryStatusEx` to read the real system memory size.
 
 ## [0.5.38] - 2026-04-13
 

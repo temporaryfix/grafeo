@@ -320,7 +320,12 @@ pub struct DPccp<'a> {
     card_estimator: &'a CardinalityEstimator,
     /// Memoization table: subset -> best plan.
     memo: HashMap<BitSet, JoinPlan>,
+    /// Iteration counter for budget enforcement.
+    iterations: usize,
 }
+
+/// Maximum iterations before falling back to heuristic ordering.
+const DPCCP_ITERATION_BUDGET: usize = 100_000;
 
 impl<'a> DPccp<'a> {
     /// Creates a new DPccp optimizer.
@@ -334,6 +339,7 @@ impl<'a> DPccp<'a> {
             cost_model,
             card_estimator,
             memo: HashMap::new(),
+            iterations: 0,
         }
     }
 
@@ -389,6 +395,13 @@ impl<'a> DPccp<'a> {
     fn enumerate_ccp(&mut self, s: BitSet) {
         // Iterate over all proper non-empty subsets
         for s1 in s.subsets() {
+            // Budget enforcement: stop exploring if we've exceeded the limit.
+            // The best plan found so far (if any) will be returned.
+            self.iterations += 1;
+            if self.iterations > DPCCP_ITERATION_BUDGET {
+                return;
+            }
+
             if s1.is_empty() || s1 == s {
                 continue;
             }
