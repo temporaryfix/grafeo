@@ -513,12 +513,19 @@ impl GraphStore for LayeredStore {
 
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
         let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_nodes.read();
 
         let mut ids: Vec<NodeId> = self
             .base
             .nodes_by_label(label)
             .into_iter()
-            .filter(|id| !deleted.contains(id) && !self.is_node_dirty(*id))
+            .filter(|id| {
+                if deleted.contains(id) {
+                    return false;
+                }
+                let (table_id, offset) = decode_node_id(*id);
+                !dirty.is_dirty(table_id, offset)
+            })
             .collect();
         ids.extend(
             self.overlay

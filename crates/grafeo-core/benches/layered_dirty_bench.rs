@@ -117,11 +117,41 @@ fn bench_nodes_by_label(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_dirty_check_point_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("layered_dirty_check_per_call");
+
+    // 10K nodes, 10% dirty — the dirty check is called once per get_node_property.
+    let (layered, ids) = build_layered(10_000, 10);
+    let key = PropertyKey::new("score");
+
+    // Single clean entity (base, not promoted).
+    let clean_id = ids[5_000]; // in the clean region
+    group.bench_function("clean_base_entity", |b| {
+        b.iter(|| black_box(layered.get_node_property(clean_id, &key)));
+    });
+
+    // Single dirty entity (promoted to overlay).
+    let dirty_id = ids[0]; // in the promoted region
+    group.bench_function("dirty_base_entity", |b| {
+        b.iter(|| black_box(layered.get_node_property(dirty_id, &key)));
+    });
+
+    // New overlay entity (above id_offset, skips bitmap entirely).
+    let overlay_id = layered.create_node(&["Item"]);
+    layered.set_node_property(overlay_id, "score", Value::Int64(777));
+    group.bench_function("overlay_entity", |b| {
+        b.iter(|| black_box(layered.get_node_property(overlay_id, &key)));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_get_node,
     bench_get_node_property,
     bench_find_nodes_by_property,
     bench_nodes_by_label,
+    bench_dirty_check_point_lookup,
 );
 criterion_main!(benches);
