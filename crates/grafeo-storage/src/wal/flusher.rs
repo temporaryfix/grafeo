@@ -40,11 +40,9 @@ impl FlusherStats {
     /// Returns the average flush duration in microseconds.
     #[must_use]
     pub fn avg_flush_time_us(&self) -> u64 {
-        if self.flush_count == 0 {
-            0
-        } else {
-            self.total_flush_time_us / self.flush_count
-        }
+        self.total_flush_time_us
+            .checked_div(self.flush_count)
+            .unwrap_or(0)
     }
 }
 

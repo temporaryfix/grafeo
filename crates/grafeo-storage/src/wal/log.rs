@@ -409,13 +409,12 @@ impl WalManager {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             // reason: millis since UNIX epoch fits in u64 for ~585 million years
-            .map(|d| {
+            .map_or(0, |d| {
                 // reason: value is bounded by format constraints
                 #[allow(clippy::cast_possible_truncation)]
                 let ms = d.as_millis() as u64;
                 ms
-            })
-            .unwrap_or(0);
+            });
 
         // Create checkpoint metadata
         let metadata = CheckpointMetadata {

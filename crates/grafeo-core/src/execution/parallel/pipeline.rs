@@ -119,9 +119,7 @@ pub struct ParallelPipelineConfig {
 impl Default for ParallelPipelineConfig {
     fn default() -> Self {
         Self {
-            num_workers: thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
+            num_workers: thread::available_parallelism().map_or(4, |n| n.get()),
             morsel_size: DEFAULT_MORSEL_SIZE,
             chunk_size: DEFAULT_CHUNK_SIZE,
             preserve_order: false,
