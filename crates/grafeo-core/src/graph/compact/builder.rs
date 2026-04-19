@@ -2027,20 +2027,20 @@ mod tests {
         assert_eq!(seen_vec_strings, 2);
     }
 
-    /// A `Value::Vector` with consistent dimensions across nodes still lands
-    /// in the Dict column: there is no Float32Vector column codec. This test
-    /// documents current behavior. If a Float32Vector codec is added later,
-    /// this test should be updated to match the new inferred type.
+    /// A `Value::Vector` with consistent dimensions across nodes round-trips
+    /// through the Float32Vector column codec and comes back as `Value::Vector`
+    /// with the original dimensions and values.
     #[test]
     fn test_from_graph_store_float32_vector() {
         use crate::graph::lpg::LpgStore;
         use std::sync::Arc;
 
         let store = LpgStore::new().unwrap();
+        let expected: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
         for name in ["Alix", "Gus", "Vincent"] {
             let id = store.create_node(&["Doc"]);
             store.set_node_property(id, "name", Value::from(name));
-            let emb: Arc<[f32]> = Arc::from([0.1f32, 0.2, 0.3, 0.4].as_slice());
+            let emb: Arc<[f32]> = Arc::from(expected.as_slice());
             store.set_node_property(id, "embedding", Value::Vector(emb));
         }
 
@@ -2052,10 +2052,12 @@ mod tests {
             let v = compact
                 .get_node_property(id, &PropertyKey::new("embedding"))
                 .expect("embedding missing");
-            assert!(
-                matches!(v, Value::String(_)),
-                "vector Value currently falls back to Dict (String); got {v:?}"
-            );
+            match v {
+                Value::Vector(data) => {
+                    assert_eq!(&*data, &expected, "unexpected vector contents");
+                }
+                other => panic!("expected Value::Vector, got {other:?}"),
+            }
         }
     }
 
