@@ -2,27 +2,32 @@
 
 All notable changes to Grafeo, for future reference (and enjoyment).
 
-## [0.5.40] - Unreleased
+## [0.5.40] - 2026-04-19
+
+Unified hybrid queries (graph + vector + text), lazy streaming results, structured Python errors, catalog hierarchy hardening, and compact-store fixes.
 
 ### Added
 
-- **Unified hybrid queries**: graph + vector + text in a single query. `text_score()` and `text_match()` evaluable as per-row filter expressions, with planner pushdown of `text_score(n.prop, "query") > threshold` and vector score predicates to dedicated `TextScan` / `VectorScan` operators. Compound AND/OR hybrid joins, ORDER BY + LIMIT recognized as top-K, and score column projection to avoid recompute. Inspired by [#287](https://github.com/GrafeoDB/grafeo/pull/287) ([@temporaryfix](https://github.com/temporaryfix)); reimplemented with a `GraphStoreSearch` subtrait, symmetric per-row fallback when no index exists, and `filter_hybrid.rs` planner module.
-- **BM25 text scan operator**: `TextScanOperator` supports top-K and threshold modes. `InvertedIndex` gains `score_document`, `search_with_threshold`, and `bm25_term_score` helpers. ([#287](https://github.com/GrafeoDB/grafeo/pull/287), [@temporaryfix](https://github.com/temporaryfix))
-- **Float64 and Float32Vector column codecs**: CompactStore now stores `Value::Float64` and `Value::Vector` properties natively instead of falling back to dictionary encoding. Mixed `Int64+Float64` columns coalesce to Float64. ([#286](https://github.com/GrafeoDB/grafeo/pull/286), [@temporaryfix](https://github.com/temporaryfix))
-- **Streaming query results** (experimental): `Session::execute_streaming` returns a `ResultStream` that pulls one `DataChunk` at a time from the operator pipeline instead of materializing the full result. Bounded memory and first-row latency for large scans. Rejects mutations, EXPLAIN/PROFILE, session commands, and queries that require push-based operators (ORDER BY, aggregate, DISTINCT). Python `execute_lazy()` and Node.js `executeStream()` expose the same surface. Active streams block `commit()` / `rollback()` until drained.
+- **Unified hybrid queries**: `text_score()` and `text_match()` usable as filter expressions, with planner pushdown of score predicates to `TextScan` / `VectorScan` operators, compound AND/OR joins, top-K recognition, and score projection. Inspired by [#287](https://github.com/GrafeoDB/grafeo/pull/287) ([@temporaryfix](https://github.com/temporaryfix)); reimplemented via `GraphStoreSearch` subtrait and `filter_hybrid.rs` planner module.
+- **BM25 text scan operator**: `TextScanOperator` with top-K and threshold modes. `InvertedIndex` gains `score_document`, `search_with_threshold`, `bm25_term_score`. ([#287](https://github.com/GrafeoDB/grafeo/pull/287), [@temporaryfix](https://github.com/temporaryfix))
+- **Native Float64 and Float32Vector codecs**: CompactStore stores them directly instead of falling back to dictionary encoding. Mixed `Int64+Float64` columns coalesce to Float64. ([#286](https://github.com/GrafeoDB/grafeo/pull/286), [@temporaryfix](https://github.com/temporaryfix))
+- **Streaming query results** (experimental): `Session::execute_streaming` returns a `ResultStream` that pulls one `DataChunk` at a time, bounded memory regardless of result-set size. Python `execute_lazy()` and Node.js `executeStream()`. Rejects mutations, EXPLAIN/PROFILE, session commands, and push-only plans.
+- **Python `GrafeoError` exception**: subclass of `RuntimeError` carrying `error_code` (`"GRAFEO-Q001"`) and `is_retryable`. Legacy `except RuntimeError:` paths keep working.
+- **Error codes reference**: user-guide page documenting every `GRAFEO-*` code, retry semantics, and a Python retry-loop sample.
+- **Catalog hierarchy docs** (ISO/IEC 39075): user-guide page covering schemas, named graphs, session state, isolation, and cross-schema transactions.
 
 ### Changed
 
-- **`DatabaseStats.memory_bytes` now reflects the full hierarchical breakdown**: `detailed_stats().memory_bytes` returns `memory_usage().total_bytes` instead of just the buffer manager's tracked allocations. Reported values now include store, indexes, MVCC chains, plan caches, string pools, and buffer manager.
-- **Python `GrafeoError` exception class**: query, transaction, and database errors now raise `grafeo.GrafeoError` (subclass of `RuntimeError`) carrying `error_code` (e.g. `"GRAFEO-Q001"`) and `is_retryable` attributes. Existing `except RuntimeError:` paths still work.
+- **`DatabaseStats.memory_bytes` reflects the full heap breakdown**: now equals `memory_usage().total_bytes` (store + indexes + MVCC + caches + string pools + buffer manager) instead of just buffer-manager-tracked bytes.
+- **Schema and graph names reject `/`**: `CREATE SCHEMA` / `CREATE GRAPH` now fail on names containing `/`, which Grafeo uses internally as the compound `schema/graph` storage-key separator.
 
 ### Fixed
 
-- **MERGE index lookup**: `MERGE (n:Label {prop: value})` now uses property indexes when available, matching the performance of `MATCH` with property constraints. Previously, MERGE always scanned all nodes with the given label and compared properties manually, causing O(n) slowdown on large graphs. (#288)
-- **Index and search after `compact()`**: `create_vector_index`, `vector_search`, `create_text_index`, `text_search`, and the other ~26 index/search methods no longer panic with "no built-in LpgStore" or silently return empty results after `compact()`. ([#286](https://github.com/GrafeoDB/grafeo/pull/286), [@temporaryfix](https://github.com/temporaryfix))
-- **`LayeredStore` new-node visibility**: `get_node` and `get_node_property` now fall back to the overlay for nodes added after `compact()`, fixing `recompact()` silently dropping those nodes from the merged base. ([#286](https://github.com/GrafeoDB/grafeo/pull/286))
-- **Named graphs across `compact()` / `recompact()`**: `list_graphs`, `drop_graph`, `create_graph`, and `set_current_graph` now see graphs that existed before compaction. Named graphs are carried from the pre-compact overlay into the new overlay on rebuild.
-- **Layered scan lock holding**: `nodes_by_label` on the layered compact store now acquires the `dirty_node_ids` lock once per scan instead of re-locking inside the chunk loop. ([#278](https://github.com/GrafeoDB/grafeo/pull/278), [@temporaryfix](https://github.com/temporaryfix))
+- **MERGE index lookup**: `MERGE (n:Label {prop: value})` now uses property indexes when available, eliminating O(n) scan on large graphs. (#288)
+- **Index and search after `compact()`**: ~26 vector/text index methods no longer panic with "no built-in LpgStore" or silently return empty results. ([#286](https://github.com/GrafeoDB/grafeo/pull/286), [@temporaryfix](https://github.com/temporaryfix))
+- **`LayeredStore` new-node visibility**: `get_node` / `get_node_property` fall back to the overlay for nodes added after `compact()`. ([#286](https://github.com/GrafeoDB/grafeo/pull/286))
+- **Named graphs across `compact()` / `recompact()`**: graphs existing before compaction are carried into the new overlay; `list_graphs`, `drop_graph`, `create_graph`, `set_current_graph` see them.
+- **Layered scan lock holding**: `nodes_by_label` acquires `dirty_node_ids` once per scan instead of re-locking in the chunk loop. ([#278](https://github.com/GrafeoDB/grafeo/pull/278), [@temporaryfix](https://github.com/temporaryfix))
 
 ## [0.5.39] - 2026-04-16
 
