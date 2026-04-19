@@ -24,7 +24,7 @@ tests:
       - "INSERT (:Article {body: 'attention mechanisms in graph neural networks'})"
       - "INSERT (:Article {body: 'rust database internals with mvcc'})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
       - "MATCH (n:Article) RETURN count(n) AS cnt"
     expect:
       rows:
@@ -39,7 +39,7 @@ tests:
       - "INSERT (:Article {title: 'A1', body: 'rust database internals'})"
       - "INSERT (:Article {title: 'A2', body: 'attention mechanisms in graph nets'})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
       - "MATCH (n:Article) WHERE text_match(n.body, 'rust database') RETURN n.title"
     expect:
       rows:
@@ -49,7 +49,7 @@ tests:
     setup:
       - "INSERT (:Article {title: 'A1', body: 'rust database'})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
       - "MATCH (n:Article) WHERE text_match(n.body, 'transformer architectures') RETURN n.title"
     expect:
       empty: true
@@ -64,7 +64,7 @@ tests:
       - "INSERT (:Article {title: 'A2', body: 'rust database internals with mvcc'})"
       - "INSERT (:Article {title: 'A3', body: 'attention transformer models'})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
       - "MATCH (n:Article) WHERE text_score(n.body, 'attention') > 0.0 RETURN n.title ORDER BY n.title"
     expect:
       ordered: true
@@ -74,13 +74,16 @@ tests:
 
   # text_score with `>=` triggers the same pushdown path as `>` and must be
   # accepted by the predicate extractor (regression for BinaryOp::Ge).
+  # Use a non-zero threshold so per-row eval and pushdown agree (zero-score
+  # documents aren't iterated by threshold-mode TextScan).
   - name: text_score_ge_operator_pushdown
     setup:
-      - "INSERT (:Article {title: 'A1', body: 'rust database'})"
-      - "INSERT (:Article {title: 'A2', body: 'graph neural networks'})"
+      - "INSERT (:Article {title: 'A1', body: 'rust database engine internals'})"
+      - "INSERT (:Article {title: 'A2', body: 'rust web framework'})"
+      - "INSERT (:Article {title: 'A3', body: 'cooking recipes for beginners'})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
-      - "MATCH (n:Article) WHERE text_score(n.body, 'rust') >= 0.0 RETURN count(n) AS c"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
+      - "MATCH (n:Article) WHERE text_score(n.body, 'rust') >= 0.001 RETURN count(n) AS c"
     expect:
       rows:
         - [2]
@@ -94,7 +97,7 @@ tests:
       - "INSERT (:Article {title: 'A1', body: 'attention is all you need'})"
       - "INSERT (:Article {title: 'A2', body: 'cooking rice for beginners'})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
       - "MATCH (n:Article) WHERE text_score(n.body, 'attention') > 0.0 RETURN n.title"
     expect:
       rows:
@@ -127,11 +130,11 @@ tests:
       - "INSERT (:Article {title: 'A2', body: 'rust database', embedding: vector([0.9, 0.1, 0.0])})"
       - "INSERT (:Article {title: 'A3', body: 'attention transformer', embedding: vector([0.0, 1.0, 0.0])})"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
-      - "CREATE VECTOR INDEX article_emb ON :Article(embedding) DIMENSION 3 METRIC 'cosine'"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
+      - "CREATE INDEX article_emb FOR (n:Article) ON (n.embedding) USING VECTOR {dimensions: 3, metric: 'cosine'}"
       - |
         MATCH (n:Article)
-        WHERE cosine_similarity(n.embedding, vector([0.9, 0.1, 0.0])) > 0.5
+        WHERE cosine_similarity(n.embedding, [0.9, 0.1, 0.0]) > 0.5
           AND text_match(n.body, 'attention')
         RETURN n.title
     expect:
@@ -152,7 +155,7 @@ tests:
       - "MATCH (u:User {name: 'Alix'}), (a:Article {title: 'A1'}) INSERT (u)-[:WROTE]->(a)"
       - "MATCH (u:User {name: 'Alix'}), (a:Article {title: 'A2'}) INSERT (u)-[:WROTE]->(a)"
     statements:
-      - "CREATE TEXT INDEX article_body ON :Article(body)"
+      - "CREATE INDEX article_body FOR (n:Article) ON (n.body) USING TEXT"
       - |
         MATCH (u:User {name: 'Alix'})-[:WROTE]->(a:Article)
         WHERE text_score(a.body, 'attention') > 0.0

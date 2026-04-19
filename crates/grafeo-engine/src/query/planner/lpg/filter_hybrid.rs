@@ -262,7 +262,15 @@ impl super::Planner {
             return Ok(None);
         }
 
-        // Build VectorScanOp (threshold mode — return all candidates above threshold)
+        // Pushdown needs a resolvable query vector. Fall through otherwise.
+        if self
+            .resolve_vector_literal(&vector_pred.query_vector)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        // Build VectorScanOp (threshold mode, return all candidates above threshold).
         let vector_scan_op = LogicalOperator::VectorScan(super::VectorScanOp {
             variable: scan.variable.clone(),
             index_name: Some(format!("{}:{}", label, vector_pred.property)),

@@ -1332,6 +1332,16 @@ impl super::Planner {
             return Ok(None);
         }
 
+        // The pushdown requires a query vector resolvable at plan time. If the
+        // expression is something like a property access or non-literal, fall
+        // through so per-row Filter evaluation handles it.
+        if self
+            .resolve_vector_literal(&extracted.query_vector)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
         // Build VectorScanOp
         let vector_scan = super::VectorScanOp {
             variable: scan.variable.clone(),

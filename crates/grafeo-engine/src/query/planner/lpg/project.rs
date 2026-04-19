@@ -1040,6 +1040,12 @@ impl super::Planner {
             return Ok(None);
         }
 
+        // Top-K rewrite needs a resolvable query vector. Fall through
+        // otherwise so the standard Sort + Filter path evaluates per-row.
+        if self.resolve_vector_literal(&query_vector).is_err() {
+            return Ok(None);
+        }
+
         let vector_scan = super::VectorScanOp {
             variable: scan_var.to_string(),
             index_name: Some(format!("{}:{}", label, property)),
