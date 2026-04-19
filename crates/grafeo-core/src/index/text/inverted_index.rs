@@ -237,7 +237,7 @@ impl InvertedIndex {
 
     /// Returns all documents scoring at or above `threshold` using BM25.
     ///
-    /// Unlike [`search()`] (top-k), this returns every document above the
+    /// Unlike [`Self::search`] (top-k), this returns every document above the
     /// threshold, sorted by score descending. Intended for index-accelerated
     /// text search with WHERE predicates.
     #[must_use]
