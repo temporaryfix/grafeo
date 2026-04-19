@@ -706,11 +706,18 @@ fn test_not_exists_standalone_anti_join() {
              RETURN n.name ORDER BY n.name",
         )
         .unwrap();
-    // Jules and Mia have no outgoing KNOWS in the fixture.
+    // Fixture KNOWS edges: alix->gus, gus->vincent, alix->jules.
+    // Persons with NO outgoing KNOWS: Vincent, Jules, Mia.
     let names = strings_col0(&r);
-    assert!(names.contains(&"Jules".to_string()));
-    assert!(names.contains(&"Mia".to_string()));
-    assert!(!names.contains(&"Alix".to_string()));
+    assert_eq!(
+        names,
+        vec![
+            "Jules".to_string(),
+            "Mia".to_string(),
+            "Vincent".to_string(),
+        ],
+        "NOT EXISTS (outgoing KNOWS) must include everyone without outgoing edges"
+    );
 }
 
 /// Complex EXISTS inside an AND tree buried two levels deep. Exercises the

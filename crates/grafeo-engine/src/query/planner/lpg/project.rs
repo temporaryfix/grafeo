@@ -1150,15 +1150,22 @@ impl super::Planner {
                 return None;
             }
 
-            // The first arg is the property access n.prop; variable is the
-            // node variable whose score column was projected by the scan.
-            // args[1] is the query expression, which is part of the column
-            // name so a different query (e.g. $q2 instead of $q1) against
-            // the same property does not reuse the wrong score.
-            let (Some(LogicalExpression::Property { variable, property }), Some(query)) =
-                (args.first(), args.get(1))
-            else {
+            // Either arg may hold the property access (the producer
+            // `try_vector_topk` accepts both orderings). Identify the
+            // property and treat the *other* arg as the query expression,
+            // which is embedded in the column name so different queries
+            // against the same property never reuse each other's score.
+            if args.len() != 2 {
                 return None;
+            }
+            let (variable, property, query) = match (&args[0], &args[1]) {
+                (LogicalExpression::Property { variable, property }, query) => {
+                    (variable, property, query)
+                }
+                (query, LogicalExpression::Property { variable, property }) => {
+                    (variable, property, query)
+                }
+                _ => return None,
             };
 
             #[cfg(feature = "vector-index")]

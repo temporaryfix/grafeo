@@ -1443,17 +1443,24 @@ impl super::Planner {
 
         let (metric, is_similarity) = match name {
             "cosine_similarity" => (super::VectorMetric::Cosine, true),
-            "dot_product" => (super::VectorMetric::DotProduct, true),
             "euclidean_distance" => (super::VectorMetric::Euclidean, false),
             "manhattan_distance" => (super::VectorMetric::Manhattan, false),
+            // dot_product is intentionally not pushed down: the physical
+            // VectorScanOperator's apply_filters only honors min_similarity
+            // when metric == Cosine, so a pushed DotProduct threshold would
+            // be silently dropped, returning unfiltered results. Fall
+            // through to per-row evaluation instead.
             _ => return None,
         };
 
-        // Similarity: >, >= threshold.  Distance: <, <= threshold.
+        // Only inclusive operators push down. Strict operators (>, <) become
+        // inclusive when mapped to min_similarity / max_distance (which
+        // apply_filters compares with >= / <=), so a boundary row would leak.
+        // Per-row evaluation handles the strict forms exactly.
         let valid_op = if is_similarity {
-            matches!(op, BinaryOp::Gt | BinaryOp::Ge)
+            matches!(op, BinaryOp::Ge)
         } else {
-            matches!(op, BinaryOp::Lt | BinaryOp::Le)
+            matches!(op, BinaryOp::Le)
         };
         if !valid_op {
             return None;

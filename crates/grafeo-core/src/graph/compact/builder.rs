@@ -1208,13 +1208,17 @@ fn infer_type_from_values(values: &[Value]) -> InferredType {
         }
     }
 
-    // Vectors are exclusive — mixed with other types falls back to Dict.
+    // Vectors are exclusive; mixed with other types falls back to Dict.
+    // Zero-dimension vectors cannot be round-tripped through the Float32Vector
+    // codec (stride=0 means no row can be decoded), so those fall back to Dict
+    // as well.
     if saw_vector
         && !saw_other
         && !saw_int
         && !saw_float
         && !saw_bool
         && let Some(dims) = vector_dims
+        && dims > 0
     {
         return InferredType::Float32Vector { dimensions: dims };
     }

@@ -829,13 +829,14 @@ impl Planner {
         // Resolve the query vector expression to Vec<f32>
         let query_vec = self.resolve_vector_literal(&scan.query_vector)?;
 
-        // Map VectorMetric to DistanceMetric
-        let metric = match scan.metric {
-            Some(VectorMetric::Cosine) | None => DistanceMetric::Cosine,
-            Some(VectorMetric::Euclidean) => DistanceMetric::Euclidean,
-            Some(VectorMetric::DotProduct) => DistanceMetric::DotProduct,
-            Some(VectorMetric::Manhattan) => DistanceMetric::Manhattan,
-        };
+        // Map the user-requested metric (if any). `None` means "use whatever
+        // the index uses"; resolved below when we can look at the index.
+        let requested_metric = scan.metric.map(|m| match m {
+            VectorMetric::Cosine => DistanceMetric::Cosine,
+            VectorMetric::Euclidean => DistanceMetric::Euclidean,
+            VectorMetric::DotProduct => DistanceMetric::DotProduct,
+            VectorMetric::Manhattan => DistanceMetric::Manhattan,
+        });
 
         let k = scan.k.unwrap_or(usize::MAX);
 
@@ -843,35 +844,53 @@ impl Planner {
         // metric matches the index's metric. The index ranks by its own
         // metric, so using it with a different metric would return the wrong
         // neighbors (with_metric only rescales threshold comparisons).
-        let mut operator = if let Some(ref label) = scan.label {
+        let (mut operator, metric) = if let Some(ref label) = scan.label {
             let indexed = self
                 .store
                 .get_vector_index_handle(label, &scan.property)
                 .and_then(|handle| handle.downcast::<VectorIndexKind>().ok())
-                .filter(|index| scan.metric.is_none() || index.config().metric == metric);
+                .filter(|index| {
+                    requested_metric.is_none() || requested_metric == Some(index.config().metric)
+                });
             if let Some(index) = indexed {
-                VectorScanOperator::with_index(Arc::clone(&self.store), index, query_vec.clone(), k)
-                    .with_property(&scan.property)
-                    .with_label(label)
-                    .with_metric(metric)
+                // When the user didn't specify a metric, adopt the index's
+                // metric so apply_filters interprets the returned distances
+                // correctly (e.g. similarity threshold only applies to cosine).
+                let m = requested_metric.unwrap_or(index.config().metric);
+                let op = VectorScanOperator::with_index(
+                    Arc::clone(&self.store),
+                    index,
+                    query_vec.clone(),
+                    k,
+                )
+                .with_property(&scan.property)
+                .with_label(label)
+                .with_metric(m);
+                (op, m)
             } else {
-                VectorScanOperator::brute_force(
+                // Brute-force has no index to borrow from; default to Cosine
+                // when the user didn't pick one.
+                let m = requested_metric.unwrap_or(DistanceMetric::Cosine);
+                let op = VectorScanOperator::brute_force(
                     Arc::clone(&self.store),
                     &scan.property,
                     query_vec.clone(),
                     k,
-                    metric,
+                    m,
                 )
-                .with_label(label)
+                .with_label(label);
+                (op, m)
             }
         } else {
-            VectorScanOperator::brute_force(
+            let m = requested_metric.unwrap_or(DistanceMetric::Cosine);
+            let op = VectorScanOperator::brute_force(
                 Arc::clone(&self.store),
                 &scan.property,
                 query_vec,
                 k,
-                metric,
-            )
+                m,
+            );
+            (op, m)
         };
 
         if let Some(sim) = scan.min_similarity {
@@ -882,12 +901,17 @@ impl Planner {
         }
 
         let mut columns = vec![scan.variable.clone()];
-        // VectorScan always projects a score column keyed by metric+property+query
-        let metric_tag = match scan.metric {
-            Some(VectorMetric::Cosine) | None => "cos",
-            Some(VectorMetric::Euclidean) => "euc",
-            Some(VectorMetric::DotProduct) => "dot",
-            Some(VectorMetric::Manhattan) => "man",
+        // VectorScan always projects a score column keyed by the resolved
+        // metric (after index-driven fallback) so downstream score reuse
+        // matches the actual distance values written out.
+        let metric_tag = match metric {
+            DistanceMetric::Cosine => "cos",
+            DistanceMetric::Euclidean => "euc",
+            DistanceMetric::DotProduct => "dot",
+            DistanceMetric::Manhattan => "man",
+            // Future metrics (DistanceMetric is #[non_exhaustive]) fall back
+            // to a generic tag so they still produce a stable column name.
+            _ => "other",
         };
         columns.push(project::vector_score_column_name(
             metric_tag,

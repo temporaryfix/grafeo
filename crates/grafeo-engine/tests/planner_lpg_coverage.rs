@@ -513,18 +513,19 @@ fn test_resolve_vector_literal_non_literal_falls_through() {
 // ============================================================================
 
 /// `collect({k: ..., v: ...})` with a grouping column lowers to MapCollectOp
-/// when the binder recognises the pattern. Accepting Ok-or-Err keeps the test
-/// robust against binder variations while still compiling the call site.
+/// when the binder recognises the pattern. The query must plan successfully;
+/// any planner error is a regression we want to surface.
 #[test]
 fn test_plan_map_collect_via_collect_map() {
-    let r = social_graph().session().execute(
-        "MATCH (n:Person) \
-         RETURN n.city AS city, collect({name: n.name, age: n.age}) AS people \
-         ORDER BY city",
-    );
-    if let Ok(rs) = r {
-        assert!(rs.column_count() >= 2);
-    }
+    let rs = social_graph()
+        .session()
+        .execute(
+            "MATCH (n:Person) \
+             RETURN n.city AS city, collect({name: n.name, age: n.age}) AS people \
+             ORDER BY city",
+        )
+        .expect("collect-map query must plan and execute");
+    assert!(rs.column_count() >= 2);
 }
 
 // ============================================================================
@@ -532,16 +533,19 @@ fn test_plan_map_collect_via_collect_map() {
 // ============================================================================
 
 /// sum(r.weight) over FOLLOWS edges in a variable-length path forces the Edge
-/// branch of plan_horizontal_aggregate when the binder emits a HorizontalAggregateOp.
+/// branch of plan_horizontal_aggregate when the binder emits a
+/// HorizontalAggregateOp. Any planner error is a regression we want to
+/// surface rather than swallow.
 #[test]
 fn test_plan_horizontal_aggregate_edge() {
-    let r = social_graph().session().execute(
-        "MATCH p = (a:Person {name: 'Alix'})-[r:FOLLOWS*1..2]->(b:Person) \
-         RETURN sum(r.weight) AS total ORDER BY total",
-    );
-    if let Ok(rs) = r {
-        assert!(rs.row_count() >= 1);
-    }
+    let rs = social_graph()
+        .session()
+        .execute(
+            "MATCH p = (a:Person {name: 'Alix'})-[r:FOLLOWS*1..2]->(b:Person) \
+             RETURN sum(r.weight) AS total ORDER BY total",
+        )
+        .expect("horizontal-aggregate edge query must plan and execute");
+    assert!(rs.row_count() >= 1);
 }
 
 // ============================================================================
