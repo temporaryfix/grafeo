@@ -992,3 +992,81 @@ fn import_empty_bytes_returns_error() {
     let result = GrafeoDB::import_snapshot(&[]);
     assert!(result.is_err(), "importing empty bytes should error");
 }
+
+// --- Multi-schema round-trip (ISO/IEC 39075 catalog hierarchy) ---
+
+#[test]
+fn snapshot_round_trip_multi_schema_isolation() {
+    let db = GrafeoDB::new_in_memory();
+    let s = db.session();
+
+    s.execute("CREATE SCHEMA reporting").unwrap();
+    s.execute("CREATE SCHEMA social").unwrap();
+
+    s.execute("SESSION SET SCHEMA reporting").unwrap();
+    s.execute("INSERT (:Report {title: 'Q1'})").unwrap();
+
+    s.execute("SESSION SET SCHEMA social").unwrap();
+    s.execute("INSERT (:Friend {name: 'Alix'})").unwrap();
+
+    let bytes = db.export_snapshot().unwrap();
+    let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
+    let r = restored.session();
+
+    // Schemas survive
+    let schemas = r.execute("SHOW SCHEMAS").unwrap();
+    assert_eq!(schemas.row_count(), 2, "both schemas should be restored");
+
+    // Cross-schema isolation is preserved
+    r.execute("SESSION SET SCHEMA reporting").unwrap();
+    let reports = r.execute("MATCH (n:Report) RETURN n").unwrap();
+    assert_eq!(reports.row_count(), 1, "reporting should have 1 Report");
+    let leaked = r.execute("MATCH (n:Friend) RETURN n").unwrap();
+    assert_eq!(
+        leaked.row_count(),
+        0,
+        "social data must not leak into reporting after restore"
+    );
+
+    r.execute("SESSION SET SCHEMA social").unwrap();
+    let friends = r.execute("MATCH (n:Friend) RETURN n").unwrap();
+    assert_eq!(friends.row_count(), 1, "social should have 1 Friend");
+    let leaked = r.execute("MATCH (n:Report) RETURN n").unwrap();
+    assert_eq!(
+        leaked.row_count(),
+        0,
+        "reporting data must not leak into social after restore"
+    );
+}
+
+#[test]
+fn snapshot_round_trip_named_graph_within_schema() {
+    let db = GrafeoDB::new_in_memory();
+    let s = db.session();
+
+    s.execute("CREATE SCHEMA reports").unwrap();
+    s.execute("SESSION SET SCHEMA reports").unwrap();
+    s.execute("CREATE GRAPH quarterly").unwrap();
+    s.execute("SESSION SET GRAPH quarterly").unwrap();
+    s.execute("INSERT (:Row {q: 1})").unwrap();
+
+    let bytes = db.export_snapshot().unwrap();
+    let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
+    let r = restored.session();
+
+    r.execute("SESSION SET SCHEMA reports").unwrap();
+    let graphs = r.execute("SHOW GRAPHS").unwrap();
+    assert_eq!(
+        graphs.row_count(),
+        1,
+        "schema-scoped named graph should survive round-trip"
+    );
+
+    r.execute("SESSION SET GRAPH quarterly").unwrap();
+    let rows = r.execute("MATCH (n:Row) RETURN n.q").unwrap();
+    assert_eq!(
+        rows.row_count(),
+        1,
+        "data in schema-scoped named graph should survive round-trip"
+    );
+}

@@ -813,7 +813,9 @@ impl Session {
                 if name.contains('/') {
                     return Err(Error::Query(QueryError::new(
                         QueryErrorKind::Semantic,
-                        format!("Graph name '{name}' must not contain '/' (reserved as schema/graph separator)"),
+                        format!(
+                            "Graph name '{name}' must not contain '/' (reserved as schema/graph separator)"
+                        ),
                     )));
                 }
                 let storage_key = self.effective_graph_key(&name);
@@ -1712,28 +1714,30 @@ impl Session {
                 if name.contains('/') {
                     return Err(Error::Query(QueryError::new(
                         QueryErrorKind::Semantic,
-                        format!("Schema name '{name}' must not contain '/' (reserved as schema/graph separator)"),
+                        format!(
+                            "Schema name '{name}' must not contain '/' (reserved as schema/graph separator)"
+                        ),
                     )));
                 }
                 match self.catalog.register_schema_namespace(name.clone()) {
-                Ok(()) => {
-                    wal_log!(self, WalRecord::CreateSchema { name: name.clone() });
-                    // Auto-create the schema's default graph partition so that
-                    // SESSION SET SCHEMA + queries work without an explicit graph.
-                    let default_key = format!("{name}/{SCHEMA_DEFAULT_GRAPH}");
-                    if self.store.create_graph(&default_key).unwrap_or(false) {
-                        wal_log!(self, WalRecord::CreateNamedGraph { name: default_key });
+                    Ok(()) => {
+                        wal_log!(self, WalRecord::CreateSchema { name: name.clone() });
+                        // Auto-create the schema's default graph partition so that
+                        // SESSION SET SCHEMA + queries work without an explicit graph.
+                        let default_key = format!("{name}/{SCHEMA_DEFAULT_GRAPH}");
+                        if self.store.create_graph(&default_key).unwrap_or(false) {
+                            wal_log!(self, WalRecord::CreateNamedGraph { name: default_key });
+                        }
+                        Ok(QueryResult::status(format!("Created schema '{name}'")))
                     }
-                    Ok(QueryResult::status(format!("Created schema '{name}'")))
-                }
-                Err(e) if if_not_exists => {
-                    let _ = e;
-                    Ok(QueryResult::status("No change"))
-                }
-                Err(e) => Err(Error::Query(QueryError::new(
-                    QueryErrorKind::Semantic,
-                    e.to_string(),
-                ))),
+                    Err(e) if if_not_exists => {
+                        let _ = e;
+                        Ok(QueryResult::status("No change"))
+                    }
+                    Err(e) => Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        e.to_string(),
+                    ))),
                 }
             }
             SchemaStatement::DropSchema { name, if_exists } => {
