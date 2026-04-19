@@ -180,7 +180,7 @@ impl super::GrafeoDB {
             edge_type_count: self.lpg_store().edge_type_count(),
             property_key_count: self.lpg_store().property_key_count(),
             index_count: self.catalog.index_count(),
-            memory_bytes: self.buffer_manager.allocated(),
+            memory_bytes: self.memory_usage().total_bytes,
             disk_bytes,
         }
     }

@@ -127,3 +127,55 @@ fn test_memory_usage_caches() {
     let usage = db.memory_usage();
     assert!(usage.caches.cached_plan_count >= 1);
 }
+
+#[test]
+fn test_detailed_stats_memory_matches_memory_usage_total() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    for i in 0..10 {
+        session
+            .create_node_with_props(&["Item"], [("v", Value::Int64(i))])
+            .unwrap();
+    }
+
+    let stats = db.detailed_stats();
+    let usage = db.memory_usage();
+    assert_eq!(
+        stats.memory_bytes, usage.total_bytes,
+        "detailed_stats.memory_bytes must equal memory_usage().total_bytes"
+    );
+    assert!(
+        stats.memory_bytes > 0,
+        "populated database should report non-zero memory_bytes"
+    );
+}
+
+#[test]
+fn test_memory_usage_thread_safe() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let db = Arc::new(GrafeoDB::new_in_memory());
+    let session = db.session();
+    for i in 0..50 {
+        session
+            .create_node_with_props(&["N"], [("v", Value::Int64(i))])
+            .unwrap();
+    }
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                for _ in 0..20 {
+                    let u = db.memory_usage();
+                    assert!(u.total_bytes > 0);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
