@@ -170,7 +170,9 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.get_edge(id);
         }
-        self.base.get_edge(id)
+        // Edges created after `compact()` live only in the overlay; fall
+        // through when the base doesn't recognise the id.
+        self.base.get_edge(id).or_else(|| self.overlay.get_edge(id))
     }
 
     fn get_node_versioned(
@@ -185,7 +187,14 @@ impl GraphStore for LayeredStore {
         if self.is_node_dirty(id) {
             return self.overlay.get_node_versioned(id, epoch, transaction_id);
         }
-        self.base.get_node(id)
+        // `dirty_node_ids` only tracks overlay modifications of *base* nodes.
+        // Overlay-only nodes (post-`compact()` writes) fall through to here;
+        // the base doesn't know them, so defer to the overlay's versioned
+        // fetch. CompactStore itself has no MVCC versions, so `get_node`
+        // is the right base call.
+        self.base
+            .get_node(id)
+            .or_else(|| self.overlay.get_node_versioned(id, epoch, transaction_id))
     }
 
     fn get_edge_versioned(
@@ -200,7 +209,9 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.get_edge_versioned(id, epoch, transaction_id);
         }
-        self.base.get_edge(id)
+        self.base
+            .get_edge(id)
+            .or_else(|| self.overlay.get_edge_versioned(id, epoch, transaction_id))
     }
 
     fn get_node_at_epoch(&self, id: NodeId, epoch: EpochId) -> Option<Node> {
@@ -210,7 +221,9 @@ impl GraphStore for LayeredStore {
         if self.is_node_dirty(id) {
             return self.overlay.get_node_at_epoch(id, epoch);
         }
-        self.base.get_node(id)
+        self.base
+            .get_node(id)
+            .or_else(|| self.overlay.get_node_at_epoch(id, epoch))
     }
 
     fn get_edge_at_epoch(&self, id: EdgeId, epoch: EpochId) -> Option<Edge> {
@@ -220,7 +233,9 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.get_edge_at_epoch(id, epoch);
         }
-        self.base.get_edge(id)
+        self.base
+            .get_edge(id)
+            .or_else(|| self.overlay.get_edge_at_epoch(id, epoch))
     }
 
     fn get_node_property(&self, id: NodeId, key: &PropertyKey) -> Option<Value> {
@@ -242,7 +257,9 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.get_edge_property(id, key);
         }
-        self.base.get_edge_property(id, key)
+        self.base
+            .get_edge_property(id, key)
+            .or_else(|| self.overlay.get_edge_property(id, key))
     }
 
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
@@ -316,18 +333,16 @@ impl GraphStore for LayeredStore {
             }
         }
 
-        // Overlay neighbors (for dirty source node or overlay-only node).
-        if self.is_node_dirty(node) || self.overlay.get_node(node).is_some() {
-            for nid in self.overlay.neighbors(node, direction) {
-                if !deleted_nodes.contains(&nid) {
-                    results.push(nid);
-                }
+        // Overlay neighbors — always consulted. An edge created after
+        // `compact()` whose src is a base node records the base id in
+        // the overlay's adjacency even though the overlay has no
+        // corresponding node object; gating on `overlay.get_node(node)`
+        // would miss that case.
+        for nid in self.overlay.neighbors(node, direction) {
+            if !deleted_nodes.contains(&nid) {
+                results.push(nid);
             }
         }
-
-        // Overlay edges that connect base nodes.
-        // If node is in the base and the overlay has edges for it
-        // (e.g., after promote), those are already in dirty.
 
         results.sort_unstable();
         results.dedup();
@@ -349,14 +364,22 @@ impl GraphStore for LayeredStore {
             }
         }
 
-        // Overlay edges.
-        if self.is_node_dirty(node) || self.overlay.get_node(node).is_some() {
-            for (target, eid) in self.overlay.edges_from(node, direction) {
-                if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
-                    results.push((target, eid));
-                }
+        // Overlay edges — always consulted. The overlay stores edges
+        // keyed by src/dst even when the endpoint is a base node (e.g. a
+        // post-`compact()` edge from a base node to an overlay node), so
+        // we can't gate this on whether the overlay has the node itself.
+        // `LpgStore::edges_from` returns empty for ids with no outgoing
+        // edges, so the unconditional call is cheap when there's nothing
+        // to report.
+        for (target, eid) in self.overlay.edges_from(node, direction) {
+            if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+                results.push((target, eid));
             }
         }
+
+        // Deduplicate in case a promoted edge appears in both layers.
+        results.sort_unstable_by_key(|&(_, eid)| eid);
+        results.dedup_by_key(|&mut (_, eid)| eid);
 
         results
     }
@@ -444,7 +467,9 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.edge_type(id);
         }
-        self.base.edge_type(id)
+        self.base
+            .edge_type(id)
+            .or_else(|| self.overlay.edge_type(id))
     }
 
     fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
@@ -598,7 +623,15 @@ impl GraphStore for LayeredStore {
         if self.is_node_dirty(id) {
             return self.overlay.is_node_visible_at_epoch(id, epoch);
         }
-        self.base.is_node_visible_at_epoch(id, epoch)
+        // `dirty_node_ids` only tracks overlay *modifications of base nodes*
+        // — overlay-only nodes (e.g. post-`compact()` writes) fall through
+        // here and must be dispatched to the overlay's MVCC check. The base
+        // doesn't know the id, so it would otherwise report them invisible.
+        if self.base.get_node(id).is_some() {
+            self.base.is_node_visible_at_epoch(id, epoch)
+        } else {
+            self.overlay.is_node_visible_at_epoch(id, epoch)
+        }
     }
 
     fn is_node_visible_versioned(
@@ -615,8 +648,13 @@ impl GraphStore for LayeredStore {
                 .overlay
                 .is_node_visible_versioned(id, epoch, transaction_id);
         }
-        self.base
-            .is_node_visible_versioned(id, epoch, transaction_id)
+        if self.base.get_node(id).is_some() {
+            self.base
+                .is_node_visible_versioned(id, epoch, transaction_id)
+        } else {
+            self.overlay
+                .is_node_visible_versioned(id, epoch, transaction_id)
+        }
     }
 
     fn is_edge_visible_at_epoch(&self, id: EdgeId, epoch: EpochId) -> bool {
@@ -626,7 +664,11 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.is_edge_visible_at_epoch(id, epoch);
         }
-        self.base.is_edge_visible_at_epoch(id, epoch)
+        if self.base.get_edge(id).is_some() {
+            self.base.is_edge_visible_at_epoch(id, epoch)
+        } else {
+            self.overlay.is_edge_visible_at_epoch(id, epoch)
+        }
     }
 
     fn is_edge_visible_versioned(
@@ -643,8 +685,13 @@ impl GraphStore for LayeredStore {
                 .overlay
                 .is_edge_visible_versioned(id, epoch, transaction_id);
         }
-        self.base
-            .is_edge_visible_versioned(id, epoch, transaction_id)
+        if self.base.get_edge(id).is_some() {
+            self.base
+                .is_edge_visible_versioned(id, epoch, transaction_id)
+        } else {
+            self.overlay
+                .is_edge_visible_versioned(id, epoch, transaction_id)
+        }
     }
 
     fn filter_visible_node_ids(&self, ids: &[NodeId], epoch: EpochId) -> Vec<NodeId> {
