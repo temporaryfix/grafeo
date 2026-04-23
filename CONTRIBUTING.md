@@ -155,9 +155,12 @@ These companion projects live in separate repositories under the [GrafeoDB](http
 
 ## Benchmarks and Performance Regressions
 
-Every PR is benchmarked on [CodSpeed](https://codspeed.io/), which runs the
-Criterion microbenchmarks under Callgrind for <1% variance. Results post as a
-PR comment with a diff vs `main`.
+PRs opened from this repository are benchmarked on
+[CodSpeed](https://codspeed.io/), which runs the Criterion microbenchmarks
+under Callgrind for <1% variance. Results post as a PR comment with a diff
+vs `main`. PRs from forks are skipped — the CodSpeed token isn't exposed to
+fork workflows; after an initial review a maintainer can push the branch to
+this repo to trigger a run.
 
 The following suites are tracked:
 
@@ -176,7 +179,8 @@ The following suites are tracked:
 Reproduce locally:
 
 ```bash
-cargo install cargo-codspeed
+# Pin matches .github/workflows/codspeed.yml; bump both in lock-step.
+cargo install cargo-codspeed --version 4.5.0
 cargo codspeed build --package grafeo-core \
     --features "vector-index compact-store" --bench index_bench
 cargo codspeed run --package grafeo-core
