@@ -770,6 +770,11 @@ unsafe fn horizontal_sum_wasm(v: std::arch::wasm32::v128) -> f32 {
 unsafe fn dot_product_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::wasm32::*;
 
+    // SAFETY precondition: the raw `v128_load` on `b` below is bounded by
+    // `a.len()`, so mismatched lengths would read out of `b`. Enforce in all
+    // builds, not just debug.
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     let n = a.len();
     let mut i = 0;
     let mut sum = f32x4_splat(0.0);
@@ -792,6 +797,8 @@ unsafe fn dot_product_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn euclidean_squared_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::wasm32::*;
+
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -817,6 +824,8 @@ unsafe fn euclidean_squared_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn cosine_distance_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::wasm32::*;
+
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -851,6 +860,8 @@ unsafe fn cosine_distance_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn manhattan_distance_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::wasm32::*;
+
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
