@@ -74,10 +74,7 @@ fn post_compact_edge_visible() {
     db.create_edge(c, d, "POST");
 
     assert_eq!(int_scalar(&db, "MATCH ()-[r]->() RETURN count(r)"), 2);
-    assert_eq!(
-        int_scalar(&db, "MATCH ()-[r:POST]->() RETURN count(r)"),
-        1
-    );
+    assert_eq!(int_scalar(&db, "MATCH ()-[r:POST]->() RETURN count(r)"), 1);
     assert_eq!(int_scalar(&db, "MATCH ()-[r:PRE]->() RETURN count(r)"), 1);
 }
 
@@ -107,9 +104,7 @@ fn post_compact_node_property_survives_reread() {
     db.set_node_property(n, "label", Value::String("hello".into()));
 
     let s = db.session();
-    let r = s
-        .execute("MATCH (n:Y) RETURN n.label")
-        .unwrap();
+    let r = s.execute("MATCH (n:Y) RETURN n.label").unwrap();
     assert_eq!(r.rows().len(), 1);
     assert_eq!(
         r.rows()[0][0],
