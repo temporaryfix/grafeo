@@ -102,8 +102,7 @@ pub fn simd_support() -> &'static str {
 /// Computes distance using the best available SIMD implementation.
 #[inline]
 pub fn compute_distance_simd(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
-
+    // Length equality is enforced at each *_simd dispatcher below.
     match metric {
         DistanceMetric::Cosine => cosine_distance_simd(a, b),
         DistanceMetric::Euclidean => euclidean_distance_simd(a, b),
@@ -116,21 +115,23 @@ pub fn compute_distance_simd(a: &[f32], b: &[f32], metric: DistanceMetric) -> f3
 #[inline]
 #[allow(unreachable_code)]
 pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: We checked AVX2 support above
+            // SAFETY: AVX2 support and equal lengths checked above
             return unsafe { dot_product_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: We checked SSE support above
+            // SAFETY: SSE support and equal lengths checked above
             return unsafe { dot_product_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { dot_product_neon(a, b) };
     }
 
@@ -142,21 +143,23 @@ pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 #[allow(unreachable_code)]
 pub fn euclidean_distance_squared_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: AVX2+FMA availability is checked by `has_avx2()` above
+            // SAFETY: AVX2+FMA checked by `has_avx2()` and lengths equal above
             return unsafe { euclidean_squared_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: SSE availability is checked by `has_sse()` above
+            // SAFETY: SSE checked by `has_sse()` and lengths equal above
             return unsafe { euclidean_squared_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { euclidean_squared_neon(a, b) };
     }
 
@@ -173,21 +176,23 @@ pub fn euclidean_distance_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 #[allow(unreachable_code)]
 pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: AVX2+FMA availability is checked by `has_avx2()` above
+            // SAFETY: AVX2+FMA checked by `has_avx2()` and lengths equal above
             return unsafe { cosine_distance_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: SSE availability is checked by `has_sse()` above
+            // SAFETY: SSE checked by `has_sse()` and lengths equal above
             return unsafe { cosine_distance_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { cosine_distance_neon(a, b) };
     }
 
@@ -198,21 +203,23 @@ pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 #[allow(unreachable_code)]
 pub fn manhattan_distance_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: AVX2+FMA availability is checked by `has_avx2()` above
+            // SAFETY: AVX2+FMA checked by `has_avx2()` and lengths equal above
             return unsafe { manhattan_distance_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: SSE availability is checked by `has_sse()` above
+            // SAFETY: SSE checked by `has_sse()` and lengths equal above
             return unsafe { manhattan_distance_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { manhattan_distance_neon(a, b) };
     }
 
@@ -276,8 +283,6 @@ fn manhattan_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
-
     let n = a.len();
     let mut i = 0;
 
@@ -308,8 +313,6 @@ unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn euclidean_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
-
     let n = a.len();
     let mut i = 0;
 
@@ -338,8 +341,6 @@ unsafe fn euclidean_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -378,8 +379,6 @@ unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx2")]
 unsafe fn manhattan_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -436,8 +435,6 @@ unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
 unsafe fn dot_product_sse(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
-
     let n = a.len();
     let mut i = 0;
 
@@ -465,8 +462,6 @@ unsafe fn dot_product_sse(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "sse")]
 unsafe fn euclidean_squared_sse(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -497,8 +492,6 @@ unsafe fn euclidean_squared_sse(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "sse")]
 unsafe fn cosine_distance_sse(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -537,8 +530,6 @@ unsafe fn cosine_distance_sse(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "sse")]
 unsafe fn manhattan_distance_sse(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -589,8 +580,6 @@ unsafe fn horizontal_sum_sse(v: std::arch::x86_64::__m128) -> f32 {
 unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
-
     let n = a.len();
     let mut i = 0;
 
@@ -616,8 +605,6 @@ unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 unsafe fn euclidean_squared_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -646,8 +633,6 @@ unsafe fn euclidean_squared_neon(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 unsafe fn cosine_distance_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
@@ -685,8 +670,6 @@ unsafe fn cosine_distance_neon(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 unsafe fn manhattan_distance_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-
-    assert_eq!(a.len(), b.len(), "vector lengths must match");
 
     let n = a.len();
     let mut i = 0;
