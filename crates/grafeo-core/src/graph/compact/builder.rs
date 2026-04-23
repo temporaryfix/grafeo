@@ -831,8 +831,8 @@ pub fn from_graph_store(
                         let zone_map = compute_zone_map_i64(&i64_values);
                         t.zone_maps.push((key.clone(), zone_map));
                         t.columns
-                            .push((key.clone(), ColumnCodec::RawI64(i64_values.clone())));
-                        t.record_len(i64_values.len());
+                            .push((key.clone(), ColumnCodec::RawI64(i64_values)));
+                        t.record_len(values.len());
                     }
                     InferredType::Float64 => {
                         let f64_values: Vec<f64> = values
