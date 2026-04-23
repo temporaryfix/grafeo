@@ -197,11 +197,13 @@ the PR description. The trade-off is often acceptable (e.g. a correctness
 fix that costs some throughput), but the maintainer should know it was
 deliberate rather than accidental.
 
-Adding a new Criterion bench: use `codspeed_criterion_compat` in place of
-`criterion` as the import, add a `[[bench]]` entry and any features in the
-owning crate's `Cargo.toml`, and add the suite to `.github/workflows/codspeed.yml`
-so it lands in the PR comment. The adapter is a drop-in replacement: plain
-`cargo bench` continues to work unchanged.
+Adding a new Criterion bench: import `use criterion::{...}` as usual. The
+workspace renames `criterion` to the `codspeed-criterion-compat` package
+(see root `Cargo.toml`), so there is nothing to change per crate: add the
+`[[bench]]` entry and any features in the owning crate's `Cargo.toml`, and
+add the suite to `.github/workflows/codspeed.yml` so it lands in the PR
+comment. The adapter is a drop-in replacement: plain `cargo bench` continues
+to work unchanged.
 
 ## Pre-commit Hooks (Optional)
 
