@@ -1,5 +1,112 @@
 //! Shared formatting utilities for CLI output.
 
+use grafeo_engine::memory_usage::MemoryUsage;
+
+/// Prints a hierarchical memory breakdown to stdout.
+///
+/// Mirrors the structure of `db.memory_usage()`: total on top, then one block
+/// per component (store, indexes, MVCC, caches, string pool, buffer manager,
+/// RDF, CDC). Zero-valued or feature-disabled components are skipped so
+/// default embedded builds stay terse.
+pub fn format_memory(usage: &MemoryUsage) {
+    println!("Total:           {}", format_bytes(usage.total_bytes));
+    println!();
+    println!("Store:           {}", format_bytes(usage.store.total_bytes));
+    if usage.store.nodes_bytes > 0 {
+        println!("  nodes:         {}", format_bytes(usage.store.nodes_bytes));
+    }
+    if usage.store.edges_bytes > 0 {
+        println!("  edges:         {}", format_bytes(usage.store.edges_bytes));
+    }
+    if usage.store.node_properties_bytes > 0 {
+        println!(
+            "  node props:    {}",
+            format_bytes(usage.store.node_properties_bytes)
+        );
+    }
+    if usage.store.edge_properties_bytes > 0 {
+        println!(
+            "  edge props:    {}",
+            format_bytes(usage.store.edge_properties_bytes)
+        );
+    }
+    println!();
+    println!(
+        "Indexes:         {}",
+        format_bytes(usage.indexes.total_bytes)
+    );
+    if !usage.indexes.vector_indexes.is_empty() {
+        for idx in &usage.indexes.vector_indexes {
+            println!(
+                "  vector[{}]: {} ({} items)",
+                idx.name,
+                format_bytes(idx.bytes),
+                idx.item_count
+            );
+        }
+    }
+    if !usage.indexes.text_indexes.is_empty() {
+        for idx in &usage.indexes.text_indexes {
+            println!(
+                "  text[{}]: {} ({} items)",
+                idx.name,
+                format_bytes(idx.bytes),
+                idx.item_count
+            );
+        }
+    }
+    println!();
+    println!("MVCC:            {}", format_bytes(usage.mvcc.total_bytes));
+    if usage.mvcc.average_chain_depth > 0.0 {
+        println!("  avg chain:     {:.2}", usage.mvcc.average_chain_depth);
+    }
+    println!();
+    println!(
+        "Caches:          {} ({} plans)",
+        format_bytes(usage.caches.total_bytes),
+        usage.caches.cached_plan_count
+    );
+    println!(
+        "String pool:     {}",
+        format_bytes(usage.string_pool.total_bytes)
+    );
+    println!(
+        "Buffer manager:  {} / {} budget",
+        format_bytes(usage.buffer_manager.allocated_bytes),
+        format_bytes(usage.buffer_manager.budget_bytes)
+    );
+    if !usage.rdf.is_empty() {
+        println!();
+        println!(
+            "RDF:             {} ({} triples, {} named graphs)",
+            format_bytes(usage.rdf.total_bytes),
+            usage.rdf.triple_count,
+            usage.rdf.named_graph_count
+        );
+        if usage.rdf.term_dictionary_bytes > 0 {
+            println!(
+                "  term dict:     {}",
+                format_bytes(usage.rdf.term_dictionary_bytes)
+            );
+        }
+        if usage.rdf.ring_index_bytes > 0 {
+            println!(
+                "  ring index:    {}",
+                format_bytes(usage.rdf.ring_index_bytes)
+            );
+        }
+    }
+    if !usage.cdc.is_empty() {
+        println!();
+        println!(
+            "CDC:             {} ({} events, {} entities)",
+            format_bytes(usage.cdc.total_bytes),
+            usage.cdc.event_count,
+            usage.cdc.entity_count
+        );
+    }
+}
+
 /// Format bytes as a human-readable string.
 pub fn format_bytes(bytes: usize) -> String {
     const KB: usize = 1024;

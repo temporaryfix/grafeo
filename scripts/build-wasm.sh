@@ -70,14 +70,27 @@ wasm-bindgen --target "$TARGET" --out-dir "$OUT_DIR" "$WASM_FILE"
 # Version mirrors [workspace.package] in Cargo.toml.
 PKG_VERSION=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
 PKG_VERSION="${PKG_VERSION:-0.0.0}"
+
+# wasm-bindgen emits CommonJS for --target nodejs and ESM for web/bundler/deno/esm.
+# The package.json "type" field must match the module format of the generated .js shim.
+case "$TARGET" in
+    nodejs)
+        PKG_TYPE="commonjs"
+        PKG_MODULE_FIELD=""
+        ;;
+    *)
+        PKG_TYPE="module"
+        PKG_MODULE_FIELD='  "module": "grafeo_wasm.js",'$'\n'
+        ;;
+esac
+
 cat > "$OUT_DIR/package.json" <<EOF
 {
   "name": "$PKG_NAME",
   "version": "$PKG_VERSION",
-  "type": "module",
+  "type": "$PKG_TYPE",
   "main": "grafeo_wasm.js",
-  "module": "grafeo_wasm.js",
-  "types": "grafeo_wasm.d.ts",
+${PKG_MODULE_FIELD}  "types": "grafeo_wasm.d.ts",
   "files": [
     "grafeo_wasm.js",
     "grafeo_wasm.d.ts",

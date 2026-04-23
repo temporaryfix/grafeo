@@ -111,6 +111,12 @@ pub struct Session {
     /// The underlying store.
     #[cfg(feature = "lpg")]
     store: Arc<LpgStore>,
+    /// Classifies the role of `store` for the active backend.
+    /// Search procedures (CALL grafeo.search.*) only reach into `store` when
+    /// this is `Active`. External-store sessions keep `store` as a placeholder
+    /// and must not expose it: it has no indexes or data.
+    #[cfg(feature = "lpg")]
+    lpg_backend: LpgBackend,
     /// Graph store trait object for pluggable storage backends (read path).
     graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
@@ -212,6 +218,20 @@ pub struct Session {
     >,
 }
 
+/// Role of the session's internal `LpgStore`.
+#[cfg(feature = "lpg")]
+#[derive(Clone, Copy)]
+enum LpgBackend {
+    /// The internal `LpgStore` is the session's active backing store (possibly
+    /// wrapped by WAL/CDC/Layered decorators on the read/write path). Search
+    /// procedures can reach its HNSW/BM25 indexes.
+    Active,
+    /// The internal `LpgStore` is an empty placeholder because the session is
+    /// backed by an external `GraphStoreSearch` implementation. Search
+    /// procedures must not use it.
+    Placeholder,
+}
+
 /// Per-graph savepoint snapshot, capturing the store state at the time of the savepoint.
 #[derive(Clone)]
 struct GraphSavepoint {
@@ -245,6 +265,7 @@ impl Session {
         let graph_store_mut = Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>);
         Self {
             store,
+            lpg_backend: LpgBackend::Active,
             graph_store,
             graph_store_mut,
             catalog: cfg.catalog,
@@ -372,6 +393,8 @@ impl Session {
         Ok(Self {
             #[cfg(feature = "lpg")]
             store: Arc::new(LpgStore::new()?),
+            #[cfg(feature = "lpg")]
+            lpg_backend: LpgBackend::Placeholder,
             graph_store: read_store,
             graph_store_mut: write_store,
             catalog: cfg.catalog,
@@ -4692,9 +4715,11 @@ impl Session {
         .with_read_only(read_only);
 
         // Attach the LPG store so CALL grafeo.search.* procedures can reach
-        // HNSW / BM25 indexes.
+        // HNSW / BM25 indexes. Skip when the session is backed by an external
+        // store — `self.store` is an empty placeholder in that case and would
+        // make search procedures see a store with no data or indexes.
         #[cfg(feature = "lpg")]
-        {
+        if matches!(self.lpg_backend, LpgBackend::Active) {
             planner = planner.with_lpg_store(Arc::clone(&self.store));
         }
 

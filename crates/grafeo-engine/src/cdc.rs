@@ -451,6 +451,30 @@ impl CdcLog {
         self.events.read().values().map(Vec::len).sum()
     }
 
+    /// Estimates the heap footprint of the log in bytes.
+    ///
+    /// Counts the entity-keyed hash map overhead, the per-entity `Vec<ChangeEvent>`
+    /// capacity, and the events themselves. `ChangeEvent` contains owned `Value`
+    /// payloads that can be arbitrarily large (property snapshots), but this
+    /// estimate treats them as fixed-size and therefore undercounts histories
+    /// that hold large strings, vectors, or bytes. Good enough to surface
+    /// "CDC is dominating heap" in a memory-usage breakdown; not a precise
+    /// accounting.
+    #[must_use]
+    pub fn heap_memory_bytes(&self) -> (usize, usize, usize) {
+        let guard = self.events.read();
+        let entity_count = guard.len();
+        let mut event_count = 0usize;
+        let mut bytes = 0usize;
+        let entry_overhead = std::mem::size_of::<(EntityId, Vec<ChangeEvent>)>() + 8;
+        let event_size = std::mem::size_of::<ChangeEvent>();
+        for events in guard.values() {
+            event_count += events.len();
+            bytes += entry_overhead + events.capacity() * event_size;
+        }
+        (bytes, entity_count, event_count)
+    }
+
     /// Removes all events with `epoch < min_epoch`.
     ///
     /// Entities whose entire history falls below the threshold are removed
@@ -912,5 +936,24 @@ mod tests {
         let freed = log.evict(100);
         assert_eq!(freed, 0, "evict with target < 256 bytes should be a no-op");
         assert_eq!(log.event_count(), 10);
+    }
+
+    #[test]
+    fn test_heap_memory_bytes_scales_with_events() {
+        let log = CdcLog::new();
+        let (empty_bytes, empty_entities, empty_events) = log.heap_memory_bytes();
+        assert_eq!(empty_entities, 0);
+        assert_eq!(empty_events, 0);
+
+        for epoch in 1..=50 {
+            log.record_create_node(NodeId::new(epoch), EpochId(epoch), None, None);
+        }
+        let (populated_bytes, populated_entities, populated_events) = log.heap_memory_bytes();
+        assert_eq!(populated_entities, 50);
+        assert_eq!(populated_events, 50);
+        assert!(
+            populated_bytes > empty_bytes,
+            "heap estimate must grow when events are recorded"
+        );
     }
 }

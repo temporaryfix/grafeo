@@ -62,14 +62,23 @@ foreach ($line in $cargoToml) {
         $pkgVersion = $Matches[1]; break
     }
 }
+# wasm-bindgen emits CommonJS for --target nodejs and ESM for web/bundler/deno/esm.
+# The package.json "type" field must match the module format of the generated .js shim.
+if ($Target -eq "nodejs") {
+    $pkgType = "commonjs"
+    $moduleField = ""
+} else {
+    $pkgType = "module"
+    $moduleField = "  `"module`": `"grafeo_wasm.js`",`n"
+}
+
 $packageJson = @"
 {
   "name": "$Name",
   "version": "$pkgVersion",
-  "type": "module",
+  "type": "$pkgType",
   "main": "grafeo_wasm.js",
-  "module": "grafeo_wasm.js",
-  "types": "grafeo_wasm.d.ts",
+$($moduleField)  "types": "grafeo_wasm.d.ts",
   "files": [
     "grafeo_wasm.js",
     "grafeo_wasm.d.ts",
