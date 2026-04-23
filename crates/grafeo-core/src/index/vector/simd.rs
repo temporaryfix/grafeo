@@ -89,7 +89,6 @@ pub fn has_wasm_simd128() -> bool {
     cfg!(target_feature = "simd128")
 }
 
-
 /// Returns the best available SIMD instruction set name.
 #[must_use]
 #[allow(unreachable_code)]
@@ -902,9 +901,7 @@ mod tests {
         let support = simd_support();
         println!("SIMD support: {support}");
         // Should be one of the valid values
-        assert!(
-            ["avx2", "sse", "neon", "wasm-simd128", "scalar"].contains(&support),
-        );
+        assert!(["avx2", "sse", "neon", "wasm-simd128", "scalar"].contains(&support),);
     }
 
     #[test]
