@@ -75,8 +75,11 @@ fn graph_spec_strategy() -> impl Strategy<Value = GraphSpec> {
     prop::collection::vec(node_spec_strategy(), 1..=20).prop_flat_map(|nodes| {
         let n = nodes.len();
         let edges = prop::collection::vec(
-            (0..n, 0..n, edge_kind_strategy())
-                .prop_map(|(src, dst, kind)| EdgeSpec { src, dst, kind }),
+            (0..n, 0..n, edge_kind_strategy()).prop_map(|(src, dst, kind)| EdgeSpec {
+                src,
+                dst,
+                kind,
+            }),
             0..=30,
         );
         (Just(nodes), edges).prop_map(|(nodes, edges)| GraphSpec { nodes, edges })
@@ -163,9 +166,8 @@ fn assert_equivalent(live: &GrafeoDB, compacted: &GrafeoDB) {
     for src_label in LABELS {
         for kind in EDGE_KINDS {
             for dst_label in LABELS {
-                let q = format!(
-                    "MATCH (a:{src_label})-[r:{kind}]->(b:{dst_label}) RETURN count(r)"
-                );
+                let q =
+                    format!("MATCH (a:{src_label})-[r:{kind}]->(b:{dst_label}) RETURN count(r)");
                 assert_scalar_equivalent(live, compacted, &q);
             }
         }
