@@ -1618,7 +1618,8 @@ fn test_create_graph_type_inline_multiple() {
     assert!(dup.is_err(), "Duplicate graph type should fail");
 }
 
-// ISO: GG03 - regression for issue #316
+// ISO: GG03
+// Regression for issue #316.
 #[test]
 fn test_create_graph_type_bare_references_preserve_catalog() {
     // Regression: issue #316. Bare `NODE TYPE X` / `EDGE TYPE X` inside
@@ -1689,7 +1690,8 @@ fn test_create_graph_type_bare_references_preserve_catalog() {
     );
 }
 
-// ISO: GG03 - regression for issue #316
+// ISO: GG03
+// Regression for issue #316.
 #[test]
 fn test_create_graph_type_bare_reference_to_missing_type_errors() {
     // Dangling reference: bare `NODE TYPE Foo` where Foo is not in the
