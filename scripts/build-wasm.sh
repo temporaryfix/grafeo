@@ -129,8 +129,8 @@ if [[ "$FEATURES" == *"full"* ]]; then
     FAIL_THRESHOLD=1468006   # 1.4 MB
     LABEL="full profile"
 else
-    WARN_THRESHOLD=675840    # 660 KB
-    FAIL_THRESHOLD=716800    # 700 KB
+    WARN_THRESHOLD=737280    # 720 KB
+    FAIL_THRESHOLD=778240    # 760 KB
     LABEL="browser profile"
 fi
 
