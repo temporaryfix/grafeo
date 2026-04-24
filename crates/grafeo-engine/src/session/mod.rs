@@ -1589,43 +1589,60 @@ impl Session {
                         (nt, et, stmt.open)
                     };
 
-                // GG03: Register inline element types and add their names
+                // GG03: Process inline element type entries. Per ISO/IEC 39075,
+                // a bare `NODE TYPE Name` or `EDGE TYPE Name` inside a graph
+                // type body is a reference; anything with a property block or
+                // a KEY clause is an inline declaration. See issue #316.
                 for inline in &stmt.inline_types {
                     match inline {
                         InlineElementType::Node {
                             name,
                             properties,
                             key_labels,
+                            is_reference,
                             ..
                         } => {
                             let inline_effective = self.effective_type_key(name);
-                            let def = NodeTypeDefinition {
-                                name: inline_effective.clone(),
-                                properties: properties
-                                    .iter()
-                                    .map(|p| TypedProperty {
-                                        name: p.name.clone(),
-                                        data_type: PropertyDataType::from_type_name(&p.data_type),
-                                        nullable: p.nullable,
-                                        default_value: None,
-                                    })
-                                    .collect(),
-                                constraints: Vec::new(),
-                                parent_types: key_labels.clone(),
-                            };
-                            // Register or replace so inline defs override existing
-                            self.catalog.register_or_replace_node_type(def);
-                            #[cfg(feature = "wal")]
-                            {
-                                let props_for_wal: Vec<(String, String, bool)> = properties
-                                    .iter()
-                                    .map(|p| (p.name.clone(), p.data_type.clone(), p.nullable))
-                                    .collect();
-                                self.log_schema_wal(&WalRecord::CreateNodeType {
+                            if *is_reference {
+                                // Reference: validate existence; do not register, do not WAL.
+                                if self.catalog.get_node_type(&inline_effective).is_none() {
+                                    return Err(Error::Query(QueryError::new(
+                                        QueryErrorKind::Semantic,
+                                        format!(
+                                            "Referenced node type '{inline_effective}' does not exist"
+                                        ),
+                                    )));
+                                }
+                            } else {
+                                let def = NodeTypeDefinition {
                                     name: inline_effective.clone(),
-                                    properties: props_for_wal,
+                                    properties: properties
+                                        .iter()
+                                        .map(|p| TypedProperty {
+                                            name: p.name.clone(),
+                                            data_type: PropertyDataType::from_type_name(
+                                                &p.data_type,
+                                            ),
+                                            nullable: p.nullable,
+                                            default_value: None,
+                                        })
+                                        .collect(),
                                     constraints: Vec::new(),
-                                });
+                                    parent_types: key_labels.clone(),
+                                };
+                                self.catalog.register_or_replace_node_type(def);
+                                #[cfg(feature = "wal")]
+                                {
+                                    let props_for_wal: Vec<(String, String, bool)> = properties
+                                        .iter()
+                                        .map(|p| (p.name.clone(), p.data_type.clone(), p.nullable))
+                                        .collect();
+                                    self.log_schema_wal(&WalRecord::CreateNodeType {
+                                        name: inline_effective.clone(),
+                                        properties: props_for_wal,
+                                        constraints: Vec::new(),
+                                    });
+                                }
                             }
                             if !node_types.contains(&inline_effective) {
                                 node_types.push(inline_effective);
@@ -1636,36 +1653,50 @@ impl Session {
                             properties,
                             source_node_types,
                             target_node_types,
+                            is_reference,
                             ..
                         } => {
                             let inline_effective = self.effective_type_key(name);
-                            let def = EdgeTypeDefinition {
-                                name: inline_effective.clone(),
-                                properties: properties
-                                    .iter()
-                                    .map(|p| TypedProperty {
-                                        name: p.name.clone(),
-                                        data_type: PropertyDataType::from_type_name(&p.data_type),
-                                        nullable: p.nullable,
-                                        default_value: None,
-                                    })
-                                    .collect(),
-                                constraints: Vec::new(),
-                                source_node_types: source_node_types.clone(),
-                                target_node_types: target_node_types.clone(),
-                            };
-                            self.catalog.register_or_replace_edge_type_def(def);
-                            #[cfg(feature = "wal")]
-                            {
-                                let props_for_wal: Vec<(String, String, bool)> = properties
-                                    .iter()
-                                    .map(|p| (p.name.clone(), p.data_type.clone(), p.nullable))
-                                    .collect();
-                                self.log_schema_wal(&WalRecord::CreateEdgeType {
+                            if *is_reference {
+                                if self.catalog.get_edge_type_def(&inline_effective).is_none() {
+                                    return Err(Error::Query(QueryError::new(
+                                        QueryErrorKind::Semantic,
+                                        format!(
+                                            "Referenced edge type '{inline_effective}' does not exist"
+                                        ),
+                                    )));
+                                }
+                            } else {
+                                let def = EdgeTypeDefinition {
                                     name: inline_effective.clone(),
-                                    properties: props_for_wal,
+                                    properties: properties
+                                        .iter()
+                                        .map(|p| TypedProperty {
+                                            name: p.name.clone(),
+                                            data_type: PropertyDataType::from_type_name(
+                                                &p.data_type,
+                                            ),
+                                            nullable: p.nullable,
+                                            default_value: None,
+                                        })
+                                        .collect(),
                                     constraints: Vec::new(),
-                                });
+                                    source_node_types: source_node_types.clone(),
+                                    target_node_types: target_node_types.clone(),
+                                };
+                                self.catalog.register_or_replace_edge_type_def(def);
+                                #[cfg(feature = "wal")]
+                                {
+                                    let props_for_wal: Vec<(String, String, bool)> = properties
+                                        .iter()
+                                        .map(|p| (p.name.clone(), p.data_type.clone(), p.nullable))
+                                        .collect();
+                                    self.log_schema_wal(&WalRecord::CreateEdgeType {
+                                        name: inline_effective.clone(),
+                                        properties: props_for_wal,
+                                        constraints: Vec::new(),
+                                    });
+                                }
                             }
                             if !edge_types.contains(&inline_effective) {
                                 edge_types.push(inline_effective);

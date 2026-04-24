@@ -666,8 +666,13 @@ impl GraphStore for LayeredStore {
         // — overlay-only nodes (e.g. post-`compact()` writes) fall through
         // here and must be dispatched to the overlay's MVCC check. The base
         // doesn't know the id, so it would otherwise report them invisible.
-        if self.base.load().get_node(id).is_some() {
-            self.base.load().is_node_visible_at_epoch(id, epoch)
+        //
+        // Snapshot the base once: a concurrent `swap_base` between the
+        // presence check and the visibility call would otherwise dispatch
+        // through a different `CompactStore` than the one we tested.
+        let base = self.base.load();
+        if base.get_node(id).is_some() {
+            base.is_node_visible_at_epoch(id, epoch)
         } else {
             self.overlay.is_node_visible_at_epoch(id, epoch)
         }
@@ -687,10 +692,9 @@ impl GraphStore for LayeredStore {
                 .overlay
                 .is_node_visible_versioned(id, epoch, transaction_id);
         }
-        if self.base.load().get_node(id).is_some() {
-            self.base
-                .load()
-                .is_node_visible_versioned(id, epoch, transaction_id)
+        let base = self.base.load();
+        if base.get_node(id).is_some() {
+            base.is_node_visible_versioned(id, epoch, transaction_id)
         } else {
             self.overlay
                 .is_node_visible_versioned(id, epoch, transaction_id)
@@ -704,8 +708,9 @@ impl GraphStore for LayeredStore {
         if self.is_edge_dirty(id) {
             return self.overlay.is_edge_visible_at_epoch(id, epoch);
         }
-        if self.base.load().get_edge(id).is_some() {
-            self.base.load().is_edge_visible_at_epoch(id, epoch)
+        let base = self.base.load();
+        if base.get_edge(id).is_some() {
+            base.is_edge_visible_at_epoch(id, epoch)
         } else {
             self.overlay.is_edge_visible_at_epoch(id, epoch)
         }
@@ -725,10 +730,9 @@ impl GraphStore for LayeredStore {
                 .overlay
                 .is_edge_visible_versioned(id, epoch, transaction_id);
         }
-        if self.base.load().get_edge(id).is_some() {
-            self.base
-                .load()
-                .is_edge_visible_versioned(id, epoch, transaction_id)
+        let base = self.base.load();
+        if base.get_edge(id).is_some() {
+            base.is_edge_visible_versioned(id, epoch, transaction_id)
         } else {
             self.overlay
                 .is_edge_visible_versioned(id, epoch, transaction_id)

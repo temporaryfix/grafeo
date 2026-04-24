@@ -75,12 +75,21 @@
 //!
 //! # Why in-memory only
 //!
-//! Durability lives in the WAL: every CDC event also corresponds to a
-//! WAL record, so a crash+recover cycle reconstructs the same mutation
-//! history from the log. Keeping CDC itself in memory avoids a second
-//! persistent log with its own crash-consistency semantics and keeps
-//! the commit path off the disk-flush critical path. The retention
-//! limits in [`CdcRetentionConfig`] therefore protect working set, not
+//! The CDC log is not persisted: it lives only in the
+//! `RwLock<HashMap<_, Vec<ChangeEvent>>>` above, is allocated fresh by
+//! [`CdcLog::new`] at database open, and a crash+recover cycle loses
+//! the entire event history. The WAL replay path
+//! ([`GrafeoDB::apply_wal_records`](crate::GrafeoDB)) rebuilds
+//! [`LpgStore`](grafeo_core::graph::lpg::LpgStore) state by calling
+//! mutation methods directly, bypassing the CDC recording sites in
+//! `database::crud`, so no events are re-emitted. The WAL does contain
+//! the same sequence of mutations a consumer would need to rebuild an
+//! equivalent history, but that reconstruction is not wired up today.
+//!
+//! Keeping CDC in memory avoids a second persistent log with its own
+//! crash-consistency semantics and keeps the commit path off the
+//! disk-flush critical path. The retention limits in
+//! [`CdcRetentionConfig`] therefore protect working set, not
 //! durability; see [#250][] for the unbounded-growth incident that
 //! motivated the retention knobs.
 //!
@@ -648,8 +657,9 @@ impl MemoryConsumer for CdcLog {
     }
 
     fn eviction_priority(&self) -> u8 {
-        // CDC events are derived data (can be re-computed from WAL if needed).
-        // Evict before index buffers and graph storage.
+        // CDC events are auxiliary history, not required for query correctness:
+        // evicting them only loses history lookups, while indexes and graph
+        // storage back live reads. Evict before those.
         priorities::QUERY_CACHE
     }
 

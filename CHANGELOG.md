@@ -34,6 +34,7 @@ Compact-store correctness (post-`compact()` read path, signed integer round-trip
 - **VectorScan `k=None` risked HNSW overflow** (#299 follow-up): unbounded k was being passed as `usize::MAX`, degrading HNSW to full traversal and risking overflow in quantized rescore. The planner now bounds k to the label's node count via a new `nodes_by_label_count` trait method.
 - **Native SIMD kernels read past `b` on mismatched slice lengths** (#312, closes #311): AVX2, SSE, and NEON kernels drove the main loop from `a.len()` and raw-pointer-loaded `b`, guarded only by a `debug_assert_eq!`. The four public `*_simd` dispatchers now assert length equality in release.
 - **`rustls-webpki` 0.103.13**: clears RUSTSEC-2026-0104 (reachable panic in CRL parsing), pulled transitively via `hf-hub -> ureq -> rustls`.
+- **GQL schema DDL: `CREATE GRAPH TYPE` bare references no longer corrupt the catalog** (#316): `NODE TYPE Person` and `EDGE TYPE KNOWS` inside a graph-type body are now treated as references to existing catalog entries per ISO/IEC 39075:2024, not as empty inline redeclarations. The previous behavior silently wiped `NOT NULL` and other property constraints on the referenced types. References to undefined types now error cleanly at `CREATE GRAPH TYPE` time.
 
 ### Dependencies
 
