@@ -166,6 +166,124 @@ mod merge_composite_keys {
 }
 
 // ============================================================================
+// MERGE ON CREATE / ON MATCH SET that references the merge variable.
+// GrafeoDB/grafeo#317: ISO/IEC 39075:2024 §15.5 puts the MERGE-bound variable
+// in scope for ON CREATE / ON MATCH SET. Before the fix, the binder rejected
+// any reference to it ("Undefined variable") and the planner silently lowered
+// any non-trivial action expression to NULL.
+// ============================================================================
+
+mod merge_action_self_reference {
+    use super::*;
+
+    #[test]
+    fn issue_317_minimal_reproduction() {
+        let db = db();
+        let s = db.session();
+        // This exact statement used to fail with
+        //   semantic error: Undefined variable 'n' in property access
+        s.execute("MERGE (n:Item {val: 1}) ON MATCH SET n.x = coalesce(n.x, 0)")
+            .unwrap();
+    }
+
+    #[test]
+    fn on_create_coalesce_uses_fallback_for_absent_property() {
+        let db = db();
+        let s = db.session();
+        s.execute(
+            "MERGE (c:Category {name: 'Electronics'}) \
+             ON CREATE SET c.description = coalesce(c.description, 'Consumer electronics')",
+        )
+        .unwrap();
+        let r = s
+            .execute("MATCH (c:Category {name: 'Electronics'}) RETURN c.description")
+            .unwrap();
+        assert_eq!(r.rows()[0][0], Value::String("Consumer electronics".into()));
+    }
+
+    #[test]
+    fn on_match_coalesce_preserves_existing_value() {
+        // Mirrors the second snippet in issue #317: a re-run with a different
+        // ON CREATE clause should not touch a matched node, and ON MATCH's
+        // coalesce(c.description, ...) must read the live value, not NULL.
+        let db = db();
+        let s = db.session();
+        s.execute(
+            "MERGE (c:Category {name: 'Electronics'}) \
+             ON CREATE SET c.description = 'Consumer electronics' \
+             ON MATCH  SET c.description = coalesce(c.description, 'Consumer electronics')",
+        )
+        .unwrap();
+        s.execute(
+            "MERGE (c:Category {name: 'Electronics'}) \
+             ON CREATE SET c.description = 'unexpected' \
+             ON MATCH  SET c.description = coalesce(c.description, 'fallback')",
+        )
+        .unwrap();
+        let r = s
+            .execute("MATCH (c:Category {name: 'Electronics'}) RETURN c.description")
+            .unwrap();
+        assert_eq!(
+            r.rows()[0][0],
+            Value::String("Consumer electronics".into()),
+            "ON MATCH with self-coalesce must keep the existing value, not silently become NULL"
+        );
+    }
+
+    #[test]
+    fn on_match_increments_self_property() {
+        // Counter pattern. Three runs: first creates with cnt=1, the next two
+        // each increment via `n.cnt + 1`, which used to silently reset to NULL.
+        let db = db();
+        let s = db.session();
+        for _ in 0..3 {
+            s.execute(
+                "MERGE (n:Counter {id: 1}) ON CREATE SET n.cnt = 1 ON MATCH SET n.cnt = n.cnt + 1",
+            )
+            .unwrap();
+        }
+        let r = s
+            .execute("MATCH (n:Counter {id: 1}) RETURN n.cnt")
+            .unwrap();
+        assert_eq!(r.rows()[0][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn on_create_arithmetic_self_reference() {
+        // Non-coalesce expression to exercise the runtime evaluator path.
+        let db = db();
+        let s = db.session();
+        s.execute("MERGE (n:Item {val: 19}) ON CREATE SET n.score = (n.val + 81) * 3")
+            .unwrap();
+        let r = s
+            .execute("MATCH (n:Item {val: 19}) RETURN n.score")
+            .unwrap();
+        assert_eq!(r.rows()[0][0], Value::Int64(300));
+    }
+
+    #[test]
+    fn merge_relationship_on_match_can_reference_edge_variable() {
+        // The same scoping rule applies to MERGE on a relationship pattern.
+        let db = db();
+        let s = db.session();
+        s.execute("INSERT (:N {name: 'Alix'})-[:KNOWS {weight: 1}]->(:N {name: 'Gus'})")
+            .unwrap();
+        s.execute(
+            "MATCH (a:N {name: 'Alix'}), (b:N {name: 'Gus'}) \
+             MERGE (a)-[r:KNOWS]->(b) ON MATCH SET r.weight = r.weight + 10",
+        )
+        .unwrap();
+        let r = s
+            .execute(
+                "MATCH (a:N {name: 'Alix'})-[r:KNOWS]->(b:N {name: 'Gus'}) \
+                 RETURN r.weight",
+            )
+            .unwrap();
+        assert_eq!(r.rows()[0][0], Value::Int64(11));
+    }
+}
+
+// ============================================================================
 // Relationship isomorphism
 // The same relationship variable must bind to the same edge.
 // ============================================================================
