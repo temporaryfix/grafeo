@@ -5,9 +5,12 @@
 //! 2. If found, return existing element (optionally apply ON MATCH SET)
 //! 3. If not found, create the element (optionally apply ON CREATE SET)
 
-use super::{ConstraintValidator, Operator, OperatorResult, PropertySource};
+use super::{
+    ConstraintValidator, ExpressionPredicate, Operator, OperatorResult, PropertySource,
+    SessionContext,
+};
 use crate::execution::chunk::{DataChunk, DataChunkBuilder};
-use crate::graph::{GraphStore, GraphStoreMut};
+use crate::graph::{GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_common::types::{
     EdgeId, EpochId, LogicalType, NodeId, PropertyKey, TransactionId, Value,
 };
@@ -57,6 +60,12 @@ pub struct MergeOperator {
     transaction_id: Option<TransactionId>,
     /// Optional constraint validator for schema enforcement.
     validator: Option<Arc<dyn ConstraintValidator>>,
+    /// Search-store handle used to evaluate `PropertySource::Expression`
+    /// runtime expressions in `ON CREATE` / `ON MATCH SET`. None when no
+    /// expression sources are present (the planner skips threading it).
+    search_store: Option<Arc<dyn GraphStoreSearch>>,
+    /// Session context for expression evaluation (info, schema, etc.).
+    session_context: SessionContext,
 }
 
 impl MergeOperator {
@@ -74,6 +83,8 @@ impl MergeOperator {
             viewing_epoch: None,
             transaction_id: None,
             validator: None,
+            search_store: None,
+            session_context: SessionContext::default(),
         }
     }
 
@@ -97,6 +108,21 @@ impl MergeOperator {
     /// Sets the constraint validator for schema enforcement.
     pub fn with_validator(mut self, validator: Arc<dyn ConstraintValidator>) -> Self {
         self.validator = Some(validator);
+        self
+    }
+
+    /// Provides a search-store handle so `PropertySource::Expression`
+    /// sources in `ON CREATE` / `ON MATCH SET` can be evaluated.
+    #[must_use]
+    pub fn with_search_store(mut self, search_store: Arc<dyn GraphStoreSearch>) -> Self {
+        self.search_store = Some(search_store);
+        self
+    }
+
+    /// Sets the session context used during expression evaluation.
+    #[must_use]
+    pub fn with_session_context(mut self, context: SessionContext) -> Self {
+        self.session_context = context;
         self
     }
 
