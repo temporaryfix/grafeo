@@ -532,6 +532,10 @@ pub struct MergeRelationshipOperator {
     transaction_id: Option<TransactionId>,
     /// Optional constraint validator for schema enforcement.
     validator: Option<Arc<dyn ConstraintValidator>>,
+    /// Search-store handle for evaluating `PropertySource::Expression`.
+    search_store: Option<Arc<dyn GraphStoreSearch>>,
+    /// Session context for expression evaluation.
+    session_context: SessionContext,
 }
 
 impl MergeRelationshipOperator {
@@ -548,6 +552,8 @@ impl MergeRelationshipOperator {
             viewing_epoch: None,
             transaction_id: None,
             validator: None,
+            search_store: None,
+            session_context: SessionContext::default(),
         }
     }
 
@@ -566,6 +572,98 @@ impl MergeRelationshipOperator {
     pub fn with_validator(mut self, validator: Arc<dyn ConstraintValidator>) -> Self {
         self.validator = Some(validator);
         self
+    }
+
+    /// Provides a search-store handle for runtime expression evaluation.
+    #[must_use]
+    pub fn with_search_store(mut self, search_store: Arc<dyn GraphStoreSearch>) -> Self {
+        self.search_store = Some(search_store);
+        self
+    }
+
+    /// Sets the session context used during expression evaluation.
+    #[must_use]
+    pub fn with_session_context(mut self, context: SessionContext) -> Self {
+        self.session_context = context;
+        self
+    }
+
+    /// Builds a one-row chunk containing the input row plus the merged edge
+    /// in the column reserved for the MERGE relationship variable.
+    fn build_augmented_edge_chunk(
+        &self,
+        chunk: &DataChunk,
+        row: usize,
+        merged_edge: EdgeId,
+    ) -> DataChunk {
+        let mut builder =
+            DataChunkBuilder::with_capacity(&self.config.output_schema, 1);
+        for col_idx in 0..chunk.column_count() {
+            let val = chunk
+                .column(col_idx)
+                .and_then(|c| c.get_value(row))
+                .unwrap_or(Value::Null);
+            if let Some(dst) = builder.column_mut(col_idx) {
+                dst.push_value(val);
+            }
+        }
+        if let Some(dst) = builder.column_mut(self.config.edge_output_column) {
+            dst.push_edge_id(merged_edge);
+        }
+        builder.advance_row();
+        builder.finish()
+    }
+
+    /// Resolves an action-property list (ON CREATE / ON MATCH SET) against
+    /// an augmented row that includes the merged edge id. Falls back to the
+    /// fast path when no expression sources are present.
+    fn resolve_action_properties(
+        &self,
+        props: &[(String, PropertySource)],
+        chunk: &DataChunk,
+        row: usize,
+        merged_edge: EdgeId,
+    ) -> Result<Vec<(String, Value)>, super::OperatorError> {
+        if !MergeOperator::has_expression_source(props) {
+            return Ok(MergeOperator::resolve_properties(
+                props,
+                Some(chunk),
+                row,
+                self.store.as_ref(),
+            ));
+        }
+
+        let augmented = self.build_augmented_edge_chunk(chunk, row, merged_edge);
+        let mut out = Vec::with_capacity(props.len());
+        for (name, source) in props {
+            let value = match source {
+                PropertySource::Expression {
+                    expr,
+                    variable_columns,
+                } => {
+                    let search_store = self.search_store.as_ref().ok_or_else(|| {
+                        super::OperatorError::Execution(
+                            "MERGE expression source requires search store; planner did not attach one"
+                                .to_string(),
+                        )
+                    })?;
+                    let mut predicate = ExpressionPredicate::new(
+                        (**expr).clone(),
+                        variable_columns.clone(),
+                        Arc::clone(search_store),
+                    )
+                    .with_session_context(self.session_context.clone());
+                    if let Some(epoch) = self.viewing_epoch {
+                        predicate =
+                            predicate.with_transaction_context(epoch, self.transaction_id);
+                    }
+                    predicate.eval_at(&augmented, 0).unwrap_or(Value::Null)
+                }
+                _ => source.resolve(&augmented, 0, self.store.as_ref()),
+            };
+            out.push((name.clone(), value));
+        }
+        Ok(out)
     }
 
     /// Tries to find a matching relationship between source and target.
