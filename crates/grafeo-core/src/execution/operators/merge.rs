@@ -803,14 +803,25 @@ impl Operator for MergeRelationshipOperator {
                 let edge_id = if let Some(existing) =
                     self.find_matching_edge(src_val, dst_val, &resolved_match)
                 {
-                    let resolved_on_match = MergeOperator::resolve_properties(
+                    let resolved_on_match = self.resolve_action_properties(
                         &self.config.on_match_properties,
-                        Some(&chunk),
+                        &chunk,
                         row,
-                        store_ref,
-                    );
+                        existing,
+                    )?;
                     self.apply_on_match_edge(existing, &resolved_on_match)?;
                     existing
+                } else if MergeOperator::has_expression_source(&self.config.on_create_properties) {
+                    // Two-phase create so ON CREATE expressions can reference the new edge.
+                    let new_id = self.create_edge(src_val, dst_val, &resolved_match, &[])?;
+                    let resolved_on_create = self.resolve_action_properties(
+                        &self.config.on_create_properties,
+                        &chunk,
+                        row,
+                        new_id,
+                    )?;
+                    self.apply_on_match_edge(new_id, &resolved_on_create)?;
+                    new_id
                 } else {
                     let resolved_on_create = MergeOperator::resolve_properties(
                         &self.config.on_create_properties,
