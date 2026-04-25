@@ -276,6 +276,27 @@ tests:
       rows:
         - [2]
 
+  # GrafeoDB/grafeo#317: ON MATCH SET expressions must be able to read the
+  # MERGE-bound variable, not error with `Undefined variable`.
+  - name: merge_on_match_set_self_reference_increment
+    statements:
+      - "CREATE (:Person {name: 'Alix', visits: 1})"
+      - "MERGE (n:Person {name: 'Alix'}) ON MATCH SET n.visits = n.visits + 1"
+      - "MATCH (n:Person {name: 'Alix'}) RETURN n.visits"
+    expect:
+      rows:
+        - [2]
+
+  # ON CREATE coalesce-over-self must use the fallback value because the
+  # property does not exist on the freshly-created node.
+  - name: merge_on_create_set_self_reference_coalesce
+    statements:
+      - "MERGE (n:Person {name: 'Beatrix'}) ON CREATE SET n.note = coalesce(n.note, 'first visit')"
+      - "MATCH (n:Person {name: 'Beatrix'}) RETURN n.note"
+    expect:
+      rows:
+        - [first visit]
+
   - name: merge_relationship
     statements:
       - "CREATE (:Person {name: 'Alix'})"
