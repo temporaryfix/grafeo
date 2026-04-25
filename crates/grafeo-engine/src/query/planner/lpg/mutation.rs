@@ -1127,6 +1127,41 @@ impl super::Planner {
         Ok((operator, output_columns))
     }
 
+    /// Lowers an ON CREATE / ON MATCH SET expression for a MERGE clause.
+    ///
+    /// Resolution order:
+    /// 1. Simple lowering against the augmented action scope (input columns +
+    ///    the MERGE variable). Catches literals, plain variable refs, and
+    ///    direct property access.
+    /// 2. Constant folding for plan-time-evaluable expressions like
+    ///    `vector([1,2,3])` or `date('2024-01-01')`.
+    /// 3. Fall back to a runtime [`PropertySource::Expression`] carrying the
+    ///    converted [`FilterExpression`] and the variable-column map. The
+    ///    operator builds an augmented row containing the merged node/edge
+    ///    and evaluates the expression via [`ExpressionPredicate`].
+    pub(super) fn merge_action_property_source(
+        &self,
+        expr: &LogicalExpression,
+        action_scope_columns: &[String],
+    ) -> Result<PropertySource> {
+        if let Ok(source) = self.expression_to_property_source(expr, action_scope_columns) {
+            return Ok(source);
+        }
+        if let Some(value) = Self::try_fold_expression(expr) {
+            return Ok(PropertySource::Constant(value));
+        }
+        let filter_expr = self.convert_expression(expr)?;
+        let variable_columns: HashMap<String, usize> = action_scope_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i))
+            .collect();
+        Ok(PropertySource::Expression {
+            expr: Box::new(filter_expr),
+            variable_columns,
+        })
+    }
+
     /// Converts a logical expression to a PropertySource.
     pub(super) fn expression_to_property_source(
         &self,
