@@ -326,6 +326,30 @@ impl LpgStore {
         self.edge_properties.zone_map(property)
     }
 
+    /// Gets the per-block zone maps for a node property, populated when
+    /// the column is compressed.
+    ///
+    /// Returns `None` when the column doesn't exist; returns `Some(empty)`
+    /// when the column exists but is uncompressed (the hot buffer has no
+    /// row order, so per-block pruning is meaningless there). Phase 4
+    /// consumes these for lazy `range_iter`-style scans.
+    #[must_use]
+    pub fn node_property_block_zone_maps(
+        &self,
+        property: &PropertyKey,
+    ) -> Option<Vec<ZoneMapEntry>> {
+        self.node_properties.block_zone_maps_for(property)
+    }
+
+    /// Gets the per-block zone maps for an edge property.
+    #[must_use]
+    pub fn edge_property_block_zone_maps(
+        &self,
+        property: &PropertyKey,
+    ) -> Option<Vec<ZoneMapEntry>> {
+        self.edge_properties.block_zone_maps_for(property)
+    }
+
     /// Rebuilds zone maps for all properties.
     #[doc(hidden)]
     pub fn rebuild_zone_maps(&self) {
