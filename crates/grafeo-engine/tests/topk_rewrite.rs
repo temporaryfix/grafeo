@@ -12,7 +12,6 @@ use grafeo_engine::GrafeoDB;
 
 /// Inserts `n` `:Item` nodes with property `r` set to a deterministic
 /// pseudo-random `Int64` derived from the index. Returns the DB.
-#[allow(dead_code)] // used by tests added in subsequent commits
 fn seed_items(n: usize) -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -26,7 +25,6 @@ fn seed_items(n: usize) -> GrafeoDB {
 }
 
 /// Returns the EXPLAIN plan text for `query` against `db`.
-#[allow(dead_code)]
 fn explain(db: &GrafeoDB, query: &str) -> String {
     let session = db.session();
     let result = session
@@ -39,7 +37,6 @@ fn explain(db: &GrafeoDB, query: &str) -> String {
 }
 
 /// Returns the PROFILE plan text for `query` against `db`.
-#[allow(dead_code)]
 fn profile(db: &GrafeoDB, query: &str) -> String {
     let session = db.session();
     let result = session
@@ -51,4 +48,25 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
-// Tests follow in subsequent commits (Tasks 17-23).
+// Task 17
+#[test]
+fn cypher_order_by_limit_uses_topk() {
+    let db = seed_items(100);
+    let session = db.session();
+
+    let result = session
+        .execute("MATCH (n:Item) RETURN n.r ORDER BY n.r DESC LIMIT 5")
+        .unwrap();
+
+    assert_eq!(result.row_count(), 5);
+
+    // Returned values should be the 5 highest `r` in DESC order.
+    // Compute expected by replaying the seed formula and sorting.
+    let mut all: Vec<i64> = (0..100u64)
+        .map(|i| (i.wrapping_mul(2_654_435_761) % 1_000_000) as i64)
+        .collect();
+    all.sort_unstable_by(|a, b| b.cmp(a));
+    let expected_top5: Vec<Value> = all.iter().take(5).map(|&v| Value::Int64(v)).collect();
+    let actual_top5: Vec<Value> = result.rows().iter().map(|row| row[0].clone()).collect();
+    assert_eq!(actual_top5, expected_top5);
+}
