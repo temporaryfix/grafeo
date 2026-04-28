@@ -561,50 +561,10 @@ impl super::Planner {
         // Top-K rewrite is wired from plan_limit (the actual plan shape is
         // Limit-above-Sort), so plan_sort only handles the standard path.
 
-        // Collect variable references from an expression tree (e.g., `n` in `labels(n)[0]`).
-        fn collect_vars(expr: &LogicalExpression, out: &mut Vec<String>) {
-            match expr {
-                LogicalExpression::Variable(v)
-                | LogicalExpression::Property { variable: v, .. }
-                | LogicalExpression::Labels(v)
-                | LogicalExpression::Type(v)
-                | LogicalExpression::Id(v) => out.push(v.clone()),
-                LogicalExpression::FunctionCall { args, .. } => {
-                    for a in args {
-                        collect_vars(a, out);
-                    }
-                }
-                LogicalExpression::IndexAccess { base, .. } => collect_vars(base, out),
-                LogicalExpression::Binary { left, right, .. } => {
-                    collect_vars(left, out);
-                    collect_vars(right, out);
-                }
-                LogicalExpression::Unary { operand, .. } => collect_vars(operand, out),
-                _ => {}
-            }
-        }
-
         // Check if we need pre-Return property/entity projections. This is
         // necessary when ORDER BY references a variable (e.g. p.age, labels(n))
         // that is not included in the RETURN clause.
-        let needs_pre_return = if let LogicalOperator::Return(ret) = sort.input.as_ref() {
-            sort.keys.iter().any(|key| {
-                let mut vars = Vec::new();
-                collect_vars(&key.expression, &mut vars);
-                vars.iter().any(|variable| {
-                    // Check if the Return items produce a column matching this variable
-                    !ret.items.iter().any(|item| {
-                        item.alias.as_deref() == Some(variable)
-                            || matches!(
-                                &item.expression,
-                                LogicalExpression::Variable(v) if v == variable
-                            )
-                    })
-                })
-            })
-        } else {
-            false
-        };
+        let needs_pre_return = sort_needs_augmenting_projection(sort);
 
         // Number of extra sort-key columns appended after Return items
         let mut sort_extra_count: usize = 0;
@@ -1250,6 +1210,63 @@ impl super::Planner {
             None
         }
     }
+}
+
+/// Collects variable references from an expression tree.
+///
+/// Walks `expr` and pushes every referenced variable name into `out`. Used by
+/// `sort_needs_augmenting_projection` and `plan_sort`'s pre-return projection
+/// logic to determine whether ORDER BY references variables that the RETURN
+/// clause has dropped.
+fn collect_vars(expr: &LogicalExpression, out: &mut Vec<String>) {
+    match expr {
+        LogicalExpression::Variable(v)
+        | LogicalExpression::Property { variable: v, .. }
+        | LogicalExpression::Labels(v)
+        | LogicalExpression::Type(v)
+        | LogicalExpression::Id(v) => out.push(v.clone()),
+        LogicalExpression::FunctionCall { args, .. } => {
+            for a in args {
+                collect_vars(a, out);
+            }
+        }
+        LogicalExpression::IndexAccess { base, .. } => collect_vars(base, out),
+        LogicalExpression::Binary { left, right, .. } => {
+            collect_vars(left, out);
+            collect_vars(right, out);
+        }
+        LogicalExpression::Unary { operand, .. } => collect_vars(operand, out),
+        _ => {}
+    }
+}
+
+/// True if `sort` requires injecting extra projection columns before sorting.
+///
+/// Mirrors the logic at the top of `plan_sort`: when the sort input is a
+/// `Return` and any sort key references a variable that the RETURN clause has
+/// projected away, the planner must augment the Return with extra columns so
+/// the sort key is available at compare time.
+///
+/// Used by both `plan_sort` (which knows how to inject the augmenting
+/// projection) and `try_heap_topk_rewrite` (which doesn't, and bails out so
+/// `plan_sort`'s unfused path runs instead).
+pub(super) fn sort_needs_augmenting_projection(sort: &SortOp) -> bool {
+    let LogicalOperator::Return(ret) = sort.input.as_ref() else {
+        return false;
+    };
+    sort.keys.iter().any(|key| {
+        let mut vars = Vec::new();
+        collect_vars(&key.expression, &mut vars);
+        vars.iter().any(|variable| {
+            !ret.items.iter().any(|item| {
+                item.alias.as_deref() == Some(variable)
+                    || matches!(
+                        &item.expression,
+                        LogicalExpression::Variable(v) if v == variable
+                    )
+            })
+        })
+    })
 }
 
 // Score-column naming. The hash of the query expression is part of the name so
