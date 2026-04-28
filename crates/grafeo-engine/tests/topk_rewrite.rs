@@ -48,6 +48,50 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
+// Task 23
+#[cfg(feature = "vector-index")]
+#[test]
+fn cypher_vector_topk_still_fires_first() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    // Embeddings spread by angle so cosine similarity to [1,0,0] is monotone:
+    // id=0 → [1,9,0] (mostly y-axis, low sim), id=9 → [10,0,0] (x-axis, sim=1).
+    for i in 0..10 {
+        let x = (i + 1) as i64;
+        let y = (9 - i) as i64;
+        session
+            .execute(&format!(
+                "INSERT (:Doc {{id: {i}, embedding: [{x}.0, {y}.0, 0.0]}})"
+            ))
+            .unwrap();
+    }
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let result = session
+        .execute(
+            "MATCH (d:Doc) RETURN d.id \
+             ORDER BY cosine_similarity(d.embedding, [1.0, 0.0, 0.0]) DESC LIMIT 3",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    // id=9 is closest to [1,0,0] in cosine similarity (embedding [10,0,0]).
+    let top_id = match &result.rows()[0][0] {
+        Value::Int64(i) => *i,
+        other => panic!("expected Int64 id, got {other:?}"),
+    };
+    assert_eq!(top_id, 9, "id=9 has embedding closest to [1,0,0]");
+}
+
 // Task 22
 #[test]
 fn cypher_order_by_after_optional_match_uses_topk() {
