@@ -972,8 +972,24 @@ impl super::Planner {
         sort: &SortOp,
         count: &crate::query::plan::CountExpr,
     ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
-        // Stub — implemented in Task 13/14.
-        let _ = (sort, count);
+        // (1) Limit must be a literal int. Parameter references fall through.
+        let crate::query::plan::CountExpr::Literal(k) = count else {
+            return Ok(None);
+        };
+        let k = *k;
+        if k == 0 {
+            return Ok(None);
+        }
+
+        // (2) Sort over a Return that requires augmenting projection falls
+        //     through; plan_sort knows how to inject the projection,
+        //     try_heap_topk_rewrite doesn't (deferred from Phase 1).
+        if sort_needs_augmenting_projection(sort) {
+            return Ok(None);
+        }
+
+        // (3-5) Operator construction lands in Task 14.
+        let _ = k;
         Ok(None)
     }
 
