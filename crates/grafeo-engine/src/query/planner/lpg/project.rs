@@ -988,9 +988,30 @@ impl super::Planner {
             return Ok(None);
         }
 
-        // (3-5) Operator construction lands in Task 14.
-        let _ = k;
-        Ok(None)
+        // (3) Plan the inner subtree as-is; reuses every existing optimization
+        //     (filter pushdown, expand-chain fusion, NodeList absorption).
+        let (input_op, columns) = self.plan_operator(&sort.input)?;
+
+        // (4) Resolve sort keys. If any key fails resolution (e.g. references
+        //     a property not yet projected), fall through so plan_sort's
+        //     extra-projection machinery handles it.
+        let physical_keys = match resolve_logical_to_physical_keys(&sort.keys, &columns) {
+            Ok(keys) => keys,
+            Err(_) => return Ok(None),
+        };
+
+        // (5) Build the operator. derive_schema_from_columns is the same
+        //     helper plan_limit's unfused path uses.
+        let schema = self.derive_schema_from_columns(&columns);
+        let op: Box<dyn Operator> = Box::new(
+            grafeo_core::execution::operators::TopKOperator::new(
+                input_op,
+                physical_keys,
+                k,
+                schema,
+            ),
+        );
+        Ok(Some((op, columns)))
     }
 
     fn try_topk_rewrite(
@@ -1252,6 +1273,57 @@ impl super::Planner {
             None
         }
     }
+}
+
+/// Resolves logical sort keys to physical sort keys for `TopKOperator`.
+///
+/// For each logical key:
+///   - Looks up the column index via `common::resolve_expression_to_column`.
+///   - Maps `SortOrder` → physical `SortDirection`.
+///   - Maps `Option<NullsOrdering>` → physical `NullOrder` (default `NullsLast`,
+///     matching `SortKey::ascending`'s default).
+///
+/// Returns `Err` if any key references a column not present in `columns` —
+/// callers translate that to `Ok(None)` to fall through to the unfused path.
+fn resolve_logical_to_physical_keys(
+    keys: &[crate::query::plan::SortKey],
+    columns: &[String],
+) -> Result<Vec<grafeo_core::execution::operators::SortKey>> {
+    use std::collections::HashMap;
+    use grafeo_core::execution::operators::{NullOrder, SortDirection, SortKey as PhysSortKey};
+    use crate::query::plan::{NullsOrdering, SortOrder};
+
+    let variable_columns: HashMap<String, usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let col = crate::query::planner::common::resolve_expression_to_column(
+            &key.expression,
+            &variable_columns,
+            " for ORDER BY",
+        )?;
+
+        let direction = match key.order {
+            SortOrder::Ascending => SortDirection::Ascending,
+            SortOrder::Descending => SortDirection::Descending,
+        };
+
+        let null_order = match key.nulls {
+            Some(NullsOrdering::First) => NullOrder::NullsFirst,
+            Some(NullsOrdering::Last) | None => NullOrder::NullsLast,
+        };
+
+        out.push(PhysSortKey {
+            column: col,
+            direction,
+            null_order,
+        });
+    }
+    Ok(out)
 }
 
 /// Collects variable references from an expression tree.
