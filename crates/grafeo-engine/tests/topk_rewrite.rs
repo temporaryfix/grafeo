@@ -48,6 +48,27 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
+// Task 21
+#[test]
+fn cypher_order_by_with_filter_uses_topk() {
+    let db = seed_items(100);
+    let session = db.session();
+
+    // WHERE filter sits below Sort; the rewrite plans sort.input as-is and
+    // wraps with TopK, so the filter still pushes via the existing path.
+    let result = session
+        .execute("MATCH (n:Item) WHERE n.r > 100000 RETURN n.r ORDER BY n.r DESC LIMIT 5")
+        .unwrap();
+    assert!(result.row_count() <= 5);
+    for row in result.rows() {
+        if let Value::Int64(r) = &row[0] {
+            assert!(*r > 100_000, "filter should be honoured: r={r}");
+        } else {
+            panic!("expected Int64, got {:?}", row[0]);
+        }
+    }
+}
+
 // Task 20
 #[test]
 fn cypher_order_by_aggregate_alias_falls_through() {
