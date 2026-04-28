@@ -48,6 +48,35 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
+// Task 22
+#[test]
+fn cypher_order_by_after_optional_match_uses_topk() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    // 10 :A nodes, half with an outgoing :R to a :B
+    for i in 0..10 {
+        session
+            .execute(&format!("INSERT (:A {{id: {i}, r: {i}}})"))
+            .unwrap();
+        if i % 2 == 0 {
+            session
+                .execute(&format!(
+                    "MATCH (a:A {{id: {i}}}) INSERT (a)-[:R]->(:B {{tag: {i}}})"
+                ))
+                .unwrap();
+        }
+    }
+
+    let result = session
+        .execute("MATCH (a:A) OPTIONAL MATCH (a)-[:R]->(b:B) RETURN a.id, b.tag ORDER BY a.r DESC LIMIT 3")
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    // Top 3 by a.r DESC: ids 9, 8, 7 (9 has no :B → b.tag is Null).
+    assert_eq!(result.rows()[0][0], Value::Int64(9));
+    assert_eq!(result.rows()[1][0], Value::Int64(8));
+    assert_eq!(result.rows()[2][0], Value::Int64(7));
+}
+
 // Task 21
 #[test]
 fn cypher_order_by_with_filter_uses_topk() {
