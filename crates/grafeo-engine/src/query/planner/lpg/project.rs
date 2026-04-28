@@ -501,9 +501,13 @@ impl super::Planner {
         // the entry-count mismatch (see `try_topk_rewrite` docstring).
         if !self.profiling.get()
             && let LogicalOperator::Sort(sort) = limit.input.as_ref()
-            && let Some(result) = self.try_topk_rewrite(sort, &limit.count)?
         {
-            return Ok(result);
+            if let Some(result) = self.try_topk_rewrite(sort, &limit.count)? {
+                return Ok(result);
+            }
+            if let Some(result) = self.try_heap_topk_rewrite(sort, &limit.count)? {
+                return Ok(result);
+            }
         }
 
         // Phase 4e LIMIT pushdown: when this LIMIT sits directly above a
@@ -951,6 +955,28 @@ impl super::Planner {
     ///
     /// Both caveats disappear if the rewrite is lifted into the logical
     /// optimization phase so the two trees stay in sync.
+    /// Attempts to rewrite Limit-above-Sort into a single `TopKOperator`.
+    ///
+    /// Phase 1: heap-based, O(k) memory, accepts any input shape but bails on the
+    /// augmenting-projection case (see `sort_needs_augmenting_projection`). Called
+    /// from `plan_limit` when the input is a `Sort`, after the more specific
+    /// vector/text rewrite (`try_topk_rewrite`).
+    ///
+    /// PROFILE-mode plans skip this rewrite via the gate in `plan_limit` —
+    /// `build_profile_tree` walks the logical tree expecting one entry per logical
+    /// op, and the rewrite collapses two logical ops (Sort + Limit) into one
+    /// physical op without recording synthetic entries (intentional — see the
+    /// numbered comment block in plan_limit and §4 of the spec).
+    fn try_heap_topk_rewrite(
+        &self,
+        sort: &SortOp,
+        count: &crate::query::plan::CountExpr,
+    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // Stub — implemented in Task 13/14.
+        let _ = (sort, count);
+        Ok(None)
+    }
+
     fn try_topk_rewrite(
         &self,
         sort: &SortOp,
