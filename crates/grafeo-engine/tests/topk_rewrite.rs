@@ -48,6 +48,25 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
+// Task 19
+#[test]
+fn cypher_skip_limit_falls_through() {
+    let db = seed_items(20);
+    let session = db.session();
+    let result = session
+        .execute("MATCH (n:Item) RETURN n.r ORDER BY n.r DESC SKIP 5 LIMIT 5")
+        .unwrap();
+    assert_eq!(result.row_count(), 5);
+
+    // The plan should be Limit ← Skip ← Sort (separate operators); the
+    // rewrite only fires when limit.input is Sort directly.
+    let plan = explain(&db, "MATCH (n:Item) RETURN n.r ORDER BY n.r DESC SKIP 5 LIMIT 5");
+    assert!(
+        plan.contains("Skip"),
+        "Plan should contain Skip operator:\n{plan}"
+    );
+}
+
 // Task 18
 #[test]
 fn cypher_order_by_limit_unfused_under_profile() {
