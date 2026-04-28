@@ -506,7 +506,30 @@ impl super::Planner {
             return Ok(result);
         }
 
-        let (input_op, columns) = self.plan_operator(&limit.input)?;
+        // Phase 4e LIMIT pushdown: when this LIMIT sits directly above a
+        // Filter, push the count as a hint into leaf scan operators
+        // (currently `RangeScanOperator`). The outer `LimitOperator`
+        // wrapper still enforces correctness; the hint is purely an
+        // optimization that bounds the inner materialization step.
+        //
+        // Only fires when the input is `Filter` directly: any
+        // intermediate operator (Sort, Skip, Project, Distinct) needs
+        // full materialization and would produce wrong results if its
+        // child were truncated. Save-and-restore via `Cell::replace` so
+        // nested LIMITs don't leak hints across scopes.
+        let saved_hint = if matches!(limit.input.as_ref(), LogicalOperator::Filter(_)) {
+            Some(self.limit_hint.replace(Some(limit.count.value())))
+        } else {
+            None
+        };
+
+        let plan_result = self.plan_operator(&limit.input);
+
+        if let Some(prev) = saved_hint {
+            self.limit_hint.set(prev);
+        }
+
+        let (input_op, columns) = plan_result?;
         let schema = self.derive_schema_from_columns(&columns);
         Ok(crate::query::planner::common::build_limit(
             input_op,

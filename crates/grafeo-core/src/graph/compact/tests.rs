@@ -9,7 +9,7 @@ use crate::graph::Direction;
 use crate::graph::compact::builder::{CompactStoreBuilder, CompactStoreError};
 use crate::graph::compact::id::{decode_edge_id, decode_node_id, encode_node_id};
 use crate::graph::lpg::CompareOp;
-use crate::graph::traits::GraphStore;
+use crate::graph::traits::{GraphStore, GraphStoreSearch};
 use grafeo_common::types::*;
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1064,91 @@ fn test_find_nodes_in_range_zone_map_prunes_max() {
         true,
     );
     assert!(results.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4b: find_nodes_in_range_iter (lazy block-skip)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alix_find_nodes_in_range_iter_matches_eager() {
+    let store = build_test_store();
+    let min = Value::Int64(30);
+    let max = Value::Int64(40);
+
+    let mut from_iter: Vec<NodeId> = store
+        .find_nodes_in_range_iter("age", Some(&min), Some(&max), true, true)
+        .collect();
+    let mut eager = store.find_nodes_in_range("age", Some(&min), Some(&max), true, true);
+
+    from_iter.sort_unstable();
+    eager.sort_unstable();
+    assert_eq!(from_iter, eager);
+}
+
+#[test]
+fn gus_find_nodes_in_range_iter_skips_disjoint_blocks() {
+    // Build a single-label store with > DEFAULT_BLOCK_ROWS values spread
+    // across 3 blocks. Per-block zone maps must let the iterator skip
+    // blocks whose stats are disjoint from the query range.
+    let mut values: Vec<u64> = Vec::with_capacity(3072);
+    for v in 0..3072u64 {
+        values.push(v);
+    }
+    let store = CompactStoreBuilder::new()
+        .node_table("Big", |t| t.column_bitpacked("v", &values, 12))
+        .build()
+        .unwrap();
+
+    // Range [1500, 1700] hits block 1 only (rows 1024..2048).
+    let min = Value::Int64(1500);
+    let max = Value::Int64(1700);
+    let from_iter: Vec<NodeId> = store
+        .find_nodes_in_range_iter("v", Some(&min), Some(&max), true, true)
+        .collect();
+    let eager = store.find_nodes_in_range("v", Some(&min), Some(&max), true, true);
+
+    let mut from_iter_sorted = from_iter.clone();
+    let mut eager_sorted = eager.clone();
+    from_iter_sorted.sort_unstable();
+    eager_sorted.sort_unstable();
+    assert_eq!(from_iter_sorted, eager_sorted);
+    // Sanity: 1500..=1700 = 201 nodes.
+    assert_eq!(from_iter.len(), 201);
+}
+
+#[test]
+fn vincent_find_nodes_in_range_iter_whole_table_pruned() {
+    // Range entirely outside all zone maps: iterator yields nothing.
+    let store = build_test_store();
+    let min = Value::Int64(100);
+    let max = Value::Int64(200);
+    let result: Vec<NodeId> = store
+        .find_nodes_in_range_iter("age", Some(&min), Some(&max), true, true)
+        .collect();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn jules_find_nodes_in_range_iter_open_bounds() {
+    let store = build_test_store();
+    // age <= 30: Alix(25), Gus(30)
+    let max = Value::Int64(30);
+    let result: Vec<NodeId> = store
+        .find_nodes_in_range_iter("age", None, Some(&max), false, true)
+        .collect();
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn mia_find_nodes_in_range_iter_missing_property_yields_nothing() {
+    let store = build_test_store();
+    let min = Value::Int64(0);
+    let max = Value::Int64(1000);
+    let result: Vec<NodeId> = store
+        .find_nodes_in_range_iter("nonexistent", Some(&min), Some(&max), true, true)
+        .collect();
+    assert!(result.is_empty());
 }
 
 #[test]

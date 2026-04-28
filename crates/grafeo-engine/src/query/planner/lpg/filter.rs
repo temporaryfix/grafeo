@@ -27,8 +27,8 @@ use super::{
     ApplyOperator, Arc, BinaryOp, DistinctOperator, EmptyOperator, ExpressionPredicate,
     FilterExpression, FilterOp, FilterOperator, GraphStoreSearch, HashAggregateOperator,
     HashJoinOperator, HashMap, LogicalExpression, LogicalOperator, NodeListOperator, Operator,
-    PhysicalAggregateExpr, PhysicalJoinType, RangeBounds, Result, TransactionId, UnaryOp,
-    UnionOperator, Value, convert_binary_op, convert_filter_expression,
+    PhysicalAggregateExpr, PhysicalJoinType, RangeBounds, RangeScanOperator, Result, TransactionId,
+    UnaryOp, UnionOperator, Value, convert_binary_op, convert_filter_expression,
 };
 
 /// Cross-type equality comparison with Int64/Float64 coercion.
@@ -1162,7 +1162,20 @@ impl super::Planner {
         Ok(None)
     }
 
-    /// Plans a range filter using `find_nodes_in_range`.
+    /// Plans a range filter using [`RangeScanOperator`].
+    ///
+    /// Phase 4d emits a dedicated range-scan operator that consumes
+    /// [`GraphStoreSearch::find_nodes_in_range_iter`] (lazy, with
+    /// per-block zone-map skip pruning when the store is a CompactStore;
+    /// eager fallback otherwise). The operator absorbs the label and
+    /// MVCC post-filters that the eager `NodeListOperator` path used to
+    /// apply manually, preserving identical query semantics.
+    ///
+    /// Phase 4e: when an outer `plan_limit` set `self.limit_hint`, the
+    /// hint is forwarded to the operator via `with_limit(n)` so the
+    /// materialization step terminates after `n` matches. The outer
+    /// `LimitOperator` still wraps the result; the hint is a pure
+    /// optimization.
     pub(super) fn plan_range_filter(
         &self,
         scan_variable: &str,
@@ -1170,32 +1183,30 @@ impl super::Planner {
         property: &str,
         bounds: RangeBounds<'_>,
     ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
-        // Use the store's range query method
-        let mut matching_nodes = self.store.find_nodes_in_range(
-            property,
-            bounds.min,
-            bounds.max,
-            bounds.min_inclusive,
-            bounds.max_inclusive,
-        );
-
-        // If there's a label filter, also filter by label
-        if let Some(label) = scan_label {
-            let label_nodes: std::collections::HashSet<_> =
-                self.store.nodes_by_label(label).into_iter().collect();
-            matching_nodes.retain(|n| label_nodes.contains(n));
-        }
-
-        // MVCC visibility: filter out nodes not visible at the current epoch/tx.
         let epoch = self.viewing_epoch;
         let tx = self.transaction_id.unwrap_or(TransactionId::SYSTEM);
-        matching_nodes.retain(|id| self.store.get_node_versioned(*id, epoch, tx).is_some());
 
-        // Create a NodeListOperator with the matching nodes
-        let node_list_op = Box::new(NodeListOperator::new(matching_nodes, 2048));
+        let mut op = RangeScanOperator::new(
+            Arc::clone(&self.store),
+            property.to_string(),
+            bounds.min.cloned(),
+            bounds.max.cloned(),
+            bounds.min_inclusive,
+            bounds.max_inclusive,
+            2048,
+        )
+        .with_transaction_context(epoch, tx);
+
+        if let Some(label) = scan_label {
+            op = op.with_label_filter(label.clone());
+        }
+
+        if let Some(hint) = self.limit_hint.get() {
+            op = op.with_limit(hint);
+        }
+
         let columns = vec![scan_variable.to_string()];
-
-        Ok(Some((node_list_op, columns)))
+        Ok(Some((Box::new(op), columns)))
     }
 
     /// Extracts a simple range predicate (>, <, >=, <=) from an expression.

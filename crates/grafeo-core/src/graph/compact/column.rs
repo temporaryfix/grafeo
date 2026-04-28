@@ -486,6 +486,45 @@ impl ColumnCodec {
         self.find_in_range_fallback(min, max, min_inclusive, max_inclusive)
     }
 
+    /// Per-row range predicate: returns `true` iff row `i` decodes to a
+    /// non-null value that satisfies `[min, max]` with the given
+    /// inclusivity. Shared by `find_in_range_fallback` and `range_iter`.
+    /// Rows with `None` decoded value (nulls, NaN floats, dictionary
+    /// nulls) and rows whose value type is incomparable with the bounds
+    /// are excluded.
+    #[inline]
+    fn matches_range(
+        &self,
+        i: usize,
+        min: Option<&Value>,
+        max: Option<&Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> bool {
+        use super::zone_map::compare_values;
+
+        let Some(v) = self.get(i) else {
+            return false;
+        };
+        if let Some(min_val) = min {
+            match compare_values(&v, min_val) {
+                Some(std::cmp::Ordering::Less) => return false,
+                Some(std::cmp::Ordering::Equal) if !min_inclusive => return false,
+                None => return false,
+                _ => {}
+            }
+        }
+        if let Some(max_val) = max {
+            match compare_values(&v, max_val) {
+                Some(std::cmp::Ordering::Greater) => return false,
+                Some(std::cmp::Ordering::Equal) if !max_inclusive => return false,
+                None => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
     /// Fallback range scan via per-row `Value` decode.
     fn find_in_range_fallback(
         &self,
@@ -494,32 +533,87 @@ impl ColumnCodec {
         min_inclusive: bool,
         max_inclusive: bool,
     ) -> Vec<usize> {
-        use super::zone_map::compare_values;
-
         (0..self.len())
-            .filter(|&i| {
-                let Some(v) = self.get(i) else {
-                    return false;
-                };
+            .filter(|&i| self.matches_range(i, min, max, min_inclusive, max_inclusive))
+            .collect()
+    }
+
+    /// Lazy iterator over row offsets matching a range predicate.
+    ///
+    /// Walks per-block zone maps to skip blocks whose stats prove no
+    /// match, then evaluates the predicate per row within matching
+    /// blocks. Yields offsets in ascending order.
+    ///
+    /// `block_zone_maps` should come from
+    /// [`NodeTable::block_zone_maps_for`](super::node_table::NodeTable::block_zone_maps_for).
+    /// When `None`, the iterator scans every block (no skip pruning) but
+    /// still yields the same correct result. When `Some(slice)`, the
+    /// slice length must equal [`block_count`](Self::block_count); a
+    /// shape mismatch falls back to a full scan.
+    ///
+    /// The predicate semantics match
+    /// [`find_in_range`](Self::find_in_range): rows whose value compares
+    /// `Less` than `min` (or `Greater` than `max`) are excluded, and
+    /// `min_inclusive`/`max_inclusive` control boundary behaviour.
+    /// Rows with `None` decoded value (nulls, NaN floats) are excluded.
+    pub fn range_iter<'a>(
+        &'a self,
+        block_zone_maps: Option<&'a [super::zone_map::ZoneMap]>,
+        min: Option<&'a Value>,
+        max: Option<&'a Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> Box<dyn Iterator<Item = usize> + 'a> {
+        use crate::graph::lpg::CompareOp;
+
+        let block_count = self.block_count();
+        let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
+        let total_len = self.len();
+
+        // Validate zone-maps shape; mismatched slices act as "absent".
+        let zone_maps_ok = block_zone_maps.is_some_and(|zm| zm.len() == block_count);
+        let zone_maps = if zone_maps_ok { block_zone_maps } else { None };
+
+        let blocks = (0..block_count).filter_map(move |block_idx| {
+            let start = block_idx * block_rows;
+            // Empty columns report block_count == 1 with start == 0 ==
+            // total_len; the resulting empty range yields nothing below.
+            let end = start.saturating_add(block_rows).min(total_len);
+
+            if let Some(zms) = zone_maps {
+                let zm = &zms[block_idx];
+                // Range matches the block iff:
+                //   - if min exists: block.max >= min  (Ge)  / >  (Gt)
+                //   - if max exists: block.min <= max  (Le)  / <  (Lt)
                 if let Some(min_val) = min {
-                    match compare_values(&v, min_val) {
-                        Some(std::cmp::Ordering::Less) => return false,
-                        Some(std::cmp::Ordering::Equal) if !min_inclusive => return false,
-                        None => return false,
-                        _ => {}
+                    let op = if min_inclusive {
+                        CompareOp::Ge
+                    } else {
+                        CompareOp::Gt
+                    };
+                    if !zm.might_match(op, min_val) {
+                        return None;
                     }
                 }
                 if let Some(max_val) = max {
-                    match compare_values(&v, max_val) {
-                        Some(std::cmp::Ordering::Greater) => return false,
-                        Some(std::cmp::Ordering::Equal) if !max_inclusive => return false,
-                        None => return false,
-                        _ => {}
+                    let op = if max_inclusive {
+                        CompareOp::Le
+                    } else {
+                        CompareOp::Lt
+                    };
+                    if !zm.might_match(op, max_val) {
+                        return None;
                     }
                 }
-                true
-            })
-            .collect()
+            }
+
+            Some((start, end))
+        });
+
+        Box::new(blocks.flat_map(move |(start, end)| {
+            (start..end)
+                .filter(move |&i| self.matches_range(i, min, max, min_inclusive, max_inclusive))
+        }))
     }
 
     // ── Serialization (for CompactStoreSection) ───────────────────
@@ -3149,5 +3243,184 @@ mod tests {
         for i in 0..col.len() {
             assert_eq!(recovered.get(i), col.get(i));
         }
+    }
+
+    // ── Phase 4a: range_iter (lazy block-skip iterator) ───────────────
+    //
+    // `range_iter` walks per-block zone maps (Phase 2c/2d) and skips
+    // blocks whose stats prove no match, then evaluates the predicate
+    // per row within matching blocks. These tests pin equivalence with
+    // the existing eager `find_in_range`, plus pruning behavior on
+    // multi-block columns.
+
+    use crate::graph::compact::zone_map::compute_block_zone_maps;
+
+    fn raw_i64_seq(n: i64) -> ColumnCodec {
+        ColumnCodec::raw_i64((0..n).collect())
+    }
+
+    #[test]
+    fn alix_range_iter_matches_find_in_range_full_scan() {
+        let col = raw_i64_seq(50);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(10);
+        let max = Value::Int64(20);
+
+        let from_iter: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), true, true)
+            .collect();
+        let eager = col.find_in_range(Some(&min), Some(&max), true, true);
+
+        assert_eq!(from_iter, eager);
+    }
+
+    #[test]
+    fn gus_range_iter_skips_disjoint_blocks() {
+        // 3 blocks at DEFAULT_BLOCK_ROWS == 1024:
+        //   block 0: rows 0..1024,    values 0..1024
+        //   block 1: rows 1024..2048, values 1024..2048
+        //   block 2: rows 2048..3072, values 2048..3072
+        // Query [1500, 1700] hits block 1 only; blocks 0 and 2 must be
+        // skipped (their zone maps prove disjointedness).
+        let col = raw_i64_seq(3072);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(1500);
+        let max = Value::Int64(1700);
+
+        let from_iter: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), true, true)
+            .collect();
+
+        let expected: Vec<usize> = (1500..=1700).collect();
+        assert_eq!(from_iter, expected);
+    }
+
+    #[test]
+    fn vincent_range_iter_open_min_bound() {
+        let col = raw_i64_seq(50);
+        let zm = compute_block_zone_maps(&col);
+        let max = Value::Int64(10);
+        let result: Vec<usize> = col
+            .range_iter(Some(&zm), None, Some(&max), false, true)
+            .collect();
+        let expected: Vec<usize> = (0..=10).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn jules_range_iter_open_max_bound() {
+        let col = raw_i64_seq(20);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(15);
+        let result: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), None, true, false)
+            .collect();
+        let expected: Vec<usize> = (15..20).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn mia_range_iter_no_zone_maps_falls_back_to_full_scan() {
+        // When block zone maps are unavailable, range_iter must still
+        // produce correct results (just without skip pruning).
+        let col = raw_i64_seq(100);
+        let min = Value::Int64(40);
+        let max = Value::Int64(60);
+        let result: Vec<usize> = col
+            .range_iter(None, Some(&min), Some(&max), true, true)
+            .collect();
+        let expected = col.find_in_range(Some(&min), Some(&max), true, true);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn butch_range_iter_empty_column_yields_nothing() {
+        let col = raw_i64_seq(0);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(0);
+        let result: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), None, true, false)
+            .collect();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn shosanna_range_iter_string_column() {
+        let mut b = DictionaryBuilder::new();
+        for s in ["amsterdam", "berlin", "paris", "prague", "barcelona"] {
+            b.add(s);
+        }
+        let col = ColumnCodec::Dict(b.build());
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::from("b");
+        let max = Value::from("c");
+        let from_iter: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), true, true)
+            .collect();
+        let eager = col.find_in_range(Some(&min), Some(&max), true, true);
+        assert_eq!(from_iter, eager);
+    }
+
+    #[test]
+    fn hans_range_iter_bitpacked_negative_min_bound() {
+        // BitPacked stores u64; a negative min bound must not crash and
+        // must match `find_in_range` semantics.
+        let col = ColumnCodec::BitPacked(BitPackedInts::pack(&(0..20u64).collect::<Vec<_>>()));
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(-5);
+        let max = Value::Int64(10);
+        let from_iter: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), true, true)
+            .collect();
+        let eager = col.find_in_range(Some(&min), Some(&max), true, true);
+        assert_eq!(from_iter, eager);
+    }
+
+    #[test]
+    fn beatrix_range_iter_exclusive_bounds() {
+        let col = raw_i64_seq(50);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(10);
+        let max = Value::Int64(20);
+        let result: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), false, false)
+            .collect();
+        let expected: Vec<usize> = (11..20).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn django_range_iter_float64_with_nan_in_column() {
+        // NaN in a Float64 column is not orderable and must never appear
+        // in any range query result.
+        let col = ColumnCodec::float64(vec![1.0, f64::NAN, 2.0, 3.0]);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Float64(0.5);
+        let max = Value::Float64(4.0);
+        let from_iter: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), true, true)
+            .collect();
+        let eager = col.find_in_range(Some(&min), Some(&max), true, true);
+        assert_eq!(from_iter, eager);
+        assert!(
+            !from_iter.contains(&1),
+            "NaN row offset 1 must not appear in range result"
+        );
+    }
+
+    #[test]
+    fn tarantino_range_iter_yields_offsets_in_ascending_order() {
+        // Iterator order matters for downstream chunking; rows must be
+        // emitted in increasing offset order.
+        let col = raw_i64_seq(2048);
+        let zm = compute_block_zone_maps(&col);
+        let min = Value::Int64(500);
+        let max = Value::Int64(1500);
+        let result: Vec<usize> = col
+            .range_iter(Some(&zm), Some(&min), Some(&max), true, true)
+            .collect();
+        let mut sorted = result.clone();
+        sorted.sort_unstable();
+        assert_eq!(result, sorted, "iterator output must be sorted ascending");
     }
 }

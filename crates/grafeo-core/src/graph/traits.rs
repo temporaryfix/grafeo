@@ -358,6 +358,31 @@ pub trait GraphStore: Send + Sync {
 /// plan, falling back to brute-force internally when the request is valid
 /// but no matching index exists.
 pub trait GraphStoreSearch: GraphStore {
+    // --- Range scan (lazy) ---
+
+    /// Returns a lazy iterator over node ids whose property value falls
+    /// within `[min, max]` (with the given inclusivity).
+    ///
+    /// The default implementation eagerly materializes via
+    /// [`find_nodes_in_range`](GraphStore::find_nodes_in_range) and chains
+    /// `.into_iter()`. Stores with per-block zone maps (e.g. `CompactStore`)
+    /// override this with a true lazy iterator that prunes blocks via
+    /// zone-map skip checks before decoding any row, enabling Phase 4
+    /// iterator bounds to deliver real work-skip on selective queries.
+    fn find_nodes_in_range_iter<'a>(
+        &'a self,
+        property: &'a str,
+        min: Option<&'a Value>,
+        max: Option<&'a Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> Box<dyn Iterator<Item = NodeId> + 'a> {
+        Box::new(
+            self.find_nodes_in_range(property, min, max, min_inclusive, max_inclusive)
+                .into_iter(),
+        )
+    }
+
     // --- Text search (BM25) ---
 
     /// Returns true if a BM25 text index exists for the given label and property.

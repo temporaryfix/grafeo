@@ -479,4 +479,58 @@ impl GraphStore for CompactStore {
     }
 }
 
-impl GraphStoreSearch for CompactStore {}
+impl GraphStoreSearch for CompactStore {
+    fn find_nodes_in_range_iter<'a>(
+        &'a self,
+        property: &'a str,
+        min: Option<&'a Value>,
+        max: Option<&'a Value>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> Box<dyn Iterator<Item = NodeId> + 'a> {
+        let key = PropertyKey::new(property);
+
+        let per_table = self.node_tables_by_id.iter().filter_map(move |nt| {
+            // Whole-table skip via per-label zone map (existing behavior).
+            if let Some(zm) = nt.zone_map(&key) {
+                if let Some(min_val) = min {
+                    let op = if min_inclusive {
+                        CompareOp::Ge
+                    } else {
+                        CompareOp::Gt
+                    };
+                    if !zm.might_match(op, min_val) {
+                        return None;
+                    }
+                }
+                if let Some(max_val) = max {
+                    let op = if max_inclusive {
+                        CompareOp::Le
+                    } else {
+                        CompareOp::Lt
+                    };
+                    if !zm.might_match(op, max_val) {
+                        return None;
+                    }
+                }
+            }
+
+            let col = nt.column(&key)?;
+            let block_zones = nt.block_zone_maps_for(&key);
+            let table_id = nt.table_id();
+            let store = self;
+            // reason: usize → u64 fits on every supported target (row count
+            // bounded by u32::MAX per the section format).
+            #[allow(clippy::cast_possible_truncation)]
+            let iter = col
+                .range_iter(block_zones, min, max, min_inclusive, max_inclusive)
+                .map(move |offset| {
+                    let compact_id = encode_node_id(table_id, offset as u64);
+                    store.to_original_node_id(compact_id)
+                });
+            Some(iter)
+        });
+
+        Box::new(per_table.flatten())
+    }
+}
