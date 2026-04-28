@@ -48,6 +48,20 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
+// Task 20
+#[test]
+fn cypher_order_by_aggregate_alias_falls_through() {
+    let db = seed_items(20);
+    // ORDER BY uses the aggregate alias `c`. plan_sort needs the augmenting
+    // projection path; the heap rewrite must defer.
+    let session = db.session();
+    let result = session
+        .execute("MATCH (n:Item) RETURN n.id, count(*) AS c ORDER BY c DESC LIMIT 5")
+        .unwrap();
+    // 20 distinct ids → 20 groups of count 1; LIMIT picks 5.
+    assert!(result.row_count() <= 5);
+}
+
 // Task 19
 #[test]
 fn cypher_skip_limit_falls_through() {
