@@ -491,6 +491,30 @@ impl super::Planner {
 
     /// Plans a LIMIT operator.
     pub(super) fn plan_limit(&self, limit: &LimitOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        // The order of try_*_topk attempts here is load-bearing, not a
+        // performance tweak:
+        //
+        // 1. The PROFILE gate (`!self.profiling.get()`) comes first. Every
+        //    fused-operator rewrite must skip under PROFILE because
+        //    build_profile_tree expects one ProfileEntry per logical
+        //    operator. Without the gate, PROFILE panics with the same
+        //    failure mode as the absorbed-NodeScan case in filter.rs
+        //    (record_absorbed_scan_entry).
+        // 2. The vector/text rewrite (try_topk_rewrite) fires before the
+        //    heap rewrite because it bypasses the input scan entirely via
+        //    HNSW or BM25 indexes — strictly better than heap top-K when
+        //    both could match (e.g. ORDER BY cosine_similarity(...)).
+        // 3. The heap rewrite (try_heap_topk_rewrite) is the generic
+        //    fallback. It always wins memory vs. the unfused Sort + Limit,
+        //    and modestly wins CPU. It accepts any input subtree shape
+        //    that doesn't need an augmenting projection.
+        // 4. Phase 2 (separate spec) would slot try_index_topk_rewrite
+        //    between vector/text and heap when a sorted property index is
+        //    applicable; the heap path remains the safety net.
+        //
+        // Changing this order needs a correctness argument, not just a
+        // benchmark.
+
         // Top-K optimization: Limit(k) -> Sort(score_fn) -> NodeScan
         // can be rewritten to VectorScan(k) or TextScan(k). GQL emits the plan as
         // Limit-above-Sort, so the check belongs here rather than in plan_sort.
