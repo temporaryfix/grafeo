@@ -48,6 +48,33 @@ fn profile(db: &GrafeoDB, query: &str) -> String {
     }
 }
 
+// Task 18
+#[test]
+fn cypher_order_by_limit_unfused_under_profile() {
+    let db = seed_items(20);
+    let plan = profile(&db, "MATCH (n:Item) RETURN n.r ORDER BY n.r DESC LIMIT 5");
+
+    // PROFILE should not panic, and the unfused path should run — both
+    // Sort and Limit operators visible.
+    assert!(
+        plan.contains("Sort"),
+        "PROFILE under heap-rewrite-disabled should show Sort:\n{plan}"
+    );
+    assert!(
+        plan.contains("Limit"),
+        "PROFILE under heap-rewrite-disabled should show Limit:\n{plan}"
+    );
+    assert!(
+        plan.contains("rows="),
+        "PROFILE should report row counts:\n{plan}"
+    );
+    // Defensive: confirm the rewrite did NOT fire under PROFILE.
+    assert!(
+        !plan.contains("TopK"),
+        "PROFILE must not show TopK — rewrite should be gated by !profiling:\n{plan}"
+    );
+}
+
 // Task 17
 #[test]
 fn cypher_order_by_limit_uses_topk() {
