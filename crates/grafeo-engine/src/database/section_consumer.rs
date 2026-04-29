@@ -15,7 +15,10 @@ use std::sync::Arc;
         not(feature = "temporal")
     ),
     all(feature = "lpg", feature = "text-index"),
-    all(feature = "compact-store", feature = "mmap", feature = "lpg")
+    // OverlayConsumer (lpg + compact-store, no mmap requirement) and
+    // CompactStoreConsumer (lpg + compact-store + mmap) both hold a Weak
+    // back to the layered store. The broader gate covers both.
+    all(feature = "compact-store", feature = "lpg")
 ))]
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
