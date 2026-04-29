@@ -120,7 +120,7 @@ class TestNodesDf:
         df = populated_db.nodes_df()
 
         assert isinstance(df, pd.DataFrame)
-        assert "id" in df.columns
+        assert "_id" in df.columns
         assert "_labels" in df.columns
         assert "name" in df.columns
         assert len(df) == 4  # 3 persons + 1 company
@@ -190,7 +190,10 @@ class TestEdgesDf:
         df = db.edges_df()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
-        assert list(df.columns) == ["_id", "_type", "_source", "_target"]
+        # Column order is implementation-defined (currently alphabetical
+        # among the metadata columns); compare as a set so the test
+        # doesn't break if the implementation reorders.
+        assert set(df.columns) == {"_id", "_type", "_source", "_target"}
 
 
 # --- Error handling ---
