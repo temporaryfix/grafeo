@@ -54,7 +54,7 @@ let db = GrafeoDB::with_config(config)?;
 | -------- | -------- |
 | `Auto` | Default. Buffer manager decides based on pressure. |
 | `ForceDisk` | At database open, the matching section is spilled immediately. Subsequent reads serve from mmap. |
-| `ForceRam` | Declarative: this section must stay in RAM. **Not yet enforced at runtime** (will be in 0.5.43); today behaves identically to `Auto`. |
+| `ForceRam` | This section is pinned in RAM. The buffer manager skips it in every spill path (pressure-driven, explicit `spill_all`, targeted `spill_consumer_by_name`). When pressure exceeds the budget and no other spillable consumers exist, allocations fail rather than spilling a ForceRam consumer. |
 
 `ForceDisk` is targeted: only the matching section is spilled, other sections are unaffected. Configure each section type that should start on disk; the rest follow the `Auto` policy.
 

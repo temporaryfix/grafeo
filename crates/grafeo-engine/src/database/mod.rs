@@ -2386,32 +2386,48 @@ impl GrafeoDB {
         );
     }
 
-    /// Applies `TierOverride::ForceDisk` overrides at database open time.
+    /// Applies `TierOverride::ForceDisk` and `TierOverride::ForceRam`
+    /// overrides at database open time.
     ///
-    /// For each section type configured as `ForceDisk` in
-    /// [`Config::section_configs`], spills the matching registered consumer
-    /// (named `"section:<TypeName>"`). Sections configured as `Auto` or
-    /// `ForceRam` are left alone — `Auto` lets the BufferManager react to
-    /// pressure normally; `ForceRam` is purely declarative until Phase 8g
-    /// adds runtime enforcement.
+    /// For each section type in [`Config::section_configs`]:
+    ///
+    /// - `ForceDisk`: spills the matching registered consumer (named
+    ///   `"section:<TypeName>"`) once.
+    /// - `ForceRam` (Phase 8g): pins the matching consumer in the buffer
+    ///   manager so subsequent spill loops (pressure-driven, explicit, or
+    ///   targeted) skip it.
+    /// - `Auto`: no action; the BufferManager applies its default policy.
     ///
     /// Must be called after [`Self::register_section_consumers`].
     fn apply_force_disk_overrides(&self) {
         use grafeo_common::storage::TierOverride;
 
         for (section_type, mem_config) in &self.config.section_configs {
-            if mem_config.tier != TierOverride::ForceDisk {
-                continue;
-            }
             let consumer_name = format!("section:{section_type:?}");
-            #[cfg(feature = "tracing")]
-            tracing::info!(
-                target: "grafeo::tier",
-                section = ?section_type,
-                tier = "ForceDisk",
-                "applying tier override at db open"
-            );
-            self.buffer_manager.spill_consumer_by_name(&consumer_name);
+            match mem_config.tier {
+                TierOverride::ForceDisk => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        target: "grafeo::tier",
+                        section = ?section_type,
+                        tier = "ForceDisk",
+                        "applying tier override at db open"
+                    );
+                    self.buffer_manager.spill_consumer_by_name(&consumer_name);
+                }
+                TierOverride::ForceRam => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        target: "grafeo::tier",
+                        section = ?section_type,
+                        tier = "ForceRam",
+                        "pinning consumer to RAM"
+                    );
+                    self.buffer_manager.mark_force_ram(&consumer_name);
+                }
+                TierOverride::Auto => {}
+                _ => {}
+            }
         }
     }
 

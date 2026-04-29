@@ -463,7 +463,7 @@ mod tests {
 
         assert_eq!(restored.len(), terms.len());
         for (i, term) in terms.iter().enumerate() {
-            let id = i as u32;
+            let id = u32::try_from(i).expect("test fixture id fits u32");
             let restored_term = restored.get_term(id).expect("get_term");
             assert_eq!(&restored_term, term, "term for id {id}");
         }
@@ -482,7 +482,8 @@ mod tests {
             let id = packed
                 .get_id(term)
                 .unwrap_or_else(|| panic!("id for {term}"));
-            assert_eq!(id, i as u32, "mismatched id for {term}");
+            let expected = u32::try_from(i).expect("test fixture id fits u32");
+            assert_eq!(id, expected, "mismatched id for {term}");
         }
     }
 

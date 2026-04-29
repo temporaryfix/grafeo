@@ -71,6 +71,10 @@ pub struct SectionConsumer {
     spill_path: Option<PathBuf>,
     /// Counter for unique spill file names within `spill_path`.
     file_counter: AtomicUsize,
+    /// `true` after a successful `spill_to_dir`, cleared on reload. Drives
+    /// `current_tier()` so introspection reports the actual state of
+    /// sections that opted into the `swap_to_mmap` path.
+    is_spilled: std::sync::atomic::AtomicBool,
 }
 
 impl SectionConsumer {
@@ -94,6 +98,11 @@ impl SectionConsumer {
     /// `<spill_path>/<SectionType>_<n>.spill`, the file is mmapped, and
     /// the resulting [`PageFetcher`](grafeo_common::storage::PageFetcher)
     /// is handed to [`Section::swap_to_mmap`] for the section to consume.
+    // Only consumed by the `ring-index` registration path today; other
+    // section consumer types use specialized constructors (CompactStore,
+    // VectorIndex, TextIndex). Allow dead_code under feature combinations
+    // that don't include ring-index.
+    #[cfg_attr(not(feature = "ring-index"), allow(dead_code))]
     pub fn with_spill(section: Arc<dyn Section>, spill_path: PathBuf) -> Self {
         Self::build(section, Some(spill_path))
     }
@@ -119,6 +128,7 @@ impl SectionConsumer {
             mmap_able: flags.mmap_able,
             spill_path,
             file_counter: AtomicUsize::new(0),
+            is_spilled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -155,6 +165,13 @@ impl SectionConsumer {
             let _ = std::fs::remove_file(&path);
             return Err(e);
         }
+
+        // Mark spilled so `current_tier()` reports OnDisk for
+        // introspection, even when the section's `memory_usage()`
+        // remains nonzero (the v2 Bytes-backed ring still occupies
+        // heap, but its bulk data is paged from the spill mmap).
+        self.is_spilled
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let after = self.section.memory_usage();
         Ok(before.saturating_sub(after))
@@ -209,7 +226,21 @@ impl MemoryConsumer for SectionConsumer {
     }
 
     fn reload(&self) -> Result<(), SpillError> {
-        self.section.reload_to_ram()
+        self.section.reload_to_ram()?;
+        self.is_spilled
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn current_tier(&self) -> grafeo_common::memory::StorageTier {
+        use grafeo_common::memory::StorageTier;
+        if self.is_spilled.load(std::sync::atomic::Ordering::Acquire) {
+            StorageTier::OnDisk
+        } else if self.section.memory_usage() == 0 {
+            StorageTier::Uninitialized
+        } else {
+            StorageTier::InMemory
+        }
     }
 }
 

@@ -23,6 +23,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use grafeo_common::memory::buffer::SpillError;
+use grafeo_common::storage::page_fetcher::PageFetcher;
 use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::utils::error::{Error, Result};
 
@@ -103,6 +105,46 @@ impl Section for RdfRingSection {
 
     fn memory_usage(&self) -> usize {
         self.store.ring().map_or(0, |r| r.size_bytes())
+    }
+
+    /// Swaps the ring backing to a `Bytes` view sourced from `fetcher`.
+    ///
+    /// Phase 6 deferred → Phase 8 audit-fix: closes the loop on the v2
+    /// packed Ring format. After the section serializes to a spill file
+    /// and the file is mmap'd, the buffer manager calls this with a
+    /// `MmapPageFetcher`. We copy the section bytes into a single
+    /// owning `Bytes`; the v2 deserializer then constructs the ring with
+    /// every bulk component (term dictionary, wavelet level bitvectors,
+    /// permutation forward arrays) refcount-sharing slices of that
+    /// `Bytes`. Reads thereafter are zero-copy against the shared buffer.
+    ///
+    /// The one allocation here is `~section_size` once, replacing the
+    /// previous eager-deserialize that allocated `~3x` that for the
+    /// reconstructed `HashMap`s. A future `PageFetcher::owned_bytes`
+    /// override on the mmap impl could drop that copy too.
+    ///
+    /// v1 bincode buffers fall through to the bincode `load_from_bytes`
+    /// path so legacy spill files still load.
+    fn swap_to_mmap(&self, fetcher: Arc<dyn PageFetcher>) -> std::result::Result<(), SpillError> {
+        let len = fetcher.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        let slice = fetcher
+            .fetch(0, len)
+            .map_err(|e| SpillError::IoError(e.to_string()))?;
+        let data = bytes::Bytes::copy_from_slice(slice);
+
+        let ring = if data.len() >= 4 && &data[0..4] == V2_MAGIC {
+            super::deserialize_triple_ring(data).map_err(|e| SpillError::IoError(e.to_string()))?
+        } else {
+            super::TripleRing::load_from_bytes(&data)
+                .map_err(|e| SpillError::IoError(e.to_string()))?
+        };
+
+        self.store.set_ring(ring);
+        Ok(())
     }
 }
 
@@ -232,6 +274,93 @@ mod tests {
         section2.deserialize(&v1_bytes).unwrap();
         let restored = store2.ring().expect("ring loaded");
         assert_eq!(restored.len(), 3);
+    }
+
+    // ── Phase 6/8 audit-fix: swap_to_mmap end-to-end ──────────────────
+
+    /// Minimal in-memory PageFetcher for testing swap_to_mmap.
+    struct MemFetcher(Vec<u8>);
+
+    impl PageFetcher for MemFetcher {
+        fn fetch(&self, offset: usize, len: usize) -> std::io::Result<&[u8]> {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| std::io::Error::other("overflow"))?;
+            if end > self.0.len() {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            Ok(&self.0[offset..end])
+        }
+
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn advise(
+            &self,
+            _offset: usize,
+            _len: usize,
+            _hint: grafeo_common::storage::page_fetcher::AccessHint,
+        ) {
+        }
+    }
+
+    /// `swap_to_mmap` rebuilds the ring from a `Bytes`-backed v2 buffer
+    /// and queries against the swapped-in ring give correct results.
+    #[test]
+    fn shosanna_swap_to_mmap_serves_queries_from_bytes() {
+        let original = test_store();
+        let v2_bytes = {
+            let section = RdfRingSection::new(Arc::clone(&original));
+            section.serialize().unwrap()
+        };
+
+        // Fresh empty store; section starts with no ring.
+        let store = Arc::new(RdfStore::new());
+        assert!(store.ring().is_none());
+
+        let section = RdfRingSection::new(Arc::clone(&store));
+        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(v2_bytes));
+        section.swap_to_mmap(fetcher).expect("swap_to_mmap");
+
+        // Ring is now populated from the fetcher bytes.
+        let ring = store.ring().expect("ring loaded via swap_to_mmap");
+        assert_eq!(ring.len(), 3);
+
+        // Query semantics still work against the post-swap ring.
+        use crate::graph::rdf::TriplePattern;
+        let name_pattern = TriplePattern {
+            subject: None,
+            predicate: Some(Term::iri("http://xmlns.com/foaf/0.1/name")),
+            object: None,
+        };
+        assert_eq!(ring.count(&name_pattern), 2);
+    }
+
+    /// Empty fetcher (zero-length section) is a no-op, not an error.
+    #[test]
+    fn butch_swap_to_mmap_empty_fetcher_is_noop() {
+        let store = Arc::new(RdfStore::new());
+        let section = RdfRingSection::new(Arc::clone(&store));
+        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(Vec::new()));
+        section.swap_to_mmap(fetcher).expect("empty swap is ok");
+        assert!(store.ring().is_none());
+    }
+
+    /// v1 bincode-encoded fetcher bytes still load via the legacy fallback.
+    #[test]
+    fn django_swap_to_mmap_v1_bincode_fetcher_still_loads() {
+        let original = test_store();
+        let ring = original.ring().expect("ring built").as_ref().clone();
+        let v1_bytes = ring.save_to_bytes().unwrap();
+        assert_ne!(&v1_bytes[0..4], V2_MAGIC);
+
+        let store = Arc::new(RdfStore::new());
+        let section = RdfRingSection::new(Arc::clone(&store));
+        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(v1_bytes));
+        section.swap_to_mmap(fetcher).expect("v1 fallback in swap");
+
+        assert_eq!(store.ring().unwrap().len(), 3);
     }
 
     /// After a v1 read + a re-serialize, the new buffer is v2.

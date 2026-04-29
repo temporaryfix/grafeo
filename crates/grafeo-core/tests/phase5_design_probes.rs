@@ -32,7 +32,8 @@ fn probe_memory_cost_lpg_vs_walov() {
     let lpg = LpgStore::new().expect("alloc");
     for i in 0..N {
         let id = lpg.create_node(&["Person"]);
-        lpg.set_node_property(id, "age", Value::Int64(i as i64));
+        let age = i64::try_from(i).expect("probe N fits i64");
+        lpg.set_node_property(id, "age", Value::Int64(age));
     }
     let (store_mem, idx_mem, mvcc_mem, pool_mem) = lpg.memory_breakdown();
     let lpg_total =
@@ -43,7 +44,8 @@ fn probe_memory_cost_lpg_vs_walov() {
     for i in 0..N {
         let id = NodeId::new(i as u64);
         wal.insert_node(id, vec!["Person".to_string()]);
-        wal.set_node_property(id, "age".to_string(), Value::Int64(i as i64));
+        let age = i64::try_from(i).expect("probe N fits i64");
+        wal.set_node_property(id, "age".to_string(), Value::Int64(age));
     }
     let wal_total = wal.approximate_memory_bytes();
 

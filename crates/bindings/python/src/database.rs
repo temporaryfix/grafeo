@@ -10,9 +10,70 @@ use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
+use grafeo_common::storage::{SectionMemoryConfig, SectionType, TierOverride};
 use grafeo_common::types::{EdgeId, LogicalType, NodeId, Value};
 use grafeo_engine::config::Config;
 use grafeo_engine::database::{GrafeoDB, QueryResult};
+
+/// Parses a section name string ("LpgStore", "VectorStore", etc.) into a
+/// [`SectionType`]. Returns `Err` for unknown names.
+fn parse_section_type(name: &str) -> Result<SectionType, PyErr> {
+    match name {
+        "Catalog" => Ok(SectionType::Catalog),
+        "LpgStore" => Ok(SectionType::LpgStore),
+        "RdfStore" => Ok(SectionType::RdfStore),
+        "CompactStore" => Ok(SectionType::CompactStore),
+        "VectorStore" => Ok(SectionType::VectorStore),
+        "TextIndex" => Ok(SectionType::TextIndex),
+        "RdfRing" => Ok(SectionType::RdfRing),
+        "PropertyIndex" => Ok(SectionType::PropertyIndex),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown section type '{other}': expected one of \
+             Catalog, LpgStore, RdfStore, CompactStore, VectorStore, \
+             TextIndex, RdfRing, PropertyIndex"
+        ))),
+    }
+}
+
+/// Parses a tier name ("auto", "force_ram", "force_disk") into a
+/// [`TierOverride`].
+fn parse_tier_override(name: &str) -> Result<TierOverride, PyErr> {
+    match name {
+        "auto" | "Auto" => Ok(TierOverride::Auto),
+        "force_ram" | "ForceRam" => Ok(TierOverride::ForceRam),
+        "force_disk" | "ForceDisk" => Ok(TierOverride::ForceDisk),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown tier '{other}': expected 'auto', 'force_ram', or 'force_disk'"
+        ))),
+    }
+}
+
+/// Renders a [`SectionType`] back into the string used by the Python API.
+fn section_type_to_str(section_type: SectionType) -> &'static str {
+    match section_type {
+        SectionType::Catalog => "Catalog",
+        SectionType::LpgStore => "LpgStore",
+        SectionType::RdfStore => "RdfStore",
+        SectionType::CompactStore => "CompactStore",
+        SectionType::VectorStore => "VectorStore",
+        SectionType::TextIndex => "TextIndex",
+        SectionType::RdfRing => "RdfRing",
+        SectionType::PropertyIndex => "PropertyIndex",
+        _ => "Unknown",
+    }
+}
+
+/// Renders a [`grafeo_common::memory::buffer::StorageTier`] into the
+/// lowercase string used by the Python API.
+fn tier_to_str(tier: grafeo_common::memory::buffer::StorageTier) -> &'static str {
+    use grafeo_common::memory::buffer::StorageTier;
+    match tier {
+        StorageTier::InMemory => "in_memory",
+        StorageTier::OnDisk => "on_disk",
+        StorageTier::Uninitialized => "uninitialized",
+        _ => "unknown",
+    }
+}
 
 #[cfg(feature = "algos")]
 use crate::bridges::{PyAlgorithms, PyNetworkXAdapter, PySolvORAdapter};
@@ -272,9 +333,23 @@ impl PyGrafeoDB {
     /// Examples:
     ///     db = GrafeoDB()           # In-memory (fast, temporary)
     ///     db = GrafeoDB("./mydb")   # Persistent (survives restarts)
+    ///
+    ///     # Pin specific sections to a storage tier:
+    ///     db = GrafeoDB("./mydb", section_tiers={
+    ///         "VectorStore": "force_disk",   # spill at open
+    ///         "LpgStore": "force_ram",       # never spill
+    ///     })
+    ///
+    /// section_tiers keys: "Catalog", "LpgStore", "RdfStore", "CompactStore",
+    /// "VectorStore", "TextIndex", "RdfRing", "PropertyIndex".
+    /// Values: "auto" (default), "force_ram", "force_disk".
     #[new]
-    #[pyo3(signature = (path=None, *, cdc=false))]
-    fn new(path: Option<String>, cdc: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path=None, *, cdc=false, section_tiers=None))]
+    fn new(
+        path: Option<String>,
+        cdc: bool,
+        section_tiers: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
         let mut config = if let Some(p) = path {
             Config::persistent(p)
         } else {
@@ -283,12 +358,65 @@ impl PyGrafeoDB {
         if cdc {
             config = config.with_cdc();
         }
+        if let Some(tiers) = section_tiers {
+            for (section_name, tier_name) in tiers {
+                let section_type = parse_section_type(&section_name)?;
+                let tier = parse_tier_override(&tier_name)?;
+                config = config.with_section_config(
+                    section_type,
+                    SectionMemoryConfig {
+                        max_ram: None,
+                        tier,
+                    },
+                );
+            }
+        }
 
         let db = GrafeoDB::with_config(config).map_err(PyGrafeoError::from)?;
 
         Ok(Self {
             inner: Arc::new(RwLock::new(db)),
         })
+    }
+
+    /// Returns the current storage tier of every registered section.
+    ///
+    /// Result is a dict mapping section name to tier name. Tier values
+    /// are "in_memory", "on_disk", or "uninitialized".
+    ///
+    /// Example:
+    ///     >>> db.storage_tiers()
+    ///     {'LpgStore': 'in_memory', 'VectorStore': 'on_disk'}
+    fn storage_tiers(&self) -> HashMap<String, String> {
+        let db = self.inner.read();
+        db.storage_tiers()
+            .into_iter()
+            .map(|(section_type, tier)| {
+                (
+                    section_type_to_str(section_type).to_string(),
+                    tier_to_str(tier).to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Reloads spilled section data back into RAM, up to `target_fraction`
+    /// of the memory budget.
+    ///
+    /// Walks consumers currently OnDisk in priority order (highest first)
+    /// and reloads each as long as projected memory stays below the target.
+    /// Returns the number of consumers reloaded.
+    ///
+    /// `target_fraction` is clamped to [0.0, 1.0]. Use 0.7 (matching the
+    /// default soft-limit) as a sane starting point.
+    ///
+    /// Example:
+    ///     >>> db.reload_eligible(0.7)
+    ///     2
+    #[pyo3(signature = (target_fraction=0.7))]
+    fn reload_eligible(&self, target_fraction: f64) -> usize {
+        let db = self.inner.read();
+        db.reload_eligible(target_fraction)
     }
 
     /// Open an existing database.
