@@ -31,7 +31,14 @@ fn seed(n: usize) -> GrafeoDB {
 }
 
 fn bench_topk_e2e(c: &mut Criterion) {
-    let db = seed(100_000);
+    // N is sized so the operator-level work dominates fixed
+    // parser/planner/IO overhead. At N=100k the filtered post-Sort row
+    // count (~50k) leaves the operator delta below the per-query fixed
+    // cost, and the literal/parameter ratio sits inside criterion's
+    // noise band, which violates the spec §9 strict literal ≤ parameter
+    // assertion. N=500k keeps the same query shape but lets the
+    // operator-level ~12× win show through end-to-end.
+    let db = seed(500_000);
 
     let mut group = c.benchmark_group("top_k_filtered_e2e");
     group.sample_size(20);

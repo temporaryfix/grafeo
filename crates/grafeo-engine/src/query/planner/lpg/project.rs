@@ -514,15 +514,6 @@ impl super::Planner {
         //
         // Changing this order needs a correctness argument, not just a
         // benchmark.
-
-        // Top-K optimization: Limit(k) -> Sort(score_fn) -> NodeScan
-        // can be rewritten to VectorScan(k) or TextScan(k). GQL emits the plan as
-        // Limit-above-Sort, so the check belongs here rather than in plan_sort.
-        //
-        // The rewrite is disabled under PROFILE because it fuses three logical
-        // operators into one physical operator without updating the logical tree.
-        // PROFILE walks the logical tree to build its output and would panic on
-        // the entry-count mismatch (see `try_topk_rewrite` docstring).
         if !self.profiling.get()
             && let LogicalOperator::Sort(sort) = limit.input.as_ref()
         {
@@ -979,65 +970,6 @@ impl super::Planner {
     ///
     /// Both caveats disappear if the rewrite is lifted into the logical
     /// optimization phase so the two trees stay in sync.
-    /// Attempts to rewrite Limit-above-Sort into a single `TopKOperator`.
-    ///
-    /// Phase 1: heap-based, O(k) memory, accepts any input shape but bails on the
-    /// augmenting-projection case (see `sort_needs_augmenting_projection`). Called
-    /// from `plan_limit` when the input is a `Sort`, after the more specific
-    /// vector/text rewrite (`try_topk_rewrite`).
-    ///
-    /// PROFILE-mode plans skip this rewrite via the gate in `plan_limit` —
-    /// `build_profile_tree` walks the logical tree expecting one entry per logical
-    /// op, and the rewrite collapses two logical ops (Sort + Limit) into one
-    /// physical op without recording synthetic entries (intentional — see the
-    /// numbered comment block in plan_limit and §4 of the spec).
-    fn try_heap_topk_rewrite(
-        &self,
-        sort: &SortOp,
-        count: &crate::query::plan::CountExpr,
-    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
-        // (1) Limit must be a literal int. Parameter references fall through.
-        let crate::query::plan::CountExpr::Literal(k) = count else {
-            return Ok(None);
-        };
-        let k = *k;
-        if k == 0 {
-            return Ok(None);
-        }
-
-        // (2) Sort over a Return that requires augmenting projection falls
-        //     through; plan_sort knows how to inject the projection,
-        //     try_heap_topk_rewrite doesn't (deferred from Phase 1).
-        if sort_needs_augmenting_projection(sort) {
-            return Ok(None);
-        }
-
-        // (3) Plan the inner subtree as-is; reuses every existing optimization
-        //     (filter pushdown, expand-chain fusion, NodeList absorption).
-        let (input_op, columns) = self.plan_operator(&sort.input)?;
-
-        // (4) Resolve sort keys. If any key fails resolution (e.g. references
-        //     a property not yet projected), fall through so plan_sort's
-        //     extra-projection machinery handles it.
-        let physical_keys = match resolve_logical_to_physical_keys(&sort.keys, &columns) {
-            Ok(keys) => keys,
-            Err(_) => return Ok(None),
-        };
-
-        // (5) Build the operator. derive_schema_from_columns is the same
-        //     helper plan_limit's unfused path uses.
-        let schema = self.derive_schema_from_columns(&columns);
-        let op: Box<dyn Operator> = Box::new(
-            grafeo_core::execution::operators::TopKOperator::new(
-                input_op,
-                physical_keys,
-                k,
-                schema,
-            ),
-        );
-        Ok(Some((op, columns)))
-    }
-
     fn try_topk_rewrite(
         &self,
         sort: &SortOp,
@@ -1297,6 +1229,65 @@ impl super::Planner {
             None
         }
     }
+
+    /// Attempts to rewrite Limit-above-Sort into a single `TopKOperator`.
+    ///
+    /// Phase 1: heap-based, O(k) memory, accepts any input shape but bails on the
+    /// augmenting-projection case (see `sort_needs_augmenting_projection`). Called
+    /// from `plan_limit` when the input is a `Sort`, after the more specific
+    /// vector/text rewrite (`try_topk_rewrite`).
+    ///
+    /// PROFILE-mode plans skip this rewrite via the gate in `plan_limit` —
+    /// `build_profile_tree` walks the logical tree expecting one entry per logical
+    /// op, and the rewrite collapses two logical ops (Sort + Limit) into one
+    /// physical op without recording synthetic entries (intentional — see the
+    /// numbered comment block in plan_limit and §4 of the spec).
+    fn try_heap_topk_rewrite(
+        &self,
+        sort: &SortOp,
+        count: &crate::query::plan::CountExpr,
+    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // (1) Limit must be a literal int. Parameter references fall through.
+        let crate::query::plan::CountExpr::Literal(k) = count else {
+            return Ok(None);
+        };
+        let k = *k;
+        if k == 0 {
+            return Ok(None);
+        }
+
+        // (2) Sort over a Return that requires augmenting projection falls
+        //     through; plan_sort knows how to inject the projection,
+        //     try_heap_topk_rewrite doesn't (deferred from Phase 1).
+        if sort_needs_augmenting_projection(sort) {
+            return Ok(None);
+        }
+
+        // (3) Plan the inner subtree as-is; reuses every existing optimization
+        //     (filter pushdown, expand-chain fusion, NodeList absorption).
+        let (input_op, columns) = self.plan_operator(&sort.input)?;
+
+        // (4) Resolve sort keys. If any key fails resolution (e.g. references
+        //     a property not yet projected), fall through so plan_sort's
+        //     extra-projection machinery handles it.
+        let physical_keys = match resolve_logical_to_physical_keys(&sort.keys, &columns) {
+            Ok(keys) => keys,
+            Err(_) => return Ok(None),
+        };
+
+        // (5) Build the operator. derive_schema_from_columns is the same
+        //     helper plan_limit's unfused path uses.
+        let schema = self.derive_schema_from_columns(&columns);
+        let op: Box<dyn Operator> = Box::new(
+            grafeo_core::execution::operators::TopKOperator::new(
+                input_op,
+                physical_keys,
+                k,
+                schema,
+            ),
+        );
+        Ok(Some((op, columns)))
+    }
 }
 
 /// Resolves logical sort keys to physical sort keys for `TopKOperator`.
@@ -1338,7 +1329,8 @@ fn resolve_logical_to_physical_keys(
 
         let null_order = match key.nulls {
             Some(NullsOrdering::First) => NullOrder::NullsFirst,
-            Some(NullsOrdering::Last) | None => NullOrder::NullsLast,
+            Some(NullsOrdering::Last) => NullOrder::NullsLast,
+            None => NullOrder::NullsLast, // default — matches plan_sort
         };
 
         out.push(PhysSortKey {

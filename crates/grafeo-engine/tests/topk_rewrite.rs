@@ -1,9 +1,18 @@
 //! Integration tests for the heap-based top-K rewrite added in
 //! `query/planner/lpg/project.rs::try_heap_topk_rewrite`.
 //!
-//! These tests exercise end-to-end via `session.execute()`, asserting both
-//! result correctness and (via EXPLAIN/PROFILE) that the rewrite fired or
-//! fell through as expected.
+//! These tests exercise end-to-end via `session.execute()`, asserting result
+//! correctness on the cases the rewrite fires for and the cases that should
+//! fall through.
+//!
+//! Direct string-match verification that the heap rewrite fired isn't
+//! possible from outside the engine: EXPLAIN walks the logical tree (which
+//! the rewrite leaves unchanged — the fusion is physical-only, see the
+//! `try_topk_rewrite` doc), and PROFILE gates the rewrite off so its output
+//! never names TopK either. PROFILE is still useful for the *negative*
+//! direction (test 18 confirms the gate works by asserting Sort + Limit
+//! both run with timings); silent fall-through under non-PROFILE mode is
+//! the regression class caught by the §2.9 e2e benchmark in `benches/topk_e2e.rs`.
 
 #![cfg(feature = "lpg")]
 
