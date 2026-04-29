@@ -35,6 +35,11 @@ pub enum SectionType {
     RdfStore = 3,
     /// Columnar CompactStore: read-only base for layered storage.
     CompactStore = 4,
+    /// Layered overlay deletion log: ids of base entities the overlay
+    /// has deleted but not yet merged. Persists tombstones so that a
+    /// previously-deleted base node does not reappear after reload
+    /// when the next compact has not yet run.
+    OverlayDeletions = 5,
 
     /// Vector embeddings, HNSW topology, quantization data.
     VectorStore = 10,
@@ -116,6 +121,15 @@ impl SectionType {
             Self::CompactStore => SectionFlags {
                 required: true,
                 mmap_able: true,
+            },
+            Self::OverlayDeletions => SectionFlags {
+                // Marked non-required so older readers that don't know about
+                // it can skip rather than refuse to open. Functionally the
+                // section is authoritative for deletion durability, but a
+                // reader that ignores it fails open (deleted base nodes
+                // reappear) rather than failing closed (refuse to open).
+                required: false,
+                mmap_able: false,
             },
             Self::VectorStore | Self::TextIndex | Self::RdfRing | Self::PropertyIndex => {
                 SectionFlags {

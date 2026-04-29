@@ -55,6 +55,7 @@ fn section_type_to_str(section_type: SectionType) -> &'static str {
         SectionType::LpgStore => "LpgStore",
         SectionType::RdfStore => "RdfStore",
         SectionType::CompactStore => "CompactStore",
+        SectionType::OverlayDeletions => "OverlayDeletions",
         SectionType::VectorStore => "VectorStore",
         SectionType::TextIndex => "TextIndex",
         SectionType::RdfRing => "RdfRing",

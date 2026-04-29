@@ -388,6 +388,15 @@ impl GrafeoDB {
             Arc<grafeo_core::graph::compact::CompactStore>,
         > = None;
 
+        // Phase 5e: snapshot of the OverlayDeletions section (if present),
+        // applied after the LayeredStore is wired so that previously-deleted
+        // base nodes/edges remain deleted across reload.
+        #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+        let mut loaded_overlay_deletions: Option<(
+            Vec<grafeo_common::types::NodeId>,
+            Vec<grafeo_common::types::EdgeId>,
+        )> = None;
+
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
         let file_manager: Option<Arc<GrafeoFileManager>> = if is_read_only {
@@ -408,6 +417,7 @@ impl GrafeoDB {
                         #[cfg(feature = "compact-store")]
                         {
                             loaded_compact_base = Self::extract_compact_base(&fm)?;
+                            loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
                         }
                     } else {
                         // Fall back to v1 blob format
@@ -465,6 +475,7 @@ impl GrafeoDB {
                     #[cfg(feature = "compact-store")]
                     {
                         loaded_compact_base = Self::extract_compact_base(&fm)?;
+                        loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
                     }
                 } else {
                     let snapshot_data = fm.read_snapshot()?;
@@ -653,7 +664,7 @@ impl GrafeoDB {
         // through the layered store.
         #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
         if let Some(compact_base) = loaded_compact_base {
-            db.wire_layered_after_load(compact_base)?;
+            db.wire_layered_after_load(compact_base, loaded_overlay_deletions)?;
         }
 
         // Start periodic checkpoint timer if configured
@@ -1437,6 +1448,10 @@ impl GrafeoDB {
     fn wire_layered_after_load(
         &mut self,
         compact_base: Arc<grafeo_core::graph::compact::CompactStore>,
+        deletion_log: Option<(
+            Vec<grafeo_common::types::NodeId>,
+            Vec<grafeo_common::types::EdgeId>,
+        )>,
     ) -> Result<()> {
         use grafeo_core::graph::compact::layered::LayeredStore;
 
@@ -1451,6 +1466,13 @@ impl GrafeoDB {
             Arc::clone(&compact_base),
             Arc::clone(overlay_store),
         ));
+
+        // Restore base-entity tombstones from the persisted deletion log,
+        // if the file carried one. Without this, base nodes/edges deleted
+        // by the previous session silently reappear after reload.
+        if let Some((nodes, edges)) = deletion_log {
+            layered.seed_deleted_from_base(nodes, edges);
+        }
 
         // Sync overlay epoch with the transaction manager.
         let current_epoch = self.transaction_manager.current_epoch();
@@ -1500,6 +1522,34 @@ impl GrafeoDB {
         let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
         section.deserialize(&data)?;
         Ok(section.store())
+    }
+
+    /// Reads the persisted overlay deletion log from the container, if
+    /// the file carries one. Returns `(deleted_nodes, deleted_edges)` so
+    /// the caller can seed `LayeredStore::seed_deleted_from_base` after
+    /// the layered store is constructed. Returns `None` when no
+    /// deletions were recorded (the section is omitted in that case).
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn extract_overlay_deletions(
+        fm: &GrafeoFileManager,
+    ) -> Result<
+        Option<(
+            Vec<grafeo_common::types::NodeId>,
+            Vec<grafeo_common::types::EdgeId>,
+        )>,
+    > {
+        use grafeo_common::storage::{Section, SectionType};
+        let Some(dir) = fm.read_section_directory()? else {
+            return Ok(None);
+        };
+        let Some(entry) = dir.find(SectionType::OverlayDeletions) else {
+            return Ok(None);
+        };
+        let data = fm.read_section_data(entry)?;
+        let mut section =
+            grafeo_core::graph::compact::deletions_section::OverlayDeletionsSection::empty();
+        section.deserialize(&data)?;
+        Ok(Some(section.take()))
     }
 
     /// Loads from a section-based `.grafeo` file (v2 format).
@@ -2601,6 +2651,24 @@ impl GrafeoDB {
             let overlay = layered.overlay_store();
             let overlay_section = grafeo_core::graph::lpg::LpgStoreSection::new(overlay);
             sections.push(Box::new(overlay_section));
+
+            // Overlay deletion log: persists base-node/edge tombstones
+            // that have not yet been merged into the base. Without this,
+            // close+reopen silently un-deletes those entities. Only push
+            // when there is actually something to record so we don't
+            // emit an empty section on every checkpoint.
+            let deletions = grafeo_core::graph::compact::deletions_section::OverlayDeletionsSection::from_layered(
+                Arc::clone(layered),
+            );
+            if !deletions.is_empty() {
+                sections.push(Box::new(deletions));
+            } else {
+                // The set may have transitioned from non-empty to empty
+                // (e.g. a compact merged the deletes); make sure the
+                // dirty flag is cleared so subsequent checkpoints don't
+                // think they need to keep flushing.
+                layered.mark_deletions_clean();
+            }
 
             return sections;
         }

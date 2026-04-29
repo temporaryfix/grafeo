@@ -8,6 +8,7 @@
 //! Requires both `compact-store` and `lpg` features.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use arcstr::ArcStr;
@@ -55,6 +56,11 @@ pub struct LayeredStore {
     deleted_from_base_nodes: RwLock<FxHashSet<NodeId>>,
     /// Base edge IDs that have been deleted.
     deleted_from_base_edges: RwLock<FxHashSet<EdgeId>>,
+    /// Tracks whether `deleted_from_base_*` has changed since the last
+    /// flush. The `OverlayDeletionsSection` checks this on each
+    /// `is_dirty()` call so periodic checkpoints skip the write when no
+    /// new deletions have accumulated.
+    deletions_dirty: AtomicBool,
     /// Merge serialization guard (Phase 5d).
     ///
     /// Mutations acquire `read()` for the duration of a single
@@ -121,10 +127,12 @@ impl LayeredStore {
     /// `deleted_from_base_edges` are NOT reconstructable from the
     /// in-memory state alone — a base node that was deleted simply has
     /// no overlay entry, so the scan can't tell it apart from a base
-    /// node that was never touched. Persisting the deletion log is
-    /// tracked separately; callers that depend on durable deletes
-    /// across reload must call `compact()` before close so the merged
-    /// base reflects the deletes.
+    /// node that was never touched. The deletion log is persisted in
+    /// the [`OverlayDeletions`](grafeo_common::storage::section::SectionType::OverlayDeletions)
+    /// section; callers should follow `with_overlay` with a call to
+    /// [`seed_deleted_from_base`](Self::seed_deleted_from_base) carrying
+    /// the snapshot read from that section, when one is present in the
+    /// container directory.
     ///
     /// The overlay's id allocator state is preserved as-is; callers
     /// should ensure it has been seeded correctly during deserialization.
@@ -149,6 +157,7 @@ impl LayeredStore {
             dirty_edge_ids: RwLock::new(dirty_edges),
             deleted_from_base_nodes: RwLock::new(FxHashSet::default()),
             deleted_from_base_edges: RwLock::new(FxHashSet::default()),
+            deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
         }
     }
@@ -161,6 +170,7 @@ impl LayeredStore {
             dirty_edge_ids: RwLock::new(FxHashSet::default()),
             deleted_from_base_nodes: RwLock::new(FxHashSet::default()),
             deleted_from_base_edges: RwLock::new(FxHashSet::default()),
+            deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
         }
     }
@@ -258,6 +268,68 @@ impl LayeredStore {
         self.dirty_edge_ids.write().clear();
         self.deleted_from_base_nodes.write().clear();
         self.deleted_from_base_edges.write().clear();
+        self.deletions_dirty.store(false, Ordering::Release);
+    }
+
+    /// Returns a snapshot of the base node ids the overlay has marked as
+    /// deleted but not yet merged. Used by the persistence layer to write
+    /// the [`OverlayDeletions`](grafeo_common::storage::section::SectionType::OverlayDeletions)
+    /// section so the deletions survive close/reopen cycles.
+    #[must_use]
+    pub fn snapshot_deleted_node_ids(&self) -> Vec<NodeId> {
+        self.deleted_from_base_nodes
+            .read()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Snapshot of base edge ids deleted-but-not-merged. See
+    /// [`Self::snapshot_deleted_node_ids`].
+    #[must_use]
+    pub fn snapshot_deleted_edge_ids(&self) -> Vec<EdgeId> {
+        self.deleted_from_base_edges
+            .read()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Seeds the deleted-from-base sets from a previously-persisted
+    /// snapshot (typically the `OverlayDeletions` section). The current
+    /// sets are replaced atomically; any in-memory deletions accumulated
+    /// before the seed are dropped (callers should only seed during
+    /// open, before any new mutations are accepted).
+    ///
+    /// Clears the deletions-dirty flag so the next checkpoint does not
+    /// re-write the section just because the seed populated it.
+    pub fn seed_deleted_from_base(
+        &self,
+        nodes: impl IntoIterator<Item = NodeId>,
+        edges: impl IntoIterator<Item = EdgeId>,
+    ) {
+        let mut node_set = self.deleted_from_base_nodes.write();
+        node_set.clear();
+        node_set.extend(nodes);
+        let mut edge_set = self.deleted_from_base_edges.write();
+        edge_set.clear();
+        edge_set.extend(edges);
+        self.deletions_dirty.store(false, Ordering::Release);
+    }
+
+    /// Whether the deletion log has changed since the last
+    /// [`mark_deletions_clean`](Self::mark_deletions_clean) call. Used by
+    /// the `OverlayDeletionsSection` to decide whether a periodic
+    /// checkpoint should re-emit the section.
+    #[must_use]
+    pub fn deletions_dirty(&self) -> bool {
+        self.deletions_dirty.load(Ordering::Acquire)
+    }
+
+    /// Marks the deletion log as clean. Called by the flush path after a
+    /// successful write of the `OverlayDeletions` section.
+    pub fn mark_deletions_clean(&self) {
+        self.deletions_dirty.store(false, Ordering::Release);
     }
 
     /// Merges the overlay into a fresh `CompactStore`, swaps it in as
@@ -1122,7 +1194,9 @@ impl GraphStoreMut for LayeredStore {
             return self.overlay.load().delete_node(id);
         }
         if self.base.load().get_node(id).is_some() {
-            self.deleted_from_base_nodes.write().insert(id);
+            if self.deleted_from_base_nodes.write().insert(id) {
+                self.deletions_dirty.store(true, Ordering::Release);
+            }
             return true;
         }
         false
@@ -1142,7 +1216,9 @@ impl GraphStoreMut for LayeredStore {
                 .delete_node_versioned(id, epoch, transaction_id);
         }
         if self.base.load().get_node(id).is_some() {
-            self.deleted_from_base_nodes.write().insert(id);
+            if self.deleted_from_base_nodes.write().insert(id) {
+                self.deletions_dirty.store(true, Ordering::Release);
+            }
             return true;
         }
         false
@@ -1155,8 +1231,16 @@ impl GraphStoreMut for LayeredStore {
             self.overlay.load().delete_node_edges(node_id);
         }
         // Mark base edges as deleted.
+        let mut deleted_any = false;
+        let mut edges = self.deleted_from_base_edges.write();
         for (_, eid) in self.base.load().edges_from(node_id, Direction::Both) {
-            self.deleted_from_base_edges.write().insert(eid);
+            if edges.insert(eid) {
+                deleted_any = true;
+            }
+        }
+        drop(edges);
+        if deleted_any {
+            self.deletions_dirty.store(true, Ordering::Release);
         }
     }
 
@@ -1166,7 +1250,9 @@ impl GraphStoreMut for LayeredStore {
             return self.overlay.load().delete_edge(id);
         }
         if self.base.load().get_edge(id).is_some() {
-            self.deleted_from_base_edges.write().insert(id);
+            if self.deleted_from_base_edges.write().insert(id) {
+                self.deletions_dirty.store(true, Ordering::Release);
+            }
             return true;
         }
         false
@@ -1186,7 +1272,9 @@ impl GraphStoreMut for LayeredStore {
                 .delete_edge_versioned(id, epoch, transaction_id);
         }
         if self.base.load().get_edge(id).is_some() {
-            self.deleted_from_base_edges.write().insert(id);
+            if self.deleted_from_base_edges.write().insert(id) {
+                self.deletions_dirty.store(true, Ordering::Release);
+            }
             return true;
         }
         false

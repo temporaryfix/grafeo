@@ -11,6 +11,9 @@ pub mod builder;
 pub mod column;
 /// Compressed Sparse Row (CSR) adjacency representation.
 pub mod csr;
+/// Container section serialization for the layered overlay deletion log.
+#[cfg(feature = "lpg")]
+pub mod deletions_section;
 mod graph_store_impl;
 /// Node/edge ID encoding and decoding helpers.
 pub mod id;
