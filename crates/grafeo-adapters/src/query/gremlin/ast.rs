@@ -209,6 +209,8 @@ pub enum Predicate {
     EndingWith(String),
     /// P.regex(pattern)
     Regex(String),
+    /// P.notRegex(pattern)
+    NotRegex(String),
     /// P.and(predicates...)
     And(Vec<Predicate>),
     /// P.or(predicates...)

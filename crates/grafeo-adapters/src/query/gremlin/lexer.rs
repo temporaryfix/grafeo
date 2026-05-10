@@ -205,6 +205,8 @@ pub enum TokenKind {
     EndingWith,
     /// The `regex()` regular-expression predicate.
     Regex,
+    /// The `notRegex()` negated regular-expression predicate.
+    NotRegex,
 
     // Tokens (T.*)
     /// The `T` token namespace (e.g., `T.id`, `T.label`).
@@ -541,6 +543,7 @@ impl<'a> Lexer<'a> {
             "startingWith" => TokenKind::StartingWith,
             "endingWith" => TokenKind::EndingWith,
             "regex" => TokenKind::Regex,
+            "notRegex" => TokenKind::NotRegex,
             "T" => TokenKind::T,
             "asc" => TokenKind::Asc,
             "desc" => TokenKind::Desc,
