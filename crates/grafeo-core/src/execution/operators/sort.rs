@@ -170,7 +170,6 @@ impl SortOperator {
     }
 }
 
-
 impl Operator for SortOperator {
     fn next(&mut self) -> OperatorResult {
         if !self.sort_complete {

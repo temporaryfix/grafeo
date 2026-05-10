@@ -732,14 +732,10 @@ impl GraphStore for LayeredStore {
     }
 
     fn has_property_index(&self, property: &str) -> bool {
-        // Property indexes only live on the overlay LpgStore — the columnar
-        // base has no equivalent — so delegating to the overlay is correct.
-        // Without this override the trait default returns false, and the
-        // planner's property-index fast path silently disables itself in
-        // any database that has been compacted (which includes every
-        // snapshot-loaded production database). The fast path falls back
-        // to a label-first scan, so queries still return the right rows
-        // — just much slower than they should.
+        // Property indexes only live on the overlay LpgStore (the columnar
+        // base has no index store). Without this delegate the trait default
+        // returns false, and the planner's property-index fast path silently
+        // disables itself after `compact()`.
         self.overlay.load().has_property_index(property)
     }
 
@@ -3797,7 +3793,7 @@ mod tests {
     fn test_has_property_index_true_when_overlay_has_index() {
         // Regression test: LayeredStore::has_property_index must call
         // self.overlay.load().has_property_index(), not
-        // self.overlay.has_property_index() — ArcSwap does not impl GraphStore.
+        // self.overlay.has_property_index() (ArcSwap does not impl GraphStore).
         let layered = build_test_layered();
         layered.overlay_store().create_property_index("name");
         assert!(layered.has_property_index("name"));

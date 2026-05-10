@@ -2,14 +2,15 @@
 //!
 //! Confirms the spec claim that TopK is strictly faster than the unfused
 //! composition at every N tested. The asserted O(k) memory bound lives in
-//! the unit test (`top_k_skips_materialization_for_losers`) — `#[cfg(test)]`-
+//! the unit test (`top_k_skips_materialization_for_losers`); `#[cfg(test)]`
 //! gated counters aren't visible from criterion bench files (the dep crate
 //! is built without `cfg(test)`).
 //!
 //! Uses `codspeed-criterion-compat` so the same file runs under
 //! plain `cargo bench` and under `cargo codspeed`.
 #![allow(missing_docs)]
-#![allow(clippy::cast_possible_truncation)]
+// reason: bench file converts indices into Int64 sort keys; values stay below i64::MAX.
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
 use std::hint::black_box;
 
@@ -66,7 +67,9 @@ impl Operator for VecSource {
 }
 
 fn pseudo_random_values(n: usize) -> Vec<i64> {
-    (0..n).map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 1_000_000_007) as i64).collect()
+    (0..n)
+        .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 1_000_000_007) as i64)
+        .collect()
 }
 
 fn drain<O: Operator + ?Sized>(op: &mut O) -> usize {

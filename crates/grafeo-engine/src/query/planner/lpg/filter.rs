@@ -23,6 +23,8 @@
 //!
 //! [pf]: super::Planner::plan_filter
 
+use grafeo_common::collections::GrafeoSet;
+
 use super::{
     ApplyOperator, Arc, BinaryOp, DistinctOperator, EmptyOperator, ExpressionPredicate,
     FilterExpression, FilterOp, FilterOperator, GraphStoreSearch, HashAggregateOperator,
@@ -951,11 +953,8 @@ impl super::Planner {
         let columns = vec![scan_variable.clone()];
         let node_list_op: Box<dyn Operator> = Box::new(NodeListOperator::new(matching_nodes, 2048));
 
-        // Index optimization absorbs the child NodeScan — emit a
-        // synthetic profile entry so build_profile_tree's strict
-        // logical-op:entry 1:1 mapping holds. See
-        // `record_absorbed_scan_entry` for full reasoning.
-        self.record_absorbed_scan_entry(&filter.input);
+        // Absorbed-scan PROFILE entry: see `record_absorbed_scan_entry`.
+        self.record_absorbed_scan_entry("NodeScan", &filter.input);
 
         // Check for remaining predicate parts that weren't pushed down
         // (e.g., range conditions in a compound predicate like `n.name = 'Alix' AND n.age > 30`)
@@ -984,13 +983,12 @@ impl super::Planner {
 
     /// Tries to optimize a filter shaped as `var.prop IN [literals]` using
     /// the property index. For each literal, calls `find_nodes_by_property`
-    /// and unions the results. Returns `Ok(None)` when not applicable —
-    /// e.g. the input isn't a simple NodeScan, the right side isn't a list
-    /// of literals, the property is unindexed, or the predicate is part of
-    /// a more complex expression we don't yet decompose.
+    /// and unions the results. Returns `Ok(None)` when not applicable: the
+    /// input isn't a simple `NodeScan`, the right side isn't a list of
+    /// literals, the property is unindexed, or the predicate is compound
+    /// (e.g. `prop IN [...] AND label-or-other`).
     ///
-    /// Compound `prop IN [...] AND label-or-other` is currently left to
-    /// the slow path. Pure `IN` is the common shape (`WHERE r.id IN $ids`).
+    /// Pure `IN` is the common shape (`WHERE r.id IN $ids`).
     pub(super) fn try_plan_filter_with_in_list_index(
         &self,
         filter: &FilterOp,
@@ -1030,23 +1028,21 @@ impl super::Planner {
                     match item {
                         LogicalExpression::Literal(v) if !v.is_null() => out.push(v.clone()),
                         // A non-literal element (parameter, expression) means
-                        // we can't enumerate at plan time — bail to slow path.
+                        // we can't enumerate at plan time. Bail to slow path.
                         _ => return Ok(None),
                     }
                 }
                 out
             }
-            LogicalExpression::Literal(Value::List(items)) => items
-                .iter()
-                .filter(|v| !v.is_null())
-                .cloned()
-                .collect(),
+            LogicalExpression::Literal(Value::List(items)) => {
+                items.iter().filter(|v| !v.is_null()).cloned().collect()
+            }
             _ => return Ok(None),
         };
         if values.is_empty() {
-            // `prop IN []` is always false — return an empty result without
+            // `prop IN []` is always false: return an empty result without
             // touching the store.
-            self.record_absorbed_scan_entry(&filter.input);
+            self.record_absorbed_scan_entry("NodeScan", &filter.input);
             let columns = vec![scan_variable];
             let empty = Box::new(NodeListOperator::new(Vec::new(), 2048));
             return Ok(Some((empty, columns)));
@@ -1054,7 +1050,7 @@ impl super::Planner {
 
         // Per-value index lookup, deduplicate (the same node could match
         // duplicate values, and we don't want to emit it twice).
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: GrafeoSet<_> = GrafeoSet::default();
         let mut matching_nodes = Vec::new();
         for value in &values {
             for node_id in self.store.find_nodes_by_property(property, value) {
@@ -1066,8 +1062,7 @@ impl super::Planner {
 
         // Intersect with the label constraint, if any.
         if let Some(label) = &scan_label {
-            let label_nodes: std::collections::HashSet<_> =
-                self.store.nodes_by_label(label).into_iter().collect();
+            let label_nodes: GrafeoSet<_> = self.store.nodes_by_label(label).into_iter().collect();
             matching_nodes.retain(|n| label_nodes.contains(n));
         }
 
@@ -1080,10 +1075,8 @@ impl super::Planner {
             matching_nodes.retain(|id| self.store.get_node_at_epoch(*id, epoch).is_some());
         }
 
-        // Index optimization absorbs the child NodeScan — emit a synthetic
-        // profile entry so build_profile_tree's strict logical-op:entry 1:1
-        // mapping holds. See `record_absorbed_scan_entry` for full reasoning.
-        self.record_absorbed_scan_entry(&filter.input);
+        // Absorbed-scan PROFILE entry: see `record_absorbed_scan_entry`.
+        self.record_absorbed_scan_entry("NodeScan", &filter.input);
 
         let columns = vec![scan_variable];
         let node_list_op: Box<dyn Operator> = Box::new(NodeListOperator::new(matching_nodes, 2048));
@@ -1215,44 +1208,38 @@ impl super::Planner {
         }
     }
 
-    /// Tries to optimize a filter using range queries on properties.
+    /// Pushes a synthetic profile entry for a scan absorbed into a fast-path
+    /// physical operator (e.g. `NodeListOperator`).
     ///
-    /// This optimization is applied when:
-    /// - The input is a simple NodeScan (no nested operations)
-    /// - The predicate contains range comparisons (>, <, >=, <=)
-    /// - The same variable and property are being filtered
+    /// `build_profile_tree` walks the logical tree in post-order and panics
+    /// if it runs out of entries. When a fast path collapses a `Filter` over
+    /// a `NodeScan` into one physical op, the scan's entry is missing
+    /// without this call. Stats stay empty: the work is attributed to the
+    /// wrapping operator's entry, leaving a cosmetic 0-row/0-ns line for
+    /// the absorbed scan in PROFILE output.
     ///
-    /// Handles both simple range predicates (`n.age > 30`) and BETWEEN patterns
-    /// (`n.age >= 30 AND n.age <= 50`).
-    ///
-    /// Returns `Ok(Some((operator, columns)))` if optimization was applied,
-    /// `Ok(None)` if not applicable, or `Err` on error.
-    /// When a `Filter` plan_* fast path absorbs its child NodeScan into
-    /// a single physical operator (NodeListOperator), the NodeScan
-    /// logical operator never gets planned via `plan_operator` — so no
-    /// `ProfileEntry` is recorded for it. `build_profile_tree` then
-    /// panics with "profile entry count must match logical operator
-    /// count" because it walks the logical plan in post-order and
-    /// expects 1 entry per logical operator. This helper pushes a
-    /// synthetic entry for the absorbed scan so the mapping holds.
-    ///
-    /// Stats stay empty — the actual scan-and-filter work is
-    /// attributed to the wrapping operator's entry, recorded by the
-    /// outer `maybe_profile` once the Filter logical op finishes
-    /// planning. Slight cosmetic quirk in PROFILE output (NodeScan
-    /// shows 0 rows / 0 ns) but no panic and no perf impact.
-    pub(super) fn record_absorbed_scan_entry(&self, absorbed: &LogicalOperator) {
+    /// Pass the source operator's `name()` (e.g. `"NodeScan"`, `"EdgeScan"`)
+    /// so future absorbers don't get mislabeled.
+    pub(super) fn record_absorbed_scan_entry(&self, op_name: &str, absorbed: &LogicalOperator) {
         if !self.profiling.get() {
             return;
         }
-        let label = match absorbed {
-            LogicalOperator::NodeScan(_) => absorbed.display_label(),
-            _ => String::from("NodeScan(absorbed)"),
-        };
-        let (entry, _stats) = crate::query::profile::ProfileEntry::new("NodeScan", label);
+        let label = absorbed.display_label();
+        let (entry, _stats) = crate::query::profile::ProfileEntry::new(op_name, label);
         self.profile_entries.borrow_mut().push(entry);
     }
 
+    /// Tries to optimize a filter using range queries on properties.
+    ///
+    /// Applies when:
+    /// - The input is a simple `NodeScan` (no nested operations).
+    /// - The predicate contains range comparisons (`>`, `<`, `>=`, `<=`).
+    /// - The same variable and property are being filtered.
+    ///
+    /// Handles both simple range predicates (`n.age > 30`) and `BETWEEN`
+    /// patterns (`n.age >= 30 AND n.age <= 50`). Returns
+    /// `Ok(Some((operator, columns)))` when applied, `Ok(None)` when not
+    /// applicable, or `Err` on error.
     pub(super) fn try_plan_filter_with_range_index(
         &self,
         filter: &FilterOp,
@@ -1270,7 +1257,7 @@ impl super::Planner {
             self.extract_between_predicate(&filter.predicate)
             && variable == scan_variable
         {
-            self.record_absorbed_scan_entry(&filter.input);
+            self.record_absorbed_scan_entry("NodeScan", &filter.input);
             return self.plan_range_filter(
                 &scan_variable,
                 &scan_label,
@@ -1296,7 +1283,7 @@ impl super::Planner {
                 BinaryOp::Ge => (Some(value), None, true, false),
                 _ => return Ok(None),
             };
-            self.record_absorbed_scan_entry(&filter.input);
+            self.record_absorbed_scan_entry("NodeScan", &filter.input);
             return self.plan_range_filter(
                 &scan_variable,
                 &scan_label,

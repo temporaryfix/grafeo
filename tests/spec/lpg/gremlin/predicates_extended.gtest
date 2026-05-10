@@ -144,6 +144,30 @@ tests:
         - [2]
 
   # ---------------------------------------------------------------------------
+  # notRegex() predicate
+  # ---------------------------------------------------------------------------
+
+  - name: not_regex_prefix
+    query: "g.V().hasLabel('Person').has('name', notRegex('A.*')).values('name')"
+    expect:
+      rows:
+        - [Gus]
+        - [Vincent]
+
+  - name: not_regex_suffix
+    query: "g.V().hasLabel('Person').has('city', notRegex('.*in$')).values('name')"
+    expect:
+      rows:
+        - [Alix]
+        - [Vincent]
+
+  - name: not_regex_substring
+    query: "g.V().hasLabel('Person').has('city', notRegex('.*er.*')).count()"
+    expect:
+      rows:
+        - [1]
+
+  # ---------------------------------------------------------------------------
   # Compound predicates P.and(), P.or(), P.not()
   # ---------------------------------------------------------------------------
 
