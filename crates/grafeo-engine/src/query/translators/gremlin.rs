@@ -2111,6 +2111,16 @@ impl GremlinTranslator {
                     pattern.clone().into(),
                 ))),
             }),
+            ast::Predicate::NotRegex(pattern) => Ok(LogicalExpression::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(LogicalExpression::Binary {
+                    left: Box::new(expr),
+                    op: BinaryOp::Regex,
+                    right: Box::new(LogicalExpression::Literal(Value::String(
+                        pattern.clone().into(),
+                    ))),
+                }),
+            }),
         }
     }
 

@@ -1432,6 +1432,45 @@ fn test_has_property_regex_substring_match() {
 }
 
 // ============================================================================
+// Text Predicates: notRegex()
+// ============================================================================
+
+#[test]
+fn test_has_property_not_regex_prefix_match() {
+    let db = create_social_network();
+    let result = db
+        .execute_gremlin("g.V().hasLabel('Person').has('name', notRegex('A.*'))")
+        .unwrap();
+    assert_eq!(result.row_count(), 2, "Gus and Vincent do not match 'A.*'");
+}
+
+#[test]
+fn test_has_property_not_regex_suffix_match() {
+    let db = create_social_network();
+    let result = db
+        .execute_gremlin("g.V().hasLabel('Person').has('city', notRegex('.*in$'))")
+        .unwrap();
+    assert_eq!(
+        result.row_count(),
+        2,
+        "Amsterdam and Paris do not match '.*in$'"
+    );
+}
+
+#[test]
+fn test_has_property_not_regex_substring_match() {
+    let db = create_social_network();
+    let result = db
+        .execute_gremlin("g.V().hasLabel('Person').has('city', notRegex('.*er.*'))")
+        .unwrap();
+    assert_eq!(
+        result.row_count(),
+        1,
+        "Only Paris does not match regex '.*er.*'"
+    );
+}
+
+// ============================================================================
 // Dedup with Keys
 // ============================================================================
 
