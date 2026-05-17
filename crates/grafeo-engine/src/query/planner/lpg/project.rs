@@ -6,7 +6,7 @@ use super::{
     Arc, Error, FilterExpression, GraphStoreSearch, HashMap, LimitOp, LogicalExpression,
     LogicalOperator, LogicalType, NullOrder, Operator, PhysicalSortKey, ProjectExpr,
     ProjectOperator, Result, ReturnOp, SkipOp, SortDirection, SortOp, SortOperator, SortOrder,
-    common, expression_to_string, value_to_logical_type,
+    common, expression_to_string, output_column_name, resolved_column_name, value_to_logical_type,
 };
 
 impl super::Planner {
@@ -80,12 +80,7 @@ impl super::Planner {
         // Extract column names from return items
         let columns: Vec<String> = items
             .iter()
-            .map(|item| {
-                item.alias.clone().unwrap_or_else(|| {
-                    // Generate a default name from the expression
-                    expression_to_string(&item.expression)
-                })
-            })
+            .map(|item| output_column_name(item.alias.as_deref(), &item.expression))
             .collect();
 
         // Check if we need a project operator (for property access or expression evaluation)
@@ -419,11 +414,7 @@ impl super::Planner {
         }
 
         for projection in &project.projections {
-            // Determine the output column name (alias or expression string)
-            let col_name = projection
-                .alias
-                .clone()
-                .unwrap_or_else(|| expression_to_string(&projection.expression));
+            let col_name = output_column_name(projection.alias.as_deref(), &projection.expression);
 
             match &projection.expression {
                 LogicalExpression::Variable(name) => {
@@ -659,7 +650,7 @@ impl super::Planner {
                         if already_in_return {
                             continue;
                         }
-                        let col_name = format!("{}_{}", variable, property);
+                        let col_name = resolved_column_name(&key.expression);
                         if seen.insert(col_name.clone()) {
                             augmented_items.push(crate::query::plan::ReturnItem {
                                 expression: key.expression.clone(),
@@ -669,7 +660,7 @@ impl super::Planner {
                         }
                     }
                     expr => {
-                        let col_name = format!("__expr_{expr:?}");
+                        let col_name = resolved_column_name(expr);
                         if seen.insert(col_name.clone()) {
                             augmented_items.push(crate::query::plan::ReturnItem {
                                 expression: expr.clone(),
@@ -719,13 +710,11 @@ impl super::Planner {
         // on a non-entity column.
         if let LogicalOperator::Return(ret) = sort.input.as_ref() {
             for item in &ret.items {
-                if let LogicalExpression::Property { variable, property } = &item.expression {
-                    let sort_col_name = format!("{variable}_{property}");
+                if matches!(&item.expression, LogicalExpression::Property { .. }) {
+                    let sort_col_name = resolved_column_name(&item.expression);
                     if !variable_columns.contains_key(&sort_col_name) {
-                        let output_name = item
-                            .alias
-                            .clone()
-                            .unwrap_or_else(|| expression_to_string(&item.expression));
+                        let output_name =
+                            output_column_name(item.alias.as_deref(), &item.expression);
                         if let Some(&col_idx) = variable_columns.get(&output_name) {
                             variable_columns.insert(sort_col_name, col_idx);
                         }
@@ -754,7 +743,7 @@ impl super::Planner {
         for key in &sort.keys {
             match &key.expression {
                 LogicalExpression::Property { variable, property } => {
-                    let col_name = format!("{}_{}", variable, property);
+                    let col_name = resolved_column_name(&key.expression);
                     if !variable_columns.contains_key(&col_name) {
                         extra_projections.push(SortExtraProjection::Property {
                             variable: variable.clone(),
@@ -773,27 +762,24 @@ impl super::Planner {
                     // If this is a vector/text score function and the scan already projected
                     // a score column, register a direct alias so resolve_sort_expression
                     // picks it up without injecting a new projection.
+                    let col_name = resolved_column_name(&key.expression);
                     if let Some(score_col) =
                         self.find_projected_score(&key.expression, &input_columns)
                     {
-                        let col_name = format!("__expr_{:?}", key.expression);
                         if !variable_columns.contains_key(&col_name)
                             && let Some(&existing_idx) = variable_columns.get(&score_col)
                         {
                             variable_columns.insert(col_name, existing_idx);
                         }
-                    } else {
-                        let col_name = format!("__expr_{:?}", key.expression);
-                        if !variable_columns.contains_key(&col_name) {
-                            let filter_expr = self.convert_expression(&key.expression)?;
-                            extra_projections.push(SortExtraProjection::Expression {
-                                filter_expr,
-                                col_name: col_name.clone(),
-                            });
-                            variable_columns.insert(col_name, next_col_idx);
-                            next_col_idx += 1;
-                            expr_extra_count += 1;
-                        }
+                    } else if !variable_columns.contains_key(&col_name) {
+                        let filter_expr = self.convert_expression(&key.expression)?;
+                        extra_projections.push(SortExtraProjection::Expression {
+                            filter_expr,
+                            col_name: col_name.clone(),
+                        });
+                        variable_columns.insert(col_name, next_col_idx);
+                        next_col_idx += 1;
+                        expr_extra_count += 1;
                     }
                 }
             }
