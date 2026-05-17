@@ -701,27 +701,7 @@ impl super::Planner {
             .map(|(i, name)| (name.clone(), i))
             .collect();
 
-        // When the sort input is a Return, some sort key expressions may
-        // already be computed by the Return under an alias. For example,
-        // RETURN caller.name AS caller ORDER BY caller.name: the property
-        // access is already materialized in column "caller". Register the
-        // sort-style name ("caller_name") so the loop below resolves to the
-        // existing column instead of adding a broken extra PropertyAccess
-        // on a non-entity column.
-        if let LogicalOperator::Return(ret) = sort.input.as_ref() {
-            for item in &ret.items {
-                if matches!(&item.expression, LogicalExpression::Property { .. }) {
-                    let sort_col_name = resolved_column_name(&item.expression);
-                    if !variable_columns.contains_key(&sort_col_name) {
-                        let output_name =
-                            output_column_name(item.alias.as_deref(), &item.expression);
-                        if let Some(&col_idx) = variable_columns.get(&output_name) {
-                            variable_columns.insert(sort_col_name, col_idx);
-                        }
-                    }
-                }
-            }
-        }
+        register_return_property_sort_aliases(sort.input.as_ref(), &mut variable_columns);
 
         // Collect extra projections in a single ordered list so that column
         // index assignment matches the order they are added to the ProjectOperator.
@@ -1286,11 +1266,23 @@ impl super::Planner {
             return Ok(None);
         };
 
+        // Build the same variable-column lookup `plan_sort` builds, including
+        // the property-alias entries (so `ORDER BY v.p` resolves to a Return
+        // item that materialises `v.p` under its human-readable column name).
+        // Without this, `RETURN n.title ORDER BY n.title LIMIT k` would skip
+        // the rewrite even though the unfused path handles it fine.
+        let mut variable_columns: HashMap<String, usize> = predicted_columns
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        register_return_property_sort_aliases(sort.input.as_ref(), &mut variable_columns);
+
         // Resolve sort keys against the prediction. If any key fails to
         // resolve, fall through with NO planner state mutated. Holding the
         // result lets us skip a second resolve after planning — the
         // `debug_assert_eq!` below proves the column indices are valid.
-        let Ok(physical_keys) = resolve_logical_to_physical_keys(&sort.keys, &predicted_columns)
+        let Ok(physical_keys) = resolve_logical_to_physical_keys(&sort.keys, &variable_columns)
         else {
             return Ok(None);
         };
@@ -1343,6 +1335,39 @@ fn predict_subtree_columns(op: &LogicalOperator) -> Option<Vec<String>> {
     }
 }
 
+/// When `sort_input` is a `Return` materializing property accesses, the Return's
+/// output column for `v.p` is named `"v.p"` (via `output_column_name`'s
+/// fallback to `expression_to_string`), but the ORDER BY resolver looks for
+/// `"v_p"` (via `resolved_column_name`). Register an alias so the resolver
+/// finds the existing column instead of treating the key as missing.
+///
+/// Without this, `RETURN v.p ORDER BY v.p [LIMIT k]` would either fall
+/// through to an unfused path (TopK rewrite skipped) or attempt to inject a
+/// `PropertyAccess` against a non-entity column. Both `plan_sort` (which
+/// builds a real `variable_columns` from planned output) and
+/// `try_heap_topk_rewrite` (which builds one from predicted output) invoke
+/// this before sort-key resolution so the two paths agree.
+fn register_return_property_sort_aliases(
+    sort_input: &LogicalOperator,
+    variable_columns: &mut HashMap<String, usize>,
+) {
+    let LogicalOperator::Return(ret) = sort_input else {
+        return;
+    };
+    for item in &ret.items {
+        if matches!(&item.expression, LogicalExpression::Property { .. }) {
+            let sort_col_name = resolved_column_name(&item.expression);
+            if variable_columns.contains_key(&sort_col_name) {
+                continue;
+            }
+            let output_name = output_column_name(item.alias.as_deref(), &item.expression);
+            if let Some(&col_idx) = variable_columns.get(&output_name) {
+                variable_columns.insert(sort_col_name, col_idx);
+            }
+        }
+    }
+}
+
 /// Resolves logical sort keys to physical sort keys for `TopKOperator`.
 ///
 /// For each logical key:
@@ -1351,27 +1376,20 @@ fn predict_subtree_columns(op: &LogicalOperator) -> Option<Vec<String>> {
 ///   - Maps `Option<NullsOrdering>` → physical `NullOrder` (default `NullsLast`,
 ///     matching `SortKey::ascending`'s default).
 ///
-/// Returns `Err` if any key references a column not present in `columns`.
+/// Returns `Err` if any key fails to resolve in `variable_columns`.
 /// Callers translate that to `Ok(None)` to fall through to the unfused path.
 fn resolve_logical_to_physical_keys(
     keys: &[crate::query::plan::SortKey],
-    columns: &[String],
+    variable_columns: &HashMap<String, usize>,
 ) -> Result<Vec<grafeo_core::execution::operators::SortKey>> {
     use crate::query::plan::{NullsOrdering, SortOrder};
     use grafeo_core::execution::operators::{NullOrder, SortDirection, SortKey as PhysSortKey};
-    use std::collections::HashMap;
-
-    let variable_columns: HashMap<String, usize> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.clone(), i))
-        .collect();
 
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         let col = crate::query::planner::common::resolve_expression_to_column(
             &key.expression,
-            &variable_columns,
+            variable_columns,
             " for ORDER BY",
         )?;
 
