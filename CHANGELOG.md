@@ -17,6 +17,11 @@ Gremlin `notRegex()` predicate plus a planner fix for `ORDER BY` + `LIMIT` over 
 ---
 
 Thanks to [@jakeboone02](https://github.com/jakeboone02) for the `notRegex()` predicate, and to [@temporaryfix](https://github.com/temporaryfix) for the precise root-cause analysis on [#335](https://github.com/GrafeoDB/grafeo/issues/335) — the side-effect interaction between `try_heap_topk_rewrite`'s probe and `plan_return_projection` was subtle, and the write-up made the follow-up extension to `collect_vars` straightforward.
+## [Unreleased]
+
+### Changed
+
+- **Auto-generated column names for unaliased complex expressions are now informative.** `expression_to_string` previously collapsed `Binary`/`Unary`/`Case`/`Labels`/`Type`/`Id`/`Slice`/`List`/`Map`/subquery shapes to the literal string `"expr"`, so two un-aliased items in one `RETURN` clause silently produced columns sharing a name (and Python/MCP dict-style result accessors would shadow). Each `LogicalExpression` variant now produces a distinct Cypher-style rendering: `n.a + n.b` → `"(n.a + n.b)"`, `id(a)` → `"id(a)"`, `count(*)` → `"count(*)"`, `labels(n)` → `"labels(n)"`, etc. Heavy expressions (`Case`, subqueries, comprehensions, `reduce`) collapse to short generic labels (`"case"`, `"exists"`, `"count"`, `"subquery"`, `"reduce"`, `"list_comprehension"`, `"pattern_comprehension"`); two unaliased instances of the same kind still collide and should be aliased explicitly. **This is a user-visible change**: callers matching column names by literal string against the old `"expr"`/`"name(...)"` outputs need to either update those checks or alias the expressions in the query.
 
 ## [0.5.42] - 2026-05-04
 
