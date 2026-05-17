@@ -1221,10 +1221,10 @@ impl super::Planner {
     /// Attempts to rewrite `Limit` over `Sort` into a single [`TopKOperator`].
     ///
     /// Phase 1: heap-based, O(k) memory, accepts any input shape but bails
-    /// on the augmenting-projection case (see
-    /// [`sort_needs_augmenting_projection`]). Called from
-    /// [`Self::plan_limit`] when the input is a `Sort`, after the more
-    /// specific vector/text rewrite ([`Self::try_topk_rewrite`]).
+    /// when the sort keys cannot be resolved against the columns the input
+    /// subtree will produce. Called from [`Self::plan_limit`] when the input
+    /// is a `Sort`, after the more specific vector/text rewrite
+    /// ([`Self::try_topk_rewrite`]).
     ///
     /// PROFILE-mode plans skip this rewrite via the gate in `plan_limit`:
     /// `build_profile_tree` walks the logical tree expecting one entry per
@@ -1236,13 +1236,36 @@ impl super::Planner {
     ///
     /// 1. `count` is not a literal (parameter `LIMIT $k` falls through).
     /// 2. `count` is zero (no rewrite needed).
-    /// 3. Sort needs an augmenting projection (`plan_sort` handles it).
-    /// 4. Any sort key fails to resolve against the planned input columns.
+    /// 3. The input subtree's output columns can't be predicted (current scope:
+    ///    only Return is supported; anything else falls through).
+    /// 4. Any sort key fails to resolve against the predicted columns.
     ///
-    /// Otherwise plans the inner subtree as-is (reusing filter pushdown,
-    /// expand-chain fusion, NodeList absorption) and wraps it in a
-    /// `TopKOperator`. `derive_schema_from_columns` is the same helper
-    /// `plan_limit`'s unfused path uses.
+    /// ## Why predict first, plan second
+    ///
+    /// Earlier shapes of this function ran `plan_operator(&sort.input)` first
+    /// and only resolved sort keys against the result. That call has side
+    /// effects on `Planner::scalar_columns` and `Planner::edge_columns` —
+    /// `plan_return_projection` registers each output column as scalar so an
+    /// enclosing Apply doesn't try to re-resolve it as a NodeId. When the
+    /// resolve step then failed and we returned `Ok(None)`, the caller fell
+    /// through to `plan_sort`'s unfused path and *re-planned the same Return*,
+    /// but now with the polluted state — and `plan_return_projection`'s
+    /// `Variable(name)` arm flips from `NodeResolve` to a raw `Column`
+    /// passthrough when it sees the name already in `scalar_columns`. Result:
+    /// `MATCH (n) RETURN n ORDER BY <complex> LIMIT k` returned raw `Int64`
+    /// NodeIds instead of resolved maps (issues #335 and #347).
+    ///
+    /// We now resolve sort keys against *predicted* columns derived from
+    /// `ret.items` alone — `output_column_name` is the single source of truth
+    /// — without touching the planner. Only when resolution succeeds do we
+    /// plan for real, so the canonical plan is built exactly once and no
+    /// shared planner state is mutated speculatively.
+    ///
+    /// `sort_needs_augmenting_projection` is no longer a gate here: the
+    /// predictive resolve subsumes it (a sort key that needs augmenting will
+    /// never be in the predicted column set, so resolution fails and we bail).
+    /// `plan_sort` still uses that function to choose between pre-Return and
+    /// post-Return augmenting, which is a separate concern.
     fn try_heap_topk_rewrite(
         &self,
         sort: &SortOp,
@@ -1255,15 +1278,30 @@ impl super::Planner {
         if k == 0 {
             return Ok(None);
         }
-        if sort_needs_augmenting_projection(sort) {
-            return Ok(None);
-        }
 
-        let (input_op, columns) = self.plan_operator(&sort.input)?;
-
-        let Ok(physical_keys) = resolve_logical_to_physical_keys(&sort.keys, &columns) else {
+        // Predict the columns `sort.input` will produce. Currently only Return
+        // is predicted; other shapes (Filter/Project/Skip wrapping Return, etc.)
+        // could be added incrementally, falling through is always safe.
+        let Some(predicted_columns) = predict_subtree_columns(sort.input.as_ref()) else {
             return Ok(None);
         };
+
+        // Resolve sort keys against the prediction. If any key fails to
+        // resolve, fall through with NO planner state mutated. Holding the
+        // result lets us skip a second resolve after planning — the
+        // `debug_assert_eq!` below proves the column indices are valid.
+        let Ok(physical_keys) = resolve_logical_to_physical_keys(&sort.keys, &predicted_columns)
+        else {
+            return Ok(None);
+        };
+
+        // Commit: plan the input for real. State mutations now happen exactly
+        // once, as part of the canonical plan we are about to return.
+        let (input_op, columns) = self.plan_operator(&sort.input)?;
+        debug_assert_eq!(
+            columns, predicted_columns,
+            "predict_subtree_columns drifted from plan_operator's output columns"
+        );
 
         let schema = self.derive_schema_from_columns(&columns);
         let op: Box<dyn Operator> = Box::new(grafeo_core::execution::operators::TopKOperator::new(
@@ -1273,6 +1311,35 @@ impl super::Planner {
             schema,
         ));
         Ok(Some((op, columns)))
+    }
+}
+
+/// Predicts the output column names of `op` without planning it.
+///
+/// Returns `None` when the shape is one we don't predict — callers must treat
+/// that as "skip the rewrite" and fall through to the canonical planning path.
+/// Each branch mirrors the column-naming rule used by the corresponding
+/// `plan_*` method. Adding more shapes here is purely a TopK-coverage
+/// improvement; the rewrite degrades to "skip" if a shape is missing.
+fn predict_subtree_columns(op: &LogicalOperator) -> Option<Vec<String>> {
+    match op {
+        LogicalOperator::Return(ret) => {
+            // `RETURN *` expands from input columns inside `plan_return_projection`,
+            // so the output column count depends on what the input produces.
+            // Without planning the input we can't know it — skip.
+            if ret.items.len() == 1
+                && matches!(&ret.items[0].expression, LogicalExpression::Variable(n) if n == "*")
+            {
+                return None;
+            }
+            Some(
+                ret.items
+                    .iter()
+                    .map(|item| output_column_name(item.alias.as_deref(), &item.expression))
+                    .collect(),
+            )
+        }
+        _ => None,
     }
 }
 
