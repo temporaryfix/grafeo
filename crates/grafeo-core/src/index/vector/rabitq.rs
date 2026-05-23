@@ -10,8 +10,9 @@
 //! A 256-dim `f32` vector (1024 B) yields a 32 B sign-bit code, plus 8 B
 //! of scalar correction factors stored alongside it.
 
-use super::quantization::hamming_distance_simd;
+use super::quantization::{ScalarQuantizer, hamming_distance_simd};
 use grafeo_common::types::NodeId;
+use grafeo_common::utils::hash::FxHashMap;
 
 /// A tiny deterministic PRNG (SplitMix64). In-tree so the codec stays
 /// dependency-free and `wasm32`-friendly; seeding makes the rotation
@@ -440,6 +441,118 @@ impl RabitqIndex {
     }
 }
 
+/// Two-stage nearest-neighbour search: a RaBitQ coarse pass over compact
+/// 1-bit codes, then an int8 rerank of the top candidates for an accurate
+/// ordering. Targets ~97–99% recall while the coarse codes are 32×
+/// smaller than `f32` vectors.
+#[derive(Debug, Clone)]
+pub struct TwoStageVectorIndex {
+    coarse: RabitqIndex,
+    scalar: ScalarQuantizer,
+    /// int8 codes parallel to `coarse.ids()`, for the rerank stage.
+    int8: Vec<Vec<u8>>,
+    /// `NodeId` → row offset, for O(1) candidate lookup.
+    id_to_row: FxHashMap<NodeId, u32>,
+}
+
+impl TwoStageVectorIndex {
+    /// Builds the index from a full set of vectors, training the int8
+    /// [`ScalarQuantizer`] on the same vectors. `seed` fixes the RaBitQ
+    /// rotation.
+    ///
+    /// # Panics
+    /// Panics if `vectors` is empty or any vector's length is not `dim`.
+    #[must_use]
+    pub fn build(vectors: &[(NodeId, Vec<f32>)], dim: usize, seed: u64) -> Self {
+        assert!(!vectors.is_empty(), "cannot build index from no vectors");
+        let refs: Vec<&[f32]> = vectors.iter().map(|(_, v)| v.as_slice()).collect();
+        let scalar = ScalarQuantizer::train(&refs);
+
+        let mut coarse = RabitqIndex::with_quantizer(RabitqQuantizer::new(dim, seed));
+        let mut int8 = Vec::with_capacity(vectors.len());
+        let mut id_to_row = FxHashMap::default();
+        for (row, (id, v)) in vectors.iter().enumerate() {
+            assert_eq!(v.len(), dim, "vector dimension mismatch");
+            coarse.insert(*id, v);
+            int8.push(scalar.quantize(v));
+            // reason: row count bounded by input length, fits u32 for any real index
+            #[allow(clippy::cast_possible_truncation)]
+            id_to_row.insert(*id, row as u32);
+        }
+        Self {
+            coarse,
+            scalar,
+            int8,
+            id_to_row,
+        }
+    }
+
+    /// Reconstructs an index from already-decoded parts (blob deserialization).
+    #[must_use]
+    pub(crate) fn from_parts(
+        coarse: RabitqIndex,
+        scalar: ScalarQuantizer,
+        int8: Vec<Vec<u8>>,
+    ) -> Self {
+        let mut id_to_row = FxHashMap::default();
+        for (row, &id) in coarse.ids().iter().enumerate() {
+            // reason: row count fits u32 for any real index
+            #[allow(clippy::cast_possible_truncation)]
+            id_to_row.insert(id, row as u32);
+        }
+        Self {
+            coarse,
+            scalar,
+            int8,
+            id_to_row,
+        }
+    }
+
+    /// Number of indexed vectors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.coarse.len()
+    }
+
+    /// True if the index is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.coarse.is_empty()
+    }
+
+    /// Searches for the `k` nearest neighbours of `query`.
+    ///
+    /// The coarse pass keeps `k · rerank_factor` candidates; the rerank
+    /// pass reorders them by int8 asymmetric Euclidean distance. A larger
+    /// `rerank_factor` trades query time for recall; 8–16 is typical.
+    #[must_use]
+    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<(NodeId, f32)> {
+        if self.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let candidate_n = k.saturating_mul(rerank_factor.max(1)).min(self.len());
+        let candidates = self.coarse.coarse_search(query, candidate_n);
+
+        let mut reranked: Vec<(NodeId, f32)> = candidates
+            .iter()
+            .filter_map(|&(id, _)| {
+                let row = *self.id_to_row.get(&id)? as usize;
+                let dist = self.scalar.asymmetric_distance(query, &self.int8[row]);
+                Some((id, dist))
+            })
+            .collect();
+        reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        reranked.truncate(k);
+        reranked
+    }
+
+    /// Accessors used by blob serialization.
+    #[must_use]
+    pub(crate) fn parts(&self) -> (&RabitqIndex, &ScalarQuantizer, &[Vec<u8>]) {
+        (&self.coarse, &self.scalar, &self.int8)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +677,51 @@ mod tests {
         }
         // The nearest hits should come from cluster A (ids 1..=10).
         assert!(hits[0].0.as_u64() <= 10, "nearest hit not from cluster A");
+    }
+
+    #[test]
+    fn two_stage_search_beats_coarse_alone_on_recall() {
+        use grafeo_common::types::NodeId;
+
+        let dim = 64;
+        // 6 well-separated clusters of 20 points each.
+        let mut rng = SplitMix64::new(2024);
+        let mut centres: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..6 {
+            centres.push((0..dim).map(|_| rng.next_gaussian() * 5.0).collect());
+        }
+        let mut vectors: Vec<(NodeId, Vec<f32>)> = Vec::new();
+        let mut id = 1u64;
+        for centre in &centres {
+            for _ in 0..20 {
+                let v: Vec<f32> = centre.iter().map(|&c| c + rng.next_gaussian() * 0.3).collect();
+                vectors.push((NodeId::new(id), v));
+                id += 1;
+            }
+        }
+
+        let index = TwoStageVectorIndex::build(&vectors, dim, 1);
+        assert_eq!(index.len(), 120);
+
+        // Query = first point of cluster 0; its 10 true neighbours are in cluster 0.
+        let query = vectors[0].1.clone();
+        let hits = index.search(&query, 10, 16);
+        assert_eq!(hits.len(), 10);
+        // Ascending distance.
+        for w in hits.windows(2) {
+            assert!(w[0].1 <= w[1].1);
+        }
+        // All 10 should be cluster-0 points (ids 1..=20).
+        let from_cluster0 = hits.iter().filter(|(id, _)| id.as_u64() <= 20).count();
+        assert!(from_cluster0 >= 9, "expected >=9 cluster-0 hits, got {from_cluster0}");
+    }
+
+    #[test]
+    fn two_stage_search_empty_and_k_zero() {
+        use grafeo_common::types::NodeId;
+        let vectors = vec![(NodeId::new(1), vec![1.0f32; 8])];
+        let index = TwoStageVectorIndex::build(&vectors, 8, 1);
+        assert!(index.search(&[1.0; 8], 0, 4).is_empty());
+        assert_eq!(index.search(&[1.0; 8], 5, 4).len(), 1);
     }
 }
