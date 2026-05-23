@@ -681,13 +681,7 @@ fn infer_column_type_from_codec(codec: &ColumnCodec) -> ColumnType {
             dimensions: *dimensions,
         },
         ColumnCodec::RawI64(_) => ColumnType::Int64,
-        // FIXME(plan-2d): Add `ColumnType::FsstString` and return it here.
-        // Returning DictString is a stub — currently safe because the builder
-        // never produces Fsst columns and the write_to_v2/v3 paths panic on
-        // Fsst before any deserializer sees this type. Sub-plan 2d (zero-copy
-        // chunk loading) wires FsstCodec::{to,from}_bytes into the section
-        // format and must replace this stub.
-        ColumnCodec::Fsst(_) => ColumnType::DictString,
+        ColumnCodec::Fsst(_) => ColumnType::FsstString,
     }
 }
 

@@ -40,6 +40,8 @@ pub enum ColumnType {
     ///
     /// [`ColumnCodec::RawI64`]: super::column::ColumnCodec::RawI64
     Int64,
+    /// FSST-compressed UTF-8 strings.
+    FsstString,
 }
 
 /// A single column within a table schema.
