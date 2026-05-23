@@ -117,6 +117,8 @@ proptest! {
 
         prop_assert_eq!(view.len(), owned.len());
 
+        // reason: index is modulo vectors.len() so truncation on 32-bit is safe
+        #[allow(clippy::cast_possible_truncation)]
         let query = vectors[(seed as usize) % vectors.len()].1.clone();
         let k = 5;
         prop_assert_eq!(view.search(&query, k, 8), owned.search(&query, k, 8));
