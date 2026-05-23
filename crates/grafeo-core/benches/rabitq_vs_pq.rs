@@ -5,6 +5,7 @@
 //! The recall numbers are printed once before the timed loops; use them
 //! together with the criterion latency report to decide whether RaBitQ
 //! replaces PQ or PQ remains the fallback.
+#![allow(missing_docs)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use grafeo_common::types::NodeId;

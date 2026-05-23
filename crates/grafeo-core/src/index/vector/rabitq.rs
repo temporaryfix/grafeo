@@ -614,6 +614,10 @@ impl TwoStageVectorIndex {
     ///
     /// The layout honours the Plan 2 zero-copy contract: a fixed header,
     /// naturally-aligned arrays, blob-relative offsets, and a trailing CRC32.
+    ///
+    /// # Panics
+    /// Panics if the internal `ScalarQuantizer` fails to serialize via
+    /// `bincode` (should never happen in practice).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let (coarse, scalar, int8) = self.parts();
@@ -679,6 +683,10 @@ impl TwoStageVectorIndex {
     /// # Errors
     /// Returns [`RabitqError`] on a bad magic, unsupported version,
     /// truncation, CRC mismatch, or a corrupt scalar-quantizer sub-blob.
+    ///
+    /// # Panics
+    /// Panics if the trailing 4-byte CRC slice cannot be converted to `[u8; 4]`
+    /// (impossible when the buffer length check at entry passes).
     pub fn from_bytes(buf: &[u8]) -> Result<Self, RabitqError> {
         if buf.len() < 8 {
             return Err(RabitqError::Truncated {
