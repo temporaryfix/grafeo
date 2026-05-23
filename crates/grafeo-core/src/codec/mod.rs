@@ -51,7 +51,9 @@ pub use block::{BlockEntry, DEFAULT_BLOCK_ROWS};
 pub use delta::{DeltaEncoding, zigzag_decode, zigzag_encode};
 pub use dictionary::{DictionaryBuilder, DictionaryEncoding};
 pub use fsst::{FsstCodec, FsstError, FsstView, SymbolTable};
-pub use webgraph::{SuccessorIter, WebGraphBuilder, WebGraphCodec, WebGraphError};
+pub use webgraph::{
+    SuccessorIter, WebGraphBuilder, WebGraphCodec, WebGraphError, WebGraphView,
+};
 pub use runlength::{Run, RunLengthAnalyzer, RunLengthEncoding, SignedRunLengthEncoding};
 pub use selector::{
     CodecSelector, CompressedData, CompressionCodec, CompressionMetadata, TypeSpecificCompressor,

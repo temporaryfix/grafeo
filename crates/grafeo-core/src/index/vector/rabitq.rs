@@ -905,6 +905,10 @@ impl RabitqView {
     /// # Errors
     /// Returns [`RabitqError`] on a malformed blob — same conditions as
     /// [`TwoStageVectorIndex::from_bytes`].
+    ///
+    /// # Panics
+    /// Panics if the CRC trailer slice is not exactly 4 bytes — an internal
+    /// invariant upheld by `to_bytes` that cannot occur on a well-formed blob.
     pub fn open(blob: bytes::Bytes) -> Result<Self, RabitqError> {
         let buf = blob.as_ref();
         if buf.len() < 8 {

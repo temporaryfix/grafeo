@@ -265,12 +265,21 @@ pub struct SuccessorIter<'a> {
     last_dst: Option<u64>,
 }
 
-impl SuccessorIter<'_> {
+impl<'a> SuccessorIter<'a> {
     fn empty() -> Self {
         Self {
             reader: BitReader::new(&[], 0),
             node: 0,
             remaining: 0,
+            last_dst: None,
+        }
+    }
+
+    pub(crate) fn new(reader: BitReader<'a>, node: u64, remaining: u64) -> Self {
+        Self {
+            reader,
+            node,
+            remaining,
             last_dst: None,
         }
     }
@@ -519,6 +528,179 @@ impl WebGraphCodec {
     }
 }
 
+/// A borrowing reader over a [`WebGraphCodec`] blob.
+///
+/// Holds a single `bytes::Bytes` and parsed header offsets; the
+/// per-node bit-offset index and the bit stream are sliced from the
+/// held bytes on demand. The owned `Vec<u64>` of offsets is decoded
+/// once at open time (typically 8 bytes per node — small relative to
+/// the bit stream).
+#[derive(Debug, Clone)]
+pub struct WebGraphView {
+    blob: bytes::Bytes,
+    num_nodes: u64,
+    num_edges: u64,
+    bit_len: u64,
+    /// Decoded once at open time.
+    offsets: Vec<u64>,
+    /// Byte offset of the bit stream within `blob`.
+    bits_offset: usize,
+    /// Number of bytes in the bit stream (`bit_len.div_ceil(8)`).
+    bits_byte_len: usize,
+}
+
+impl WebGraphView {
+    /// Opens a blob produced by [`WebGraphCodec::to_bytes`].
+    ///
+    /// # Errors
+    /// Returns [`WebGraphError`] on a malformed blob — same conditions
+    /// as [`WebGraphCodec::from_bytes`].
+    ///
+    /// # Panics
+    /// Panics if the CRC trailer slice is not exactly 4 bytes or an offsets
+    /// chunk is not exactly 8 bytes — these are internal invariants upheld by
+    /// `to_bytes` and cannot occur on a well-formed blob.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn open(blob: bytes::Bytes) -> Result<Self, WebGraphError> {
+        let buf = blob.as_ref();
+        if buf.len() < 8 {
+            return Err(WebGraphError::Truncated {
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        if &buf[0..4] != b"GWBG" {
+            return Err(WebGraphError::BadMagic);
+        }
+        if buf[4] != BLOB_VERSION {
+            return Err(WebGraphError::BadVersion(buf[4]));
+        }
+        let body_end = buf.len() - 4;
+        let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
+        let computed = crc32fast::hash(&buf[..body_end]);
+        if stored != computed {
+            return Err(WebGraphError::CrcMismatch { stored, computed });
+        }
+
+        let mut pos = 8;
+        let num_nodes = read_u64(buf, &mut pos)?;
+        let num_edges = read_u64(buf, &mut pos)?;
+        let bit_len = read_u64(buf, &mut pos)?;
+        // reason: section offsets are blob-relative byte indices; blobs fit in memory
+        let offsets_offset = read_u64(buf, &mut pos)? as usize;
+        let bits_offset = read_u64(buf, &mut pos)? as usize;
+        let _reserved1 = read_u64(buf, &mut pos)?;
+        let _reserved2 = read_u64(buf, &mut pos)?;
+
+        // Decode offsets array.
+        // reason: num_nodes is bounded by available memory
+        let n_offsets = num_nodes as usize + 1;
+        let offsets_byte_end = offsets_offset + 8 * n_offsets;
+        let offsets_bytes = buf
+            .get(offsets_offset..offsets_byte_end)
+            .ok_or(WebGraphError::Truncated {
+                need: offsets_byte_end,
+                have: buf.len(),
+            })?;
+        let mut offsets = Vec::with_capacity(n_offsets);
+        for chunk in offsets_bytes.chunks_exact(8) {
+            offsets.push(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+        }
+        // Validate offsets.
+        if let Some(&first) = offsets.first()
+            && first != 0
+        {
+            return Err(WebGraphError::BadOffset {
+                node: 0,
+                offset: first,
+                bit_len,
+            });
+        }
+        for (i, w) in offsets.windows(2).enumerate() {
+            if w[1] < w[0] || w[1] > bit_len {
+                return Err(WebGraphError::BadOffset {
+                    node: i as u64,
+                    offset: w[1],
+                    bit_len,
+                });
+            }
+        }
+        if let Some(&last) = offsets.last()
+            && last != bit_len
+        {
+            return Err(WebGraphError::BadOffset {
+                node: num_nodes,
+                offset: last,
+                bit_len,
+            });
+        }
+
+        // Validate the bits section fits.
+        // reason: bit_len/8 fits usize for any practical snapshot
+        let bits_byte_len = bit_len.div_ceil(8) as usize;
+        let bits_end = bits_offset + bits_byte_len;
+        if bits_end > buf.len() {
+            return Err(WebGraphError::Truncated {
+                need: bits_end,
+                have: buf.len(),
+            });
+        }
+
+        Ok(Self {
+            blob,
+            num_nodes,
+            num_edges,
+            bit_len,
+            offsets,
+            bits_offset,
+            bits_byte_len,
+        })
+    }
+
+    /// Number of nodes.
+    #[must_use]
+    pub fn num_nodes(&self) -> u64 {
+        self.num_nodes
+    }
+
+    /// Number of edges.
+    #[must_use]
+    pub fn num_edges(&self) -> u64 {
+        self.num_edges
+    }
+
+    /// Out-degree of `node`.
+    #[must_use]
+    pub fn out_degree(&self, node: u64) -> u64 {
+        if node >= self.num_nodes {
+            return 0;
+        }
+        // reason: node < num_nodes, bounded by allocation size
+        #[allow(clippy::cast_possible_truncation)]
+        let start = self.offsets[node as usize];
+        let bits = &self.blob.as_ref()[self.bits_offset..self.bits_offset + self.bits_byte_len];
+        let mut reader = BitReader::new(bits, self.bit_len);
+        reader.seek(start);
+        reader.read_gamma().unwrap_or(1) - 1
+    }
+
+    /// Iterator over the successors of `node`, in ascending dst order.
+    pub fn successors(&self, node: u64) -> SuccessorIter<'_> {
+        if node >= self.num_nodes {
+            return SuccessorIter::empty();
+        }
+        // reason: node < num_nodes, bounded by allocation size
+        #[allow(clippy::cast_possible_truncation)]
+        let start = self.offsets[node as usize];
+        let bits = &self.blob.as_ref()[self.bits_offset..self.bits_offset + self.bits_byte_len];
+        let mut reader = BitReader::new(bits, self.bit_len);
+        reader.seek(start);
+        let degree_plus_one = reader.read_gamma().unwrap_or(1);
+        let degree = degree_plus_one - 1;
+        SuccessorIter::new(reader, node, degree)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +853,41 @@ mod tests {
         let blob = bytes::Bytes::from(b.build().to_bytes());
         let reopened = WebGraphCodec::from_bytes_shared(blob).expect("from_bytes_shared");
         assert_eq!(reopened.successors(0).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn view_successors_matches_owned() {
+        let mut b = WebGraphBuilder::new(15);
+        let edges = [
+            (0u64, 1), (0, 5), (0, 14),
+            (3, 0), (3, 3),
+            (10, 7), (10, 8), (10, 9),
+            (14, 0),
+        ];
+        for &(s, d) in &edges {
+            b.add_edge(s, d).unwrap();
+        }
+        let owned = b.build();
+        let blob = bytes::Bytes::from(owned.to_bytes());
+        let view = WebGraphView::open(blob).expect("open");
+
+        assert_eq!(view.num_nodes(), owned.num_nodes());
+        assert_eq!(view.num_edges(), owned.num_edges());
+        for u in 0..owned.num_nodes() {
+            let owned_succ: Vec<u64> = owned.successors(u).collect();
+            let view_succ: Vec<u64> = view.successors(u).collect();
+            assert_eq!(view_succ, owned_succ, "successors of {u} mismatched");
+        }
+    }
+
+    #[test]
+    fn view_rejects_bad_magic() {
+        let owned = WebGraphBuilder::new(3).build();
+        let mut bad = owned.to_bytes();
+        bad[0] = b'X';
+        assert!(matches!(
+            WebGraphView::open(bytes::Bytes::from(bad)),
+            Err(WebGraphError::BadMagic)
+        ));
     }
 }
