@@ -97,3 +97,7 @@ required-features = ["vector-index"]
 [[bench]]
 name = "top_k"
 harness = false
+
+[[bench]]
+name = "rabitq_vs_pq"
+harness = false
