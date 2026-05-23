@@ -172,6 +172,61 @@ impl SymbolTable {
         self.lengths.iter().all(|&l| l == 0)
     }
 
+    /// Encodes `input` to a byte stream using this symbol table.
+    ///
+    /// At each position the longest matching symbol is emitted as a single
+    /// code byte; bytes with no matching symbol are encoded as `[ESCAPE, byte]`.
+    #[must_use]
+    pub fn encode(&self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0usize;
+        while i < input.len() {
+            match self.longest_match(&input[i..]) {
+                Some((code, len)) => {
+                    out.push(code);
+                    i += len;
+                }
+                None => {
+                    out.push(ESCAPE);
+                    out.push(input[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Decodes a compressed byte stream produced by [`Self::encode`].
+    ///
+    /// # Errors
+    /// Returns [`FsstError::TruncatedEscape`] if the stream ends mid-escape
+    /// (a trailing `ESCAPE` byte with no following literal).
+    pub fn decode(&self, compressed: &[u8]) -> Result<Vec<u8>, FsstError> {
+        let mut out = Vec::with_capacity(compressed.len());
+        let mut i = 0usize;
+        while i < compressed.len() {
+            let c = compressed[i];
+            if c == ESCAPE {
+                let literal = *compressed
+                    .get(i + 1)
+                    .ok_or(FsstError::TruncatedEscape(i))?;
+                out.push(literal);
+                i += 2;
+            } else if let Some(sym) = self.symbol(c) {
+                out.extend_from_slice(sym);
+                i += 1;
+            } else {
+                // Absent symbol — treat as a literal of the code byte itself.
+                // This branch is unreachable for streams produced by
+                // `encode` on this same table, but a corrupt or mismatched
+                // table could otherwise crash the decoder.
+                out.push(c);
+                i += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// Builds a symbol table from a sample of strings by greedy substring
     /// selection.
     ///
@@ -335,5 +390,63 @@ mod tests {
         // we test the latter by checking the symbol table is buildable.
         let strings: Vec<&[u8]> = vec![b"hello", b"world", b""];
         let _ = SymbolTable::train(&strings);  // does not panic on empty strings
+    }
+
+    #[test]
+    fn encode_decode_round_trip_simple() {
+        let mut table = SymbolTable::default();
+        table.set(1, b"the ");
+        table.set(2, b"cat");
+        table.set(3, b"dog");
+
+        let input = b"the cat";
+        let compressed = table.encode(input);
+        let decoded = table.decode(&compressed).expect("decode");
+        assert_eq!(decoded, input);
+
+        // 'the ' (1) + 'cat' (1) = 2 bytes compressed vs 7 input.
+        assert_eq!(compressed.len(), 2);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_with_escapes() {
+        let mut table = SymbolTable::default();
+        table.set(1, b"hello");
+        // 'world' is NOT in the table; every byte should be escape-encoded.
+
+        let input = b"helloworld";
+        let compressed = table.encode(input);
+        let decoded = table.decode(&compressed).expect("decode");
+        assert_eq!(decoded, input);
+
+        // 1 byte for 'hello' + 5 × 2 bytes for 'world' escapes = 11 bytes.
+        assert_eq!(compressed.len(), 11);
+    }
+
+    #[test]
+    fn encode_empty_string() {
+        let table = SymbolTable::default();
+        assert!(table.encode(b"").is_empty());
+        assert_eq!(table.decode(&[]).expect("decode"), b"");
+    }
+
+    #[test]
+    fn encode_with_no_symbols_uses_only_escapes() {
+        let table = SymbolTable::default();
+        let input = b"abc";
+        let compressed = table.encode(input);
+        // 3 input bytes × 2 (escape + literal) = 6 bytes.
+        assert_eq!(compressed, vec![0, b'a', 0, b'b', 0, b'c']);
+        assert_eq!(table.decode(&compressed).expect("decode"), input);
+    }
+
+    #[test]
+    fn decode_rejects_truncated_escape() {
+        let table = SymbolTable::default();
+        // Trailing escape byte with no literal following.
+        assert!(matches!(
+            table.decode(&[0]),
+            Err(FsstError::TruncatedEscape(0))
+        ));
     }
 }
