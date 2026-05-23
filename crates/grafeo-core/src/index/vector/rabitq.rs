@@ -78,6 +78,88 @@ pub enum RabitqError {
     Quantizer(String),
 }
 
+/// A fixed random orthogonal `D × D` rotation matrix.
+///
+/// RaBitQ rotates every data and query vector by the same matrix before
+/// sign-quantizing. The rotation decorrelates the coordinates, which is
+/// what gives the method its error bound over plain sign quantization.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rotation {
+    dim: usize,
+    /// Row-major `D × D` orthonormal matrix.
+    matrix: Vec<f32>,
+}
+
+impl Rotation {
+    /// Builds a random orthogonal matrix from `seed` by orthonormalising
+    /// Gaussian random rows with modified Gram-Schmidt.
+    ///
+    /// # Panics
+    /// Panics if `dim` is zero.
+    #[must_use]
+    pub fn new_seeded(dim: usize, seed: u64) -> Self {
+        assert!(dim > 0, "rotation dimension must be > 0");
+        let mut rng = SplitMix64::new(seed);
+        let mut rows: Vec<Vec<f32>> = (0..dim)
+            .map(|_| (0..dim).map(|_| rng.next_gaussian()).collect())
+            .collect();
+
+        for i in 0..dim {
+            for j in 0..i {
+                let dot: f32 = (0..dim).map(|k| rows[i][k] * rows[j][k]).sum();
+                for k in 0..dim {
+                    rows[i][k] -= dot * rows[j][k];
+                }
+            }
+            let norm: f32 = rows[i].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let inv = if norm > f32::EPSILON { 1.0 / norm } else { 1.0 };
+            for x in &mut rows[i] {
+                *x *= inv;
+            }
+        }
+
+        Self {
+            dim,
+            matrix: rows.into_iter().flatten().collect(),
+        }
+    }
+
+    /// Reconstructs a rotation from an already-computed matrix (used by
+    /// blob deserialization).
+    #[must_use]
+    pub(crate) fn from_matrix(dim: usize, matrix: Vec<f32>) -> Self {
+        debug_assert_eq!(matrix.len(), dim * dim, "matrix must be dim*dim");
+        Self { dim, matrix }
+    }
+
+    /// Returns the rotated vector `M · v`.
+    ///
+    /// # Panics
+    /// Panics if `v.len() != self.dim()`.
+    #[must_use]
+    pub fn apply(&self, v: &[f32]) -> Vec<f32> {
+        assert_eq!(v.len(), self.dim, "vector dimension mismatch");
+        (0..self.dim)
+            .map(|i| {
+                let row = &self.matrix[i * self.dim..(i + 1) * self.dim];
+                row.iter().zip(v).map(|(&m, &x)| m * x).sum()
+            })
+            .collect()
+    }
+
+    /// Number of dimensions.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// The raw row-major matrix (used by blob serialization).
+    #[must_use]
+    pub(crate) fn matrix(&self) -> &[f32] {
+        &self.matrix
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +179,26 @@ mod tests {
         let n = 50_000;
         let mean: f32 = (0..n).map(|_| rng.next_gaussian()).sum::<f32>() / n as f32;
         assert!(mean.abs() < 0.01, "gaussian mean drifted: {mean}");
+    }
+
+    #[test]
+    fn rotation_preserves_l2_norm() {
+        let rot = Rotation::new_seeded(64, 123);
+        let v: Vec<f32> = (0..64).map(|i| (i as f32 * 0.13).sin()).collect();
+        let norm_in: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let rotated = rot.apply(&v);
+        let norm_out: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm_in - norm_out).abs() < 1e-3,
+            "rotation changed norm: {norm_in} -> {norm_out}"
+        );
+    }
+
+    #[test]
+    fn rotation_is_deterministic_for_a_seed() {
+        let a = Rotation::new_seeded(32, 99);
+        let b = Rotation::new_seeded(32, 99);
+        let v: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        assert_eq!(a.apply(&v), b.apply(&v));
     }
 }
