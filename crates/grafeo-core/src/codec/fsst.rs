@@ -234,4 +234,20 @@ mod tests {
         // Empty input: no match.
         assert_eq!(t.longest_match(b""), None);
     }
+
+    #[test]
+    fn symbol_table_set_overwrites_with_zero_fill() {
+        let mut a = SymbolTable::default();
+        a.set(1, b"abcdefgh"); // full 8-byte slot
+        a.set(1, b"x");        // overwrite with 1-byte symbol
+
+        // Lookup returns the new shorter symbol.
+        assert_eq!(a.symbol(1), Some(b"x" as &[u8]));
+
+        // The body slot must be zeroed beyond the new length, so PartialEq
+        // with a freshly-built table holding only "x" matches.
+        let mut b = SymbolTable::default();
+        b.set(1, b"x");
+        assert_eq!(a, b, "trailing body bytes from previous symbol must be zeroed");
+    }
 }
