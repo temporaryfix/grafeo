@@ -34,6 +34,7 @@ pub mod bitvec;
 pub mod block;
 pub mod delta;
 pub mod dictionary;
+pub mod fsst;
 #[cfg(feature = "tiered-storage")]
 pub mod epoch_store;
 pub mod runlength;
