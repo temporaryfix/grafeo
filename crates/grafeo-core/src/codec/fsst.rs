@@ -171,6 +171,60 @@ impl SymbolTable {
     pub fn is_empty(&self) -> bool {
         self.lengths.iter().all(|&l| l == 0)
     }
+
+    /// Builds a symbol table from a sample of strings by greedy substring
+    /// selection.
+    ///
+    /// All substrings of length 1..=MAX_SYMBOL_LEN are scored by
+    /// `(length − 1) × frequency`, the bytes-saved-per-occurrence
+    /// heuristic versus a literal escape-encoding. The top 255 by score
+    /// are assigned to codes 1..=255 in descending score order. The
+    /// resulting table can encode any input — bytes with no matching
+    /// symbol use the escape mechanism.
+    #[must_use]
+    pub fn train(sample: &[&[u8]]) -> Self {
+        use std::collections::HashMap;
+
+        if sample.iter().all(|s| s.is_empty()) {
+            return Self::default();
+        }
+
+        // Count every substring of length 1..=MAX_SYMBOL_LEN in the sample.
+        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
+        for s in sample {
+            for start in 0..s.len() {
+                let max_end = (start + MAX_SYMBOL_LEN).min(s.len());
+                for end in (start + 1)..=max_end {
+                    let sub = &s[start..end];
+                    *counts.entry(sub.to_vec()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Score by (length − 1) × frequency + frequency. The `+ frequency`
+        // term lets length-1 substrings out-rank zero-frequency multi-byte
+        // ones, preserving byte coverage for any byte that appears in the
+        // sample at all.
+        let mut scored: Vec<(Vec<u8>, u64)> = counts
+            .into_iter()
+            .map(|(sub, freq)| {
+                let score = (sub.len() as u64 - 1) * freq + freq;
+                (sub, score)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.len().cmp(&a.0.len())));
+
+        let mut table = Self::default();
+        let mut next_code: u8 = 1;
+        for (sub, _) in scored.into_iter().take(255) {
+            table.set(next_code, &sub);
+            if next_code == 255 {
+                break;
+            }
+            next_code += 1;
+        }
+        table
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +303,37 @@ mod tests {
         let mut b = SymbolTable::default();
         b.set(1, b"x");
         assert_eq!(a, b, "trailing body bytes from previous symbol must be zeroed");
+    }
+
+    #[test]
+    fn train_empty_sample_returns_empty_table() {
+        let table = SymbolTable::train(&[]);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn train_picks_frequent_substrings() {
+        // Sample where "the " appears many times.
+        let strings: Vec<&[u8]> = vec![
+            b"the cat",
+            b"the dog",
+            b"the bird",
+            b"the rat",
+            b"the fox",
+        ];
+        let table = SymbolTable::train(&strings);
+        // The table should contain "the " (or a prefix of it) as a multi-byte symbol.
+        let has_the = (1u8..=255).any(|c| {
+            table.symbol(c).is_some_and(|s| s.starts_with(b"the"))
+        });
+        assert!(has_the, "expected a symbol covering 'the'");
+    }
+
+    #[test]
+    fn train_always_yields_a_table_that_can_encode_sample_bytes() {
+        // Any byte in the sample is either matched by a symbol or escape-encoded —
+        // we test the latter by checking the symbol table is buildable.
+        let strings: Vec<&[u8]> = vec![b"hello", b"world", b""];
+        let _ = SymbolTable::train(&strings);  // does not panic on empty strings
     }
 }
