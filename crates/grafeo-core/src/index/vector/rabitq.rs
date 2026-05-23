@@ -10,6 +10,8 @@
 //! A 256-dim `f32` vector (1024 B) yields a 32 B sign-bit code, plus 8 B
 //! of scalar correction factors stored alongside it.
 
+use super::quantization::hamming_distance_simd;
+
 /// A tiny deterministic PRNG (SplitMix64). In-tree so the codec stays
 /// dependency-free and `wasm32`-friendly; seeding makes the rotation
 /// reproducible across processes and platforms that store the matrix.
@@ -295,6 +297,54 @@ impl RabitqQuantizer {
     }
 }
 
+/// A sign-quantized query vector. See [`RabitqQuantizer::encode_query`].
+#[derive(Debug, Clone)]
+pub struct RabitqQuery {
+    bits: Vec<u64>,
+    norm: f32,
+}
+
+impl RabitqQuantizer {
+    /// Encodes a query vector. The query is sign-quantized the same way as
+    /// data vectors, so distance estimation is a popcount over two bit
+    /// arrays.
+    ///
+    /// # Panics
+    /// Panics if `query.len() != self.dim()`.
+    #[must_use]
+    pub fn encode_query(&self, query: &[f32]) -> RabitqQuery {
+        assert_eq!(query.len(), self.dim, "query dimension mismatch");
+        let (rotated, norm) = self.rotate_unit(query);
+        RabitqQuery {
+            bits: self.sign_bits(&rotated),
+            norm,
+        }
+    }
+
+    /// Estimates the Euclidean distance between `query` and the vector
+    /// behind `code`. Lower is closer.
+    ///
+    /// This is the coarse-stage score; [`TwoStageVectorIndex`] reranks the
+    /// top candidates against int8 vectors for an accurate ordering.
+    #[must_use]
+    pub fn estimate_distance(&self, query: &RabitqQuery, code: &RabitqCode) -> f32 {
+        // reason: dim and hamming are small non-negative integers
+        #[allow(clippy::cast_precision_loss)]
+        {
+            let hamming = hamming_distance_simd(&query.bits, &code.bits);
+            // ⟨q̄, ō⟩ for ±1/√D codebooks = (D − 2·hamming) / D.
+            let ip_quant = (self.dim as f32 - 2.0 * hamming as f32) / self.dim as f32;
+            // Unbias by the data-side quantization loss.
+            let cos_est =
+                (ip_quant / code.dot_oo.max(f32::MIN_POSITIVE)).clamp(-1.0, 1.0);
+            // d² = |a|² + |b|² − 2|a||b|cosθ.
+            let d2 = code.norm.mul_add(code.norm, query.norm * query.norm)
+                - 2.0 * code.norm * query.norm * cos_est;
+            d2.max(0.0).sqrt()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +410,37 @@ mod tests {
         let q = RabitqQuantizer::new(100, 5);
         let v: Vec<f32> = (0..100).map(|i| i as f32 - 50.0).collect();
         assert_eq!(q.encode(&v).code_bytes(), 16);
+    }
+
+    #[test]
+    fn estimate_distance_ranks_self_closest() {
+        let q = RabitqQuantizer::new(128, 3);
+        let target: Vec<f32> = (0..128).map(|i| (i as f32 * 0.05).sin()).collect();
+        let far: Vec<f32> = (0..128).map(|i| (i as f32 * 0.05).cos() * 3.0).collect();
+
+        let query = q.encode_query(&target);
+        let code_self = q.encode(&target);
+        let code_far = q.encode(&far);
+
+        let d_self = q.estimate_distance(&query, &code_self);
+        let d_far = q.estimate_distance(&query, &code_far);
+        assert!(d_self < d_far, "self {d_self} should be closer than far {d_far}");
+        assert!(d_self >= 0.0);
+    }
+
+    #[test]
+    fn estimate_distance_orders_a_small_set() {
+        let q = RabitqQuantizer::new(64, 11);
+        let base: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
+        let query = q.encode_query(&base);
+
+        // Increasingly perturbed copies must estimate increasingly far.
+        let mut last = -1.0f32;
+        for scale in [0.0f32, 0.5, 1.0, 2.0] {
+            let v: Vec<f32> = base.iter().map(|&x| x + scale).collect();
+            let d = q.estimate_distance(&query, &q.encode(&v));
+            assert!(d >= last - 0.5, "distance not monotone at scale {scale}: {d} < {last}");
+            last = d;
+        }
     }
 }
