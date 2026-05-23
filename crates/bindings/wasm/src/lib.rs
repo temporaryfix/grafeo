@@ -21,7 +21,7 @@ mod signed_snapshot;
 mod types;
 mod utils;
 
-#[cfg(feature = "rabitq-codec")]
+#[cfg(any(feature = "rabitq-codec", feature = "fsst-codec"))]
 pub mod codecs;
 
 use std::cell::{Cell, RefCell};

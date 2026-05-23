@@ -575,3 +575,27 @@ fn rabitq_codec_encode_open_search_round_trip() {
         assert!(id <= 20, "expected cluster-0 hit, got id {id}");
     }
 }
+
+#[cfg(feature = "fsst-codec")]
+#[wasm_bindgen_test]
+fn fsst_codec_encode_open_get_round_trip() {
+    use grafeo_wasm::codecs::FsstCodec;
+
+    let strings = ["alpha", "beta gamma", "alpha", "the quick brown fox"];
+    let lengths: Vec<u32> = strings.iter().map(|s| s.len() as u32).collect();
+    let mut flat: Vec<u8> = Vec::new();
+    for s in &strings {
+        flat.extend_from_slice(s.as_bytes());
+    }
+
+    let blob = FsstCodec::encode(&flat, &lengths).expect("encode");
+    assert_eq!(&blob[0..4], b"GFST");
+
+    let codec = FsstCodec::open(&blob).expect("open");
+    assert_eq!(codec.len() as usize, strings.len());
+    for (i, expected) in strings.iter().enumerate() {
+        let decoded_bytes = codec.get(i as u32);
+        let decoded_str = std::str::from_utf8(&decoded_bytes).expect("utf-8");
+        assert_eq!(decoded_str, *expected, "string {i} mismatched");
+    }
+}
