@@ -221,6 +221,78 @@ impl WebGraphCodec {
         // The stored value is degree + 1 (gamma encodes n >= 1).
         reader.read_gamma().unwrap_or(1) - 1
     }
+
+    /// Iterator over the successors of `node`, in ascending dst order.
+    ///
+    /// Reads one node's adjacency block in-place from the bit stream; no
+    /// other node's data is touched.
+    pub fn successors(&self, node: u64) -> SuccessorIter<'_> {
+        if node >= self.num_nodes {
+            return SuccessorIter::empty();
+        }
+        let start = self.offsets[node as usize];
+        let mut reader = BitReader::new(&self.bits, self.bit_len);
+        reader.seek(start);
+        // The stored value is degree + 1 (gamma encodes n >= 1).
+        let degree_plus_one = reader.read_gamma().unwrap_or(1);
+        let degree = degree_plus_one - 1;
+        SuccessorIter {
+            reader,
+            node,
+            remaining: degree,
+            last_dst: None,
+        }
+    }
+}
+
+/// Streaming iterator over a single node's successors.
+pub struct SuccessorIter<'a> {
+    reader: BitReader<'a>,
+    node: u64,
+    remaining: u64,
+    /// `None` before the first successor, `Some(prev)` after.
+    last_dst: Option<u64>,
+}
+
+impl<'a> SuccessorIter<'a> {
+    fn empty() -> Self {
+        Self {
+            reader: BitReader::new(&[], 0),
+            node: 0,
+            remaining: 0,
+            last_dst: None,
+        }
+    }
+}
+
+impl<'a> Iterator for SuccessorIter<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let dst = match self.last_dst {
+            None => {
+                let first_gap = self.reader.read_zigzag_gamma()?;
+                // reason: encoder ensures (node as i64 + first_gap) >= 0 by
+                // construction (dst was a valid u64 node id).
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    (self.node as i64 + first_gap) as u64
+                }
+            }
+            Some(prev) => prev + self.reader.read_gamma()?,
+        };
+        self.last_dst = Some(dst);
+        Some(dst)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = self.remaining as usize;
+        (r, Some(r))
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +352,39 @@ mod tests {
             b.add_edge(0, 5),
             Err(WebGraphError::EdgeOutOfRange { dst: 5, .. })
         ));
+    }
+
+    #[test]
+    fn successors_match_input_for_simple_graph() {
+        let mut b = WebGraphBuilder::new(6);
+        // Node 0 -> {1, 3, 5}, node 2 -> {0, 4}, node 5 -> {5} (self-loop).
+        for (s, d) in [(0u64, 1), (0, 3), (0, 5), (2, 0), (2, 4), (5, 5)] {
+            b.add_edge(s, d).unwrap();
+        }
+        let codec = b.build();
+        assert_eq!(
+            codec.successors(0).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(codec.successors(1).collect::<Vec<_>>(), Vec::<u64>::new());
+        assert_eq!(codec.successors(2).collect::<Vec<_>>(), vec![0, 4]);
+        assert_eq!(codec.successors(5).collect::<Vec<_>>(), vec![5]);
+    }
+
+    #[test]
+    fn successors_handles_dst_less_than_src() {
+        // First gap is signed; verify dst < src round-trips correctly.
+        let mut b = WebGraphBuilder::new(10);
+        b.add_edge(7, 0).unwrap();
+        b.add_edge(7, 1).unwrap();
+        b.add_edge(7, 9).unwrap();
+        let codec = b.build();
+        assert_eq!(codec.successors(7).collect::<Vec<_>>(), vec![0, 1, 9]);
+    }
+
+    #[test]
+    fn successors_for_out_of_range_node_is_empty() {
+        let codec = WebGraphBuilder::new(3).build();
+        assert_eq!(codec.successors(99).collect::<Vec<_>>(), Vec::<u64>::new());
     }
 }
