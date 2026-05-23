@@ -392,6 +392,10 @@ impl ColumnCodec {
                 val
             }),
             Self::Dict(dict) => dict.get(index).map(|s| Value::String(ArcStr::from(s))),
+            // FSST: `.ok()` maps FsstError (e.g. TruncatedEscape on a
+            // corrupt stream) to None, and `from_utf8(...).ok()` does the
+            // same for non-UTF-8 bytes. Both match the Dict variant's
+            // get-returns-None-on-failure contract.
             Self::Fsst(fsst) => fsst
                 .get(index)
                 .ok()
@@ -1285,7 +1289,9 @@ impl ColumnCodec {
             }
             Self::Fsst(_) => {
                 // FSST serialization not yet wired into the v2 block format.
-                unimplemented!("ColumnCodec::Fsst write_to_v2 not implemented")
+                unimplemented!(
+                    "ColumnCodec::Fsst serialization not yet implemented (deferred to sub-plan 2d)"
+                )
             }
         }
 
