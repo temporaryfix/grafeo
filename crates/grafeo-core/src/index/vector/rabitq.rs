@@ -234,7 +234,11 @@ impl RabitqQuantizer {
     /// Reconstructs a quantizer from a stored rotation matrix.
     #[must_use]
     pub(crate) fn from_parts(dim: usize, seed: u64, rotation: Rotation) -> Self {
-        Self { dim, seed, rotation }
+        Self {
+            dim,
+            seed,
+            rotation,
+        }
     }
 
     /// Number of dimensions.
@@ -337,8 +341,7 @@ impl RabitqQuantizer {
             // ⟨q̄, ō⟩ for ±1/√D codebooks = (D − 2·hamming) / D.
             let ip_quant = (self.dim as f32 - 2.0 * hamming as f32) / self.dim as f32;
             // Unbias by the data-side quantization loss.
-            let cos_est =
-                (ip_quant / code.dot_oo.max(f32::MIN_POSITIVE)).clamp(-1.0, 1.0);
+            let cos_est = (ip_quant / code.dot_oo.max(f32::MIN_POSITIVE)).clamp(-1.0, 1.0);
             // d² = |a|² + |b|² − 2|a||b|cosθ.
             let d2 = code.norm.mul_add(code.norm, query.norm * query.norm)
                 - 2.0 * code.norm * query.norm * cos_est;
@@ -435,7 +438,11 @@ impl RabitqIndex {
     /// # Panics
     /// Panics if `ids.len() != codes.len()`.
     pub(crate) fn load_entries(&mut self, ids: Vec<NodeId>, codes: Vec<RabitqCode>) {
-        assert_eq!(ids.len(), codes.len(), "ids and codes must have equal length");
+        assert_eq!(
+            ids.len(),
+            codes.len(),
+            "ids and codes must have equal length"
+        );
         self.ids = ids;
         self.codes = codes;
     }
@@ -647,9 +654,8 @@ impl TwoStageVectorIndex {
         let words = quantizer.words();
         let count = coarse.len();
 
-        let quant_blob =
-            bincode::serde::encode_to_vec(scalar, bincode::config::standard())
-                .expect("ScalarQuantizer is serializable");
+        let quant_blob = bincode::serde::encode_to_vec(scalar, bincode::config::standard())
+            .expect("ScalarQuantizer is serializable");
 
         let mut buf = Vec::new();
         buf.extend_from_slice(b"GRBQ");
@@ -711,14 +717,10 @@ impl TwoStageVectorIndex {
         pad_to(&mut buf, 4);
 
         // Patch offsets into placeholder.
-        buf[offsets_pos..offsets_pos + 8]
-            .copy_from_slice(&rotation_offset.to_le_bytes());
-        buf[offsets_pos + 8..offsets_pos + 16]
-            .copy_from_slice(&ids_offset.to_le_bytes());
-        buf[offsets_pos + 16..offsets_pos + 24]
-            .copy_from_slice(&codes_offset.to_le_bytes());
-        buf[offsets_pos + 24..offsets_pos + 32]
-            .copy_from_slice(&int8_offset.to_le_bytes());
+        buf[offsets_pos..offsets_pos + 8].copy_from_slice(&rotation_offset.to_le_bytes());
+        buf[offsets_pos + 8..offsets_pos + 16].copy_from_slice(&ids_offset.to_le_bytes());
+        buf[offsets_pos + 16..offsets_pos + 24].copy_from_slice(&codes_offset.to_le_bytes());
+        buf[offsets_pos + 24..offsets_pos + 32].copy_from_slice(&int8_offset.to_le_bytes());
 
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -771,16 +773,21 @@ impl TwoStageVectorIndex {
         #[allow(clippy::cast_possible_truncation)]
         let int8_offset = read_u64(buf, &mut pos)? as usize;
 
-        let quant_slice = buf.get(pos..pos + quant_len).ok_or(RabitqError::Truncated {
-            need: pos + quant_len,
-            have: buf.len(),
-        })?;
+        let quant_slice = buf
+            .get(pos..pos + quant_len)
+            .ok_or(RabitqError::Truncated {
+                need: pos + quant_len,
+                have: buf.len(),
+            })?;
         let (scalar, _): (ScalarQuantizer, usize) =
             bincode::serde::decode_from_slice(quant_slice, bincode::config::standard())
                 .map_err(|e| RabitqError::Quantizer(e.to_string()))?;
         pos += quant_len;
         pos = pos.next_multiple_of(8);
-        debug_assert_eq!(pos, rotation_offset, "rotation_offset mismatch: writer/reader diverged");
+        debug_assert_eq!(
+            pos, rotation_offset,
+            "rotation_offset mismatch: writer/reader diverged"
+        );
 
         // Rotation matrix.
         let mut matrix = Vec::with_capacity(dim * dim);
@@ -788,10 +795,12 @@ impl TwoStageVectorIndex {
             matrix.push(read_f32(buf, &mut pos)?);
         }
         pos = pos.next_multiple_of(8);
-        debug_assert_eq!(pos, ids_offset, "ids_offset mismatch: writer/reader diverged");
+        debug_assert_eq!(
+            pos, ids_offset,
+            "ids_offset mismatch: writer/reader diverged"
+        );
 
-        let quantizer =
-            RabitqQuantizer::from_parts(dim, seed, Rotation::from_matrix(dim, matrix));
+        let quantizer = RabitqQuantizer::from_parts(dim, seed, Rotation::from_matrix(dim, matrix));
         let mut coarse = RabitqIndex::with_quantizer(quantizer);
 
         // ids.
@@ -799,7 +808,10 @@ impl TwoStageVectorIndex {
         for _ in 0..count {
             ids.push(NodeId::new(read_u64(buf, &mut pos)?));
         }
-        debug_assert_eq!(pos, codes_offset, "codes_offset mismatch: writer/reader diverged");
+        debug_assert_eq!(
+            pos, codes_offset,
+            "codes_offset mismatch: writer/reader diverged"
+        );
 
         // codes.
         let mut codes = Vec::with_capacity(count);
@@ -812,7 +824,10 @@ impl TwoStageVectorIndex {
             let norm = read_f32(buf, &mut pos)?;
             codes.push(RabitqCode { bits, dot_oo, norm });
         }
-        debug_assert_eq!(pos, int8_offset, "int8_offset mismatch: writer/reader diverged");
+        debug_assert_eq!(
+            pos, int8_offset,
+            "int8_offset mismatch: writer/reader diverged"
+        );
         coarse.load_entries(ids, codes);
 
         // int8 codes.
@@ -841,6 +856,240 @@ impl TwoStageVectorIndex {
     /// Same as [`Self::from_bytes`].
     pub fn from_bytes_shared(blob: bytes::Bytes) -> Result<Self, RabitqError> {
         Self::from_bytes(&blob)
+    }
+}
+
+/// A borrowing reader over a [`TwoStageVectorIndex`] blob.
+///
+/// Holds a single `bytes::Bytes` and a parsed header; the int8 rerank
+/// codes and the RaBitQ bit codes are sliced from the held bytes on
+/// demand for each query, avoiding the per-vector heap allocations that
+/// [`TwoStageVectorIndex::from_bytes`] does.
+///
+/// Search results are bit-identical to the owned path; see the
+/// `view_search_matches_owned_search` test and the
+/// `codec_view_parity` integration proptest.
+#[derive(Debug, Clone)]
+pub struct RabitqView {
+    blob: bytes::Bytes,
+    dim: usize,
+    count: usize,
+    words: usize,
+    /// Decoded once at open time (small).
+    scalar: ScalarQuantizer,
+    /// Decoded once at open time (`dim*dim` f32s — typically ≤ 256 KB).
+    /// Retained for future re-encoding use; not read during search.
+    #[allow(dead_code)]
+    rotation: Rotation,
+    /// Owned to avoid alignment concerns on `[u64]` borrowed from Bytes.
+    /// Decoded once at open time.
+    rotation_quantizer: RabitqQuantizer,
+    /// Owned `Vec<NodeId>` decoded at open time (8 bytes per id; small
+    /// relative to int8/codes which stay in the borrowed `blob`).
+    ids: Vec<NodeId>,
+    /// Byte offset into `blob` where the codes section starts.
+    codes_offset: usize,
+    /// Byte stride for one code: `words*8 + 8` bytes (bits + dot_oo + norm).
+    code_stride: usize,
+    /// Byte offset into `blob` where the int8 section starts.
+    int8_offset: usize,
+}
+
+impl RabitqView {
+    /// Opens a blob produced by [`TwoStageVectorIndex::to_bytes`].
+    ///
+    /// The blob's `bytes::Bytes` is held; per-query reads slice it
+    /// directly. The scalar quantizer, rotation matrix, and id list are
+    /// decoded once into owned storage (each is small).
+    ///
+    /// # Errors
+    /// Returns [`RabitqError`] on a malformed blob — same conditions as
+    /// [`TwoStageVectorIndex::from_bytes`].
+    pub fn open(blob: bytes::Bytes) -> Result<Self, RabitqError> {
+        let buf = blob.as_ref();
+        if buf.len() < 8 {
+            return Err(RabitqError::Truncated {
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        if &buf[0..4] != b"GRBQ" {
+            return Err(RabitqError::BadMagic);
+        }
+        if buf[4] != BLOB_VERSION {
+            return Err(RabitqError::BadVersion(buf[4]));
+        }
+        let body_end = buf.len() - 4;
+        let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
+        let computed = crc32fast::hash(&buf[..body_end]);
+        if stored != computed {
+            return Err(RabitqError::CrcMismatch { stored, computed });
+        }
+
+        let mut pos = 8;
+        let dim = read_u32(buf, &mut pos)? as usize;
+        let count = read_u32(buf, &mut pos)? as usize;
+        let seed = read_u64(buf, &mut pos)?;
+        let words = read_u32(buf, &mut pos)? as usize;
+        let quant_len = read_u32(buf, &mut pos)? as usize;
+        // Skip the four offset slots written by `to_bytes`.
+        // reason: offsets fit in usize on any platform that can hold the blob in memory
+        #[allow(clippy::cast_possible_truncation)]
+        let rotation_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let ids_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let codes_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let int8_offset = read_u64(buf, &mut pos)? as usize;
+
+        // ScalarQuantizer — decoded once into owned storage.
+        let quant_slice = buf.get(pos..pos + quant_len).ok_or(RabitqError::Truncated {
+            need: pos + quant_len,
+            have: buf.len(),
+        })?;
+        let (scalar, _): (ScalarQuantizer, usize) =
+            bincode::serde::decode_from_slice(quant_slice, bincode::config::standard())
+                .map_err(|e| RabitqError::Quantizer(e.to_string()))?;
+
+        // Rotation matrix — decoded once into owned storage.
+        let mut matrix = Vec::with_capacity(dim * dim);
+        let mut rpos = rotation_offset;
+        for _ in 0..dim * dim {
+            matrix.push(read_f32(buf, &mut rpos)?);
+        }
+        let rotation = Rotation::from_matrix(dim, matrix);
+        let rotation_quantizer =
+            RabitqQuantizer::from_parts(dim, seed, rotation.clone());
+
+        // ids — decoded once.
+        let mut ids = Vec::with_capacity(count);
+        let mut ipos = ids_offset;
+        for _ in 0..count {
+            ids.push(NodeId::new(read_u64(buf, &mut ipos)?));
+        }
+
+        let code_stride = words * 8 + 8;
+        // Validate codes/int8 sections fit in the blob.
+        let codes_end = codes_offset
+            .checked_add(count.saturating_mul(code_stride))
+            .ok_or(RabitqError::Truncated {
+                need: usize::MAX,
+                have: buf.len(),
+            })?;
+        if codes_end > buf.len() {
+            return Err(RabitqError::Truncated {
+                need: codes_end,
+                have: buf.len(),
+            });
+        }
+        let int8_end = int8_offset
+            .checked_add(count.saturating_mul(dim))
+            .ok_or(RabitqError::Truncated {
+                need: usize::MAX,
+                have: buf.len(),
+            })?;
+        if int8_end > buf.len() {
+            return Err(RabitqError::Truncated {
+                need: int8_end,
+                have: buf.len(),
+            });
+        }
+
+        Ok(Self {
+            blob,
+            dim,
+            count,
+            words,
+            scalar,
+            rotation,
+            rotation_quantizer,
+            ids,
+            codes_offset,
+            code_stride,
+            int8_offset,
+        })
+    }
+
+    /// Number of indexed vectors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// True if empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Reads the bits of code at row `row` directly from `self.blob`,
+    /// returning a per-call `Vec<u64>` (one allocation of `words * 8`
+    /// bytes per coarse-search candidate).
+    fn read_code_bits(&self, row: usize) -> Vec<u64> {
+        let start = self.codes_offset + row * self.code_stride;
+        let buf = self.blob.as_ref();
+        (0..self.words)
+            .map(|w| {
+                let pos = start + w * 8;
+                u64::from_le_bytes(buf[pos..pos + 8].try_into().expect("8 bytes"))
+            })
+            .collect()
+    }
+
+    /// Reads the `dot_oo` and `norm` factors for the code at row `row`.
+    fn read_code_factors(&self, row: usize) -> (f32, f32) {
+        let start = self.codes_offset + row * self.code_stride + self.words * 8;
+        let buf = self.blob.as_ref();
+        let dot_oo = f32::from_le_bytes(buf[start..start + 4].try_into().expect("4 bytes"));
+        let norm = f32::from_le_bytes(buf[start + 4..start + 8].try_into().expect("4 bytes"));
+        (dot_oo, norm)
+    }
+
+    /// Returns the int8 code slice for row `row` (borrowed from `self.blob`).
+    fn int8_row(&self, row: usize) -> &[u8] {
+        let start = self.int8_offset + row * self.dim;
+        &self.blob.as_ref()[start..start + self.dim]
+    }
+
+    /// Searches for the `k` nearest neighbours of `query`.
+    ///
+    /// Identical results to [`TwoStageVectorIndex::search`] (see the
+    /// parity proptest).
+    #[must_use]
+    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<(NodeId, f32)> {
+        if self.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let candidate_n = k
+            .saturating_mul(rerank_factor.max(1))
+            .min(self.count);
+
+        // Coarse pass: encode the query, then iterate stored codes.
+        let q = self.rotation_quantizer.encode_query(query);
+        let mut scored: Vec<(usize, f32)> = (0..self.count)
+            .map(|row| {
+                let bits = self.read_code_bits(row);
+                let (dot_oo, norm) = self.read_code_factors(row);
+                let code = RabitqCode { bits, dot_oo, norm };
+                let est = self.rotation_quantizer.estimate_distance(&q, &code);
+                (row, est)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(candidate_n);
+
+        // Rerank by int8.
+        let mut reranked: Vec<(NodeId, f32)> = scored
+            .iter()
+            .map(|&(row, _)| {
+                let dist = self.scalar.asymmetric_distance(query, self.int8_row(row));
+                (self.ids[row], dist)
+            })
+            .collect();
+        reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        reranked.truncate(k);
+        reranked
     }
 }
 
@@ -891,7 +1140,11 @@ mod tests {
         let q = RabitqQuantizer::new(256, 1);
         let v: Vec<f32> = (0..256).map(|i| (i as f32 * 0.01).sin()).collect();
         let code = q.encode(&v);
-        assert_eq!(code.code_bytes(), 32, "256 sign bits must pack into 32 bytes");
+        assert_eq!(
+            code.code_bytes(),
+            32,
+            "256 sign bits must pack into 32 bytes"
+        );
         assert!(code.dot_oo() > 0.0 && code.dot_oo() <= 1.0 + 1e-4);
         assert!(code.norm() > 0.0);
     }
@@ -923,7 +1176,10 @@ mod tests {
 
         let d_self = q.estimate_distance(&query, &code_self);
         let d_far = q.estimate_distance(&query, &code_far);
-        assert!(d_self < d_far, "self {d_self} should be closer than far {d_far}");
+        assert!(
+            d_self < d_far,
+            "self {d_self} should be closer than far {d_far}"
+        );
         assert!(d_self >= 0.0);
     }
 
@@ -938,7 +1194,10 @@ mod tests {
         for scale in [0.0f32, 0.5, 1.0, 2.0] {
             let v: Vec<f32> = base.iter().map(|&x| x + scale).collect();
             let d = q.estimate_distance(&query, &q.encode(&v));
-            assert!(d >= last - 0.5, "distance not monotone at scale {scale}: {d} < {last}");
+            assert!(
+                d >= last - 0.5,
+                "distance not monotone at scale {scale}: {d} < {last}"
+            );
             last = d;
         }
     }
@@ -950,7 +1209,9 @@ mod tests {
         let mut index = RabitqIndex::new(32, 17);
         // Cluster A near 0.0, cluster B near 5.0.
         for i in 0..10 {
-            let a: Vec<f32> = (0..32).map(|d| (d as f32 * 0.1).sin() + i as f32 * 0.01).collect();
+            let a: Vec<f32> = (0..32)
+                .map(|d| (d as f32 * 0.1).sin() + i as f32 * 0.01)
+                .collect();
             index.insert(NodeId::new(i + 1), &a);
         }
         for i in 0..10 {
@@ -985,7 +1246,10 @@ mod tests {
         let mut id = 1u64;
         for centre in &centres {
             for _ in 0..20 {
-                let v: Vec<f32> = centre.iter().map(|&c| c + rng.next_gaussian() * 0.3).collect();
+                let v: Vec<f32> = centre
+                    .iter()
+                    .map(|&c| c + rng.next_gaussian() * 0.3)
+                    .collect();
                 vectors.push((NodeId::new(id), v));
                 id += 1;
             }
@@ -1004,7 +1268,10 @@ mod tests {
         }
         // All 10 should be cluster-0 points (ids 1..=20).
         let from_cluster0 = hits.iter().filter(|(id, _)| id.as_u64() <= 20).count();
-        assert!(from_cluster0 >= 9, "expected >=9 cluster-0 hits, got {from_cluster0}");
+        assert!(
+            from_cluster0 >= 9,
+            "expected >=9 cluster-0 hits, got {from_cluster0}"
+        );
     }
 
     #[test]
@@ -1052,10 +1319,7 @@ mod tests {
 
         // Identical query results before and after a round trip.
         let query = vectors[3].1.clone();
-        assert_eq!(
-            index.search(&query, 10, 8),
-            reopened.search(&query, 10, 8),
-        );
+        assert_eq!(index.search(&query, 10, 8), reopened.search(&query, 10, 8),);
     }
 
     #[test]
@@ -1088,5 +1352,44 @@ mod tests {
         let blob = bytes::Bytes::from(index.to_bytes());
         let reopened = TwoStageVectorIndex::from_bytes_shared(blob).expect("from_bytes_shared");
         assert_eq!(reopened.len(), 1);
+    }
+
+    #[test]
+    fn view_search_matches_owned_search() {
+        use grafeo_common::types::NodeId;
+        let dim = 32;
+        let mut rng = SplitMix64::new(2025);
+        let vectors: Vec<(NodeId, Vec<f32>)> = (0..40)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.next_gaussian()).collect();
+                (NodeId::new(i + 1), v)
+            })
+            .collect();
+        let owned = TwoStageVectorIndex::build(&vectors, dim, 7);
+        let blob = bytes::Bytes::from(owned.to_bytes());
+        let view = RabitqView::open(blob).expect("open");
+
+        assert_eq!(view.len(), owned.len());
+
+        let query = vectors[3].1.clone();
+        let owned_hits = owned.search(&query, 10, 8);
+        let view_hits = view.search(&query, 10, 8);
+        assert_eq!(view_hits, owned_hits);
+    }
+
+    #[test]
+    fn view_rejects_bad_magic() {
+        use grafeo_common::types::NodeId;
+        let owned = TwoStageVectorIndex::build(
+            &[(NodeId::new(1), vec![1.0f32; 8])],
+            8,
+            1,
+        );
+        let mut bad = owned.to_bytes();
+        bad[0] = b'X';
+        assert!(matches!(
+            RabitqView::open(bytes::Bytes::from(bad)),
+            Err(RabitqError::BadMagic)
+        ));
     }
 }

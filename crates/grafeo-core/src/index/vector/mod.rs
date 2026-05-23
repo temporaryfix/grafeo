@@ -109,7 +109,8 @@ pub use distance::{
 pub use mmr::mmr_select;
 pub use quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
 pub use rabitq::{
-    RabitqCode, RabitqError, RabitqIndex, RabitqQuantizer, RabitqQuery, TwoStageVectorIndex,
+    RabitqCode, RabitqError, RabitqIndex, RabitqQuantizer, RabitqQuery, RabitqView,
+    TwoStageVectorIndex,
 };
 #[cfg(feature = "mmap")]
 pub use storage::MmapStorage;
