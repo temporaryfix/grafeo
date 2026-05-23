@@ -460,8 +460,15 @@ impl TwoStageVectorIndex {
     /// [`ScalarQuantizer`] on the same vectors. `seed` fixes the RaBitQ
     /// rotation.
     ///
+    /// # Preconditions
+    /// `vectors` must not contain two entries with the same `NodeId`.
+    /// In debug builds a duplicate is caught by a `debug_assert!`; in
+    /// release builds the second entry's int8 row wins in `id_to_row`,
+    /// leaving the first row unreachable via reranking.
+    ///
     /// # Panics
     /// Panics if `vectors` is empty or any vector's length is not `dim`.
+    /// In debug builds, also panics on a duplicate `NodeId`.
     #[must_use]
     pub fn build(vectors: &[(NodeId, Vec<f32>)], dim: usize, seed: u64) -> Self {
         assert!(!vectors.is_empty(), "cannot build index from no vectors");
@@ -475,6 +482,10 @@ impl TwoStageVectorIndex {
             assert_eq!(v.len(), dim, "vector dimension mismatch");
             coarse.insert(*id, v);
             int8.push(scalar.quantize(v));
+            debug_assert!(
+                !id_to_row.contains_key(id),
+                "duplicate NodeId in TwoStageVectorIndex::build input"
+            );
             // reason: row count bounded by input length, fits u32 for any real index
             #[allow(clippy::cast_possible_truncation)]
             id_to_row.insert(*id, row as u32);
@@ -488,12 +499,20 @@ impl TwoStageVectorIndex {
     }
 
     /// Reconstructs an index from already-decoded parts (blob deserialization).
+    ///
+    /// # Panics
+    /// Panics if `int8.len() != coarse.len()`.
     #[must_use]
     pub(crate) fn from_parts(
         coarse: RabitqIndex,
         scalar: ScalarQuantizer,
         int8: Vec<Vec<u8>>,
     ) -> Self {
+        assert_eq!(
+            int8.len(),
+            coarse.len(),
+            "int8 and coarse must have equal length"
+        );
         let mut id_to_row = FxHashMap::default();
         for (row, &id) in coarse.ids().iter().enumerate() {
             // reason: row count fits u32 for any real index
