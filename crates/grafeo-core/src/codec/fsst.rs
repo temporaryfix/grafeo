@@ -149,7 +149,7 @@ impl SymbolTable {
             if len == 0 || len > max_check {
                 continue;
             }
-            if &self.bodies[code as usize][..len] == &input[..len] {
+            if self.bodies[code as usize][..len] == input[..len] {
                 match best {
                     None => best = Some((code, len)),
                     Some((_, blen)) if len > blen => best = Some((code, len)),
@@ -237,6 +237,7 @@ impl SymbolTable {
     /// resulting table can encode any input — bytes with no matching
     /// symbol use the escape mechanism.
     #[must_use]
+    #[allow(clippy::explicit_counter_loop)] // u8 counter: 1..=255 overflows with range-zip
     pub fn train(sample: &[&[u8]]) -> Self {
         use std::collections::HashMap;
 
@@ -486,6 +487,10 @@ impl FsstCodec {
     /// # Errors
     /// Returns [`FsstError`] on a bad magic, unsupported version, truncation,
     /// CRC mismatch, or a malformed symbol table.
+    ///
+    /// # Panics
+    /// Never panics in practice; the internal `expect("4 bytes")` is infallible
+    /// because the length guard above ensures at least 8 bytes are present.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, FsstError> {
         if buf.len() < 8 {
             return Err(FsstError::Truncated {
@@ -510,9 +515,15 @@ impl FsstCodec {
         let mut pos = 8;
         let count = read_u32(buf, &mut pos)? as usize;
         let compressed_len = read_u32(buf, &mut pos)? as usize;
-        let table_offset = read_u64(buf, &mut pos)? as usize;
-        let offsets_offset = read_u64(buf, &mut pos)? as usize;
-        let compressed_offset = read_u64(buf, &mut pos)? as usize;
+        let table_offset = usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| {
+            FsstError::Truncated { need: usize::MAX, have: buf.len() }
+        })?;
+        let offsets_offset = usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| {
+            FsstError::Truncated { need: usize::MAX, have: buf.len() }
+        })?;
+        let compressed_offset = usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| {
+            FsstError::Truncated { need: usize::MAX, have: buf.len() }
+        })?;
         let _reserved = read_u64(buf, &mut pos)?;
 
         debug_assert_eq!(pos, 48, "header end at offset 48");
@@ -587,23 +598,23 @@ impl FsstCodec {
         // The first offset must be zero (the first string starts at the
         // beginning of the compressed stream). A non-zero offsets[0]
         // would silently shift every subsequent get() window.
-        if let Some(&first) = offsets.first() {
-            if first != 0 {
-                return Err(FsstError::BadOffset {
-                    index: 0,
-                    offset: u64::from(first),
-                    len: u64::from(compressed_len as u32),
-                });
-            }
+        if let Some(&first) = offsets.first()
+            && first != 0
+        {
+            return Err(FsstError::BadOffset {
+                index: 0,
+                offset: u64::from(first),
+                len: compressed_len as u64,
+            });
         }
 
         // Validate offsets monotonically increase and stay within compressed.
         for (i, w) in offsets.windows(2).enumerate() {
-            if w[1] < w[0] || u64::from(w[1]) > u64::from(compressed_len as u32) {
+            if w[1] < w[0] || u64::from(w[1]) > compressed_len as u64 {
                 return Err(FsstError::BadOffset {
                     index: i,
                     offset: u64::from(w[1]),
-                    len: u64::from(compressed_len as u32),
+                    len: compressed_len as u64,
                 });
             }
         }
@@ -796,7 +807,7 @@ mod tests {
 
     #[test]
     fn fsst_codec_round_trip_random_access() {
-        let strings = vec![
+        let strings = [
             b"the quick brown fox".to_vec(),
             b"jumps over the lazy dog".to_vec(),
             b"".to_vec(),
@@ -835,7 +846,7 @@ mod tests {
 
     #[test]
     fn fsst_blob_round_trip_preserves_strings() {
-        let strings = vec![
+        let strings = [
             b"alpha".to_vec(),
             b"beta gamma delta".to_vec(),
             b"".to_vec(),
@@ -892,7 +903,7 @@ mod tests {
         // Find the offsets section using the header u64 at offset 24
         // (offsets_offset). Patch offsets[0] to a non-zero value and re-patch CRC.
         let offsets_section_offset =
-            u64::from_le_bytes(blob[24..32].try_into().unwrap()) as usize;
+            usize::try_from(u64::from_le_bytes(blob[24..32].try_into().unwrap())).unwrap();
         blob[offsets_section_offset..offsets_section_offset + 4]
             .copy_from_slice(&7u32.to_le_bytes());
 

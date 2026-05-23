@@ -72,7 +72,7 @@ fn fsst_round_trip_all_empty_strings() {
 
 #[test]
 fn fsst_round_trip_all_bytes_0_to_255() {
-    let s: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
+    let s: Vec<u8> = (0u8..=255).collect();
     check_round_trip(&[s]);
 }
 
