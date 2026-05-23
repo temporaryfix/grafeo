@@ -82,6 +82,7 @@ mod accessor;
 mod distance;
 mod mmr;
 pub mod quantization;
+pub mod rabitq;
 mod simd;
 pub mod storage;
 pub mod zone_map;
