@@ -545,6 +545,7 @@ fn test_export_signed_requires_key() {
     assert!(db.export_snapshot_signed(b"").is_err());
 }
 
+#[cfg(feature = "rabitq-codec")]
 #[wasm_bindgen_test]
 fn rabitq_codec_encode_open_search_round_trip() {
     use grafeo_wasm::codecs::RabitqCodec;
