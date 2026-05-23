@@ -584,6 +584,19 @@ impl FsstCodec {
             })?
             .to_vec();
 
+        // The first offset must be zero (the first string starts at the
+        // beginning of the compressed stream). A non-zero offsets[0]
+        // would silently shift every subsequent get() window.
+        if let Some(&first) = offsets.first() {
+            if first != 0 {
+                return Err(FsstError::BadOffset {
+                    index: 0,
+                    offset: u64::from(first),
+                    len: u64::from(compressed_len as u32),
+                });
+            }
+        }
+
         // Validate offsets monotonically increase and stay within compressed.
         for (i, w) in offsets.windows(2).enumerate() {
             if w[1] < w[0] || u64::from(w[1]) > u64::from(compressed_len as u32) {
@@ -869,5 +882,29 @@ mod tests {
         let blob = bytes::Bytes::from(codec.to_bytes());
         let reopened = FsstCodec::from_bytes_shared(blob).expect("from_bytes_shared");
         assert_eq!(reopened.get(0).expect("get").expect("decode"), b"hello world");
+    }
+
+    #[test]
+    fn fsst_blob_rejects_non_zero_first_offset() {
+        let codec = FsstCodec::build(&[b"abc", b"def"]);
+        let mut blob = codec.to_bytes();
+
+        // Find the offsets section using the header u64 at offset 24
+        // (offsets_offset). Patch offsets[0] to a non-zero value and re-patch CRC.
+        let offsets_section_offset =
+            u64::from_le_bytes(blob[24..32].try_into().unwrap()) as usize;
+        blob[offsets_section_offset..offsets_section_offset + 4]
+            .copy_from_slice(&7u32.to_le_bytes());
+
+        // Re-patch the trailing CRC so the offsets-validation path (not CRC) is
+        // exercised.
+        let body_end = blob.len() - 4;
+        let crc = crc32fast::hash(&blob[..body_end]);
+        blob[body_end..].copy_from_slice(&crc.to_le_bytes());
+
+        match FsstCodec::from_bytes(&blob) {
+            Err(FsstError::BadOffset { index: 0, offset: 7, .. }) => {}
+            other => panic!("expected BadOffset{{index:0, offset:7, ...}}, got {other:?}"),
+        }
     }
 }
