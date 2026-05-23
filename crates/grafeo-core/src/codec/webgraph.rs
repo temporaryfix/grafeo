@@ -11,7 +11,6 @@
 //! assumption holds. For mutable graphs see
 //! [`crate::index::adjacency::ChunkedAdjacency`].
 
-#[allow(unused_imports)]
 use super::bitstream::{BitReader, BitWriter};
 
 /// Errors returned when opening or building a WebGraph blob.
@@ -114,9 +113,151 @@ impl WebGraphBuilder {
     }
 }
 
+impl WebGraphBuilder {
+    /// Sorts and de-duplicates the added edges, then encodes each node's
+    /// adjacency list with gap+gamma.
+    ///
+    /// Returns a [`WebGraphCodec`] holding the bit-packed stream and a
+    /// per-node bit-offset index.
+    #[must_use]
+    pub fn build(mut self) -> WebGraphCodec {
+        // Sort by (src, dst) then de-duplicate parallel edges.
+        self.edges.sort_unstable();
+        self.edges.dedup();
+
+        let mut writer = BitWriter::new();
+        let mut offsets: Vec<u64> = Vec::with_capacity(self.num_nodes as usize + 1);
+
+        // Walk edges in source order; each node's successors are a
+        // contiguous sub-slice.
+        let mut idx: usize = 0;
+        for u in 0..self.num_nodes {
+            offsets.push(writer.bit_len());
+
+            // Find the end of node u's successor block.
+            let start = idx;
+            while idx < self.edges.len() && self.edges[idx].0 == u {
+                idx += 1;
+            }
+            let successors = &self.edges[start..idx];
+            let k = successors.len() as u64;
+
+            // Encode out-degree + 1 in gamma (so degree=0 encodes as gamma(1)).
+            writer.write_gamma(k + 1);
+            if k == 0 {
+                continue;
+            }
+
+            // First gap is signed: v1 - u, encoded as zigzag-gamma.
+            // reason: edges validated as u64 < num_nodes in add_edge
+            #[allow(clippy::cast_possible_wrap)]
+            let first_gap = successors[0].1 as i64 - u as i64;
+            writer.write_zigzag_gamma(first_gap);
+
+            // Subsequent gaps are strictly positive (sorted, deduped).
+            for w in successors.windows(2) {
+                let gap = w[1].1 - w[0].1; // > 0
+                writer.write_gamma(gap);
+            }
+        }
+
+        // Terminal offset = total bit length, lets `successors` know the
+        // end of the last node's adjacency.
+        offsets.push(writer.bit_len());
+
+        let (bytes, bit_len) = writer.into_bytes();
+        let num_edges = self.edges.len() as u64;
+        WebGraphCodec {
+            num_nodes: self.num_nodes,
+            num_edges,
+            offsets,
+            bits: bytes,
+            bit_len,
+        }
+    }
+}
+
+/// A static compressed adjacency in WebGraph-style gap+gamma encoding.
+///
+/// Built via [`WebGraphBuilder::build`]; loaded via [`Self::from_bytes`].
+/// Per-node successor iteration is supported in-place without
+/// decompressing other nodes via the bit-offset index.
+#[derive(Debug, Clone)]
+pub struct WebGraphCodec {
+    pub(crate) num_nodes: u64,
+    pub(crate) num_edges: u64,
+    /// Bit offset of each node's adjacency block in `bits`. Length
+    /// `num_nodes + 1`; the trailing entry is the total bit length.
+    pub(crate) offsets: Vec<u64>,
+    /// Bit-packed adjacency stream.
+    pub(crate) bits: Vec<u8>,
+    /// Number of bits actually written (`<= bits.len() * 8`).
+    pub(crate) bit_len: u64,
+}
+
+impl WebGraphCodec {
+    /// Number of nodes.
+    #[must_use]
+    pub fn num_nodes(&self) -> u64 {
+        self.num_nodes
+    }
+
+    /// Number of edges (post-deduplication).
+    #[must_use]
+    pub fn num_edges(&self) -> u64 {
+        self.num_edges
+    }
+
+    /// Out-degree of `node`. Reads only the first gamma of the node's
+    /// adjacency block — O(log degree).
+    #[must_use]
+    pub fn out_degree(&self, node: u64) -> u64 {
+        if node >= self.num_nodes {
+            return 0;
+        }
+        let start = self.offsets[node as usize];
+        let mut reader = BitReader::new(&self.bits, self.bit_len);
+        reader.seek(start);
+        // The stored value is degree + 1 (gamma encodes n >= 1).
+        reader.read_gamma().unwrap_or(1) - 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_empty_graph_has_no_edges() {
+        let codec = WebGraphBuilder::new(0).build();
+        assert_eq!(codec.num_nodes(), 0);
+        assert_eq!(codec.num_edges(), 0);
+    }
+
+    #[test]
+    fn build_isolated_nodes_have_zero_degree() {
+        let codec = WebGraphBuilder::new(5).build();
+        assert_eq!(codec.num_nodes(), 5);
+        assert_eq!(codec.num_edges(), 0);
+        for u in 0u64..5 {
+            assert_eq!(codec.out_degree(u), 0);
+        }
+    }
+
+    #[test]
+    fn build_records_edge_count_after_deduplication() {
+        let mut b = WebGraphBuilder::new(4);
+        b.add_edge(0, 1).unwrap();
+        b.add_edge(0, 2).unwrap();
+        b.add_edge(0, 1).unwrap(); // duplicate
+        b.add_edge(1, 2).unwrap();
+        let codec = b.build();
+        assert_eq!(codec.num_edges(), 3); // duplicate removed
+        assert_eq!(codec.out_degree(0), 2);
+        assert_eq!(codec.out_degree(1), 1);
+        assert_eq!(codec.out_degree(2), 0);
+        assert_eq!(codec.out_degree(3), 0);
+    }
 
     #[test]
     fn builder_records_added_edges() {
