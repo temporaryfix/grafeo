@@ -21,6 +21,9 @@ mod signed_snapshot;
 mod types;
 mod utils;
 
+#[cfg(feature = "rabitq-codec")]
+pub mod codecs;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 

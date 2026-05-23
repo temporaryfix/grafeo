@@ -544,3 +544,33 @@ fn test_export_signed_requires_key() {
     let db = Database::new().expect("create db");
     assert!(db.export_snapshot_signed(b"").is_err());
 }
+
+#[wasm_bindgen_test]
+fn rabitq_codec_encode_open_search_round_trip() {
+    use grafeo_wasm::codecs::RabitqCodec;
+
+    let dim = 32usize;
+    let count = 40u32;
+    // Two clusters: ids 1..=20 near 0, ids 21..=40 near 10.
+    let mut ids = Vec::new();
+    let mut flat = Vec::new();
+    for i in 0..count {
+        ids.push(i + 1);
+        let base = if i < 20 { 0.0f32 } else { 10.0f32 };
+        for d in 0..dim {
+            flat.push(base + (d as f32 * 0.05).sin());
+        }
+    }
+
+    let blob = RabitqCodec::encode(&ids, &flat, dim, 1.0).expect("encode");
+    assert_eq!(&blob[0..4], b"GRBQ");
+
+    let codec = RabitqCodec::open(&blob).expect("open");
+    // Query from cluster 0 -> hits should be ids 1..=20.
+    let query: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.05).sin()).collect();
+    let hits = codec.search(&query, 5, 8);
+    assert_eq!(hits.len(), 5);
+    for id in hits {
+        assert!(id <= 20, "expected cluster-0 hit, got id {id}");
+    }
+}
