@@ -597,6 +597,7 @@ fn infer_column_type(codec: &ColumnCodec) -> ColumnType {
             dimensions: *dimensions,
         },
         ColumnCodec::RawI64(_) => ColumnType::Int64,
+        ColumnCodec::Fsst(_) => ColumnType::DictString,
     }
 }
 

@@ -10,7 +10,7 @@ use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use grafeo_common::types::Value;
 
-use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding};
+use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding, FsstCodec};
 
 // ── Phase 3a: Bytes-backed read helpers ──────────────────────────────
 //
@@ -232,6 +232,11 @@ pub enum ColumnCodec {
     BitPacked(BitPackedInts),
     /// Dictionary-encoded strings.
     Dict(DictionaryEncoding),
+    /// FSST-compressed strings with O(1) random-access decode.
+    /// See [`crate::codec::FsstCodec`]. Sits alongside [`Self::Dict`]; pick
+    /// FSST for high-cardinality string columns where dictionary encoding
+    /// loses to per-string compression.
+    Fsst(FsstCodec),
     /// Null/boolean bitmap.
     Bitmap(BitVector),
     /// Int8 quantized vectors (flat array with stride). Bytes-backed
@@ -387,6 +392,11 @@ impl ColumnCodec {
                 val
             }),
             Self::Dict(dict) => dict.get(index).map(|s| Value::String(ArcStr::from(s))),
+            Self::Fsst(fsst) => fsst
+                .get(index)
+                .ok()
+                .flatten()
+                .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| Value::String(ArcStr::from(s)))),
             Self::Bitmap(bv) => bv.get(index).map(Value::Bool),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
@@ -476,6 +486,7 @@ impl ColumnCodec {
         match self {
             Self::BitPacked(bp) => bp.len(),
             Self::Dict(dict) => dict.len(),
+            Self::Fsst(fsst) => fsst.len(),
             Self::Bitmap(bv) => bv.len(),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
@@ -888,6 +899,10 @@ impl ColumnCodec {
                 write_usize_as_u32(buf, body.len() / 8);
                 buf.extend_from_slice(&body);
             }
+            Self::Fsst(_) => {
+                // FSST serialization not yet wired into the v1 block format.
+                unimplemented!("ColumnCodec::Fsst write_to v1 not implemented")
+            }
         }
     }
 
@@ -1268,6 +1283,10 @@ impl ColumnCodec {
                     });
                 }
             }
+            Self::Fsst(_) => {
+                // FSST serialization not yet wired into the v2 block format.
+                unimplemented!("ColumnCodec::Fsst write_to_v2 not implemented")
+            }
         }
 
         (metas, bodies)
@@ -1617,6 +1636,12 @@ impl ColumnCodec {
                 let codes_bytes = d.code_count() * 4;
                 let dict_bytes: usize = d.dictionary().iter().map(|s| s.len()).sum();
                 codes_bytes + dict_bytes
+            }
+            Self::Fsst(fsst) => {
+                let (_, compressed, offsets) = fsst.parts();
+                // 2304 bytes for the symbol table (256 length bytes + 256×8 body bytes),
+                // plus the compressed bytes and offsets array.
+                2304 + compressed.len() + offsets.len() * 4
             }
             Self::Bitmap(bv) => bv.data_bytes().len(),
             Self::Int8Vector { bytes, .. } => bytes.len(),
@@ -3809,5 +3834,30 @@ mod tests {
         let mut sorted = result.clone();
         sorted.sort_unstable();
         assert_eq!(result, sorted, "iterator output must be sorted ascending");
+    }
+
+    #[test]
+    fn column_codec_fsst_round_trip() {
+        use crate::codec::FsstCodec;
+
+        let strings: Vec<&[u8]> = vec![
+            b"Vincent",
+            b"Mia",
+            b"Vincent",
+            b"Butch",
+        ];
+        let codec = FsstCodec::build(&strings);
+        let col = ColumnCodec::Fsst(codec);
+
+        assert_eq!(col.len(), 4);
+        assert_eq!(col.get(0), Some(Value::String(ArcStr::from("Vincent"))));
+        assert_eq!(col.get(1), Some(Value::String(ArcStr::from("Mia"))));
+        assert_eq!(col.get(2), Some(Value::String(ArcStr::from("Vincent"))));
+        assert_eq!(col.get(3), Some(Value::String(ArcStr::from("Butch"))));
+        assert_eq!(col.get(4), None);
+
+        // find_eq falls back to scanning via get; verify it still finds duplicates.
+        let hits = col.find_eq(&Value::String("Vincent".into()));
+        assert_eq!(hits, vec![0, 2]);
     }
 }
