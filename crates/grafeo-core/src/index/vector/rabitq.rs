@@ -168,6 +168,133 @@ impl Rotation {
     }
 }
 
+/// One quantized vector: a sign bit per dimension, plus two scalar
+/// correction factors. The packed bit array is `ceil(D/64)` `u64` words
+/// (32 bytes for 256 dims); the factors add 8 bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RabitqCode {
+    /// Sign bits of the rotated unit vector, 64 dimensions per word.
+    bits: Vec<u64>,
+    /// `⟨o, ō⟩` — dot product of the rotated unit vector with its own
+    /// quantized form. Unbiases the popcount estimator. Lies in `(0, 1]`.
+    dot_oo: f32,
+    /// Original L2 norm of the input, so Euclidean magnitude is
+    /// recoverable from the stored unit-vector code. Zero for a zero input.
+    norm: f32,
+}
+
+impl RabitqCode {
+    /// Size of the packed sign-bit array in bytes (excludes the 8-byte
+    /// correction factors).
+    #[must_use]
+    pub fn code_bytes(&self) -> usize {
+        self.bits.len() * 8
+    }
+
+    /// The `⟨o, ō⟩` correction factor.
+    #[must_use]
+    pub fn dot_oo(&self) -> f32 {
+        self.dot_oo
+    }
+
+    /// The original L2 norm of the encoded vector.
+    #[must_use]
+    pub fn norm(&self) -> f32 {
+        self.norm
+    }
+}
+
+/// Encodes `f32` vectors to [`RabitqCode`]s and estimates distances.
+#[derive(Debug, Clone)]
+pub struct RabitqQuantizer {
+    dim: usize,
+    seed: u64,
+    rotation: Rotation,
+}
+
+impl RabitqQuantizer {
+    /// Creates a quantizer for `dim`-dimensional vectors. `seed` fixes the
+    /// rotation so encoding is reproducible.
+    ///
+    /// # Panics
+    /// Panics if `dim` is zero.
+    #[must_use]
+    pub fn new(dim: usize, seed: u64) -> Self {
+        Self {
+            dim,
+            seed,
+            rotation: Rotation::new_seeded(dim, seed),
+        }
+    }
+
+    /// Reconstructs a quantizer from a stored rotation matrix.
+    #[must_use]
+    pub(crate) fn from_parts(dim: usize, seed: u64, rotation: Rotation) -> Self {
+        Self { dim, seed, rotation }
+    }
+
+    /// Number of dimensions.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// The rotation seed.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// The rotation matrix (used by blob serialization).
+    #[must_use]
+    pub(crate) fn rotation(&self) -> &Rotation {
+        &self.rotation
+    }
+
+    /// Number of `u64` words in a code's bit array.
+    #[must_use]
+    pub fn words(&self) -> usize {
+        self.dim.div_ceil(64)
+    }
+
+    /// Rotates and unit-normalises `vector`, returning `(rotated_unit, norm)`.
+    fn rotate_unit(&self, vector: &[f32]) -> (Vec<f32>, f32) {
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let inv = if norm > f32::EPSILON { 1.0 / norm } else { 0.0 };
+        let unit: Vec<f32> = vector.iter().map(|&x| x * inv).collect();
+        (self.rotation.apply(&unit), norm)
+    }
+
+    /// Packs sign bits of `rotated` into `u64` words (bit `i` set iff
+    /// `rotated[i] >= 0`). Padding bits past `dim` stay zero.
+    fn sign_bits(&self, rotated: &[f32]) -> Vec<u64> {
+        let mut bits = vec![0u64; self.words()];
+        for (i, &x) in rotated.iter().enumerate() {
+            if x >= 0.0 {
+                bits[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+        bits
+    }
+
+    /// Encodes a data vector to a [`RabitqCode`].
+    ///
+    /// # Panics
+    /// Panics if `vector.len() != self.dim()`.
+    #[must_use]
+    pub fn encode(&self, vector: &[f32]) -> RabitqCode {
+        assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
+        let (rotated, norm) = self.rotate_unit(vector);
+        let bits = self.sign_bits(&rotated);
+        // ō_i = ±1/√D, so ⟨o, ō⟩ = (1/√D) · Σ|o_i|.
+        let abs_sum: f32 = rotated.iter().map(|x| x.abs()).sum();
+        // reason: dim is small and positive, cast is exact
+        #[allow(clippy::cast_precision_loss)]
+        let dot_oo = abs_sum / (self.dim as f32).sqrt();
+        RabitqCode { bits, dot_oo, norm }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +335,30 @@ mod tests {
         let b = Rotation::new_seeded(32, 99);
         let v: Vec<f32> = (0..32).map(|i| i as f32).collect();
         assert_eq!(a.apply(&v), b.apply(&v));
+    }
+
+    #[test]
+    fn encode_256_dim_yields_32_byte_code() {
+        let q = RabitqQuantizer::new(256, 1);
+        let v: Vec<f32> = (0..256).map(|i| (i as f32 * 0.01).sin()).collect();
+        let code = q.encode(&v);
+        assert_eq!(code.code_bytes(), 32, "256 sign bits must pack into 32 bytes");
+        assert!(code.dot_oo() > 0.0 && code.dot_oo() <= 1.0 + 1e-4);
+        assert!(code.norm() > 0.0);
+    }
+
+    #[test]
+    fn encode_zero_vector_does_not_panic() {
+        let q = RabitqQuantizer::new(8, 1);
+        let code = q.encode(&[0.0; 8]);
+        assert_eq!(code.norm(), 0.0);
+    }
+
+    #[test]
+    fn encode_non_multiple_of_64_dim() {
+        // 100 dims -> ceil(100/64) = 2 words = 16 bytes.
+        let q = RabitqQuantizer::new(100, 5);
+        let v: Vec<f32> = (0..100).map(|i| i as f32 - 50.0).collect();
+        assert_eq!(q.encode(&v).code_bytes(), 16);
     }
 }
