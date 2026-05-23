@@ -665,6 +665,11 @@ impl FsstView {
     /// # Errors
     /// Returns [`FsstError`] on a malformed blob — same conditions as
     /// [`FsstCodec::from_bytes`].
+    ///
+    /// # Panics
+    /// Never panics in practice; the internal `expect("4 bytes")` is infallible
+    /// because the length guard ensures at least 8 bytes are present and the
+    /// CRC trailer is always exactly 4 bytes wide.
     pub fn open(blob: bytes::Bytes) -> Result<Self, FsstError> {
         let buf = blob.as_ref();
         if buf.len() < 8 {
@@ -680,6 +685,8 @@ impl FsstView {
             return Err(FsstError::BadVersion(buf[4]));
         }
         let body_end = buf.len() - 4;
+        // SAFETY: body_end = buf.len() - 4; the length guard above ensures
+        // buf.len() >= 8, so buf[body_end..] is always exactly 4 bytes.
         let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
         let computed = crc32fast::hash(&buf[..body_end]);
         if stored != computed {
@@ -689,8 +696,13 @@ impl FsstView {
         let mut pos = 8;
         let count = read_u32(buf, &mut pos)? as usize;
         let compressed_len = read_u32(buf, &mut pos)? as usize;
+        // reason: section offsets fit usize — blobs are memory-mapped and
+        // cannot exceed the addressable space of the current target
+        #[allow(clippy::cast_possible_truncation)]
         let table_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let offsets_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let compressed_offset = read_u64(buf, &mut pos)? as usize;
         let _reserved = read_u64(buf, &mut pos)?;
 
@@ -759,6 +771,8 @@ impl FsstView {
                 return Err(FsstError::BadOffset {
                     index: 0,
                     offset: u64::from(first),
+                    // reason: compressed_len fits u32 — bounded by the u32 stored in the blob header
+                    #[allow(clippy::cast_possible_truncation)]
                     len: u64::from(compressed_len as u32),
                 });
             }
@@ -810,6 +824,8 @@ impl FsstView {
             return Err(FsstError::BadOffset {
                 index,
                 offset: u64::from(self.read_offset(index)),
+                // reason: compressed_len fits u32 — bounded by the u32 stored in the blob header
+                #[allow(clippy::cast_possible_truncation)]
                 len: u64::from(self.compressed_len as u32),
             });
         }
