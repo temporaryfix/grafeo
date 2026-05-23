@@ -637,6 +637,188 @@ impl FsstCodec {
     }
 }
 
+/// A borrowing reader over an [`FsstCodec`] blob.
+///
+/// Holds a single `bytes::Bytes` and the parsed offsets; per-string
+/// decode slices the compressed stream directly from the blob, avoiding
+/// the heap-copy that [`FsstCodec::from_bytes`] does on the `compressed`
+/// vector. The symbol table is decoded once at open time into an owned
+/// [`SymbolTable`] (~2 KB).
+#[derive(Debug, Clone)]
+pub struct FsstView {
+    blob: bytes::Bytes,
+    /// Decoded once at open time (~2 KB).
+    table: SymbolTable,
+    /// Number of strings.
+    count: usize,
+    /// Byte offset into `blob` where the offsets array starts.
+    offsets_offset: usize,
+    /// Byte offset into `blob` where the compressed stream starts.
+    compressed_offset: usize,
+    /// Length of the compressed stream in bytes.
+    compressed_len: usize,
+}
+
+impl FsstView {
+    /// Opens a blob produced by [`FsstCodec::to_bytes`].
+    ///
+    /// # Errors
+    /// Returns [`FsstError`] on a malformed blob — same conditions as
+    /// [`FsstCodec::from_bytes`].
+    pub fn open(blob: bytes::Bytes) -> Result<Self, FsstError> {
+        let buf = blob.as_ref();
+        if buf.len() < 8 {
+            return Err(FsstError::Truncated {
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        if &buf[0..4] != b"GFST" {
+            return Err(FsstError::BadMagic);
+        }
+        if buf[4] != BLOB_VERSION {
+            return Err(FsstError::BadVersion(buf[4]));
+        }
+        let body_end = buf.len() - 4;
+        let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
+        let computed = crc32fast::hash(&buf[..body_end]);
+        if stored != computed {
+            return Err(FsstError::CrcMismatch { stored, computed });
+        }
+
+        let mut pos = 8;
+        let count = read_u32(buf, &mut pos)? as usize;
+        let compressed_len = read_u32(buf, &mut pos)? as usize;
+        let table_offset = read_u64(buf, &mut pos)? as usize;
+        let offsets_offset = read_u64(buf, &mut pos)? as usize;
+        let compressed_offset = read_u64(buf, &mut pos)? as usize;
+        let _reserved = read_u64(buf, &mut pos)?;
+
+        // Symbol table — decoded once into owned SymbolTable.
+        let lengths_end = table_offset + 256;
+        let lengths_slice = buf.get(table_offset..lengths_end).ok_or(FsstError::Truncated {
+            need: lengths_end,
+            have: buf.len(),
+        })?;
+        let bodies_end = lengths_end + 256 * MAX_SYMBOL_LEN;
+        let bodies_slice = buf.get(lengths_end..bodies_end).ok_or(FsstError::Truncated {
+            need: bodies_end,
+            have: buf.len(),
+        })?;
+        let mut table = SymbolTable::default();
+        for (code, &len_byte) in lengths_slice.iter().enumerate() {
+            // reason: code 0..=255 fits u8 by construction
+            #[allow(clippy::cast_possible_truncation)]
+            let code_u8 = code as u8;
+            if code_u8 == ESCAPE {
+                if len_byte != 0 {
+                    return Err(FsstError::BadSymbolLength {
+                        code: code_u8,
+                        length: len_byte,
+                    });
+                }
+                continue;
+            }
+            if len_byte == 0 {
+                continue;
+            }
+            if (len_byte as usize) > MAX_SYMBOL_LEN {
+                return Err(FsstError::BadSymbolLength {
+                    code: code_u8,
+                    length: len_byte,
+                });
+            }
+            let body_start = code * MAX_SYMBOL_LEN;
+            let sym = &bodies_slice[body_start..body_start + len_byte as usize];
+            table.set(code_u8, sym);
+        }
+
+        // Validate the offsets and compressed sections fit.
+        let offsets_byte_end = offsets_offset + 4 * (count + 1);
+        if offsets_byte_end > buf.len() {
+            return Err(FsstError::Truncated {
+                need: offsets_byte_end,
+                have: buf.len(),
+            });
+        }
+        let compressed_end = compressed_offset + compressed_len;
+        if compressed_end > buf.len() {
+            return Err(FsstError::Truncated {
+                need: compressed_end,
+                have: buf.len(),
+            });
+        }
+        // Validate offsets[0] == 0.
+        if count > 0 {
+            let first = u32::from_le_bytes(
+                buf[offsets_offset..offsets_offset + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            if first != 0 {
+                return Err(FsstError::BadOffset {
+                    index: 0,
+                    offset: u64::from(first),
+                    len: u64::from(compressed_len as u32),
+                });
+            }
+        }
+
+        Ok(Self {
+            blob,
+            table,
+            count,
+            offsets_offset,
+            compressed_offset,
+            compressed_len,
+        })
+    }
+
+    /// Number of strings stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// True if empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Reads `offsets[index]` from the blob.
+    fn read_offset(&self, index: usize) -> u32 {
+        let pos = self.offsets_offset + index * 4;
+        u32::from_le_bytes(
+            self.blob.as_ref()[pos..pos + 4]
+                .try_into()
+                .expect("4 bytes"),
+        )
+    }
+
+    /// Decodes string `index`, or `Ok(None)` if out of bounds.
+    ///
+    /// # Errors
+    /// Returns [`FsstError`] if the stored bytes are malformed.
+    pub fn get(&self, index: usize) -> Result<Option<Vec<u8>>, FsstError> {
+        if index >= self.count {
+            return Ok(None);
+        }
+        let start = self.read_offset(index) as usize;
+        let end = self.read_offset(index + 1) as usize;
+        if end > self.compressed_len || start > end {
+            return Err(FsstError::BadOffset {
+                index,
+                offset: u64::from(self.read_offset(index)),
+                len: u64::from(self.compressed_len as u32),
+            });
+        }
+        let compressed = &self.blob.as_ref()
+            [self.compressed_offset + start..self.compressed_offset + end];
+        Ok(Some(self.table.decode(compressed)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1075,38 @@ mod tests {
         let blob = bytes::Bytes::from(codec.to_bytes());
         let reopened = FsstCodec::from_bytes_shared(blob).expect("from_bytes_shared");
         assert_eq!(reopened.get(0).expect("get").expect("decode"), b"hello world");
+    }
+
+    #[test]
+    fn view_get_matches_owned_get() {
+        let strings: Vec<&[u8]> = vec![
+            b"alpha",
+            b"beta gamma",
+            b"",
+            b"the quick brown fox",
+        ];
+        let owned = FsstCodec::build(&strings);
+        let blob = bytes::Bytes::from(owned.to_bytes());
+        let view = FsstView::open(blob).expect("open");
+
+        assert_eq!(view.len(), owned.len());
+        for i in 0..strings.len() {
+            let owned_s = owned.get(i).expect("owned").expect("decode");
+            let view_s = view.get(i).expect("view").expect("decode");
+            assert_eq!(view_s, owned_s, "string {i} mismatched");
+        }
+        assert!(view.get(strings.len()).expect("view").is_none());
+    }
+
+    #[test]
+    fn view_rejects_bad_magic() {
+        let owned = FsstCodec::build(&[b"hello"]);
+        let mut bad = owned.to_bytes();
+        bad[0] = b'X';
+        assert!(matches!(
+            FsstView::open(bytes::Bytes::from(bad)),
+            Err(FsstError::BadMagic)
+        ));
     }
 
     #[test]
