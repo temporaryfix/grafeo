@@ -11,6 +11,7 @@
 //! of scalar correction factors stored alongside it.
 
 use super::quantization::hamming_distance_simd;
+use grafeo_common::types::NodeId;
 
 /// A tiny deterministic PRNG (SplitMix64). In-tree so the codec stays
 /// dependency-free and `wasm32`-friendly; seeding makes the rotation
@@ -345,6 +346,97 @@ impl RabitqQuantizer {
     }
 }
 
+/// An in-memory set of RaBitQ codes supporting a coarse nearest-neighbour
+/// scan. Used standalone, or as the first stage of [`TwoStageVectorIndex`].
+#[derive(Debug, Clone)]
+pub struct RabitqIndex {
+    quantizer: RabitqQuantizer,
+    ids: Vec<NodeId>,
+    codes: Vec<RabitqCode>,
+}
+
+impl RabitqIndex {
+    /// Creates an empty index for `dim`-dimensional vectors.
+    #[must_use]
+    pub fn new(dim: usize, seed: u64) -> Self {
+        Self {
+            quantizer: RabitqQuantizer::new(dim, seed),
+            ids: Vec::new(),
+            codes: Vec::new(),
+        }
+    }
+
+    /// Creates an empty index sharing an existing quantizer.
+    #[must_use]
+    pub(crate) fn with_quantizer(quantizer: RabitqQuantizer) -> Self {
+        Self {
+            quantizer,
+            ids: Vec::new(),
+            codes: Vec::new(),
+        }
+    }
+
+    /// Number of vectors in the index.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// True if the index holds no vectors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// The underlying quantizer.
+    #[must_use]
+    pub fn quantizer(&self) -> &RabitqQuantizer {
+        &self.quantizer
+    }
+
+    /// Encodes and stores one vector.
+    pub fn insert(&mut self, id: NodeId, vector: &[f32]) {
+        self.codes.push(self.quantizer.encode(vector));
+        self.ids.push(id);
+    }
+
+    /// Returns the `n` nearest candidates to `query` by RaBitQ distance
+    /// estimate, sorted ascending (closest first).
+    #[must_use]
+    pub fn coarse_search(&self, query: &[f32], n: usize) -> Vec<(NodeId, f32)> {
+        let q = self.quantizer.encode_query(query);
+        let mut scored: Vec<(NodeId, f32)> = self
+            .ids
+            .iter()
+            .zip(&self.codes)
+            .map(|(&id, code)| (id, self.quantizer.estimate_distance(&q, code)))
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(n);
+        scored
+    }
+
+    /// Stored ids, parallel to [`Self::codes`].
+    #[must_use]
+    pub(crate) fn ids(&self) -> &[NodeId] {
+        &self.ids
+    }
+
+    /// Stored codes, parallel to [`Self::ids`].
+    #[must_use]
+    pub(crate) fn codes(&self) -> &[RabitqCode] {
+        &self.codes
+    }
+
+    /// Replaces the index contents with pre-decoded ids and codes
+    /// (blob deserialization).
+    pub(crate) fn load_entries(&mut self, ids: Vec<NodeId>, codes: Vec<RabitqCode>) {
+        debug_assert_eq!(ids.len(), codes.len());
+        self.ids = ids;
+        self.codes = codes;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +534,32 @@ mod tests {
             assert!(d >= last - 0.5, "distance not monotone at scale {scale}: {d} < {last}");
             last = d;
         }
+    }
+
+    #[test]
+    fn rabitq_index_coarse_search_returns_sorted_candidates() {
+        use grafeo_common::types::NodeId;
+
+        let mut index = RabitqIndex::new(32, 17);
+        // Cluster A near 0.0, cluster B near 5.0.
+        for i in 0..10 {
+            let a: Vec<f32> = (0..32).map(|d| (d as f32 * 0.1).sin() + i as f32 * 0.01).collect();
+            index.insert(NodeId::new(i + 1), &a);
+        }
+        for i in 0..10 {
+            let b: Vec<f32> = (0..32).map(|d| (d as f32 * 0.1).sin() + 5.0).collect();
+            index.insert(NodeId::new(100 + i), &b);
+        }
+        assert_eq!(index.len(), 20);
+
+        let query: Vec<f32> = (0..32).map(|d| (d as f32 * 0.1).sin()).collect();
+        let hits = index.coarse_search(&query, 5);
+        assert_eq!(hits.len(), 5);
+        // Sorted ascending by estimated distance.
+        for w in hits.windows(2) {
+            assert!(w[0].1 <= w[1].1);
+        }
+        // The nearest hits should come from cluster A (ids 1..=10).
+        assert!(hits[0].0.as_u64() <= 10, "nearest hit not from cluster A");
     }
 }
