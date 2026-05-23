@@ -30,6 +30,7 @@
 //! ```
 
 pub mod bitpack;
+pub(crate) mod bitstream;
 pub mod bitvec;
 pub mod block;
 pub mod delta;
