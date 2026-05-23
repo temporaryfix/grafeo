@@ -101,3 +101,7 @@ harness = false
 [[bench]]
 name = "rabitq_vs_pq"
 harness = false
+
+[[bench]]
+name = "codec_views"
+harness = false
