@@ -282,6 +282,108 @@ impl SymbolTable {
     }
 }
 
+/// A compressed set of strings with O(1) random-access decode.
+///
+/// Internally stores a [`SymbolTable`] trained on the input, a flat
+/// `compressed` byte stream of all strings concatenated, and an
+/// `offsets` array where `offsets[k]..offsets[k+1]` is the byte range
+/// of string `k` in `compressed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FsstCodec {
+    table: SymbolTable,
+    /// Concatenated compressed strings.
+    compressed: Vec<u8>,
+    /// One entry per string + one trailing total-length entry.
+    /// `offsets[k]..offsets[k+1]` is string `k`'s byte range.
+    offsets: Vec<u32>,
+}
+
+impl FsstCodec {
+    /// Builds a codec from a slice of byte strings.
+    ///
+    /// Trains a [`SymbolTable`] on the input and compresses each string in
+    /// turn, recording its start offset for random access.
+    #[must_use]
+    pub fn build(strings: &[&[u8]]) -> Self {
+        let table = SymbolTable::train(strings);
+        let mut compressed = Vec::new();
+        let mut offsets: Vec<u32> = Vec::with_capacity(strings.len() + 1);
+        for s in strings {
+            // reason: compressed size is bounded by 2 × total input bytes; for
+            // any practical workload this stays well under u32::MAX (4 GiB).
+            #[allow(clippy::cast_possible_truncation)]
+            offsets.push(compressed.len() as u32);
+            compressed.extend(table.encode(s));
+        }
+        // reason: same bound as above
+        #[allow(clippy::cast_possible_truncation)]
+        offsets.push(compressed.len() as u32);
+        Self {
+            table,
+            compressed,
+            offsets,
+        }
+    }
+
+    /// Reconstructs a codec from its parts (blob deserialization).
+    ///
+    /// # Panics
+    /// Panics if `offsets` is empty or the last offset exceeds
+    /// `compressed.len()`.
+    #[must_use]
+    pub(crate) fn from_parts(
+        table: SymbolTable,
+        compressed: Vec<u8>,
+        offsets: Vec<u32>,
+    ) -> Self {
+        assert!(
+            !offsets.is_empty(),
+            "offsets must contain at least the terminal length"
+        );
+        assert!(
+            *offsets.last().unwrap() as usize <= compressed.len(),
+            "terminal offset must not exceed compressed length"
+        );
+        Self {
+            table,
+            compressed,
+            offsets,
+        }
+    }
+
+    /// Number of strings stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    /// True if no strings are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Decodes string `index`, or `Ok(None)` if `index` is out of bounds.
+    ///
+    /// # Errors
+    /// Returns [`FsstError`] if the stored bytes are malformed (e.g., a
+    /// trailing escape with no literal).
+    pub fn get(&self, index: usize) -> Result<Option<Vec<u8>>, FsstError> {
+        if index >= self.len() {
+            return Ok(None);
+        }
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        Ok(Some(self.table.decode(&self.compressed[start..end])?))
+    }
+
+    /// Accessors used by blob serialization.
+    #[must_use]
+    pub(crate) fn parts(&self) -> (&SymbolTable, &[u8], &[u32]) {
+        (&self.table, &self.compressed, &self.offsets)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +550,44 @@ mod tests {
             table.decode(&[0]),
             Err(FsstError::TruncatedEscape(0))
         ));
+    }
+
+    #[test]
+    fn fsst_codec_round_trip_random_access() {
+        let strings = vec![
+            b"the quick brown fox".to_vec(),
+            b"jumps over the lazy dog".to_vec(),
+            b"".to_vec(),
+            b"the".to_vec(),
+            b"the cat sat on the mat".to_vec(),
+        ];
+        let refs: Vec<&[u8]> = strings.iter().map(Vec::as_slice).collect();
+        let codec = FsstCodec::build(&refs);
+
+        assert_eq!(codec.len(), 5);
+        for (i, s) in strings.iter().enumerate() {
+            let decoded = codec.get(i).expect("get").expect("decode");
+            assert_eq!(&decoded, s, "string {i} mismatched");
+        }
+        // Out-of-bounds returns Ok(None).
+        assert!(codec.get(5).expect("get").is_none());
+    }
+
+    #[test]
+    fn fsst_codec_handles_all_empty() {
+        let refs: Vec<&[u8]> = vec![b"", b"", b""];
+        let codec = FsstCodec::build(&refs);
+        assert_eq!(codec.len(), 3);
+        for i in 0..3 {
+            assert_eq!(codec.get(i).expect("get").expect("decode"), Vec::<u8>::new());
+        }
+    }
+
+    #[test]
+    fn fsst_codec_handles_no_strings() {
+        let refs: Vec<&[u8]> = vec![];
+        let codec = FsstCodec::build(&refs);
+        assert_eq!(codec.len(), 0);
+        assert!(codec.is_empty());
     }
 }
