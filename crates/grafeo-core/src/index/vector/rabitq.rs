@@ -572,6 +572,196 @@ impl TwoStageVectorIndex {
     }
 }
 
+/// Current RaBitQ blob format version.
+const BLOB_VERSION: u8 = 1;
+
+/// Appends zero bytes until `buf.len()` is a multiple of `align`.
+fn pad_to(buf: &mut Vec<u8>, align: usize) {
+    while !buf.len().is_multiple_of(align) {
+        buf.push(0);
+    }
+}
+
+/// Reads a little-endian `u32` at `*pos`, advancing `*pos`.
+fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, RabitqError> {
+    let end = *pos + 4;
+    let slice = buf.get(*pos..end).ok_or(RabitqError::Truncated {
+        need: end,
+        have: buf.len(),
+    })?;
+    *pos = end;
+    Ok(u32::from_le_bytes(slice.try_into().expect("4 bytes")))
+}
+
+/// Reads a little-endian `u64` at `*pos`, advancing `*pos`.
+fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64, RabitqError> {
+    let end = *pos + 8;
+    let slice = buf.get(*pos..end).ok_or(RabitqError::Truncated {
+        need: end,
+        have: buf.len(),
+    })?;
+    *pos = end;
+    Ok(u64::from_le_bytes(slice.try_into().expect("8 bytes")))
+}
+
+/// Reads a little-endian `f32` at `*pos`, advancing `*pos`.
+fn read_f32(buf: &[u8], pos: &mut usize) -> Result<f32, RabitqError> {
+    Ok(f32::from_bits(read_u32(buf, pos)?))
+}
+
+impl TwoStageVectorIndex {
+    /// Serializes the index to a self-describing, position-independent blob.
+    ///
+    /// The layout honours the Plan 2 zero-copy contract: a fixed header,
+    /// naturally-aligned arrays, blob-relative offsets, and a trailing CRC32.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let (coarse, scalar, int8) = self.parts();
+        let quantizer = coarse.quantizer();
+        let dim = quantizer.dim();
+        let words = quantizer.words();
+        let count = coarse.len();
+
+        let quant_blob =
+            bincode::serde::encode_to_vec(scalar, bincode::config::standard())
+                .expect("ScalarQuantizer is serializable");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GRBQ");
+        buf.push(BLOB_VERSION);
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // padding
+        // reason: dim/count/words bounded well below u32::MAX in practice
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf.extend_from_slice(&(dim as u32).to_le_bytes());
+            buf.extend_from_slice(&(count as u32).to_le_bytes());
+            buf.extend_from_slice(&quantizer.seed().to_le_bytes());
+            buf.extend_from_slice(&(words as u32).to_le_bytes());
+            buf.extend_from_slice(&(quant_blob.len() as u32).to_le_bytes());
+        }
+        buf.extend_from_slice(&quant_blob);
+        pad_to(&mut buf, 8);
+
+        // Rotation matrix (dim*dim f32).
+        for &m in quantizer.rotation().matrix() {
+            buf.extend_from_slice(&m.to_le_bytes());
+        }
+        pad_to(&mut buf, 8);
+
+        // ids.
+        for &id in coarse.ids() {
+            buf.extend_from_slice(&id.as_u64().to_le_bytes());
+        }
+
+        // codes: bit words, then dot_oo, then norm.
+        for code in coarse.codes() {
+            for &w in &code.bits {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            buf.extend_from_slice(&code.dot_oo().to_le_bytes());
+            buf.extend_from_slice(&code.norm().to_le_bytes());
+        }
+
+        // int8 codes.
+        for row in int8 {
+            buf.extend_from_slice(row);
+        }
+        pad_to(&mut buf, 4);
+
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Opens a blob produced by [`Self::to_bytes`].
+    ///
+    /// # Errors
+    /// Returns [`RabitqError`] on a bad magic, unsupported version,
+    /// truncation, CRC mismatch, or a corrupt scalar-quantizer sub-blob.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, RabitqError> {
+        if buf.len() < 8 {
+            return Err(RabitqError::Truncated {
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        if &buf[0..4] != b"GRBQ" {
+            return Err(RabitqError::BadMagic);
+        }
+        if buf[4] != BLOB_VERSION {
+            return Err(RabitqError::BadVersion(buf[4]));
+        }
+        // Verify CRC over everything but the trailing 4 bytes.
+        let body_end = buf.len() - 4;
+        let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
+        let computed = crc32fast::hash(&buf[..body_end]);
+        if stored != computed {
+            return Err(RabitqError::CrcMismatch { stored, computed });
+        }
+
+        let mut pos = 8;
+        let dim = read_u32(buf, &mut pos)? as usize;
+        let count = read_u32(buf, &mut pos)? as usize;
+        let seed = read_u64(buf, &mut pos)?;
+        let words = read_u32(buf, &mut pos)? as usize;
+        let quant_len = read_u32(buf, &mut pos)? as usize;
+
+        let quant_slice = buf.get(pos..pos + quant_len).ok_or(RabitqError::Truncated {
+            need: pos + quant_len,
+            have: buf.len(),
+        })?;
+        let (scalar, _): (ScalarQuantizer, usize) =
+            bincode::serde::decode_from_slice(quant_slice, bincode::config::standard())
+                .map_err(|e| RabitqError::Quantizer(e.to_string()))?;
+        pos += quant_len;
+        pos = pos.next_multiple_of(8);
+
+        // Rotation matrix.
+        let mut matrix = Vec::with_capacity(dim * dim);
+        for _ in 0..dim * dim {
+            matrix.push(read_f32(buf, &mut pos)?);
+        }
+        pos = pos.next_multiple_of(8);
+
+        let quantizer =
+            RabitqQuantizer::from_parts(dim, seed, Rotation::from_matrix(dim, matrix));
+        let mut coarse = RabitqIndex::with_quantizer(quantizer);
+
+        // ids.
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(NodeId::new(read_u64(buf, &mut pos)?));
+        }
+
+        // codes.
+        let mut codes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut bits = Vec::with_capacity(words);
+            for _ in 0..words {
+                bits.push(read_u64(buf, &mut pos)?);
+            }
+            let dot_oo = read_f32(buf, &mut pos)?;
+            let norm = read_f32(buf, &mut pos)?;
+            codes.push(RabitqCode { bits, dot_oo, norm });
+        }
+        coarse.load_entries(ids, codes);
+
+        // int8 codes.
+        let mut int8 = Vec::with_capacity(count);
+        for _ in 0..count {
+            let slice = buf.get(pos..pos + dim).ok_or(RabitqError::Truncated {
+                need: pos + dim,
+                have: buf.len(),
+            })?;
+            int8.push(slice.to_vec());
+            pos += dim;
+        }
+
+        Ok(Self::from_parts(coarse, scalar, int8))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,5 +932,58 @@ mod tests {
         let index = TwoStageVectorIndex::build(&vectors, 8, 1);
         assert!(index.search(&[1.0; 8], 0, 4).is_empty());
         assert_eq!(index.search(&[1.0; 8], 5, 4).len(), 1);
+    }
+
+    #[test]
+    fn blob_round_trip_preserves_search_results() {
+        use grafeo_common::types::NodeId;
+
+        let dim = 48;
+        let mut rng = SplitMix64::new(555);
+        let vectors: Vec<(NodeId, Vec<f32>)> = (0..80)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.next_gaussian()).collect();
+                (NodeId::new(i + 1), v)
+            })
+            .collect();
+
+        let index = TwoStageVectorIndex::build(&vectors, dim, 9);
+        let blob = index.to_bytes();
+
+        // Header contract: magic, version, 8-byte aligned total length.
+        assert_eq!(&blob[0..4], b"GRBQ");
+        assert_eq!(blob[4], 1);
+
+        let reopened = TwoStageVectorIndex::from_bytes(&blob).expect("from_bytes");
+        assert_eq!(reopened.len(), index.len());
+
+        // Identical query results before and after a round trip.
+        let query = vectors[3].1.clone();
+        assert_eq!(
+            index.search(&query, 10, 8),
+            reopened.search(&query, 10, 8),
+        );
+    }
+
+    #[test]
+    fn blob_rejects_bad_magic_and_crc() {
+        use grafeo_common::types::NodeId;
+        let vectors = vec![(NodeId::new(1), vec![1.0f32; 8])];
+        let mut blob = TwoStageVectorIndex::build(&vectors, 8, 1).to_bytes();
+
+        let mut bad_magic = blob.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            TwoStageVectorIndex::from_bytes(&bad_magic),
+            Err(RabitqError::BadMagic)
+        ));
+
+        // Corrupt a body byte; the trailing CRC must catch it.
+        let mid = blob.len() / 2;
+        blob[mid] ^= 0xFF;
+        assert!(matches!(
+            TwoStageVectorIndex::from_bytes(&blob),
+            Err(RabitqError::CrcMismatch { .. })
+        ));
     }
 }
