@@ -613,7 +613,28 @@ impl TwoStageVectorIndex {
     /// Serializes the index to a self-describing, position-independent blob.
     ///
     /// The layout honours the Plan 2 zero-copy contract: a fixed header,
-    /// naturally-aligned arrays, blob-relative offsets, and a trailing CRC32.
+    /// naturally-aligned arrays, blob-relative `u64` offsets to each section,
+    /// and a trailing CRC32. See `BLOB_VERSION` for the wire-format version.
+    ///
+    /// Header layout (64 bytes):
+    /// ```text
+    /// offset 0   "GRBQ"               magic (4)
+    ///        4   version = 1          u8
+    ///        5   flags = 0            u8
+    ///        6   padding              u16
+    ///        8   dim                  u32
+    ///       12   count                u32
+    ///       16   seed                 u64
+    ///       24   words                u32
+    ///       28   quantizer_len        u32
+    ///       32   rotation_offset      u64   (blob-relative)
+    ///       40   ids_offset           u64   (blob-relative)
+    ///       48   codes_offset         u64   (blob-relative)
+    ///       56   int8_offset          u64   (blob-relative)
+    ///       64   quantizer bytes ... + pad to 8
+    ///            ... sections in offset-table order
+    ///            trailing CRC32 (4 bytes)
+    /// ```
     ///
     /// # Panics
     /// Panics if the internal `ScalarQuantizer` fails to serialize via
@@ -644,20 +665,33 @@ impl TwoStageVectorIndex {
             buf.extend_from_slice(&(words as u32).to_le_bytes());
             buf.extend_from_slice(&(quant_blob.len() as u32).to_le_bytes());
         }
+        // 4×u64 placeholder for section offsets, patched at the end.
+        let offsets_pos = buf.len(); // = 32
+        buf.extend_from_slice(&[0u8; 32]); // 4 × u64
+
         buf.extend_from_slice(&quant_blob);
         pad_to(&mut buf, 8);
 
+        // reason: section offsets fit in u64 for any realistic blob size
+        #[allow(clippy::cast_possible_truncation)]
+        let rotation_offset = buf.len() as u64;
         // Rotation matrix (dim*dim f32).
         for &m in quantizer.rotation().matrix() {
             buf.extend_from_slice(&m.to_le_bytes());
         }
         pad_to(&mut buf, 8);
 
+        // reason: section offsets fit in u64 for any realistic blob size
+        #[allow(clippy::cast_possible_truncation)]
+        let ids_offset = buf.len() as u64;
         // ids.
         for &id in coarse.ids() {
             buf.extend_from_slice(&id.as_u64().to_le_bytes());
         }
 
+        // reason: section offsets fit in u64 for any realistic blob size
+        #[allow(clippy::cast_possible_truncation)]
+        let codes_offset = buf.len() as u64;
         // codes: bit words, then dot_oo, then norm.
         for code in coarse.codes() {
             for &w in &code.bits {
@@ -667,11 +701,24 @@ impl TwoStageVectorIndex {
             buf.extend_from_slice(&code.norm().to_le_bytes());
         }
 
+        // reason: section offsets fit in u64 for any realistic blob size
+        #[allow(clippy::cast_possible_truncation)]
+        let int8_offset = buf.len() as u64;
         // int8 codes.
         for row in int8 {
             buf.extend_from_slice(row);
         }
         pad_to(&mut buf, 4);
+
+        // Patch offsets into placeholder.
+        buf[offsets_pos..offsets_pos + 8]
+            .copy_from_slice(&rotation_offset.to_le_bytes());
+        buf[offsets_pos + 8..offsets_pos + 16]
+            .copy_from_slice(&ids_offset.to_le_bytes());
+        buf[offsets_pos + 16..offsets_pos + 24]
+            .copy_from_slice(&codes_offset.to_le_bytes());
+        buf[offsets_pos + 24..offsets_pos + 32]
+            .copy_from_slice(&int8_offset.to_le_bytes());
 
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -714,6 +761,15 @@ impl TwoStageVectorIndex {
         let seed = read_u64(buf, &mut pos)?;
         let words = read_u32(buf, &mut pos)? as usize;
         let quant_len = read_u32(buf, &mut pos)? as usize;
+        // reason: offsets fit in usize on any platform that can hold the blob in memory
+        #[allow(clippy::cast_possible_truncation)]
+        let rotation_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let ids_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let codes_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let int8_offset = read_u64(buf, &mut pos)? as usize;
 
         let quant_slice = buf.get(pos..pos + quant_len).ok_or(RabitqError::Truncated {
             need: pos + quant_len,
@@ -724,6 +780,7 @@ impl TwoStageVectorIndex {
                 .map_err(|e| RabitqError::Quantizer(e.to_string()))?;
         pos += quant_len;
         pos = pos.next_multiple_of(8);
+        debug_assert_eq!(pos, rotation_offset, "rotation_offset mismatch: writer/reader diverged");
 
         // Rotation matrix.
         let mut matrix = Vec::with_capacity(dim * dim);
@@ -731,6 +788,7 @@ impl TwoStageVectorIndex {
             matrix.push(read_f32(buf, &mut pos)?);
         }
         pos = pos.next_multiple_of(8);
+        debug_assert_eq!(pos, ids_offset, "ids_offset mismatch: writer/reader diverged");
 
         let quantizer =
             RabitqQuantizer::from_parts(dim, seed, Rotation::from_matrix(dim, matrix));
@@ -741,6 +799,7 @@ impl TwoStageVectorIndex {
         for _ in 0..count {
             ids.push(NodeId::new(read_u64(buf, &mut pos)?));
         }
+        debug_assert_eq!(pos, codes_offset, "codes_offset mismatch: writer/reader diverged");
 
         // codes.
         let mut codes = Vec::with_capacity(count);
@@ -753,6 +812,7 @@ impl TwoStageVectorIndex {
             let norm = read_f32(buf, &mut pos)?;
             codes.push(RabitqCode { bits, dot_oo, norm });
         }
+        debug_assert_eq!(pos, int8_offset, "int8_offset mismatch: writer/reader diverged");
         coarse.load_entries(ids, codes);
 
         // int8 codes.
@@ -767,6 +827,20 @@ impl TwoStageVectorIndex {
         }
 
         Ok(Self::from_parts(coarse, scalar, int8))
+    }
+
+    /// Opens a blob shared via [`bytes::Bytes`].
+    ///
+    /// Provided so callers can pass an mmap-backed `Bytes` region without
+    /// copying it through `&[u8]` first. The current implementation parses
+    /// into owned `Vec`s (one copy); sub-plan 2d adds a borrowing
+    /// `RabitqView` over the same wire format that holds `Bytes` slices
+    /// of the codes / int8 arrays directly.
+    ///
+    /// # Errors
+    /// Same as [`Self::from_bytes`].
+    pub fn from_bytes_shared(blob: bytes::Bytes) -> Result<Self, RabitqError> {
+        Self::from_bytes(&blob)
     }
 }
 
@@ -962,6 +1036,17 @@ mod tests {
         assert_eq!(&blob[0..4], b"GRBQ");
         assert_eq!(blob[4], 1);
 
+        // New header fields (offsets at 32, 40, 48, 56).
+        let rotation_offset = u64::from_le_bytes(blob[32..40].try_into().unwrap());
+        let ids_offset = u64::from_le_bytes(blob[40..48].try_into().unwrap());
+        let codes_offset = u64::from_le_bytes(blob[48..56].try_into().unwrap());
+        let int8_offset = u64::from_le_bytes(blob[56..64].try_into().unwrap());
+        assert!(rotation_offset >= 64);
+        assert!(rotation_offset < ids_offset);
+        assert!(ids_offset < codes_offset);
+        assert!(codes_offset < int8_offset);
+        assert!(int8_offset < blob.len() as u64 - 4);
+
         let reopened = TwoStageVectorIndex::from_bytes(&blob).expect("from_bytes");
         assert_eq!(reopened.len(), index.len());
 
@@ -993,5 +1078,15 @@ mod tests {
             TwoStageVectorIndex::from_bytes(&blob),
             Err(RabitqError::CrcMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn blob_from_bytes_shared_round_trip() {
+        use grafeo_common::types::NodeId;
+        let vectors = vec![(NodeId::new(1), vec![1.0f32; 8])];
+        let index = TwoStageVectorIndex::build(&vectors, 8, 1);
+        let blob = bytes::Bytes::from(index.to_bytes());
+        let reopened = TwoStageVectorIndex::from_bytes_shared(blob).expect("from_bytes_shared");
+        assert_eq!(reopened.len(), 1);
     }
 }
