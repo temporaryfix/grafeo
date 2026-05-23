@@ -35,7 +35,8 @@ impl SplitMix64 {
         // reason: 24-bit value always fits f32 mantissa exactly
         #[allow(clippy::cast_precision_loss)]
         {
-            (self.next_u64() >> 40) as f32 / 4096.0_f32 / 4096.0_f32
+            const SCALE: f32 = 1.0 / (1u32 << 24) as f32;
+            (self.next_u64() >> 40) as f32 * SCALE
         }
     }
 
@@ -95,6 +96,6 @@ mod tests {
         let mut rng = SplitMix64::new(7);
         let n = 50_000;
         let mean: f32 = (0..n).map(|_| rng.next_gaussian()).sum::<f32>() / n as f32;
-        assert!(mean.abs() < 0.05, "gaussian mean drifted: {mean}");
+        assert!(mean.abs() < 0.01, "gaussian mean drifted: {mean}");
     }
 }
