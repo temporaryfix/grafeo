@@ -24,6 +24,8 @@ Thanks to [@jakeboone02](https://github.com/jakeboone02) for the `notRegex()` pr
 - `index::vector::rabitq` — RaBitQ 1-bit vector quantization codec with a two-stage search (RaBitQ coarse pass + int8 rerank), zero-copy blob serialization, and a `RabitqCodec` WASM binding (behind the `rabitq-codec` feature on the wasm crate).
 - `codec::fsst` — Fast Static Symbol Table string compression codec with O(1) random-access decode, a new `ColumnCodec::Fsst` variant for compact-store string columns (serialization deferred to sub-plan 2d), and an `FsstCodec` WASM binding (behind the `fsst-codec` feature on the wasm crate).
 - `codec::webgraph` — Static compressed adjacency codec (gap coding + Elias gamma codes + per-node bit-offset index) with streaming successor iteration in-place, and a `WebGraphCodec` WASM binding (behind the `webgraph-codec` feature on the wasm crate). The `webgraph` crate from `crates.io` was evaluated and rejected for `wasm32-unknown-unknown` due to incompatible transitive dependencies (`mmap-rs`, `rayon-core`, `getrandom v0.3`).
+- `RabitqView`, `FsstView`, `WebGraphView` — borrowing readers over each codec's blob that hold `bytes::Bytes` and slice the query-hot data on demand. Search/get/successors produce bit-identical results to the owned codecs (see `codec_view_parity` proptest) without the per-vector heap allocations the owned `from_bytes` path materializes. Plan 3's mmap-backed build pipeline targets these.
+- `ColumnType::FsstString` and `ColumnCodec::Fsst` serialization — completes the deferred sub-plan 2c integration. FSST columns now round-trip through the compact-store section format and are correctly classified by the schema inference paths.
 
 ### Changed
 

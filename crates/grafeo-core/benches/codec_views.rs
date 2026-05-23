@@ -6,6 +6,8 @@
 //! the View types. A meaningful latency penalty (e.g., > 1.5×) means the
 //! current owned-codec WASM bindings are the right default; a comparable
 //! or smaller latency means the views are a Pareto improvement.
+// Benchmarks are not public API — suppress doc and name-length lints.
+#![allow(missing_docs, clippy::many_single_char_names)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use grafeo_common::types::NodeId;
@@ -90,14 +92,14 @@ fn bench_fsst(c: &mut Criterion) {
 
 fn bench_webgraph(c: &mut Criterion) {
     let mut rng = Rng(7);
-    let n: u64 = 1000;
-    let mut b = WebGraphBuilder::new(n);
+    let num_nodes: u64 = 1000;
+    let mut builder = WebGraphBuilder::new(num_nodes);
     for _ in 0..15_000 {
-        let s = rng.u64() % n;
-        let d = rng.u64() % n;
-        b.add_edge(s, d).unwrap();
+        let src = rng.u64() % num_nodes;
+        let dst = rng.u64() % num_nodes;
+        builder.add_edge(src, dst).unwrap();
     }
-    let owned = b.build();
+    let owned = builder.build();
     let blob = bytes::Bytes::from(owned.to_bytes());
     let view = WebGraphView::open(blob).expect("open");
 
