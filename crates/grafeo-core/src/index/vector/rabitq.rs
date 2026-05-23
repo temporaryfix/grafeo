@@ -844,13 +844,11 @@ impl TwoStageVectorIndex {
         Ok(Self::from_parts(coarse, scalar, int8))
     }
 
-    /// Opens a blob shared via [`bytes::Bytes`].
+    /// Opens a blob shared via [`bytes::Bytes`] into an owned index.
     ///
-    /// Provided so callers can pass an mmap-backed `Bytes` region without
-    /// copying it through `&[u8]` first. The current implementation parses
-    /// into owned `Vec`s (one copy); sub-plan 2d adds a borrowing
-    /// `RabitqView` over the same wire format that holds `Bytes` slices
-    /// of the codes / int8 arrays directly.
+    /// This still copies the codes and int8 arrays into owned `Vec`s.
+    /// For a true borrowing reader that holds `Bytes` slices and decodes
+    /// query-hot data on demand, use [`RabitqView::open`] instead.
     ///
     /// # Errors
     /// Same as [`Self::from_bytes`].
@@ -877,10 +875,6 @@ pub struct RabitqView {
     words: usize,
     /// Decoded once at open time (small).
     scalar: ScalarQuantizer,
-    /// Decoded once at open time (`dim*dim` f32s — typically ≤ 256 KB).
-    /// Retained for future re-encoding use; not read during search.
-    #[allow(dead_code)]
-    rotation: Rotation,
     /// Owned to avoid alignment concerns on `[u64]` borrowed from Bytes.
     /// Decoded once at open time.
     rotation_quantizer: RabitqQuantizer,
@@ -962,9 +956,8 @@ impl RabitqView {
         for _ in 0..dim * dim {
             matrix.push(read_f32(buf, &mut rpos)?);
         }
-        let rotation = Rotation::from_matrix(dim, matrix);
         let rotation_quantizer =
-            RabitqQuantizer::from_parts(dim, seed, rotation.clone());
+            RabitqQuantizer::from_parts(dim, seed, Rotation::from_matrix(dim, matrix));
 
         // ids — decoded once.
         let mut ids = Vec::with_capacity(count);
@@ -1006,7 +999,6 @@ impl RabitqView {
             count,
             words,
             scalar,
-            rotation,
             rotation_quantizer,
             ids,
             codes_offset,

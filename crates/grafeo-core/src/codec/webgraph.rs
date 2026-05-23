@@ -327,19 +327,6 @@ fn pad_to(buf: &mut Vec<u8>, align: usize) {
     }
 }
 
-/// Reads a little-endian `u32` at `*pos`, advancing `*pos`.
-// Available for future use (e.g., sub-plan 2d WebGraphView).
-#[allow(dead_code)]
-fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, WebGraphError> {
-    let end = *pos + 4;
-    let slice = buf.get(*pos..end).ok_or(WebGraphError::Truncated {
-        need: end,
-        have: buf.len(),
-    })?;
-    *pos = end;
-    Ok(u32::from_le_bytes(slice.try_into().expect("4 bytes")))
-}
-
 /// Reads a little-endian `u64` at `*pos`, advancing `*pos`.
 fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64, WebGraphError> {
     let end = *pos + 8;
@@ -514,12 +501,11 @@ impl WebGraphCodec {
         })
     }
 
-    /// Opens a blob shared via [`bytes::Bytes`].
+    /// Opens a blob shared via [`bytes::Bytes`] into an owned codec.
     ///
-    /// Provided so callers can pass an mmap-backed `Bytes` region without
-    /// copying it through `&[u8]` first. The current implementation parses
-    /// into owned `Vec`s (one copy); sub-plan 2d adds a borrowing
-    /// `WebGraphView` over the same wire format.
+    /// This still copies the offsets array and bit stream into owned `Vec`s.
+    /// For a true borrowing reader that holds `Bytes` slices and serves
+    /// adjacency queries without copying, use [`WebGraphView::open`] instead.
     ///
     /// # Errors
     /// Same as [`Self::from_bytes`].

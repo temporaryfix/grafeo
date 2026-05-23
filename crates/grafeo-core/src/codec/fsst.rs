@@ -622,13 +622,11 @@ impl FsstCodec {
         Ok(Self::from_parts(table, compressed, offsets))
     }
 
-    /// Opens a blob shared via [`bytes::Bytes`].
+    /// Opens a blob shared via [`bytes::Bytes`] into an owned codec.
     ///
-    /// Provided so callers can pass an mmap-backed `Bytes` region without
-    /// copying it through `&[u8]` first. The current implementation parses
-    /// into owned `Vec`s (one copy); sub-plan 2d adds a borrowing
-    /// `FsstView` over the same wire format that holds `Bytes` slices of
-    /// the compressed stream and offsets array directly.
+    /// This still copies the compressed stream and offsets array into owned
+    /// `Vec`s. For a true borrowing reader that holds `Bytes` slices and
+    /// decodes strings on demand, use [`FsstView::open`] instead.
     ///
     /// # Errors
     /// Same as [`Self::from_bytes`].

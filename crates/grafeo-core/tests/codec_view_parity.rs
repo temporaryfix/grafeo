@@ -95,7 +95,7 @@ impl Rng {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(128))]
 
     /// RabitqView::search matches TwoStageVectorIndex::search.
     #[test]
