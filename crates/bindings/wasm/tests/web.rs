@@ -599,3 +599,22 @@ fn fsst_codec_encode_open_get_round_trip() {
         assert_eq!(decoded_str, *expected, "string {i} mismatched");
     }
 }
+
+#[cfg(feature = "webgraph-codec")]
+#[wasm_bindgen_test]
+fn webgraph_codec_encode_open_successors_round_trip() {
+    use grafeo_wasm::codecs::WebGraphCodec;
+
+    // Star graph: node 0 connects to 1, 2, 3; node 5 has a self-loop.
+    let srcs: Vec<u32> = vec![0, 0, 0, 5];
+    let dsts: Vec<u32> = vec![1, 2, 3, 5];
+    let blob = WebGraphCodec::encode(6, &srcs, &dsts).expect("encode");
+    assert_eq!(&blob[0..4], b"GWBG");
+
+    let codec = WebGraphCodec::open(&blob).expect("open");
+    assert_eq!(codec.num_nodes(), 6);
+    assert_eq!(codec.num_edges(), 4);
+    assert_eq!(codec.successors(0), vec![1u32, 2, 3]);
+    assert_eq!(codec.successors(1), Vec::<u32>::new());
+    assert_eq!(codec.successors(5), vec![5u32]);
+}

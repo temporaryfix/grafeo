@@ -174,3 +174,94 @@ impl FsstCodec {
         self.inner.is_empty()
     }
 }
+
+/// A JS-facing handle to a WebGraph adjacency codec.
+#[cfg(feature = "webgraph-codec")]
+#[wasm_bindgen]
+pub struct WebGraphCodec {
+    inner: grafeo_core::codec::WebGraphCodec,
+}
+
+#[cfg(feature = "webgraph-codec")]
+#[wasm_bindgen]
+impl WebGraphCodec {
+    /// Encodes an edge list into a compressed adjacency blob.
+    ///
+    /// `srcs` and `dsts` are parallel arrays; entry `i` is the edge
+    /// `srcs[i] -> dsts[i]`. All ids must be `< num_nodes`. Duplicates are
+    /// de-duplicated by the underlying codec. Returns the blob bytes.
+    ///
+    /// # Errors
+    /// Returns a `JsError` if `srcs.length != dsts.length` or if any id
+    /// is `>= num_nodes`.
+    #[wasm_bindgen(js_name = "encode")]
+    pub fn encode(num_nodes: u32, srcs: &[u32], dsts: &[u32]) -> Result<Vec<u8>, JsError> {
+        if srcs.len() != dsts.len() {
+            return Err(JsError::new("srcs.length must equal dsts.length"));
+        }
+        let mut builder = grafeo_core::codec::WebGraphBuilder::new(u64::from(num_nodes));
+        for (&s, &d) in srcs.iter().zip(dsts) {
+            builder
+                .add_edge(u64::from(s), u64::from(d))
+                .map_err(|e| JsError::new(&e.to_string()))?;
+        }
+        Ok(builder.build().to_bytes())
+    }
+
+    /// Opens a blob produced by [`WebGraphCodec::encode`] for querying.
+    ///
+    /// # Errors
+    /// Returns a `JsError` if the blob is malformed (bad magic, version,
+    /// truncation, or CRC mismatch).
+    #[wasm_bindgen(js_name = "open")]
+    pub fn open(blob: &[u8]) -> Result<WebGraphCodec, JsError> {
+        let inner = grafeo_core::codec::WebGraphCodec::from_bytes(blob)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Returns the successors of `node` as a `Uint32Array`.
+    #[wasm_bindgen(js_name = "successors")]
+    #[must_use]
+    pub fn successors(&self, node: u32) -> Vec<u32> {
+        // reason: snapshot node ids fit u32 for the JS surface
+        #[allow(clippy::cast_possible_truncation)]
+        self.inner
+            .successors(u64::from(node))
+            .map(|d| d as u32)
+            .collect()
+    }
+
+    /// Out-degree of `node`.
+    #[wasm_bindgen(js_name = "outDegree")]
+    #[must_use]
+    pub fn out_degree(&self, node: u32) -> u32 {
+        // reason: degree fits u32 for any practical snapshot
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.inner.out_degree(u64::from(node)) as u32
+        }
+    }
+
+    /// Number of nodes.
+    #[wasm_bindgen(js_name = "numNodes")]
+    #[must_use]
+    pub fn num_nodes(&self) -> u32 {
+        // reason: snapshot node count fits u32
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.inner.num_nodes() as u32
+        }
+    }
+
+    /// Number of edges.
+    #[wasm_bindgen(js_name = "numEdges")]
+    #[must_use]
+    pub fn num_edges(&self) -> u32 {
+        // reason: snapshot edge count fits u32
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.inner.num_edges() as u32
+        }
+    }
+}
