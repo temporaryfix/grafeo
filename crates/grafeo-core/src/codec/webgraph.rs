@@ -126,6 +126,8 @@ impl WebGraphBuilder {
         self.edges.dedup();
 
         let mut writer = BitWriter::new();
+        // reason: num_nodes is bounded by available memory on both 32-bit and 64-bit targets
+        #[allow(clippy::cast_possible_truncation)]
         let mut offsets: Vec<u64> = Vec::with_capacity(self.num_nodes as usize + 1);
 
         // Walk edges in source order; each node's successors are a
@@ -215,6 +217,8 @@ impl WebGraphCodec {
         if node >= self.num_nodes {
             return 0;
         }
+        // reason: node < num_nodes, bounded by allocation size
+        #[allow(clippy::cast_possible_truncation)]
         let start = self.offsets[node as usize];
         let mut reader = BitReader::new(&self.bits, self.bit_len);
         reader.seek(start);
@@ -230,6 +234,8 @@ impl WebGraphCodec {
         if node >= self.num_nodes {
             return SuccessorIter::empty();
         }
+        // reason: node < num_nodes, bounded by allocation size
+        #[allow(clippy::cast_possible_truncation)]
         let start = self.offsets[node as usize];
         let mut reader = BitReader::new(&self.bits, self.bit_len);
         reader.seek(start);
@@ -254,7 +260,7 @@ pub struct SuccessorIter<'a> {
     last_dst: Option<u64>,
 }
 
-impl<'a> SuccessorIter<'a> {
+impl SuccessorIter<'_> {
     fn empty() -> Self {
         Self {
             reader: BitReader::new(&[], 0),
@@ -265,7 +271,7 @@ impl<'a> SuccessorIter<'a> {
     }
 }
 
-impl<'a> Iterator for SuccessorIter<'a> {
+impl Iterator for SuccessorIter<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<u64> {
@@ -276,9 +282,9 @@ impl<'a> Iterator for SuccessorIter<'a> {
         let dst = match self.last_dst {
             None => {
                 let first_gap = self.reader.read_zigzag_gamma()?;
-                // reason: encoder ensures (node as i64 + first_gap) >= 0 by
-                // construction (dst was a valid u64 node id).
-                #[allow(clippy::cast_sign_loss)]
+                // reason: node ids fit in i64 (validated < num_nodes at build);
+                // the result is non-negative by construction.
+                #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
                 {
                     (self.node as i64 + first_gap) as u64
                 }
@@ -290,6 +296,8 @@ impl<'a> Iterator for SuccessorIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
+        // reason: remaining is bounded by out-degree, which fits in memory
+        #[allow(clippy::cast_possible_truncation)]
         let r = self.remaining as usize;
         (r, Some(r))
     }
@@ -381,6 +389,11 @@ impl WebGraphCodec {
     /// # Errors
     /// Returns [`WebGraphError`] on bad magic, unsupported version,
     /// truncation, CRC mismatch, or a malformed offsets array.
+    ///
+    /// # Panics
+    /// Panics if the CRC trailer slice is not exactly 4 bytes or an offsets
+    /// chunk is not exactly 8 bytes — these are internal invariants upheld by
+    /// `to_bytes` and cannot occur on a well-formed blob.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, WebGraphError> {
         if buf.len() < 8 {
             return Err(WebGraphError::Truncated {
@@ -406,7 +419,10 @@ impl WebGraphCodec {
         let num_nodes = read_u64(buf, &mut pos)?;
         let num_edges = read_u64(buf, &mut pos)?;
         let bit_len = read_u64(buf, &mut pos)?;
+        // reason: section offsets are blob-relative byte indices; blobs fit in memory
+        #[allow(clippy::cast_possible_truncation)]
         let offsets_offset = read_u64(buf, &mut pos)? as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let bits_offset = read_u64(buf, &mut pos)? as usize;
         let _reserved1 = read_u64(buf, &mut pos)?;
         let _reserved2 = read_u64(buf, &mut pos)?;
@@ -414,6 +430,8 @@ impl WebGraphCodec {
         debug_assert_eq!(pos, 64, "header end at offset 64");
 
         // Offsets array.
+        // reason: num_nodes is bounded by available memory
+        #[allow(clippy::cast_possible_truncation)]
         let n_offsets = num_nodes as usize + 1;
         let offsets_byte_end = offsets_offset + 8 * n_offsets;
         let offsets_bytes = buf
@@ -428,6 +446,8 @@ impl WebGraphCodec {
         }
 
         // Bit stream.
+        // reason: bit_len / 8 is the byte count, bounded by available memory
+        #[allow(clippy::cast_possible_truncation)]
         let bytes_needed = bit_len.div_ceil(8) as usize;
         let bits_end = bits_offset + bytes_needed;
         let bits = buf
@@ -439,14 +459,14 @@ impl WebGraphCodec {
             .to_vec();
 
         // Validate offsets: monotonic, [0] == 0, last == bit_len.
-        if let Some(&first) = offsets.first() {
-            if first != 0 {
-                return Err(WebGraphError::BadOffset {
-                    node: 0,
-                    offset: first,
-                    bit_len,
-                });
-            }
+        if let Some(&first) = offsets.first()
+            && first != 0
+        {
+            return Err(WebGraphError::BadOffset {
+                node: 0,
+                offset: first,
+                bit_len,
+            });
         }
         for (i, w) in offsets.windows(2).enumerate() {
             if w[1] < w[0] || w[1] > bit_len {
@@ -457,14 +477,14 @@ impl WebGraphCodec {
                 });
             }
         }
-        if let Some(&last) = offsets.last() {
-            if last != bit_len {
-                return Err(WebGraphError::BadOffset {
-                    node: num_nodes,
-                    offset: last,
-                    bit_len,
-                });
-            }
+        if let Some(&last) = offsets.last()
+            && last != bit_len
+        {
+            return Err(WebGraphError::BadOffset {
+                node: num_nodes,
+                offset: last,
+                bit_len,
+            });
         }
 
         Ok(Self {

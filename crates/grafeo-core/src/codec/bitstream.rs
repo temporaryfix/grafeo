@@ -69,6 +69,8 @@ impl BitWriter {
     pub(crate) fn write_gamma(&mut self, n: u64) {
         assert!(n >= 1, "gamma encodes n >= 1, got 0");
         assert!(n <= GAMMA_MAX, "gamma overflow: n={n} > GAMMA_MAX");
+        // reason: leading_zeros() for a u64 is in 0..=64, always fits u8
+        #[allow(clippy::cast_possible_truncation)]
         let bits_needed = 64 - n.leading_zeros() as u8; // 1..=64
         // unary prefix: (bits_needed - 1) zeros + a terminating 1.
         for _ in 0..(bits_needed - 1) {
@@ -81,20 +83,16 @@ impl BitWriter {
     }
 
     /// Appends `zigzag_gamma(n)`: maps `n` to non-negative, then gamma.
+    #[allow(clippy::cast_sign_loss)] // n >= 0 arm: safe reinterpret; n < 0 arm: -(n+1) >= 0
     pub(crate) fn write_zigzag_gamma(&mut self, n: i64) {
         // n >= 0 -> 2n + 1; n < 0 -> -2n. Always yields a positive u64.
         let folded: u64 = if n >= 0 {
-            (n as u64).checked_mul(2).expect("zigzag overflow")
-                + 1
+            (n as u64).checked_mul(2).expect("zigzag overflow") + 1
         } else {
-            // reason: n is strictly negative, abs fits in u64
-            #[allow(clippy::cast_sign_loss)]
-            {
-                ((-(n + 1)) as u64)
-                    .checked_mul(2)
-                    .expect("zigzag overflow")
-                    + 2
-            }
+            ((-(n + 1)) as u64)
+                .checked_mul(2)
+                .expect("zigzag overflow")
+                + 2
         };
         self.write_gamma(folded);
     }
@@ -131,11 +129,6 @@ impl<'a> BitReader<'a> {
     /// Seeks to `bit_pos` from the start of the stream.
     pub(crate) fn seek(&mut self, bit_pos: u64) {
         self.bit_pos = bit_pos;
-    }
-
-    /// Current bit position from the start of the stream.
-    pub(crate) fn bit_pos(&self) -> u64 {
-        self.bit_pos
     }
 
     /// Reads one bit (returns 0 or 1).

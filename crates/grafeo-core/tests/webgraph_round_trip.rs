@@ -26,6 +26,8 @@ fn graph_strategy() -> impl Strategy<Value = (u64, Vec<(u64, u64)>)> {
     })
 }
 
+// reason: test graphs are small (num_nodes <= 24); all u64 -> usize casts are safe
+#[allow(clippy::cast_possible_truncation)]
 fn check_round_trip(num_nodes: u64, edges: &[(u64, u64)]) {
     // Build expected adjacency: per source, the set of distinct destinations
     // in ascending order.
