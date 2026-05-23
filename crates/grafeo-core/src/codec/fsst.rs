@@ -384,6 +384,235 @@ impl FsstCodec {
     }
 }
 
+/// Current FSST blob format version.
+const BLOB_VERSION: u8 = 1;
+
+/// Appends zero bytes until `buf.len()` is a multiple of `align`.
+fn pad_to(buf: &mut Vec<u8>, align: usize) {
+    while !buf.len().is_multiple_of(align) {
+        buf.push(0);
+    }
+}
+
+/// Reads a little-endian `u32` at `*pos`, advancing `*pos`.
+fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, FsstError> {
+    let end = *pos + 4;
+    let slice = buf.get(*pos..end).ok_or(FsstError::Truncated {
+        need: end,
+        have: buf.len(),
+    })?;
+    *pos = end;
+    Ok(u32::from_le_bytes(slice.try_into().expect("4 bytes")))
+}
+
+/// Reads a little-endian `u64` at `*pos`, advancing `*pos`.
+fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64, FsstError> {
+    let end = *pos + 8;
+    let slice = buf.get(*pos..end).ok_or(FsstError::Truncated {
+        need: end,
+        have: buf.len(),
+    })?;
+    *pos = end;
+    Ok(u64::from_le_bytes(slice.try_into().expect("8 bytes")))
+}
+
+impl FsstCodec {
+    /// Serializes the codec to a self-describing, position-independent blob.
+    ///
+    /// The layout honours the Plan 2 zero-copy contract: a fixed 48-byte
+    /// header with blob-relative `u64` section offsets, naturally-aligned
+    /// arrays, and a trailing CRC32. See [`BLOB_VERSION`] for the version.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let (table, compressed, offsets) = self.parts();
+        // reason: counts/sizes bounded well below u32::MAX in practice
+        #[allow(clippy::cast_possible_truncation)]
+        let count = (offsets.len().saturating_sub(1)) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let compressed_len = compressed.len() as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GFST");
+        buf.push(BLOB_VERSION);
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // padding
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&compressed_len.to_le_bytes());
+
+        // Four u64s: three offsets + one reserved (zero), patched after assembly.
+        let offsets_pos = buf.len(); // = 16
+        buf.extend_from_slice(&[0u8; 32]);
+
+        // Symbol table: 256 length bytes, then 256 × 8 body bytes.
+        // reason: section offsets fit u64
+        #[allow(clippy::cast_possible_truncation)]
+        let table_offset = buf.len() as u64;
+        for code in 0u8..=255 {
+            buf.push(table.lengths[code as usize]);
+        }
+        for code in 0u8..=255 {
+            buf.extend_from_slice(&table.bodies[code as usize]);
+        }
+        pad_to(&mut buf, 8);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let offsets_section_offset = buf.len() as u64;
+        for &o in offsets {
+            buf.extend_from_slice(&o.to_le_bytes());
+        }
+        pad_to(&mut buf, 8);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let compressed_section_offset = buf.len() as u64;
+        buf.extend_from_slice(compressed);
+        pad_to(&mut buf, 4);
+
+        // Patch the three offsets.
+        buf[offsets_pos..offsets_pos + 8]
+            .copy_from_slice(&table_offset.to_le_bytes());
+        buf[offsets_pos + 8..offsets_pos + 16]
+            .copy_from_slice(&offsets_section_offset.to_le_bytes());
+        buf[offsets_pos + 16..offsets_pos + 24]
+            .copy_from_slice(&compressed_section_offset.to_le_bytes());
+        // The fourth u64 stays zero (reserved for future format additions).
+
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Opens a blob produced by [`Self::to_bytes`].
+    ///
+    /// # Errors
+    /// Returns [`FsstError`] on a bad magic, unsupported version, truncation,
+    /// CRC mismatch, or a malformed symbol table.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, FsstError> {
+        if buf.len() < 8 {
+            return Err(FsstError::Truncated {
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        if &buf[0..4] != b"GFST" {
+            return Err(FsstError::BadMagic);
+        }
+        if buf[4] != BLOB_VERSION {
+            return Err(FsstError::BadVersion(buf[4]));
+        }
+
+        let body_end = buf.len() - 4;
+        let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
+        let computed = crc32fast::hash(&buf[..body_end]);
+        if stored != computed {
+            return Err(FsstError::CrcMismatch { stored, computed });
+        }
+
+        let mut pos = 8;
+        let count = read_u32(buf, &mut pos)? as usize;
+        let compressed_len = read_u32(buf, &mut pos)? as usize;
+        let table_offset = read_u64(buf, &mut pos)? as usize;
+        let offsets_offset = read_u64(buf, &mut pos)? as usize;
+        let compressed_offset = read_u64(buf, &mut pos)? as usize;
+        let _reserved = read_u64(buf, &mut pos)?;
+
+        debug_assert_eq!(pos, 48, "header end at offset 48");
+
+        // Symbol table.
+        let lengths_end = table_offset + 256;
+        let lengths_slice = buf
+            .get(table_offset..lengths_end)
+            .ok_or(FsstError::Truncated {
+                need: lengths_end,
+                have: buf.len(),
+            })?;
+        let bodies_end = lengths_end + 256 * MAX_SYMBOL_LEN;
+        let bodies_slice = buf
+            .get(lengths_end..bodies_end)
+            .ok_or(FsstError::Truncated {
+                need: bodies_end,
+                have: buf.len(),
+            })?;
+        let mut table = SymbolTable::default();
+        for (code, &len_byte) in lengths_slice.iter().enumerate() {
+            // reason: code 0..=255 fits u8 by construction
+            #[allow(clippy::cast_possible_truncation)]
+            let code_u8 = code as u8;
+            if code_u8 == ESCAPE {
+                // Skip the escape slot — its length must be 0.
+                if len_byte != 0 {
+                    return Err(FsstError::BadSymbolLength {
+                        code: code_u8,
+                        length: len_byte,
+                    });
+                }
+                continue;
+            }
+            if len_byte == 0 {
+                continue; // Empty slot.
+            }
+            if (len_byte as usize) > MAX_SYMBOL_LEN {
+                return Err(FsstError::BadSymbolLength {
+                    code: code_u8,
+                    length: len_byte,
+                });
+            }
+            let body_start = code * MAX_SYMBOL_LEN;
+            let sym = &bodies_slice[body_start..body_start + len_byte as usize];
+            table.set(code_u8, sym);
+        }
+
+        // Offsets.
+        let offsets_byte_end = offsets_offset + 4 * (count + 1);
+        let offsets_bytes = buf
+            .get(offsets_offset..offsets_byte_end)
+            .ok_or(FsstError::Truncated {
+                need: offsets_byte_end,
+                have: buf.len(),
+            })?;
+        let mut offsets = Vec::with_capacity(count + 1);
+        for chunk in offsets_bytes.chunks_exact(4) {
+            offsets.push(u32::from_le_bytes(chunk.try_into().expect("4 bytes")));
+        }
+
+        // Compressed stream.
+        let compressed_end = compressed_offset + compressed_len;
+        let compressed = buf
+            .get(compressed_offset..compressed_end)
+            .ok_or(FsstError::Truncated {
+                need: compressed_end,
+                have: buf.len(),
+            })?
+            .to_vec();
+
+        // Validate offsets monotonically increase and stay within compressed.
+        for (i, w) in offsets.windows(2).enumerate() {
+            if w[1] < w[0] || u64::from(w[1]) > u64::from(compressed_len as u32) {
+                return Err(FsstError::BadOffset {
+                    index: i,
+                    offset: u64::from(w[1]),
+                    len: u64::from(compressed_len as u32),
+                });
+            }
+        }
+
+        Ok(Self::from_parts(table, compressed, offsets))
+    }
+
+    /// Opens a blob shared via [`bytes::Bytes`].
+    ///
+    /// Provided so callers can pass an mmap-backed `Bytes` region without
+    /// copying it through `&[u8]` first. The current implementation parses
+    /// into owned `Vec`s (one copy); sub-plan 2d adds a borrowing
+    /// `FsstView` over the same wire format that holds `Bytes` slices of
+    /// the compressed stream and offsets array directly.
+    ///
+    /// # Errors
+    /// Same as [`Self::from_bytes`].
+    pub fn from_bytes_shared(blob: bytes::Bytes) -> Result<Self, FsstError> {
+        Self::from_bytes(&blob)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +818,56 @@ mod tests {
         let codec = FsstCodec::build(&refs);
         assert_eq!(codec.len(), 0);
         assert!(codec.is_empty());
+    }
+
+    #[test]
+    fn fsst_blob_round_trip_preserves_strings() {
+        let strings = vec![
+            b"alpha".to_vec(),
+            b"beta gamma delta".to_vec(),
+            b"".to_vec(),
+            b"alpha beta gamma".to_vec(),
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+        ];
+        let refs: Vec<&[u8]> = strings.iter().map(Vec::as_slice).collect();
+        let codec = FsstCodec::build(&refs);
+        let blob = codec.to_bytes();
+
+        assert_eq!(&blob[0..4], b"GFST");
+        assert_eq!(blob[4], 1);
+
+        let reopened = FsstCodec::from_bytes(&blob).expect("from_bytes");
+        assert_eq!(reopened.len(), codec.len());
+        for (i, s) in strings.iter().enumerate() {
+            assert_eq!(&reopened.get(i).expect("get").expect("decode"), s);
+        }
+    }
+
+    #[test]
+    fn fsst_blob_rejects_bad_magic_and_crc() {
+        let codec = FsstCodec::build(&[b"hi", b"bye"]);
+        let mut blob = codec.to_bytes();
+
+        let mut bad_magic = blob.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            FsstCodec::from_bytes(&bad_magic),
+            Err(FsstError::BadMagic)
+        ));
+
+        let mid = blob.len() / 2;
+        blob[mid] ^= 0xFF;
+        assert!(matches!(
+            FsstCodec::from_bytes(&blob),
+            Err(FsstError::CrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn fsst_blob_from_bytes_shared_round_trip() {
+        let codec = FsstCodec::build(&[b"hello world"]);
+        let blob = bytes::Bytes::from(codec.to_bytes());
+        let reopened = FsstCodec::from_bytes_shared(blob).expect("from_bytes_shared");
+        assert_eq!(reopened.get(0).expect("get").expect("decode"), b"hello world");
     }
 }
