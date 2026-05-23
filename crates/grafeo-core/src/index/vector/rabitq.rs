@@ -112,7 +112,12 @@ impl Rotation {
                 }
             }
             let norm: f32 = rows[i].iter().map(|x| x * x).sum::<f32>().sqrt();
-            let inv = if norm > f32::EPSILON { 1.0 / norm } else { 1.0 };
+            assert!(
+                norm > f32::EPSILON,
+                "rabitq rotation: row {i} collapsed to near-zero norm \
+                 (PRNG produced linearly dependent rows; this should be unreachable)"
+            );
+            let inv = 1.0 / norm;
             for x in &mut rows[i] {
                 *x *= inv;
             }
@@ -126,9 +131,12 @@ impl Rotation {
 
     /// Reconstructs a rotation from an already-computed matrix (used by
     /// blob deserialization).
+    ///
+    /// # Panics
+    /// Panics if `matrix.len() != dim * dim`.
     #[must_use]
     pub(crate) fn from_matrix(dim: usize, matrix: Vec<f32>) -> Self {
-        debug_assert_eq!(matrix.len(), dim * dim, "matrix must be dim*dim");
+        assert_eq!(matrix.len(), dim * dim, "matrix must be dim*dim");
         Self { dim, matrix }
     }
 
