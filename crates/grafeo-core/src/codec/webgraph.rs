@@ -59,6 +59,11 @@ pub enum WebGraphError {
         bit_len: u64,
     },
     /// Reached the end of the stream mid-record (malformed gamma).
+    ///
+    /// Reserved for sub-plan 2d's borrowing `WebGraphView` reader, which
+    /// surfaces malformed compressed streams through this variant. The
+    /// current owned `from_bytes` path validates the offsets array up
+    /// front so this variant is never constructed here.
     #[error("webgraph decode: unexpected end of stream at bit {0}")]
     UnexpectedEnd(u64),
 }
@@ -365,6 +370,10 @@ impl WebGraphCodec {
         for &o in &self.offsets {
             buf.extend_from_slice(&o.to_le_bytes());
         }
+        // The offsets section starts at byte 64 (header end, 8-aligned) and
+        // writes (num_nodes+1) × 8 bytes, so position is always 8-aligned
+        // here. This pad call is kept as structural symmetry with the bits
+        // section pad below; it is a no-op by construction.
         pad_to(&mut buf, 8);
 
         #[allow(clippy::cast_possible_truncation)]
