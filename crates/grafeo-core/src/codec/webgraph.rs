@@ -295,6 +295,201 @@ impl<'a> Iterator for SuccessorIter<'a> {
     }
 }
 
+/// Current WebGraph blob format version.
+const BLOB_VERSION: u8 = 1;
+
+/// Appends zero bytes until `buf.len()` is a multiple of `align`.
+fn pad_to(buf: &mut Vec<u8>, align: usize) {
+    while !buf.len().is_multiple_of(align) {
+        buf.push(0);
+    }
+}
+
+/// Reads a little-endian `u32` at `*pos`, advancing `*pos`.
+// Available for future use (e.g., sub-plan 2d WebGraphView).
+#[allow(dead_code)]
+fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32, WebGraphError> {
+    let end = *pos + 4;
+    let slice = buf.get(*pos..end).ok_or(WebGraphError::Truncated {
+        need: end,
+        have: buf.len(),
+    })?;
+    *pos = end;
+    Ok(u32::from_le_bytes(slice.try_into().expect("4 bytes")))
+}
+
+/// Reads a little-endian `u64` at `*pos`, advancing `*pos`.
+fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64, WebGraphError> {
+    let end = *pos + 8;
+    let slice = buf.get(*pos..end).ok_or(WebGraphError::Truncated {
+        need: end,
+        have: buf.len(),
+    })?;
+    *pos = end;
+    Ok(u64::from_le_bytes(slice.try_into().expect("8 bytes")))
+}
+
+impl WebGraphCodec {
+    /// Serializes to a self-describing, position-independent blob.
+    ///
+    /// Honours the Plan 2 zero-copy contract: a fixed 64-byte header with
+    /// blob-relative `u64` section offsets, naturally-aligned arrays, and
+    /// a trailing CRC32. See [`BLOB_VERSION`] for the version.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GWBG");
+        buf.push(BLOB_VERSION);
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // padding
+        buf.extend_from_slice(&self.num_nodes.to_le_bytes());
+        buf.extend_from_slice(&self.num_edges.to_le_bytes());
+        buf.extend_from_slice(&self.bit_len.to_le_bytes());
+
+        // Four u64s: two offsets + two reserved (zero), patched after assembly.
+        let offsets_pos = buf.len(); // = 32
+        buf.extend_from_slice(&[0u8; 32]);
+
+        // Offsets array (num_nodes + 1 entries).
+        // reason: section offsets fit u64
+        #[allow(clippy::cast_possible_truncation)]
+        let offsets_offset = buf.len() as u64;
+        for &o in &self.offsets {
+            buf.extend_from_slice(&o.to_le_bytes());
+        }
+        pad_to(&mut buf, 8);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let bits_offset = buf.len() as u64;
+        buf.extend_from_slice(&self.bits);
+        pad_to(&mut buf, 4);
+
+        // Patch the two offsets.
+        buf[offsets_pos..offsets_pos + 8]
+            .copy_from_slice(&offsets_offset.to_le_bytes());
+        buf[offsets_pos + 8..offsets_pos + 16]
+            .copy_from_slice(&bits_offset.to_le_bytes());
+        // The third and fourth u64s stay zero (reserved).
+
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Opens a blob produced by [`Self::to_bytes`].
+    ///
+    /// # Errors
+    /// Returns [`WebGraphError`] on bad magic, unsupported version,
+    /// truncation, CRC mismatch, or a malformed offsets array.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, WebGraphError> {
+        if buf.len() < 8 {
+            return Err(WebGraphError::Truncated {
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        if &buf[0..4] != b"GWBG" {
+            return Err(WebGraphError::BadMagic);
+        }
+        if buf[4] != BLOB_VERSION {
+            return Err(WebGraphError::BadVersion(buf[4]));
+        }
+
+        let body_end = buf.len() - 4;
+        let stored = u32::from_le_bytes(buf[body_end..].try_into().expect("4 bytes"));
+        let computed = crc32fast::hash(&buf[..body_end]);
+        if stored != computed {
+            return Err(WebGraphError::CrcMismatch { stored, computed });
+        }
+
+        let mut pos = 8;
+        let num_nodes = read_u64(buf, &mut pos)?;
+        let num_edges = read_u64(buf, &mut pos)?;
+        let bit_len = read_u64(buf, &mut pos)?;
+        let offsets_offset = read_u64(buf, &mut pos)? as usize;
+        let bits_offset = read_u64(buf, &mut pos)? as usize;
+        let _reserved1 = read_u64(buf, &mut pos)?;
+        let _reserved2 = read_u64(buf, &mut pos)?;
+
+        debug_assert_eq!(pos, 64, "header end at offset 64");
+
+        // Offsets array.
+        let n_offsets = num_nodes as usize + 1;
+        let offsets_byte_end = offsets_offset + 8 * n_offsets;
+        let offsets_bytes = buf
+            .get(offsets_offset..offsets_byte_end)
+            .ok_or(WebGraphError::Truncated {
+                need: offsets_byte_end,
+                have: buf.len(),
+            })?;
+        let mut offsets = Vec::with_capacity(n_offsets);
+        for chunk in offsets_bytes.chunks_exact(8) {
+            offsets.push(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+        }
+
+        // Bit stream.
+        let bytes_needed = bit_len.div_ceil(8) as usize;
+        let bits_end = bits_offset + bytes_needed;
+        let bits = buf
+            .get(bits_offset..bits_end)
+            .ok_or(WebGraphError::Truncated {
+                need: bits_end,
+                have: buf.len(),
+            })?
+            .to_vec();
+
+        // Validate offsets: monotonic, [0] == 0, last == bit_len.
+        if let Some(&first) = offsets.first() {
+            if first != 0 {
+                return Err(WebGraphError::BadOffset {
+                    node: 0,
+                    offset: first,
+                    bit_len,
+                });
+            }
+        }
+        for (i, w) in offsets.windows(2).enumerate() {
+            if w[1] < w[0] || w[1] > bit_len {
+                return Err(WebGraphError::BadOffset {
+                    node: i as u64,
+                    offset: w[1],
+                    bit_len,
+                });
+            }
+        }
+        if let Some(&last) = offsets.last() {
+            if last != bit_len {
+                return Err(WebGraphError::BadOffset {
+                    node: num_nodes,
+                    offset: last,
+                    bit_len,
+                });
+            }
+        }
+
+        Ok(Self {
+            num_nodes,
+            num_edges,
+            offsets,
+            bits,
+            bit_len,
+        })
+    }
+
+    /// Opens a blob shared via [`bytes::Bytes`].
+    ///
+    /// Provided so callers can pass an mmap-backed `Bytes` region without
+    /// copying it through `&[u8]` first. The current implementation parses
+    /// into owned `Vec`s (one copy); sub-plan 2d adds a borrowing
+    /// `WebGraphView` over the same wire format.
+    ///
+    /// # Errors
+    /// Same as [`Self::from_bytes`].
+    pub fn from_bytes_shared(blob: bytes::Bytes) -> Result<Self, WebGraphError> {
+        Self::from_bytes(&blob)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +581,66 @@ mod tests {
     fn successors_for_out_of_range_node_is_empty() {
         let codec = WebGraphBuilder::new(3).build();
         assert_eq!(codec.successors(99).collect::<Vec<_>>(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn blob_round_trip_preserves_adjacency() {
+        let mut b = WebGraphBuilder::new(20);
+        let edges = [
+            (0u64, 1), (0, 5), (0, 17),
+            (1, 0), (1, 2),
+            (3, 3),
+            (5, 18), (5, 19),
+            (10, 0), (10, 5), (10, 11), (10, 12),
+            (19, 0),
+        ];
+        for &(s, d) in &edges {
+            b.add_edge(s, d).unwrap();
+        }
+        let codec = b.build();
+        let blob = codec.to_bytes();
+
+        assert_eq!(&blob[0..4], b"GWBG");
+        assert_eq!(blob[4], 1);
+
+        let reopened = WebGraphCodec::from_bytes(&blob).expect("from_bytes");
+        assert_eq!(reopened.num_nodes(), codec.num_nodes());
+        assert_eq!(reopened.num_edges(), codec.num_edges());
+        for u in 0..codec.num_nodes() {
+            let original: Vec<u64> = codec.successors(u).collect();
+            let reopened_succ: Vec<u64> = reopened.successors(u).collect();
+            assert_eq!(reopened_succ, original, "successors of {u} mismatched");
+        }
+    }
+
+    #[test]
+    fn blob_rejects_bad_magic_and_crc() {
+        let mut b = WebGraphBuilder::new(3);
+        b.add_edge(0, 1).unwrap();
+        b.add_edge(1, 2).unwrap();
+        let mut blob = b.build().to_bytes();
+
+        let mut bad_magic = blob.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            WebGraphCodec::from_bytes(&bad_magic),
+            Err(WebGraphError::BadMagic)
+        ));
+
+        let mid = blob.len() / 2;
+        blob[mid] ^= 0xFF;
+        assert!(matches!(
+            WebGraphCodec::from_bytes(&blob),
+            Err(WebGraphError::CrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn blob_from_bytes_shared_round_trip() {
+        let mut b = WebGraphBuilder::new(3);
+        b.add_edge(0, 2).unwrap();
+        let blob = bytes::Bytes::from(b.build().to_bytes());
+        let reopened = WebGraphCodec::from_bytes_shared(blob).expect("from_bytes_shared");
+        assert_eq!(reopened.successors(0).collect::<Vec<_>>(), vec![2]);
     }
 }
