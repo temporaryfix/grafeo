@@ -430,8 +430,11 @@ impl RabitqIndex {
 
     /// Replaces the index contents with pre-decoded ids and codes
     /// (blob deserialization).
+    ///
+    /// # Panics
+    /// Panics if `ids.len() != codes.len()`.
     pub(crate) fn load_entries(&mut self, ids: Vec<NodeId>, codes: Vec<RabitqCode>) {
-        debug_assert_eq!(ids.len(), codes.len());
+        assert_eq!(ids.len(), codes.len(), "ids and codes must have equal length");
         self.ids = ids;
         self.codes = codes;
     }
