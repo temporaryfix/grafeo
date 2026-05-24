@@ -419,17 +419,20 @@ pub(crate) fn resolve_expression_to_column(
     context: &str,
 ) -> Result<usize> {
     let col_name = resolved_column_name(expr);
-    variable_columns.get(&col_name).copied().ok_or_else(|| match expr {
-        LogicalExpression::Variable(name) => {
-            Error::Internal(format!("Variable '{name}' not found{context}"))
-        }
-        LogicalExpression::Property { variable, property } => Error::Internal(format!(
-            "Property column '{col_name}' not found{context} (from {variable}.{property})"
-        )),
-        _ => Error::Internal(format!(
-            "Cannot resolve expression to column{context}: {expr:?}"
-        )),
-    })
+    variable_columns
+        .get(&col_name)
+        .copied()
+        .ok_or_else(|| match expr {
+            LogicalExpression::Variable(name) => {
+                Error::Internal(format!("Variable '{name}' not found{context}"))
+            }
+            LogicalExpression::Property { variable, property } => Error::Internal(format!(
+                "Property column '{col_name}' not found{context} (from {variable}.{property})"
+            )),
+            _ => Error::Internal(format!(
+                "Cannot resolve expression to column{context}: {expr:?}"
+            )),
+        })
 }
 
 /// Converts a logical expression to a human-readable string for column naming.

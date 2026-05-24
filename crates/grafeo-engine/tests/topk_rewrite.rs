@@ -406,12 +406,8 @@ fn order_by_limit_binary_key_yields_map() {
     // Binary expression sort key, variable in Return.
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
-    session
-        .execute("INSERT (:Item {a: 3, b: 5})")
-        .unwrap();
-    session
-        .execute("INSERT (:Item {a: 1, b: 2})")
-        .unwrap();
+    session.execute("INSERT (:Item {a: 3, b: 5})").unwrap();
+    session.execute("INSERT (:Item {a: 1, b: 2})").unwrap();
 
     let result = session
         .execute("MATCH (n:Item) RETURN n ORDER BY n.a + n.b DESC LIMIT 50")

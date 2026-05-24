@@ -156,10 +156,7 @@ fn open_multi_with_single_snapshot_matches_import_snapshot() {
 #[test]
 fn open_multi_resolves_edges_whose_endpoint_lives_in_another_snapshot() {
     // Snapshot A — shared chunk: one UniversalConcept node.
-    let a = encode_snapshot(
-        vec![node(10, "UniversalConcept")],
-        vec![],
-    );
+    let a = encode_snapshot(vec![node(10, "UniversalConcept")], vec![]);
 
     // Snapshot B — niche chunk: one NicheDescriptor node and an edge
     // pointing at the UniversalConcept node that only exists in A.
@@ -353,13 +350,9 @@ fn open_multi_unions_property_indexes_across_snapshots() {
     db_b.create_property_index("slug");
     let bytes_b = db_b.export_snapshot().expect("export b");
 
-    let merged = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
-        .expect("merge");
+    let merged = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()]).expect("merge");
 
-    assert!(
-        merged.has_property_index("id"),
-        "id index must be restored"
-    );
+    assert!(merged.has_property_index("id"), "id index must be restored");
     assert!(
         merged.has_property_index("slug"),
         "slug index must be restored"

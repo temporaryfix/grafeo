@@ -118,10 +118,7 @@ fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     // Both endpoints are now entirely in the snapshot tier and the
     // BUSINESS_MEMBER-shaped pattern resolves cleanly.
     assert_eq!(
-        row_count(
-            &db,
-            "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"
-        ),
+        row_count(&db, "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"),
         1,
         "double-anchor edge query should match before any overlay write"
     );
@@ -134,10 +131,7 @@ fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     db.create_edge(a, c, "UNRELATED");
 
     assert_eq!(
-        row_count(
-            &db,
-            "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"
-        ),
+        row_count(&db, "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"),
         1,
         "snapshot-tier T edge must still match after an unrelated overlay write \
          promotes its source endpoint"
@@ -158,10 +152,7 @@ fn post_compact_property_anchored_edge_survives_unrelated_overlay_write() {
     db.create_edge(c, b, "UNRELATED"); // promotes b
 
     assert_eq!(
-        row_count(
-            &db,
-            "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"
-        ),
+        row_count(&db, "MATCH (a:A {id: 1})-[:T]->(b:B {id: 2}) RETURN true"),
         1,
         "snapshot-tier T edge must still match after an unrelated overlay write \
          promotes its destination endpoint"

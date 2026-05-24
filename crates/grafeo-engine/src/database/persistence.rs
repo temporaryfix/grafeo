@@ -1218,6 +1218,12 @@ impl super::GrafeoDB {
     ///
     /// Returns an error if `snapshots` is empty, any blob fails to
     /// decode, any cross-snapshot validation fails, or population fails.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice. The internal `.expect()` that resolves
+    /// the maximum epoch is guarded by the non-empty check at the top of
+    /// the function; it is unreachable when the function is called correctly.
     pub fn open_multi(snapshots: &[&[u8]]) -> Result<Self> {
         if snapshots.is_empty() {
             return Err(Error::Internal(
@@ -1231,9 +1237,8 @@ impl super::GrafeoDB {
             .iter()
             .enumerate()
             .map(|(idx, bytes)| {
-                decode_snapshot_bytes(bytes).map_err(|e| {
-                    Error::Internal(format!("snapshot[{idx}]: {e}"))
-                })
+                decode_snapshot_bytes(bytes)
+                    .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))
             })
             .collect::<Result<_>>()?;
 
@@ -1242,9 +1247,8 @@ impl super::GrafeoDB {
         // snapshots). Cross-snapshot endpoint validation runs next via
         // validate_snapshot_set.
         for (idx, snap) in decoded.iter().enumerate() {
-            validate_snapshot_ids(&snap.nodes, &snap.edges).map_err(|e| {
-                Error::Internal(format!("snapshot[{idx}]: {e}"))
-            })?;
+            validate_snapshot_ids(&snap.nodes, &snap.edges)
+                .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))?;
         }
 
         validate_snapshot_set(&decoded)?;
@@ -1285,11 +1289,7 @@ impl super::GrafeoDB {
                     .create_graph(&graph.name)
                     .map_err(|e| Error::Internal(e.to_string()))?;
                 if let Some(graph_store) = db.lpg_store().graph(&graph.name) {
-                    populate_store_from_snapshot_ref(
-                        &graph_store,
-                        &graph.nodes,
-                        &graph.edges,
-                    )?;
+                    populate_store_from_snapshot_ref(&graph_store, &graph.nodes, &graph.edges)?;
                 }
             }
         }

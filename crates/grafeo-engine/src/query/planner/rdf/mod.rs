@@ -5309,7 +5309,9 @@ fn resolve_expression(
 }
 
 // expression_to_string is now in planner/common.rs
-use crate::query::planner::common::{expression_to_string, output_column_name, resolved_column_name};
+use crate::query::planner::common::{
+    expression_to_string, output_column_name, resolved_column_name,
+};
 
 /// Converts a value to its string representation.
 fn value_to_string(value: &Value) -> String {
