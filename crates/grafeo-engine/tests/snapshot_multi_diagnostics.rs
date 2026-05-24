@@ -120,3 +120,37 @@ fn duplicate_node_error_names_both_snapshots_and_their_labels() {
         }
     }
 }
+
+#[test]
+fn schema_conflict_under_union_policy_names_the_type() {
+    let db_a = GrafeoDB::new_in_memory();
+    db_a.session()
+        .execute("CREATE NODE TYPE Person (name STRING)")
+        .expect("ddl a");
+    let bytes_a = db_a.export_snapshot().expect("export a");
+
+    let db_b = GrafeoDB::new_in_memory();
+    db_b.session()
+        .execute("CREATE NODE TYPE Person (age INTEGER)")
+        .expect("ddl b");
+    let bytes_b = db_b.export_snapshot().expect("export b");
+
+    match GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()]) {
+        Ok(_) => panic!("same-name-different-shape must reject under union policy"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("Person"),
+                "conflict must name the offending type: {message}"
+            );
+            assert!(
+                message.contains("NodeType"),
+                "conflict must name the catalog kind: {message}"
+            );
+            assert!(
+                message.contains("redefines") || message.contains("differs"),
+                "conflict must signal a redefinition: {message}"
+            );
+        }
+    }
+}
