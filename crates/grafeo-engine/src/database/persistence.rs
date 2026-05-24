@@ -264,6 +264,59 @@ fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Res
     Ok(())
 }
 
+/// Validates that node IDs and edge IDs are disjoint across all
+/// snapshots, and that every edge endpoint resolves somewhere in the
+/// union of all snapshots' nodes.
+///
+/// Per-snapshot validation (duplicate IDs within one snapshot, edge
+/// endpoints inside that snapshot) is done separately by
+/// `validate_snapshot_data` and runs first.
+fn validate_snapshot_set(snapshots: &[Snapshot]) -> Result<()> {
+    let mut all_node_ids: HashSet<NodeId> =
+        HashSet::with_capacity(snapshots.iter().map(|s| s.nodes.len()).sum());
+    for (idx, snap) in snapshots.iter().enumerate() {
+        for node in &snap.nodes {
+            if !all_node_ids.insert(node.id) {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] introduces duplicate node ID {} \
+                     already present in an earlier snapshot",
+                    node.id
+                )));
+            }
+        }
+    }
+
+    let mut all_edge_ids: HashSet<EdgeId> =
+        HashSet::with_capacity(snapshots.iter().map(|s| s.edges.len()).sum());
+    for (idx, snap) in snapshots.iter().enumerate() {
+        for edge in &snap.edges {
+            if !all_edge_ids.insert(edge.id) {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] introduces duplicate edge ID {} \
+                     already present in an earlier snapshot",
+                    edge.id
+                )));
+            }
+            if !all_node_ids.contains(&edge.src) {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] edge {} references non-existent source node {} \
+                     (not present in any snapshot)",
+                    edge.id, edge.src
+                )));
+            }
+            if !all_node_ids.contains(&edge.dst) {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] edge {} references non-existent destination node {} \
+                     (not present in any snapshot)",
+                    edge.id, edge.dst
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Collects all triples from an RDF store into snapshot format.
 #[cfg(feature = "triple-store")]
 fn collect_rdf_triples(store: &grafeo_core::graph::rdf::RdfStore) -> Vec<SnapshotTriple> {
@@ -1073,6 +1126,8 @@ impl super::GrafeoDB {
                 Error::Internal(format!("snapshot[{idx}]: {e}"))
             })?;
         }
+
+        validate_snapshot_set(&decoded)?;
 
         // Reject any snapshot carrying named graphs or RDF triples for
         // now — `open_multi` does not yet merge those payloads, and

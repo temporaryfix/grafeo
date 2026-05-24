@@ -9,6 +9,101 @@
 use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
 use grafeo_engine::GrafeoDB;
 
+// --------------------------------------------------------------------
+// TestSnapshot mirror — lets us craft snapshot bytes with hand-picked
+// NodeIds / EdgeIds for the cross-snapshot conflict tests. Bincode
+// encoding is identical to the real `Snapshot` struct in
+// persistence.rs because the field shapes match exactly.
+// --------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TestSnapshot {
+    version: u8,
+    nodes: Vec<TestNode>,
+    edges: Vec<TestEdge>,
+    named_graphs: Vec<()>,
+    rdf_triples: Vec<()>,
+    rdf_named_graphs: Vec<()>,
+    schema: TestSnapshotSchema,
+    indexes: TestSnapshotIndexes,
+    epoch: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct TestSnapshotSchema {
+    node_types: Vec<()>,
+    edge_types: Vec<()>,
+    graph_types: Vec<()>,
+    procedures: Vec<()>,
+    schemas: Vec<()>,
+    graph_type_bindings: Vec<()>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct TestSnapshotIndexes {
+    property_indexes: Vec<()>,
+    vector_indexes: Vec<()>,
+    text_indexes: Vec<()>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TestNode {
+    id: NodeId,
+    labels: Vec<String>,
+    properties: Vec<(String, Vec<(EpochId, Value)>)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TestEdge {
+    id: EdgeId,
+    src: NodeId,
+    dst: NodeId,
+    edge_type: String,
+    properties: Vec<(String, Vec<(EpochId, Value)>)>,
+}
+
+fn encode_snapshot(nodes: Vec<TestNode>, edges: Vec<TestEdge>) -> Vec<u8> {
+    let snap = TestSnapshot {
+        version: 4,
+        nodes,
+        edges,
+        named_graphs: vec![],
+        rdf_triples: vec![],
+        rdf_named_graphs: vec![],
+        schema: TestSnapshotSchema::default(),
+        indexes: TestSnapshotIndexes::default(),
+        epoch: 0,
+    };
+    bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap()
+}
+
+fn node(id: u64, label: &str) -> TestNode {
+    TestNode {
+        id: NodeId::new(id),
+        labels: vec![label.to_string()],
+        properties: vec![],
+    }
+}
+
+#[test]
+fn open_multi_rejects_duplicate_node_id_across_snapshots() {
+    let a = encode_snapshot(vec![node(1, "Person")], vec![]);
+    let b = encode_snapshot(vec![node(1, "Animal")], vec![]);
+
+    let result = GrafeoDB::open_multi(&[a.as_slice(), b.as_slice()]);
+
+    match result {
+        Ok(_) => panic!("must reject duplicate NodeId"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("duplicate") && message.contains("node"),
+                "error must name the conflict; got: {message}"
+            );
+        }
+    }
+}
+
 #[test]
 fn open_multi_with_single_snapshot_matches_import_snapshot() {
     // Build a small graph, export it, and confirm `open_multi(&[bytes])`
