@@ -1036,24 +1036,33 @@ impl super::GrafeoDB {
     // =========================================================================
 
     /// Produces a new in-memory database containing exactly the
-    /// requested nodes plus every edge whose source and destination
-    /// are both in `node_ids`. NodeIds and EdgeIds are preserved
-    /// verbatim so multiple sibling extracts can later be merged via
-    /// [`open_multi`](Self::open_multi) without ID collisions.
+    /// requested nodes plus every edge whose SOURCE is in `node_ids`,
+    /// regardless of where the destination lives. NodeIds and EdgeIds
+    /// are preserved verbatim so multiple sibling extracts can later
+    /// be merged via [`open_multi`](Self::open_multi) without ID
+    /// collisions.
+    ///
+    /// Edges: every edge whose SOURCE is in `node_ids` is carried,
+    /// regardless of where its destination lives. The result is that
+    /// each edge in the source is "owned" by exactly one extract — the
+    /// one containing its source node. Merging sibling extracts of a
+    /// partition via [`open_multi`](Self::open_multi) restores the
+    /// source's edge set exactly. An extract may carry edges with
+    /// dangling dst NodeIds in isolation; this is intentional and only
+    /// valid when consumed via `open_multi` (which validates endpoints
+    /// across the merged union), not via `import_snapshot` (which
+    /// demands per-snapshot endpoint resolution).
     ///
     /// Properties (full temporal history when the `temporal` feature
     /// is on), the full schema catalog, and index metadata are copied
     /// from the source. Index *data* is rebuilt over the extracted
     /// nodes/edges; index parameters (vector dimensions, metric, m,
     /// ef_construction) carry verbatim.
-    /// Edges whose endpoints span the request boundary are dropped —
-    /// sibling extracts plus `open_multi` are the supported way to
-    /// keep cross-shard edges.
     ///
     /// # Errors
     ///
     /// Returns an error if any `node_ids` entry does not exist in
-    /// `self`, or if interior copy operations fail.
+    /// `self`, or if copy operations fail.
     pub fn extract_subgraph(&self, node_ids: &[NodeId]) -> Result<Self> {
         let store = self.lpg_store();
 
@@ -1100,20 +1109,32 @@ impl super::GrafeoDB {
             }
         }
 
-        // Copy interior edges. For each requested node, walk its
-        // outgoing edges and emit each whose destination is also in
-        // the request set. Each edge surfaces exactly once because the
-        // outer loop iterates the requested set as a `HashSet<NodeId>`
-        // (no node visited twice) and `Direction::Outgoing` consults
-        // only the forward adjacency list — so even self-loops appear
-        // exactly once via their source node.
+        // Copy outgoing edges. For each requested node, walk every
+        // outgoing edge and carry it into the target — including
+        // edges whose destination is OUTSIDE the request set. This
+        // is the "source-side ownership" semantic: each edge is owned
+        // by the extract that contains its source node. When sibling
+        // extracts of a partition are merged via `open_multi`, every
+        // edge surfaces in exactly one extract and the union restores
+        // the source edge set verbatim. Cross-snapshot endpoint
+        // validation in `open_multi` confirms every dst exists
+        // somewhere in the union.
+        //
+        // An individual extract may therefore contain edges with
+        // dangling dst NodeIds in isolation. This is intentional;
+        // extracts are transport artifacts for `open_multi`, not
+        // standalone databases. `import_snapshot` would reject such
+        // an extract (its per-snapshot validator demands endpoint
+        // resolution); `open_multi` does not.
+        //
+        // Each edge surfaces exactly once because the outer loop
+        // iterates the requested set as a `HashSet<NodeId>` and
+        // `Direction::Outgoing` consults only the forward adjacency
+        // list.
         for &src_id in &requested {
-            for (dst_id, edge_id) in
+            for (_dst_id, edge_id) in
                 store.edges_from(src_id, grafeo_core::graph::Direction::Outgoing)
             {
-                if !requested.contains(&dst_id) {
-                    continue;
-                }
                 let Some(edge) = store.get_edge(edge_id) else { continue };
                 target_store
                     .create_edge_with_id(edge.id, edge.src, edge.dst, &edge.edge_type)

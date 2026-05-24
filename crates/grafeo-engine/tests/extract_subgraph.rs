@@ -1,7 +1,7 @@
 //! Integration tests for `GrafeoDB::extract_subgraph` — produces a new
 //! in-memory database containing exactly the requested nodes plus
-//! every edge whose endpoints are both in the request set, with
-//! source-allocated NodeIds and EdgeIds preserved.
+//! every edge whose SOURCE is in the request set (source-side ownership),
+//! with source-allocated NodeIds and EdgeIds preserved.
 
 use grafeo_common::types::{NodeId, Value};
 use grafeo_engine::GrafeoDB;
@@ -44,7 +44,7 @@ fn extract_subgraph_carries_schema_and_indexes() {
 }
 
 #[test]
-fn extract_subgraph_preserves_node_ids_and_includes_interior_edges() {
+fn extract_subgraph_preserves_node_ids_and_carries_all_outgoing_edges() {
     let source = GrafeoDB::new_in_memory();
     let a = source.create_node(&["Concept"]);
     source.set_node_property(a, "id", Value::String("concept:bitter".into()));
@@ -53,19 +53,28 @@ fn extract_subgraph_preserves_node_ids_and_includes_interior_edges() {
     let c = source.create_node(&["NicheDescriptor"]);
     source.set_node_property(c, "id", Value::String("tea:bitter".into()));
 
-    // Interior edge (c → a, both in extract set)
+    // Outgoing edge with dst inside the request set (c → a)
     source.create_edge(c, a, "MAPS_TO_CONCEPT");
-    // Boundary edge (c → b, b NOT in extract set; must be excluded)
+    // Outgoing edge with dst OUTSIDE the request set (c → b).
+    // Under source-side ownership, this edge is still carried because
+    // `c` is in the request set. `b` is not carried, so this edge will
+    // have a dangling dst in the extract — that's intentional and
+    // resolves cleanly when a sibling extract containing `b` is
+    // merged via `open_multi`.
     source.create_edge(c, b, "RELATED");
 
     let target = source
         .extract_subgraph(&[c, a])
         .expect("extract_subgraph");
 
-    // NodeIds preserved exactly — caller can union with a sibling extract.
+    // Only the two requested nodes are carried; b is not.
     assert_eq!(target.node_count(), 2);
-    assert_eq!(target.edge_count(), 1);
+    // Both of c's outgoing edges are carried, even though c→b has
+    // a dst (b) that lives outside the request set.
+    assert_eq!(target.edge_count(), 2);
 
+    // The MAPS_TO_CONCEPT edge resolves cleanly — both endpoints
+    // are in the extract.
     let result = target
         .session()
         .execute("MATCH (n:NicheDescriptor)-[:MAPS_TO_CONCEPT]->(c:Concept) RETURN c.id")
@@ -74,7 +83,22 @@ fn extract_subgraph_preserves_node_ids_and_includes_interior_edges() {
     assert_eq!(
         result.rows()[0][0],
         Value::String("concept:bitter".into()),
-        "interior edge resolves; boundary edge excluded"
+        "MAPS_TO_CONCEPT resolves against the in-set destination"
+    );
+
+    // The RELATED edge has a dangling dst (b is not in the extract).
+    // A Cypher MATCH that tries to bind the dst won't find a node,
+    // so the query returns zero rows. This is the expected behavior
+    // for an extract viewed in isolation; sibling-extract merge via
+    // open_multi is what restores the dst.
+    let dangling = target
+        .session()
+        .execute("MATCH (n:NicheDescriptor)-[:RELATED]->(d) RETURN d.id")
+        .expect("query");
+    assert_eq!(
+        dangling.rows().len(),
+        0,
+        "RELATED edge's dst is not in the extract; Cypher MATCH does not bind"
     );
 }
 
@@ -138,17 +162,17 @@ fn extract_subgraph_preserves_property_history() {
 // --------------------------------------------------------------------
 // Proptest — extract two disjoint halves of a random graph, merge via
 // open_multi, assert the result is observationally equivalent to the
-// source for edges that are interior to one partition half.
+// source.
 //
-// `extract_subgraph` carries interior edges — those whose src AND dst
-// are both in the requested node set. Cross-partition edges (one
-// endpoint in each half) are dropped by both extracts. `open_multi`
-// unions the two extracted edge bags; it does NOT re-stitch edges that
-// neither extract carried. The guarantees tested here are therefore:
+// `extract_subgraph` uses source-side ownership: every edge whose src
+// is in the requested node set is carried, including edges whose dst
+// lives outside the set. When two disjoint halves of a graph's nodes
+// are each extracted, every edge appears in exactly one extract (the
+// one containing its src node). `open_multi` merges the two extracts
+// and validates endpoints across the union. The guarantee tested here:
 //
 //   1. Node count round-trips exactly.
-//   2. Every intra-partition edge round-trips exactly.
-//   3. No spurious edges appear in the merged DB.
+//   2. Edge bag round-trips exactly (every edge, not just intra-partition).
 //
 // This is the headline correctness property for the
 // "extract per chunk, merge at load" workflow.
@@ -262,14 +286,10 @@ proptest! {
     /// Verifies the round-trip properties of `extract_subgraph` + `open_multi`:
     ///
     /// 1. All nodes survive (node count is exact).
-    /// 2. All intra-partition edges survive (no interior edges are dropped or
-    ///    duplicated by the extract → snapshot → open_multi pipeline).
-    /// 3. No spurious edges appear (merged edge count ≤ source edge count).
-    ///
-    /// Cross-partition edges (those spanning the two halves) are intentionally
-    /// dropped by `extract_subgraph`, which only carries interior edges. The
-    /// test accounts for this by computing the expected merged bag as the subset
-    /// of source edges that are wholly within one partition half.
+    /// 2. The full edge bag round-trips exactly — including edges that cross
+    ///    the partition boundary. Under source-side ownership, every edge is
+    ///    carried by the extract that contains its src node, so merging the
+    ///    two halves via `open_multi` reproduces the complete source edge set.
     #[test]
     fn extract_then_merge_round_trips(spec in graph_spec()) {
         let (source, ids) = build_graph(&spec);
@@ -280,18 +300,13 @@ proptest! {
         // Partition: alternating indices into two halves.
         // half_a gets ids[0], ids[2], ids[4], ...
         // half_b gets ids[1], ids[3], ids[5], ...
-        let set_a: std::collections::HashSet<NodeId> =
-            ids.iter().step_by(2).copied().collect();
-        let set_b: std::collections::HashSet<NodeId> =
-            ids.iter().skip(1).step_by(2).copied().collect();
+        let half_a: Vec<NodeId> = ids.iter().step_by(2).copied().collect();
+        let half_b: Vec<NodeId> = ids.iter().skip(1).step_by(2).copied().collect();
 
         // Skip single-node cases — they produce an empty half_b, which
         // doesn't exercise the merge path. proptest will retry with a
         // different seed.
-        prop_assume!(!set_b.is_empty());
-
-        let half_a: Vec<NodeId> = set_a.iter().copied().collect();
-        let half_b: Vec<NodeId> = set_b.iter().copied().collect();
+        prop_assume!(!half_b.is_empty());
 
         let ext_a = source.extract_subgraph(&half_a).expect("extract a");
         let ext_b = source.extract_subgraph(&half_b).expect("extract b");
@@ -304,68 +319,12 @@ proptest! {
         let merged = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
             .expect("open_multi must accept disjoint sibling extracts");
 
-        // Property 1: node count round-trips exactly.
-        prop_assert_eq!(
-            merged.node_count(),
-            source.node_count(),
-            "node count must round-trip"
-        );
+        prop_assert_eq!(merged.node_count(), source.node_count(),
+            "node count must round-trip");
 
-        let merged_bag = edge_triples_bag(&merged);
         let source_bag = edge_triples_bag(&source);
-
-        // Property 3: no spurious edges. Every edge in merged must
-        // have been in source.
-        for (key, &merged_count) in &merged_bag {
-            let source_count = source_bag.get(key).copied().unwrap_or(0);
-            prop_assert!(
-                merged_count <= source_count,
-                "spurious edge in merged DB: {:?} appears {} times in merged but \
-                 only {} times in source",
-                key, merged_count, source_count
-            );
-        }
-
-        // Property 2: every intra-partition edge round-trips. Build the
-        // expected bag as source edges with both endpoints in the same half.
-        let mut expected_bag = std::collections::BTreeMap::<(String, String, String), usize>::new();
-        {
-            let result = source
-                .session()
-                .execute("MATCH (a)-[r]->(b) RETURN id(a), a.id, id(b), b.id, type(r)")
-                .expect("source edge query with node ids");
-            for row in result.rows() {
-                // id(a) returns the internal NodeId as an integer.
-                let Value::Int64(src_internal) = &row[0] else { continue };
-                let Value::String(src_id) = &row[1] else { continue };
-                let Value::Int64(dst_internal) = &row[2] else { continue };
-                let Value::String(dst_id) = &row[3] else { continue };
-                let Value::String(rel_type) = &row[4] else { continue };
-
-                let src_node = NodeId::new(*src_internal as u64);
-                let dst_node = NodeId::new(*dst_internal as u64);
-
-                // Include this edge in the expected bag only if both
-                // endpoints are in the same partition half.
-                let intra = (set_a.contains(&src_node) && set_a.contains(&dst_node))
-                    || (set_b.contains(&src_node) && set_b.contains(&dst_node));
-                if intra {
-                    let key = (
-                        src_id.to_string(),
-                        dst_id.to_string(),
-                        rel_type.to_string(),
-                    );
-                    *expected_bag.entry(key).or_insert(0) += 1;
-                }
-            }
-        }
-
-        prop_assert_eq!(
-            merged_bag,
-            expected_bag,
-            "intra-partition edge triples must round-trip exactly via \
-             extract + open_multi (cross-partition edges are intentionally \
-             dropped by extract_subgraph)"
-        );
+        let merged_bag = edge_triples_bag(&merged);
+        prop_assert_eq!(merged_bag, source_bag,
+            "edge triples must round-trip exactly via extract + open_multi");
     }
 }
