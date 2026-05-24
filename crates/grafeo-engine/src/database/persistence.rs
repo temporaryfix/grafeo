@@ -1032,6 +1032,131 @@ impl super::GrafeoDB {
     }
 
     // =========================================================================
+    // ADMIN API: Subgraph Extraction
+    // =========================================================================
+
+    /// Produces a new in-memory database containing exactly the
+    /// requested nodes plus every edge whose source and destination
+    /// are both in `node_ids`. NodeIds and EdgeIds are preserved
+    /// verbatim so multiple sibling extracts can later be merged via
+    /// [`open_multi`](Self::open_multi) without ID collisions.
+    ///
+    /// Properties (full temporal history when the `temporal` feature
+    /// is on), schema catalog, and index metadata are copied from the
+    /// source. Edges whose endpoints span the request boundary are
+    /// dropped — sibling extracts plus `open_multi` are the supported
+    /// way to keep cross-shard edges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `node_ids` entry does not exist in
+    /// `self`, or if interior copy operations fail.
+    pub fn extract_subgraph(&self, node_ids: &[NodeId]) -> Result<Self> {
+        let store = self.lpg_store();
+
+        // Dedup the request set — caller convenience; duplicates here
+        // would otherwise cause `create_node_with_id` to error on the
+        // second insert.
+        let requested: HashSet<NodeId> = node_ids.iter().copied().collect();
+
+        // Validate up front so a missing ID surfaces before any work.
+        for &id in &requested {
+            if store.get_node(id).is_none() {
+                return Err(Error::Internal(format!(
+                    "extract_subgraph: NodeId {id} does not exist in source database"
+                )));
+            }
+        }
+
+        let target = Self::new_in_memory();
+        let target_store = target.lpg_store();
+
+        // Copy nodes preserving IDs + labels + properties. Property
+        // history is restored under `temporal`; otherwise just the
+        // current value.
+        for &id in &requested {
+            let Some(node) = store.get_node(id) else { continue };
+            let label_refs: Vec<&str> = node.labels.iter().map(|s| &**s).collect();
+            target_store
+                .create_node_with_id(id, &label_refs)
+                .map_err(|e| Error::Internal(format!("extract_subgraph: create node {id}: {e}")))?;
+
+            #[cfg(feature = "temporal")]
+            {
+                for (key, entries) in store.node_property_history(id) {
+                    for (epoch, value) in entries {
+                        target_store.set_node_property_at_epoch(id, key.as_str(), value, epoch);
+                    }
+                }
+            }
+            #[cfg(not(feature = "temporal"))]
+            {
+                for (key, value) in node.properties {
+                    target_store.set_node_property(id, key.as_str(), value);
+                }
+            }
+        }
+
+        // Copy interior edges. Walk outgoing edges from each requested
+        // node; include only those whose destination is also in the
+        // set. Tracking `seen` deduplicates self-loops (which appear
+        // in both incoming and outgoing iterations).
+        let mut seen_edges: HashSet<EdgeId> = HashSet::new();
+        for &src_id in &requested {
+            for (dst_id, edge_id) in
+                store.edges_from(src_id, grafeo_core::graph::Direction::Outgoing)
+            {
+                if !requested.contains(&dst_id) {
+                    continue;
+                }
+                if !seen_edges.insert(edge_id) {
+                    continue;
+                }
+                let Some(edge) = store.get_edge(edge_id) else { continue };
+                target_store
+                    .create_edge_with_id(edge.id, edge.src, edge.dst, &edge.edge_type)
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "extract_subgraph: create edge {}: {e}",
+                            edge.id
+                        ))
+                    })?;
+
+                #[cfg(feature = "temporal")]
+                {
+                    for (key, entries) in store.edge_property_history(edge.id) {
+                        for (epoch, value) in entries {
+                            target_store.set_edge_property_at_epoch(
+                                edge.id,
+                                key.as_str(),
+                                value,
+                                epoch,
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(feature = "temporal"))]
+                {
+                    for (key, value) in edge.properties {
+                        target_store.set_edge_property(edge.id, key.as_str(), value);
+                    }
+                }
+            }
+        }
+
+        // Sync epoch so subsequent writes against the extract use the
+        // same logical clock as the source.
+        #[cfg(feature = "temporal")]
+        {
+            let epoch = self.transaction_manager.current_epoch();
+            target_store.sync_epoch(epoch);
+            target.transaction_manager.sync_epoch(epoch);
+        }
+
+        Ok(target)
+    }
+
+    // =========================================================================
     // ADMIN API: Snapshot Export/Import
     // =========================================================================
 
