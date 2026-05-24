@@ -5,6 +5,7 @@ use std::path::Path;
 
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
 use grafeo_common::grafeo_warn;
+use grafeo_common::{grafeo_debug_span, grafeo_info, grafeo_info_span};
 use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
 use grafeo_common::utils::error::{Error, Result};
 use hashbrown::{HashMap, HashSet};
@@ -1486,35 +1487,45 @@ impl super::GrafeoDB {
             ));
         }
 
+        let _span = grafeo_info_span!("open_multi", n_snapshots = snapshots.len());
+
         // Decode every blob first so any version / bincode failure
         // surfaces before we touch a target database.
-        let decoded: Vec<Snapshot> = snapshots
-            .iter()
-            .enumerate()
-            .map(|(idx, bytes)| {
-                decode_snapshot_bytes(bytes)
-                    .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))
-            })
-            .collect::<Result<_>>()?;
+        let decoded: Vec<Snapshot> = {
+            let _decode = grafeo_debug_span!("decode");
+            snapshots
+                .iter()
+                .enumerate()
+                .map(|(idx, bytes)| {
+                    decode_snapshot_bytes(bytes)
+                        .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))
+                })
+                .collect::<Result<_>>()?
+        };
 
         // Per-snapshot duplicate-ID validation only (not endpoint
         // resolution — niche chunks can reference nodes from other
         // snapshots). Cross-snapshot endpoint validation runs next via
         // validate_snapshot_set.
-        for (idx, snap) in decoded.iter().enumerate() {
-            validate_snapshot_ids(&snap.nodes, &snap.edges)
-                .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))?;
+        {
+            let _validate = grafeo_debug_span!("validate");
+            for (idx, snap) in decoded.iter().enumerate() {
+                validate_snapshot_ids(&snap.nodes, &snap.edges)
+                    .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))?;
+            }
+            validate_snapshot_set(&decoded)?;
         }
 
-        validate_snapshot_set(&decoded)?;
-
-        let canonical = normalize_schema_bytes(&decoded[0].schema);
-        for (idx, snap) in decoded.iter().enumerate().skip(1) {
-            if normalize_schema_bytes(&snap.schema) != canonical {
-                return Err(Error::Internal(format!(
-                    "snapshot[{idx}] schema does not match snapshot[0] schema; \
-                     all snapshots passed to open_multi must declare the same schema"
-                )));
+        {
+            let _schema = grafeo_debug_span!("schema");
+            let canonical = normalize_schema_bytes(&decoded[0].schema);
+            for (idx, snap) in decoded.iter().enumerate().skip(1) {
+                if normalize_schema_bytes(&snap.schema) != canonical {
+                    return Err(Error::Internal(format!(
+                        "snapshot[{idx}] schema does not match snapshot[0] schema; \
+                         all snapshots passed to open_multi must declare the same schema"
+                    )));
+                }
             }
         }
 
@@ -1522,78 +1533,99 @@ impl super::GrafeoDB {
         let db = Self::new_in_memory();
 
         // Default graph: union of all snapshots' (nodes, edges).
-        for snap in &decoded {
-            populate_store_from_snapshot_ref(db.lpg_store(), &snap.nodes, &snap.edges)?;
+        {
+            let _populate = grafeo_debug_span!("populate");
+            for snap in &decoded {
+                populate_store_from_snapshot_ref(db.lpg_store(), &snap.nodes, &snap.edges)?;
+            }
         }
 
         // Named graphs: each name may live in exactly one snapshot.
         // A name appearing in two snapshots is rejected — the caller
         // must produce disjoint chunk subsets.
-        let mut seen_graphs: HashSet<String> = HashSet::new();
-        for (idx, snap) in decoded.iter().enumerate() {
-            for graph in &snap.named_graphs {
-                if !seen_graphs.insert(graph.name.clone()) {
+        {
+            let _named_graphs = grafeo_debug_span!("named_graphs");
+            let mut seen_graphs: HashSet<String> = HashSet::new();
+            for (idx, snap) in decoded.iter().enumerate() {
+                for graph in &snap.named_graphs {
+                    if !seen_graphs.insert(graph.name.clone()) {
+                        return Err(Error::Internal(format!(
+                            "named graph '{}' appears in snapshot[{idx}] and at \
+                             least one earlier snapshot; open_multi requires named \
+                             graphs to be disjoint across snapshots",
+                            graph.name
+                        )));
+                    }
+                    db.lpg_store()
+                        .create_graph(&graph.name)
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    if let Some(graph_store) = db.lpg_store().graph(&graph.name) {
+                        populate_store_from_snapshot_ref(
+                            &graph_store,
+                            &graph.nodes,
+                            &graph.edges,
+                        )?;
+                    }
+                }
+            }
+
+            // RDF: same single-owner policy.
+            #[cfg(feature = "triple-store")]
+            {
+                let owners = decoded
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !s.rdf_triples.is_empty() || !s.rdf_named_graphs.is_empty())
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>();
+                if owners.len() > 1 {
                     return Err(Error::Internal(format!(
-                        "named graph '{}' appears in snapshot[{idx}] and at \
-                         least one earlier snapshot; open_multi requires named \
-                         graphs to be disjoint across snapshots",
-                        graph.name
+                        "RDF data is present in snapshots {owners:?}; open_multi \
+                         requires at most one snapshot to carry RDF triples or \
+                         named graphs"
                     )));
                 }
-                db.lpg_store()
-                    .create_graph(&graph.name)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-                if let Some(graph_store) = db.lpg_store().graph(&graph.name) {
-                    populate_store_from_snapshot_ref(&graph_store, &graph.nodes, &graph.edges)?;
+                if let Some(&idx) = owners.first() {
+                    let snap = &decoded[idx];
+                    populate_rdf_store(&db.rdf_store, &snap.rdf_triples);
+                    for rng in &snap.rdf_named_graphs {
+                        let graph = db.rdf_store.graph_or_create(&rng.name);
+                        populate_rdf_store(&graph, &rng.triples);
+                    }
                 }
             }
         }
 
-        // RDF: same single-owner policy.
-        #[cfg(feature = "triple-store")]
+        // Restore epoch, schema, and indexes.
         {
-            let owners = decoded
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.rdf_triples.is_empty() || !s.rdf_named_graphs.is_empty())
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
-            if owners.len() > 1 {
-                return Err(Error::Internal(format!(
-                    "RDF data is present in snapshots {owners:?}; open_multi \
-                     requires at most one snapshot to carry RDF triples or \
-                     named graphs"
-                )));
+            let _indexes = grafeo_debug_span!("indexes");
+
+            // Restore epoch as max across snapshots.
+            #[cfg(feature = "temporal")]
+            {
+                let max_epoch = decoded
+                    .iter()
+                    .map(|s| s.epoch)
+                    .max()
+                    .expect("decoded is non-empty after empty-input guard");
+                let epoch = EpochId::new(max_epoch);
+                db.lpg_store().sync_epoch(epoch);
+                db.transaction_manager.sync_epoch(epoch);
             }
-            if let Some(&idx) = owners.first() {
-                let snap = &decoded[idx];
-                populate_rdf_store(&db.rdf_store, &snap.rdf_triples);
-                for rng in &snap.rdf_named_graphs {
-                    let graph = db.rdf_store.graph_or_create(&rng.name);
-                    populate_rdf_store(&graph, &rng.triples);
-                }
-            }
+
+            // Restore schema from the first snapshot. Later tasks add the
+            // cross-snapshot schema-equality check.
+            restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &decoded[0].schema);
+
+            // Restore indexes from the union of all snapshots' metadata.
+            restore_indexes_from_snapshot(&db, &union_index_metadata(&decoded));
         }
 
-        // Restore epoch as max across snapshots.
-        #[cfg(feature = "temporal")]
-        {
-            let max_epoch = decoded
-                .iter()
-                .map(|s| s.epoch)
-                .max()
-                .expect("decoded is non-empty after empty-input guard");
-            let epoch = EpochId::new(max_epoch);
-            db.lpg_store().sync_epoch(epoch);
-            db.transaction_manager.sync_epoch(epoch);
-        }
-
-        // Restore schema from the first snapshot. Later tasks add the
-        // cross-snapshot schema-equality check.
-        restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &decoded[0].schema);
-
-        // Restore indexes from the union of all snapshots' metadata.
-        restore_indexes_from_snapshot(&db, &union_index_metadata(&decoded));
+        grafeo_info!(
+            "open_multi complete: nodes={nodes} edges={edges}",
+            nodes = db.node_count(),
+            edges = db.edge_count()
+        );
 
         Ok(db)
     }
