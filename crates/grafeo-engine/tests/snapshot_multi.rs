@@ -212,3 +212,28 @@ fn open_multi_rejects_dangling_edge_endpoint() {
         }
     }
 }
+
+#[test]
+fn open_multi_rejects_duplicate_edge_id_across_snapshots() {
+    let a = encode_snapshot(
+        vec![node(1, "Person"), node(2, "Person")],
+        vec![edge(100, 1, 2, "KNOWS")],
+    );
+    let b = encode_snapshot(
+        vec![node(3, "Person"), node(4, "Person")],
+        vec![edge(100, 3, 4, "KNOWS")],
+    );
+
+    let result = GrafeoDB::open_multi(&[a.as_slice(), b.as_slice()]);
+
+    match result {
+        Ok(_) => panic!("must reject duplicate EdgeId"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("duplicate") && message.contains("edge"),
+                "error must name the conflict; got: {message}"
+            );
+        }
+    }
+}
