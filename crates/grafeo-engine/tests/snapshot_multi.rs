@@ -307,3 +307,38 @@ fn open_multi_accepts_matching_schemas() {
         .expect("Cypher must compile against the merged schema");
     assert_eq!(result.rows().len(), 1);
 }
+
+#[test]
+fn open_multi_rejects_empty_input() {
+    let result = GrafeoDB::open_multi(&[]);
+    match result {
+        Ok(_) => panic!("must reject empty snapshot list"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("at least one"),
+                "error must explain why; got: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn open_multi_accepts_named_graphs_from_single_snapshot() {
+    let db = GrafeoDB::new_in_memory();
+    db.create_graph("g1").expect("create_graph");
+    let bytes = db.export_snapshot().expect("export");
+
+    // Pair the named-graph snapshot with a plain one — should still load.
+    let plain = GrafeoDB::new_in_memory();
+    plain.create_node(&["Marker"]);
+    let plain_bytes = plain.export_snapshot().expect("export plain");
+
+    let merged = GrafeoDB::open_multi(&[bytes.as_slice(), plain_bytes.as_slice()])
+        .expect("named graph in only one snapshot is fine");
+    let names = merged.list_graphs();
+    assert!(
+        names.iter().any(|n| n == "g1"),
+        "named graph must be restored; got names: {names:?}"
+    );
+}

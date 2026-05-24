@@ -1194,29 +1194,65 @@ impl super::GrafeoDB {
             }
         }
 
-        // Reject any snapshot carrying named graphs or RDF triples for
-        // now — `open_multi` does not yet merge those payloads, and
-        // silently dropping them on the floor is worse than failing
-        // loud. Lifted in Task 11 when the single-owner policy lands.
+        // Build the merged database from the decoded snapshots.
+        let db = Self::new_in_memory();
+
+        // Default graph: union of all snapshots' (nodes, edges).
+        for snap in &decoded {
+            populate_store_from_snapshot_ref(db.lpg_store(), &snap.nodes, &snap.edges)?;
+        }
+
+        // Named graphs: each name may live in exactly one snapshot.
+        // A name appearing in two snapshots is rejected — the caller
+        // must produce disjoint chunk subsets.
+        let mut seen_graphs: HashSet<String> = HashSet::new();
         for (idx, snap) in decoded.iter().enumerate() {
-            if !snap.named_graphs.is_empty() {
-                return Err(Error::Internal(format!(
-                    "snapshot[{idx}] carries named graphs; open_multi \
-                     does not yet support named graphs (see Task 11)"
-                )));
-            }
-            if !snap.rdf_triples.is_empty() || !snap.rdf_named_graphs.is_empty() {
-                return Err(Error::Internal(format!(
-                    "snapshot[{idx}] carries RDF triples; open_multi \
-                     does not yet support RDF (see Task 11)"
-                )));
+            for graph in &snap.named_graphs {
+                if !seen_graphs.insert(graph.name.clone()) {
+                    return Err(Error::Internal(format!(
+                        "named graph '{}' appears in snapshot[{idx}] and at \
+                         least one earlier snapshot; open_multi requires named \
+                         graphs to be disjoint across snapshots",
+                        graph.name
+                    )));
+                }
+                db.lpg_store()
+                    .create_graph(&graph.name)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                if let Some(graph_store) = db.lpg_store().graph(&graph.name) {
+                    populate_store_from_snapshot_ref(
+                        &graph_store,
+                        &graph.nodes,
+                        &graph.edges,
+                    )?;
+                }
             }
         }
 
-        // Build the merged database from the decoded snapshots.
-        let db = Self::new_in_memory();
-        for snap in &decoded {
-            populate_store_from_snapshot_ref(db.lpg_store(), &snap.nodes, &snap.edges)?;
+        // RDF: same single-owner policy.
+        #[cfg(feature = "triple-store")]
+        {
+            let owners = decoded
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.rdf_triples.is_empty() || !s.rdf_named_graphs.is_empty())
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            if owners.len() > 1 {
+                return Err(Error::Internal(format!(
+                    "RDF data is present in snapshots {owners:?}; open_multi \
+                     requires at most one snapshot to carry RDF triples or \
+                     named graphs"
+                )));
+            }
+            if let Some(&idx) = owners.first() {
+                let snap = &decoded[idx];
+                populate_rdf_store(&db.rdf_store, &snap.rdf_triples);
+                for rng in &snap.rdf_named_graphs {
+                    let graph = db.rdf_store.graph_or_create(&rng.name);
+                    populate_rdf_store(&graph, &rng.triples);
+                }
+            }
         }
 
         // Restore epoch as max across snapshots.
