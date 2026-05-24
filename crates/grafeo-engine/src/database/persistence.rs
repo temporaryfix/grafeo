@@ -1675,7 +1675,11 @@ impl super::GrafeoDB {
     /// Does not panic in practice. The internal `.expect()` that resolves
     /// the maximum epoch is guarded by the non-empty check at the top of
     /// the function; it is unreachable when the function is called correctly.
-    pub fn open_multi(snapshots: &[&[u8]]) -> Result<Self> {
+    pub fn open_multi<I, B>(snapshots: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
         Self::open_multi_with(snapshots, OpenMultiOptions::default())
     }
 
@@ -1686,24 +1690,29 @@ impl super::GrafeoDB {
     /// # Errors
     ///
     /// Same conditions as [`open_multi`](Self::open_multi).
-    pub fn open_multi_with(snapshots: &[&[u8]], options: OpenMultiOptions) -> Result<Self> {
-        if snapshots.is_empty() {
+    pub fn open_multi_with<I, B>(snapshots: I, options: OpenMultiOptions) -> Result<Self>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let owned: Vec<B> = snapshots.into_iter().collect();
+        if owned.is_empty() {
             return Err(Error::Internal(
                 "open_multi requires at least one snapshot blob".to_string(),
             ));
         }
 
-        let _span = grafeo_info_span!("open_multi", n_snapshots = snapshots.len());
+        let _span = grafeo_info_span!("open_multi", n_snapshots = owned.len());
 
         // Decode every blob first so any version / bincode failure
         // surfaces before we touch a target database.
         let decoded: Vec<Snapshot> = {
             let _decode = grafeo_debug_span!("decode");
-            snapshots
+            owned
                 .iter()
                 .enumerate()
                 .map(|(idx, bytes)| {
-                    decode_snapshot_bytes(bytes)
+                    decode_snapshot_bytes(bytes.as_ref())
                         .map_err(|e| Error::Internal(format!("snapshot[{idx}]: {e}")))
                 })
                 .collect::<Result<_>>()?

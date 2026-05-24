@@ -310,7 +310,8 @@ fn open_multi_accepts_matching_schemas() {
 
 #[test]
 fn open_multi_rejects_empty_input() {
-    let result = GrafeoDB::open_multi(&[]);
+    let empty: &[&[u8]] = &[];
+    let result = GrafeoDB::open_multi(empty);
     match result {
         Ok(_) => panic!("must reject empty snapshot list"),
         Err(e) => {
@@ -439,4 +440,24 @@ fn open_multi_restores_max_epoch_across_snapshots() {
         EpochId::new(42),
         "open_multi must restore epoch as max across snapshots"
     );
+}
+
+#[test]
+fn open_multi_accepts_vec_of_vecs_and_array_of_slices() {
+    let db = GrafeoDB::new_in_memory();
+    db.create_node(&["A"]);
+    let bytes = db.export_snapshot().expect("export");
+
+    // Vec<Vec<u8>>
+    let owned: Vec<Vec<u8>> = vec![bytes.clone()];
+    let m1 = GrafeoDB::open_multi(owned).expect("Vec<Vec<u8>> works");
+    assert_eq!(m1.node_count(), 1);
+
+    // Array of &[u8]
+    let m2 = GrafeoDB::open_multi([bytes.as_slice()]).expect("array of slices works");
+    assert_eq!(m2.node_count(), 1);
+
+    // Original &[&[u8]] still works (backwards-compat).
+    let m3 = GrafeoDB::open_multi(&[bytes.as_slice()]).expect("slice of slices works");
+    assert_eq!(m3.node_count(), 1);
 }
