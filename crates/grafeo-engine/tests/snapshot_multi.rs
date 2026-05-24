@@ -31,12 +31,18 @@ struct TestSnapshot {
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct TestSnapshotSchema {
+    // Field shapes here must match `SnapshotSchema` in persistence.rs
+    // for bincode encoding to round-trip cleanly. `Vec<()>` is safe for
+    // the inner sequences as long as we keep them empty (an empty
+    // Vec<T> encodes as a length-0 prefix regardless of T); the
+    // `graph_type_bindings` field uses the real tuple type because
+    // we may legitimately want to seed it in future tests.
     node_types: Vec<()>,
     edge_types: Vec<()>,
     graph_types: Vec<()>,
     procedures: Vec<()>,
     schemas: Vec<()>,
-    graph_type_bindings: Vec<()>,
+    graph_type_bindings: Vec<(String, String)>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -64,6 +70,10 @@ struct TestEdge {
 
 fn encode_snapshot(nodes: Vec<TestNode>, edges: Vec<TestEdge>) -> Vec<u8> {
     let snap = TestSnapshot {
+        // Must match `SNAPSHOT_VERSION` in
+        // crates/grafeo-engine/src/database/persistence.rs (crate-private,
+        // so it can't be imported here). If that constant bumps, update
+        // this literal in the same change.
         version: 4,
         nodes,
         edges,
