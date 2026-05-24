@@ -41,6 +41,8 @@ mod import;
 mod index;
 #[cfg(feature = "lpg")]
 mod persistence;
+#[cfg(feature = "lpg")]
+pub use persistence::{snapshot_info, OpenMultiOptions, SchemaMergePolicy, SnapshotInfo};
 mod query;
 #[cfg(feature = "triple-store")]
 mod rdf_ops;

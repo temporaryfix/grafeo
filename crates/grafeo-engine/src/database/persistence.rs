@@ -56,6 +56,58 @@ pub struct OpenMultiOptions {
     pub schema_policy: SchemaMergePolicy,
 }
 
+/// Summary metadata about a snapshot blob, as produced by
+/// [`snapshot_info`]. Useful for pre-flight checks (e.g. rejecting a
+/// snapshot whose `version` is older than the runtime expects, or
+/// alerting on an unexpected `node_count`) without loading the
+/// snapshot into a full database.
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    /// Snapshot format version byte (currently 4).
+    pub version: u8,
+    /// Store epoch at snapshot time (0 when temporal is disabled).
+    pub epoch: u64,
+    /// Number of nodes serialized in the blob.
+    pub node_count: usize,
+    /// Number of edges serialized in the blob.
+    pub edge_count: usize,
+    /// Number of named graphs (outer Vec length, not inner node/edge counts).
+    pub named_graph_count: usize,
+    /// Number of RDF named-graph blocks (outer Vec length).
+    pub rdf_triple_count: usize,
+    /// Number of property index keys recorded in the blob.
+    pub property_index_count: usize,
+    /// Number of vector index descriptors recorded in the blob.
+    pub vector_index_count: usize,
+    /// Number of text index descriptors recorded in the blob.
+    pub text_index_count: usize,
+}
+
+/// Parses a snapshot blob and returns its summary metadata without
+/// constructing a [`GrafeoDB`]. The blob is fully decoded
+/// (bincode requires it), so this isn't free — it's just much cheaper
+/// than [`GrafeoDB::open_multi`] because no graph store is built and
+/// no indexes are rebuilt.
+///
+/// # Errors
+///
+/// Returns an error if the blob is empty, the version byte is
+/// unsupported, or the bincode payload fails to decode.
+pub fn snapshot_info(bytes: &[u8]) -> Result<SnapshotInfo> {
+    let snap = decode_snapshot_bytes(bytes)?;
+    Ok(SnapshotInfo {
+        version: snap.version,
+        epoch: snap.epoch,
+        node_count: snap.nodes.len(),
+        edge_count: snap.edges.len(),
+        named_graph_count: snap.named_graphs.len(),
+        rdf_triple_count: snap.rdf_triples.len(),
+        property_index_count: snap.indexes.property_indexes.len(),
+        vector_index_count: snap.indexes.vector_indexes.len(),
+        text_index_count: snap.indexes.text_indexes.len(),
+    })
+}
+
 /// Binary snapshot format (v4: graph data, named graphs, RDF, schema, index metadata,
 /// and property version history for temporal support).
 #[derive(serde::Serialize, serde::Deserialize)]

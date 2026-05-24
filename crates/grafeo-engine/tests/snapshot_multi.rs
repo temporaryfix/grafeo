@@ -443,6 +443,27 @@ fn open_multi_restores_max_epoch_across_snapshots() {
 }
 
 #[test]
+fn snapshot_info_reports_blob_stats_without_loading() {
+    use grafeo_engine::snapshot_info;
+
+    let db = GrafeoDB::new_in_memory();
+    let a = db.create_node(&["A"]);
+    db.set_node_property(a, "id", Value::String("a".into()));
+    let b = db.create_node(&["B"]);
+    db.create_edge(a, b, "R");
+    db.create_property_index("id");
+
+    let bytes = db.export_snapshot().expect("export");
+    let info = snapshot_info(&bytes).expect("info");
+
+    assert_eq!(info.version, 4, "snapshot format version");
+    assert_eq!(info.node_count, 2);
+    assert_eq!(info.edge_count, 1);
+    assert_eq!(info.property_index_count, 1);
+    assert_eq!(info.named_graph_count, 0);
+}
+
+#[test]
 fn open_multi_accepts_vec_of_vecs_and_array_of_slices() {
     let db = GrafeoDB::new_in_memory();
     db.create_node(&["A"]);
