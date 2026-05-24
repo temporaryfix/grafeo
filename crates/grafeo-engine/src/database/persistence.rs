@@ -468,6 +468,28 @@ fn restore_indexes_from_snapshot(db: &super::GrafeoDB, indexes: &SnapshotIndexes
     }
 }
 
+/// Decode a snapshot blob into the in-memory `Snapshot` struct after
+/// validating the leading version byte. Shared by `import_snapshot` and
+/// `open_multi` so the two paths can't drift.
+fn decode_snapshot_bytes(data: &[u8]) -> Result<Snapshot> {
+    if data.is_empty() {
+        return Err(Error::Internal("empty snapshot data".to_string()));
+    }
+
+    let version = data[0];
+    if version != SNAPSHOT_VERSION {
+        return Err(Error::Internal(format!(
+            "unsupported snapshot version: {version} (expected {SNAPSHOT_VERSION})"
+        )));
+    }
+
+    let config = bincode::config::standard();
+    let (snapshot, _): (Snapshot, _) = bincode::serde::decode_from_slice(data, config)
+        .map_err(|e| Error::Internal(format!("snapshot decode failed: {e}")))?;
+
+    Ok(snapshot)
+}
+
 /// Collects index metadata from a store into snapshot format.
 fn collect_index_metadata(store: &grafeo_core::graph::lpg::LpgStore) -> SnapshotIndexes {
     let property_indexes = store.property_index_keys();
@@ -934,20 +956,7 @@ impl super::GrafeoDB {
     /// Returns an error if the snapshot is invalid, contains dangling edge
     /// references, has duplicate IDs, or deserialization fails.
     pub fn import_snapshot(data: &[u8]) -> Result<Self> {
-        if data.is_empty() {
-            return Err(Error::Internal("empty snapshot data".to_string()));
-        }
-
-        let version = data[0];
-        if version != 4 {
-            return Err(Error::Internal(format!(
-                "unsupported snapshot version: {version} (expected 4)"
-            )));
-        }
-
-        let config = bincode::config::standard();
-        let (snapshot, _): (Snapshot, _) = bincode::serde::decode_from_slice(data, config)
-            .map_err(|e| Error::Internal(format!("snapshot import failed: {e}")))?;
+        let snapshot = decode_snapshot_bytes(data)?;
 
         // Validate default graph data
         validate_snapshot_data(&snapshot.nodes, &snapshot.edges)?;
@@ -1021,20 +1030,7 @@ impl super::GrafeoDB {
     /// Returns an error if the snapshot is invalid, contains dangling edge
     /// references, has duplicate IDs, or deserialization fails.
     pub fn restore_snapshot(&self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Err(Error::Internal("empty snapshot data".to_string()));
-        }
-
-        let version = data[0];
-        if version != 4 {
-            return Err(Error::Internal(format!(
-                "unsupported snapshot version: {version} (expected 4)"
-            )));
-        }
-
-        let config = bincode::config::standard();
-        let (snapshot, _): (Snapshot, _) = bincode::serde::decode_from_slice(data, config)
-            .map_err(|e| Error::Internal(format!("snapshot restore failed: {e}")))?;
+        let snapshot = decode_snapshot_bytes(data)?;
 
         // Validate all data before making any changes
         validate_snapshot_data(&snapshot.nodes, &snapshot.edges)?;
