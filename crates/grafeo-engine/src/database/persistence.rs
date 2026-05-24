@@ -1022,13 +1022,21 @@ impl super::GrafeoDB {
     /// - Nodes and edges are preserved with their producer-allocated IDs.
     /// - A NodeId (or EdgeId) appearing in two snapshots is rejected as a
     ///   producer bug; the caller is responsible for emitting disjoint
-    ///   subsets.
+    ///   subsets. (Cross-snapshot dedup validation is not yet enforced;
+    ///   see Task 5 of the open_multi plan.)
     /// - Every edge endpoint must exist somewhere in the union, so a chunk
     ///   may carry edges whose endpoints belong to a different chunk.
+    ///   (Endpoint resolution across the union is not yet enforced; see
+    ///   Task 5–7 of the open_multi plan.)
     /// - All snapshots must declare the same schema (after canonical
-    ///   ordering). Differing schemas are rejected.
+    ///   ordering). Differing schemas are rejected. (Schema-equality
+    ///   check is not yet enforced; see Task 10 of the open_multi plan.)
     /// - Indexes are unioned; the epoch is the maximum across inputs.
+    ///   (Currently restored from the first snapshot only; index union
+    ///   lands in Task 12 of the open_multi plan.)
     /// - At most one snapshot may carry named graphs or RDF triples.
+    ///   (Currently rejected outright; full single-owner policy lands in
+    ///   Task 11 of the open_multi plan.)
     ///
     /// All validation runs before any data is inserted; a rejection
     /// leaves no partial database behind (the function never publishes
@@ -1066,6 +1074,25 @@ impl super::GrafeoDB {
             })?;
         }
 
+        // Reject any snapshot carrying named graphs or RDF triples for
+        // now — `open_multi` does not yet merge those payloads, and
+        // silently dropping them on the floor is worse than failing
+        // loud. Lifted in Task 11 when the single-owner policy lands.
+        for (idx, snap) in decoded.iter().enumerate() {
+            if !snap.named_graphs.is_empty() {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] carries named graphs; open_multi \
+                     does not yet support named graphs (see Task 11)"
+                )));
+            }
+            if !snap.rdf_triples.is_empty() || !snap.rdf_named_graphs.is_empty() {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] carries RDF triples; open_multi \
+                     does not yet support RDF (see Task 11)"
+                )));
+            }
+        }
+
         // Build the merged database from the decoded snapshots.
         let db = Self::new_in_memory();
         for snap in &decoded {
@@ -1079,7 +1106,7 @@ impl super::GrafeoDB {
                 .iter()
                 .map(|s| s.epoch)
                 .max()
-                .unwrap_or(0);
+                .expect("decoded is non-empty after empty-input guard");
             let epoch = EpochId::new(max_epoch);
             db.lpg_store().sync_epoch(epoch);
             db.transaction_manager.sync_epoch(epoch);

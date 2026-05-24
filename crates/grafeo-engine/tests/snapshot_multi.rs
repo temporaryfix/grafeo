@@ -32,4 +32,8 @@ fn open_multi_with_single_snapshot_matches_import_snapshot() {
         .execute("MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.name")
         .expect("query");
     assert_eq!(result.rows().len(), 1);
+
+    let row = &result.rows()[0];
+    assert_eq!(row[0], Value::String("Alix".into()));
+    assert_eq!(row[1], Value::String("Gus".into()));
 }
