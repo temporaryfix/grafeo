@@ -22,6 +22,40 @@ use crate::catalog::{
 /// Current snapshot version.
 const SNAPSHOT_VERSION: u8 = 4;
 
+/// How `open_multi` should reconcile schema catalogs across snapshots.
+///
+/// The default ([`SchemaMergePolicy::UnionWithConflictCheck`]) matches
+/// the natural pattern of "shared chunk has shared DDL, niche chunk
+/// has niche-specific DDL, no overlap on type names." For callers who
+/// genuinely need byte-equal schemas across all chunks (e.g. testing
+/// snapshot determinism), set [`SchemaMergePolicy::StrictEquality`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchemaMergePolicy {
+    /// Union types across all snapshots. Same-name types must have
+    /// matching definitions (compared via canonical bincode bytes);
+    /// differently-named types are accumulated into the merged
+    /// catalog. This is the default — required for sibling extracts
+    /// of a single source DB where each carries only the relevant
+    /// types but every type appears in at least one extract.
+    #[default]
+    UnionWithConflictCheck,
+
+    /// All snapshots must declare identical schemas (after canonical
+    /// ordering of inner Vecs). Stricter than `UnionWithConflictCheck`
+    /// — useful for tests that want to detect any schema drift, not
+    /// just incompatible drift.
+    StrictEquality,
+}
+
+/// Configuration for [`GrafeoDB::open_multi_with`]. Cheap to construct
+/// via `..Default::default()` field updates.
+#[derive(Debug, Clone, Default)]
+pub struct OpenMultiOptions {
+    /// How to reconcile schema catalogs across the input snapshots.
+    /// See [`SchemaMergePolicy`].
+    pub schema_policy: SchemaMergePolicy,
+}
+
 /// Binary snapshot format (v4: graph data, named graphs, RDF, schema, index metadata,
 /// and property version history for temporal support).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -317,6 +351,167 @@ fn normalize_schema_bytes(schema: &SnapshotSchema) -> Vec<u8> {
     };
     bincode::serde::encode_to_vec(&normalized, bincode::config::standard())
         .expect("encoding a SnapshotSchema cannot fail")
+}
+
+/// Merges the schemas from multiple decoded snapshots into one
+/// `SnapshotSchema`, per the chosen policy. Returns the merged schema
+/// ready to hand to `restore_schema_from_snapshot`.
+fn merge_snapshot_schemas(
+    snapshots: &[Snapshot],
+    policy: SchemaMergePolicy,
+) -> Result<SnapshotSchema> {
+    match policy {
+        SchemaMergePolicy::StrictEquality => {
+            let canonical = normalize_schema_bytes(&snapshots[0].schema);
+            for (idx, snap) in snapshots.iter().enumerate().skip(1) {
+                if normalize_schema_bytes(&snap.schema) != canonical {
+                    return Err(Error::Internal(format!(
+                        "snapshot[{idx}] schema does not match snapshot[0] schema \
+                         (SchemaMergePolicy::StrictEquality); all snapshots must \
+                         declare byte-identical schemas after canonical ordering"
+                    )));
+                }
+            }
+            Ok(snapshots[0].schema.clone())
+        }
+        SchemaMergePolicy::UnionWithConflictCheck => {
+            // Each typed catalog field is HashMap<name, def>. Inserting
+            // again with the same name requires the definitions to be
+            // byte-equal (post-normalization within each definition).
+            // Same-name+different-shape rejects with a diagnostic.
+
+            let mut node_types: HashMap<String, NodeTypeDefinition> = HashMap::new();
+            let mut edge_types: HashMap<String, EdgeTypeDefinition> = HashMap::new();
+            let mut graph_types: HashMap<String, GraphTypeDefinition> = HashMap::new();
+            let mut procedures: HashMap<String, ProcedureDefinition> = HashMap::new();
+            let mut schemas: HashSet<String> = HashSet::new();
+            let mut bindings: HashMap<String, String> = HashMap::new();
+
+            let cfg = bincode::config::standard();
+
+            for (idx, snap) in snapshots.iter().enumerate() {
+                for def in &snap.schema.node_types {
+                    match node_types.entry(def.name.clone()) {
+                        hashbrown::hash_map::Entry::Occupied(existing) => {
+                            let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
+                                .expect("schema entry encode");
+                            let def_bytes =
+                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            if existing_bytes != def_bytes {
+                                return Err(Error::Internal(format!(
+                                    "snapshot[{idx}] redefines NodeType {:?} with \
+                                     a shape that differs from an earlier snapshot",
+                                    def.name
+                                )));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(def.clone());
+                        }
+                    }
+                }
+                for def in &snap.schema.edge_types {
+                    match edge_types.entry(def.name.clone()) {
+                        hashbrown::hash_map::Entry::Occupied(existing) => {
+                            let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
+                                .expect("schema entry encode");
+                            let def_bytes =
+                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            if existing_bytes != def_bytes {
+                                return Err(Error::Internal(format!(
+                                    "snapshot[{idx}] redefines EdgeType {:?} with \
+                                     a shape that differs from an earlier snapshot",
+                                    def.name
+                                )));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(def.clone());
+                        }
+                    }
+                }
+                for def in &snap.schema.graph_types {
+                    match graph_types.entry(def.name.clone()) {
+                        hashbrown::hash_map::Entry::Occupied(existing) => {
+                            let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
+                                .expect("schema entry encode");
+                            let def_bytes =
+                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            if existing_bytes != def_bytes {
+                                return Err(Error::Internal(format!(
+                                    "snapshot[{idx}] redefines GraphType {:?} with \
+                                     a shape that differs from an earlier snapshot",
+                                    def.name
+                                )));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(def.clone());
+                        }
+                    }
+                }
+                for def in &snap.schema.procedures {
+                    match procedures.entry(def.name.clone()) {
+                        hashbrown::hash_map::Entry::Occupied(existing) => {
+                            let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
+                                .expect("schema entry encode");
+                            let def_bytes =
+                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            if existing_bytes != def_bytes {
+                                return Err(Error::Internal(format!(
+                                    "snapshot[{idx}] redefines Procedure {:?} with \
+                                     a shape that differs from an earlier snapshot",
+                                    def.name
+                                )));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(def.clone());
+                        }
+                    }
+                }
+                for s in &snap.schema.schemas {
+                    schemas.insert(s.clone());
+                }
+                for (gname, gtype) in &snap.schema.graph_type_bindings {
+                    match bindings.entry(gname.clone()) {
+                        hashbrown::hash_map::Entry::Occupied(existing) => {
+                            if existing.get() != gtype {
+                                return Err(Error::Internal(format!(
+                                    "snapshot[{idx}] binds graph {gname:?} to \
+                                     {gtype:?} but an earlier snapshot bound it \
+                                     to {:?}",
+                                    existing.get()
+                                )));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(gtype.clone());
+                        }
+                    }
+                }
+            }
+
+            let mut merged = SnapshotSchema {
+                node_types: node_types.into_values().collect(),
+                edge_types: edge_types.into_values().collect(),
+                graph_types: graph_types.into_values().collect(),
+                procedures: procedures.into_values().collect(),
+                schemas: schemas.into_iter().collect(),
+                graph_type_bindings: bindings.into_iter().collect(),
+            };
+            // Sort the merged vecs so the result is deterministic and
+            // the eventual round-trip through export_snapshot is
+            // reproducible.
+            merged.node_types.sort_by(|a, b| a.name.cmp(&b.name));
+            merged.edge_types.sort_by(|a, b| a.name.cmp(&b.name));
+            merged.graph_types.sort_by(|a, b| a.name.cmp(&b.name));
+            merged.procedures.sort_by(|a, b| a.name.cmp(&b.name));
+            merged.schemas.sort();
+            merged.graph_type_bindings.sort();
+            Ok(merged)
+        }
+    }
 }
 
 /// Origin information for a node observed during cross-snapshot
@@ -1481,6 +1676,17 @@ impl super::GrafeoDB {
     /// the maximum epoch is guarded by the non-empty check at the top of
     /// the function; it is unreachable when the function is called correctly.
     pub fn open_multi(snapshots: &[&[u8]]) -> Result<Self> {
+        Self::open_multi_with(snapshots, OpenMultiOptions::default())
+    }
+
+    /// Variant of [`open_multi`](Self::open_multi) that takes an
+    /// explicit [`OpenMultiOptions`] for callers who need a non-default
+    /// schema-merge policy.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`open_multi`](Self::open_multi).
+    pub fn open_multi_with(snapshots: &[&[u8]], options: OpenMultiOptions) -> Result<Self> {
         if snapshots.is_empty() {
             return Err(Error::Internal(
                 "open_multi requires at least one snapshot blob".to_string(),
@@ -1516,18 +1722,12 @@ impl super::GrafeoDB {
             validate_snapshot_set(&decoded)?;
         }
 
-        {
+        // Reconcile schemas per the chosen policy. The merged schema
+        // is what gets restored to the target catalog below.
+        let merged_schema = {
             let _schema = grafeo_debug_span!("schema");
-            let canonical = normalize_schema_bytes(&decoded[0].schema);
-            for (idx, snap) in decoded.iter().enumerate().skip(1) {
-                if normalize_schema_bytes(&snap.schema) != canonical {
-                    return Err(Error::Internal(format!(
-                        "snapshot[{idx}] schema does not match snapshot[0] schema; \
-                         all snapshots passed to open_multi must declare the same schema"
-                    )));
-                }
-            }
-        }
+            merge_snapshot_schemas(&decoded, options.schema_policy)?
+        };
 
         // Build the merged database from the decoded snapshots.
         let db = Self::new_in_memory();
@@ -1613,9 +1813,8 @@ impl super::GrafeoDB {
                 db.transaction_manager.sync_epoch(epoch);
             }
 
-            // Restore schema from the first snapshot. Later tasks add the
-            // cross-snapshot schema-equality check.
-            restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &decoded[0].schema);
+            // Restore the merged schema (union or strict-equality, per policy).
+            restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &merged_schema);
 
             // Restore indexes from the union of all snapshots' metadata.
             restore_indexes_from_snapshot(&db, &union_index_metadata(&decoded));

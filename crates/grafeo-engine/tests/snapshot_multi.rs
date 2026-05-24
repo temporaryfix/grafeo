@@ -265,9 +265,12 @@ fn open_multi_rejects_divergent_schemas() {
         Ok(_) => panic!("must reject schema mismatch"),
         Err(e) => {
             let message = e.to_string();
+            // Under UnionWithConflictCheck (default), same-name-different-shape
+            // types are rejected with "redefines NodeType". The old strict-equality
+            // path said "schema does not match". Both communicate the same conflict.
             assert!(
-                message.contains("schema"),
-                "error must mention schema; got: {message}"
+                message.contains("redefines") || message.contains("schema"),
+                "error must describe the type conflict; got: {message}"
             );
         }
     }
@@ -356,6 +359,49 @@ fn open_multi_unions_property_indexes_across_snapshots() {
     assert!(
         merged.has_property_index("slug"),
         "slug index must be restored"
+    );
+}
+
+#[test]
+fn open_multi_unions_disjoint_schemas_by_default() {
+    // Snapshot A — shared chunk: declares UniversalConcept type only.
+    let db_a = GrafeoDB::new_in_memory();
+    db_a.session()
+        .execute("CREATE NODE TYPE UniversalConcept (id STRING, label STRING)")
+        .expect("ddl a");
+    let bytes_a = db_a.export_snapshot().expect("export a");
+
+    // Snapshot B — niche chunk: declares NicheDescriptor type only.
+    let db_b = GrafeoDB::new_in_memory();
+    db_b.session()
+        .execute("CREATE NODE TYPE NicheDescriptor (id STRING, niche STRING)")
+        .expect("ddl b");
+    let bytes_b = db_b.export_snapshot().expect("export b");
+
+    let merged = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
+        .expect("disjoint schemas must merge (default policy is union)");
+
+    // The merged catalog should know about BOTH types — not just
+    // the first snapshot's. Probe via the same DDL-redeclaration
+    // pattern used in extract_subgraph_carries_schema_and_indexes:
+    // a re-declaration of either type should fail because the
+    // catalog already contains it after merge.
+    let probe_concept = merged
+        .session()
+        .execute("CREATE NODE TYPE UniversalConcept (id STRING, label STRING)");
+    assert!(
+        probe_concept.is_err(),
+        "merged catalog must carry snapshot A's UniversalConcept type — \
+         re-declaration should fail. Got: {probe_concept:?}"
+    );
+
+    let probe_descriptor = merged
+        .session()
+        .execute("CREATE NODE TYPE NicheDescriptor (id STRING, niche STRING)");
+    assert!(
+        probe_descriptor.is_err(),
+        "merged catalog must carry snapshot B's NicheDescriptor type — \
+         re-declaration should fail. Got: {probe_descriptor:?}"
     );
 }
 
