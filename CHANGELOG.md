@@ -21,6 +21,15 @@ Thanks to [@jakeboone02](https://github.com/jakeboone02) for the `notRegex()` pr
 
 ### Added
 
+- `GrafeoDB::open_multi(snapshots: &[&[u8]])` — load multiple snapshot
+  blobs into one in-memory database. Nodes and edges keep their
+  producer-allocated IDs, so an edge in one chunk can reference a node
+  in another (the use case is per-niche graph chunks pointing at a
+  shared ontology chunk without duplicating the ontology in every
+  niche). Cross-snapshot ID disjointness, edge endpoint resolution,
+  and schema equality are validated up-front; a rejection leaves no
+  partial database. At most one snapshot may carry named graphs or
+  RDF triples in this initial cut.
 - `index::vector::rabitq` — RaBitQ 1-bit vector quantization codec with a two-stage search (RaBitQ coarse pass + int8 rerank), zero-copy blob serialization, and a `RabitqCodec` WASM binding (behind the `rabitq-codec` feature on the wasm crate).
 - `codec::fsst` — Fast Static Symbol Table string compression codec with O(1) random-access decode, a new `ColumnCodec::Fsst` variant for compact-store string columns (serialization deferred to sub-plan 2d), and an `FsstCodec` WASM binding (behind the `fsst-codec` feature on the wasm crate).
 - `codec::webgraph` — Static compressed adjacency codec (gap coding + Elias gamma codes + per-node bit-offset index) with streaming successor iteration in-place, and a `WebGraphCodec` WASM binding (behind the `webgraph-codec` feature on the wasm crate). The `webgraph` crate from `crates.io` was evaluated and rejected for `wasm32-unknown-unknown` due to incompatible transitive dependencies (`mmap-rs`, `rayon-core`, `getrandom v0.3`).
