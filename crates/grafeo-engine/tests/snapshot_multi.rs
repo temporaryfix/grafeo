@@ -95,6 +95,16 @@ fn node(id: u64, label: &str) -> TestNode {
     }
 }
 
+fn edge(id: u64, src: u64, dst: u64, edge_type: &str) -> TestEdge {
+    TestEdge {
+        id: EdgeId::new(id),
+        src: NodeId::new(src),
+        dst: NodeId::new(dst),
+        edge_type: edge_type.to_string(),
+        properties: vec![],
+    }
+}
+
 #[test]
 fn open_multi_rejects_duplicate_node_id_across_snapshots() {
     let a = encode_snapshot(vec![node(1, "Person")], vec![]);
@@ -141,4 +151,64 @@ fn open_multi_with_single_snapshot_matches_import_snapshot() {
     let row = &result.rows()[0];
     assert_eq!(row[0], Value::String("Alix".into()));
     assert_eq!(row[1], Value::String("Gus".into()));
+}
+
+#[test]
+fn open_multi_resolves_edges_whose_endpoint_lives_in_another_snapshot() {
+    // Snapshot A — shared chunk: one UniversalConcept node.
+    let a = encode_snapshot(
+        vec![node(10, "UniversalConcept")],
+        vec![],
+    );
+
+    // Snapshot B — niche chunk: one NicheDescriptor node and an edge
+    // pointing at the UniversalConcept node that only exists in A.
+    let b = encode_snapshot(
+        vec![node(20, "NicheDescriptor")],
+        vec![edge(100, 20, 10, "MAPS_TO_CONCEPT")],
+    );
+
+    let db = GrafeoDB::open_multi(&[a.as_slice(), b.as_slice()])
+        .expect("merge two disjoint snapshots with cross-snapshot edge");
+
+    assert_eq!(db.node_count(), 2);
+    assert_eq!(db.edge_count(), 1);
+
+    let result = db
+        .session()
+        .execute(
+            "MATCH (n:NicheDescriptor)-[:MAPS_TO_CONCEPT]->(c:UniversalConcept) RETURN count(*)",
+        )
+        .expect("cypher");
+    assert_eq!(result.rows().len(), 1);
+    let row = &result.rows()[0];
+    let count = match &row[0] {
+        Value::Int64(n) => *n,
+        other => panic!("expected Int64 count, got {other:?}"),
+    };
+    assert_eq!(count, 1, "MAPS_TO_CONCEPT must resolve across snapshots");
+}
+
+#[test]
+fn open_multi_rejects_dangling_edge_endpoint() {
+    // Snapshot B carries an edge whose `dst` (NodeId 99) is not
+    // present in any snapshot. open_multi must reject; otherwise the
+    // edge silently becomes orphaned at load time.
+    let a = encode_snapshot(vec![node(10, "UniversalConcept")], vec![]);
+    let b = encode_snapshot(
+        vec![node(20, "NicheDescriptor")],
+        vec![edge(100, 20, 99, "MAPS_TO_CONCEPT")],
+    );
+
+    let result = GrafeoDB::open_multi(&[a.as_slice(), b.as_slice()]);
+    match result {
+        Ok(_) => panic!("must reject dangling endpoint"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("99") && message.contains("non-existent"),
+                "error must name the missing endpoint; got: {message}"
+            );
+        }
+    }
 }

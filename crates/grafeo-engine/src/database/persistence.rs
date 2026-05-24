@@ -229,8 +229,11 @@ fn populate_store_from_snapshot(
     Ok(())
 }
 
-/// Validates snapshot nodes/edges for duplicates and dangling references.
-fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Result<()> {
+/// Validates snapshot nodes/edges for duplicates within a single
+/// snapshot. Does NOT check edge endpoint resolution — that's done
+/// separately so multi-snapshot callers can validate endpoints across
+/// the union.
+fn validate_snapshot_ids(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Result<()> {
     let mut node_ids = HashSet::with_capacity(nodes.len());
     for node in nodes {
         if !node_ids.insert(node.id) {
@@ -248,6 +251,18 @@ fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Res
                 edge.id
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validates snapshot nodes/edges for duplicates AND that every edge
+/// endpoint resolves inside the same snapshot. Used by the single-
+/// snapshot path (`import_snapshot`, `restore_snapshot`) where edges
+/// must be self-contained.
+fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Result<()> {
+    validate_snapshot_ids(nodes, edges)?;
+    let node_ids: HashSet<NodeId> = nodes.iter().map(|n| n.id).collect();
+    for edge in edges {
         if !node_ids.contains(&edge.src) {
             return Err(Error::Internal(format!(
                 "snapshot edge {} references non-existent source node {}",
@@ -268,9 +283,9 @@ fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Res
 /// snapshots, and that every edge endpoint resolves somewhere in the
 /// union of all snapshots' nodes.
 ///
-/// Per-snapshot validation (duplicate IDs within one snapshot, edge
-/// endpoints inside that snapshot) is done separately by
-/// `validate_snapshot_data` and runs first.
+/// Per-snapshot duplicate-ID validation is done separately by
+/// `validate_snapshot_ids` (multi-snapshot path) or
+/// `validate_snapshot_data` (single-snapshot path) and runs first.
 fn validate_snapshot_set(snapshots: &[Snapshot]) -> Result<()> {
     let mut all_node_ids: HashSet<NodeId> =
         HashSet::with_capacity(snapshots.iter().map(|s| s.nodes.len()).sum());
@@ -1118,11 +1133,12 @@ impl super::GrafeoDB {
             })
             .collect::<Result<_>>()?;
 
-        // Per-snapshot internal validation (duplicate node IDs within
-        // a single snapshot, edge endpoints inside that snapshot etc.).
-        // Cross-snapshot validation runs next.
+        // Per-snapshot duplicate-ID validation only (not endpoint
+        // resolution — niche chunks can reference nodes from other
+        // snapshots). Cross-snapshot endpoint validation runs next via
+        // validate_snapshot_set.
         for (idx, snap) in decoded.iter().enumerate() {
-            validate_snapshot_data(&snap.nodes, &snap.edges).map_err(|e| {
+            validate_snapshot_ids(&snap.nodes, &snap.edges).map_err(|e| {
                 Error::Internal(format!("snapshot[{idx}]: {e}"))
             })?;
         }
