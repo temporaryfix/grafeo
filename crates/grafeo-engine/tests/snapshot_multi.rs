@@ -342,3 +342,26 @@ fn open_multi_accepts_named_graphs_from_single_snapshot() {
         "named graph must be restored; got names: {names:?}"
     );
 }
+
+#[test]
+fn open_multi_unions_property_indexes_across_snapshots() {
+    let db_a = GrafeoDB::new_in_memory();
+    db_a.create_property_index("id");
+    let bytes_a = db_a.export_snapshot().expect("export a");
+
+    let db_b = GrafeoDB::new_in_memory();
+    db_b.create_property_index("slug");
+    let bytes_b = db_b.export_snapshot().expect("export b");
+
+    let merged = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
+        .expect("merge");
+
+    assert!(
+        merged.has_property_index("id"),
+        "id index must be restored"
+    );
+    assert!(
+        merged.has_property_index("slug"),
+        "slug index must be restored"
+    );
+}

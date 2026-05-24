@@ -643,6 +643,71 @@ fn collect_index_metadata(store: &grafeo_core::graph::lpg::LpgStore) -> Snapshot
     }
 }
 
+/// Unions index metadata across multiple snapshots. Deduplicates by
+/// the natural key (property name for property indexes, label+property
+/// for vector and text indexes). The first occurrence of a given key
+/// wins on configuration values (dimensions, metric, m, ef_construction
+/// for vector indexes) so the lead snapshot drives index parameters —
+/// callers needing identical configs across chunks should produce them
+/// from the same source.
+fn union_index_metadata(snapshots: &[Snapshot]) -> SnapshotIndexes {
+    let mut property_index_set: HashSet<String> = HashSet::new();
+    let mut property_indexes = Vec::new();
+    for snap in snapshots {
+        for name in &snap.indexes.property_indexes {
+            if property_index_set.insert(name.clone()) {
+                property_indexes.push(name.clone());
+            }
+        }
+    }
+
+    #[cfg(feature = "vector-index")]
+    let mut vector_keys: HashSet<(String, String)> = HashSet::new();
+    #[cfg(feature = "vector-index")]
+    let mut vector_indexes = Vec::new();
+    #[cfg(feature = "vector-index")]
+    for snap in snapshots {
+        for vi in &snap.indexes.vector_indexes {
+            if vector_keys.insert((vi.label.clone(), vi.property.clone())) {
+                vector_indexes.push(SnapshotVectorIndex {
+                    label: vi.label.clone(),
+                    property: vi.property.clone(),
+                    dimensions: vi.dimensions,
+                    metric: vi.metric,
+                    m: vi.m,
+                    ef_construction: vi.ef_construction,
+                });
+            }
+        }
+    }
+    #[cfg(not(feature = "vector-index"))]
+    let vector_indexes = Vec::new();
+
+    #[cfg(feature = "text-index")]
+    let mut text_keys: HashSet<(String, String)> = HashSet::new();
+    #[cfg(feature = "text-index")]
+    let mut text_indexes = Vec::new();
+    #[cfg(feature = "text-index")]
+    for snap in snapshots {
+        for ti in &snap.indexes.text_indexes {
+            if text_keys.insert((ti.label.clone(), ti.property.clone())) {
+                text_indexes.push(SnapshotTextIndex {
+                    label: ti.label.clone(),
+                    property: ti.property.clone(),
+                });
+            }
+        }
+    }
+    #[cfg(not(feature = "text-index"))]
+    let text_indexes = Vec::new();
+
+    SnapshotIndexes {
+        property_indexes,
+        vector_indexes,
+        text_indexes,
+    }
+}
+
 impl super::GrafeoDB {
     // =========================================================================
     // ADMIN API: Persistence Control
@@ -1272,9 +1337,8 @@ impl super::GrafeoDB {
         // cross-snapshot schema-equality check.
         restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &decoded[0].schema);
 
-        // Restore indexes from the first snapshot's metadata. Later
-        // tasks extend this to the union across all snapshots.
-        restore_indexes_from_snapshot(&db, &decoded[0].indexes);
+        // Restore indexes from the union of all snapshots' metadata.
+        restore_indexes_from_snapshot(&db, &union_index_metadata(&decoded));
 
         Ok(db)
     }
