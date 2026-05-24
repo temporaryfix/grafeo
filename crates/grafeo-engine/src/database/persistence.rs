@@ -1041,11 +1041,13 @@ impl super::GrafeoDB {
     /// verbatim so multiple sibling extracts can later be merged via
     /// [`open_multi`](Self::open_multi) without ID collisions.
     ///
-    /// Properties (full temporal history when the `temporal` feature
-    /// is on), schema catalog, and index metadata are copied from the
-    /// source. Edges whose endpoints span the request boundary are
-    /// dropped — sibling extracts plus `open_multi` are the supported
-    /// way to keep cross-shard edges.
+    /// Properties are copied from the source (full temporal history
+    /// when the `temporal` feature is on). Schema catalog and index
+    /// metadata copy is deferred and lands in a follow-up
+    /// (`extract_subgraph` Task 3 of the open-multi-ambitious plan).
+    /// Edges whose endpoints span the request boundary are dropped —
+    /// sibling extracts plus `open_multi` are the supported way to
+    /// keep cross-shard edges.
     ///
     /// # Errors
     ///
@@ -1097,19 +1099,18 @@ impl super::GrafeoDB {
             }
         }
 
-        // Copy interior edges. Walk outgoing edges from each requested
-        // node; include only those whose destination is also in the
-        // set. Tracking `seen` deduplicates self-loops (which appear
-        // in both incoming and outgoing iterations).
-        let mut seen_edges: HashSet<EdgeId> = HashSet::new();
+        // Copy interior edges. For each requested node, walk its
+        // outgoing edges and emit each whose destination is also in
+        // the request set. Each edge surfaces exactly once because the
+        // outer loop iterates the requested set as a `HashSet<NodeId>`
+        // (no node visited twice) and `Direction::Outgoing` consults
+        // only the forward adjacency list — so even self-loops appear
+        // exactly once via their source node.
         for &src_id in &requested {
             for (dst_id, edge_id) in
                 store.edges_from(src_id, grafeo_core::graph::Direction::Outgoing)
             {
                 if !requested.contains(&dst_id) {
-                    continue;
-                }
-                if !seen_edges.insert(edge_id) {
                     continue;
                 }
                 let Some(edge) = store.get_edge(edge_id) else { continue };
