@@ -365,3 +365,39 @@ fn open_multi_unions_property_indexes_across_snapshots() {
         "slug index must be restored"
     );
 }
+
+#[cfg(feature = "temporal")]
+#[test]
+fn open_multi_restores_max_epoch_across_snapshots() {
+    use grafeo_common::types::EpochId;
+
+    // Two empty-by-design snapshot blobs whose ONLY meaningful
+    // difference is the epoch field, so the test isolates that path
+    // from any node/edge restoration noise.
+    let mk = |epoch: u64| {
+        let snap = TestSnapshot {
+            version: 4,
+            nodes: vec![],
+            edges: vec![],
+            named_graphs: vec![],
+            rdf_triples: vec![],
+            rdf_named_graphs: vec![],
+            schema: TestSnapshotSchema::default(),
+            indexes: TestSnapshotIndexes::default(),
+            epoch,
+        };
+        bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap()
+    };
+
+    let low = mk(5);
+    let high = mk(42);
+    let merged = GrafeoDB::open_multi(&[low.as_slice(), high.as_slice()]).unwrap();
+
+    // The merged DB should sit at the higher epoch; otherwise a later
+    // write would clobber high-epoch property history from `high`.
+    assert_eq!(
+        merged.current_epoch(),
+        EpochId::new(42),
+        "open_multi must restore epoch as max across snapshots"
+    );
+}
