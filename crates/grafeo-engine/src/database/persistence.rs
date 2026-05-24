@@ -281,8 +281,17 @@ fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Res
 
 /// Produces a canonical byte representation of a `SnapshotSchema` for
 /// cross-snapshot equality comparison. `collect_schema()` reads from
-/// `HashMap::values()` so raw vec ordering varies across runs; sort
-/// each inner Vec by its primary name field before encoding.
+/// `HashMap::values()` so the *outer* Vec ordering varies across runs;
+/// sort each outer Vec by its primary name field before encoding.
+///
+/// **Inner ordering assumption.** Within each type definition, nested
+/// `properties` / `constraints` Vecs are NOT re-sorted — we treat their
+/// DDL-insertion order as part of the schema identity. Two snapshots
+/// of the same logical schema produced by the same DDL batch will
+/// share inner ordering and round-trip cleanly. If a future code path
+/// builds the same logical schema via different DDL insertion orders,
+/// extend the sort here to normalise the nested Vecs too (will require
+/// `Ord` on `TypeConstraint`).
 fn normalize_schema_bytes(schema: &SnapshotSchema) -> Vec<u8> {
     let mut node_types = schema.node_types.clone();
     node_types.sort_by(|a, b| a.name.cmp(&b.name));

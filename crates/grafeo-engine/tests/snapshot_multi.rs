@@ -255,6 +255,14 @@ fn open_multi_rejects_divergent_schemas() {
         .expect("ddl b");
     let bytes_b = db_b.export_snapshot().expect("export b");
 
+    // Defensive: confirm the test actually exercises a schema difference.
+    // If DDL parsing changes were to collapse both forms to the same
+    // schema bytes, this test would silently become a false green.
+    assert_ne!(
+        bytes_a, bytes_b,
+        "test setup: divergent-DDL snapshots must produce different bytes"
+    );
+
     let result = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()]);
     match result {
         Ok(_) => panic!("must reject schema mismatch"),
@@ -287,6 +295,15 @@ fn open_multi_accepts_matching_schemas() {
     let db_b = make_db();
     let bytes_b = db_b.export_snapshot().expect("export b");
 
-    GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
+    let merged = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
         .expect("matching schemas must merge");
+
+    // Sanity: the merged database should still know about the Person
+    // node type — confirms schema survived the merge, not just that
+    // `open_multi` returned Ok.
+    let result = merged
+        .session()
+        .execute("MATCH (n:Person) RETURN count(*)")
+        .expect("Cypher must compile against the merged schema");
+    assert_eq!(result.rows().len(), 1);
 }
