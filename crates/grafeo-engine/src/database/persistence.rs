@@ -1041,10 +1041,11 @@ impl super::GrafeoDB {
     /// verbatim so multiple sibling extracts can later be merged via
     /// [`open_multi`](Self::open_multi) without ID collisions.
     ///
-    /// Properties are copied from the source (full temporal history
-    /// when the `temporal` feature is on). Schema catalog and index
-    /// metadata copy is deferred and lands in a follow-up
-    /// (`extract_subgraph` Task 3 of the open-multi-ambitious plan).
+    /// Properties (full temporal history when the `temporal` feature
+    /// is on), the full schema catalog, and index metadata are copied
+    /// from the source. Index *data* is rebuilt over the extracted
+    /// nodes/edges; index parameters (vector dimensions, metric, m,
+    /// ef_construction) carry verbatim.
     /// Edges whose endpoints span the request boundary are dropped —
     /// sibling extracts plus `open_multi` are the supported way to
     /// keep cross-shard edges.
@@ -1153,6 +1154,21 @@ impl super::GrafeoDB {
             target_store.sync_epoch(epoch);
             target.transaction_manager.sync_epoch(epoch);
         }
+
+        // Carry the full source schema catalog so the extract
+        // round-trips with the source's type system intact. We copy
+        // the full schema verbatim (not a subset filtered to the
+        // requested labels) because the merge-time schema policy
+        // already handles unionable schemas, and stripping types here
+        // would prevent the natural "extract many, merge into one"
+        // workflow.
+        let schema = collect_schema(&self.catalog);
+        restore_schema_from_snapshot(&target_store, &target.catalog, &schema);
+
+        // Carry index metadata. Index *data* is rebuilt over the
+        // populated nodes/edges by `restore_indexes_from_snapshot`.
+        let indexes = collect_index_metadata(&store);
+        restore_indexes_from_snapshot(&target, &indexes);
 
         Ok(target)
     }

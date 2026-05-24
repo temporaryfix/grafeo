@@ -3,8 +3,45 @@
 //! every edge whose endpoints are both in the request set, with
 //! source-allocated NodeIds and EdgeIds preserved.
 
-use grafeo_common::types::{NodeId, Value};
+use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
+
+#[test]
+fn extract_subgraph_carries_schema_and_indexes() {
+    let source = GrafeoDB::new_in_memory();
+    source
+        .session()
+        .execute("CREATE NODE TYPE Concept (id STRING, label STRING)")
+        .expect("ddl concept");
+    source
+        .session()
+        .execute("CREATE NODE TYPE NicheDescriptor (id STRING, niche STRING)")
+        .expect("ddl niche");
+    source.create_property_index("id");
+
+    let a = source.create_node(&["Concept"]);
+    source.set_node_property(a, "id", Value::String("concept:bitter".into()));
+
+    let target = source.extract_subgraph(&[a]).expect("extract");
+
+    // Schema survived — NicheDescriptor was declared in source but no node
+    // with that label is in the extract. If the full catalog was carried,
+    // re-declaring the type must fail with "already exists".
+    let schema = serde_json::to_string(&target.schema()).expect("schema json");
+    assert!(schema.contains("Concept"), "Concept type carried");
+
+    let redeclare = target
+        .session()
+        .execute("CREATE NODE TYPE NicheDescriptor (id STRING, niche STRING)");
+    assert!(
+        redeclare.is_err(),
+        "NicheDescriptor type carried (full schema, not subset) — \
+         re-declaration must fail with type-already-exists"
+    );
+
+    // Property index survived.
+    assert!(target.has_property_index("id"), "id property index carried");
+}
 
 #[test]
 fn extract_subgraph_preserves_node_ids_and_includes_interior_edges() {
