@@ -77,3 +77,62 @@ fn extract_subgraph_preserves_node_ids_and_includes_interior_edges() {
         "interior edge resolves; boundary edge excluded"
     );
 }
+
+#[cfg(feature = "temporal")]
+#[test]
+fn extract_subgraph_preserves_property_history() {
+    use grafeo_common::types::NodeId;
+
+    let source = GrafeoDB::new_in_memory();
+    let mut session = source.session();
+
+    // tx1: create the node with score=1.
+    session.begin_transaction().unwrap();
+    session
+        .execute("INSERT (:Tracked {score: 1})")
+        .unwrap();
+    session.commit().unwrap();
+
+    // tx2: advance to score=2; capture epoch after this commit.
+    session.begin_transaction().unwrap();
+    session
+        .execute("MATCH (n:Tracked) SET n.score = 2")
+        .unwrap();
+    session.commit().unwrap();
+    let epoch_at_v2 = source.current_epoch();
+
+    // tx3: advance to score=3 (the final / current value).
+    session.begin_transaction().unwrap();
+    session
+        .execute("MATCH (n:Tracked) SET n.score = 3")
+        .unwrap();
+    session.commit().unwrap();
+
+    // The first (and only) node is NodeId(0).
+    let node = NodeId::new(0);
+    let target = source.extract_subgraph(&[node]).expect("extract");
+
+    // Current value must be the latest write.
+    let current = target
+        .session()
+        .execute("MATCH (n:Tracked) RETURN n.score")
+        .expect("current query");
+    assert_eq!(
+        current.rows()[0][0],
+        Value::Int64(3),
+        "latest value preserved after extract"
+    );
+
+    // Intermediate epoch must be readable — proves the version chain was
+    // copied into the extracted DB, not just the final value.
+    let mid = target
+        .session()
+        .execute_at_epoch("MATCH (n:Tracked) RETURN n.score", epoch_at_v2)
+        .expect("epoch query");
+    assert_eq!(mid.rows().len(), 1, "node visible at intermediate epoch");
+    assert_eq!(
+        mid.rows()[0][0],
+        Value::Int64(2),
+        "intermediate epoch returns score=2"
+    );
+}
