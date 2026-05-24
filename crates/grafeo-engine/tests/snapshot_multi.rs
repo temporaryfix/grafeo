@@ -237,3 +237,56 @@ fn open_multi_rejects_duplicate_edge_id_across_snapshots() {
         }
     }
 }
+
+#[test]
+fn open_multi_rejects_divergent_schemas() {
+    // Two real databases with different DDL — same node type label but
+    // different declared property names — must reject as schema mismatch.
+    // No nodes are inserted so no NodeId collision masks the schema check.
+    let db_a = GrafeoDB::new_in_memory();
+    db_a.session()
+        .execute("CREATE NODE TYPE Person (name STRING)")
+        .expect("ddl a");
+    let bytes_a = db_a.export_snapshot().expect("export a");
+
+    let db_b = GrafeoDB::new_in_memory();
+    db_b.session()
+        .execute("CREATE NODE TYPE Person (age INTEGER)")
+        .expect("ddl b");
+    let bytes_b = db_b.export_snapshot().expect("export b");
+
+    let result = GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()]);
+    match result {
+        Ok(_) => panic!("must reject schema mismatch"),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("schema"),
+                "error must mention schema; got: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn open_multi_accepts_matching_schemas() {
+    // Two databases with identical DDL — even though catalog iteration
+    // order is HashMap-dependent — must merge cleanly.
+    // No nodes are inserted so no NodeId collision masks the schema check.
+    let make_db = || {
+        let db = GrafeoDB::new_in_memory();
+        db.session()
+            .execute("CREATE NODE TYPE Person (name STRING)")
+            .expect("ddl");
+        db
+    };
+
+    let db_a = make_db();
+    let bytes_a = db_a.export_snapshot().expect("export a");
+
+    let db_b = make_db();
+    let bytes_b = db_b.export_snapshot().expect("export b");
+
+    GrafeoDB::open_multi(&[bytes_a.as_slice(), bytes_b.as_slice()])
+        .expect("matching schemas must merge");
+}

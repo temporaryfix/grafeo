@@ -38,7 +38,7 @@ struct Snapshot {
 }
 
 /// Schema metadata within a snapshot.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 struct SnapshotSchema {
     node_types: Vec<NodeTypeDefinition>,
     edge_types: Vec<EdgeTypeDefinition>,
@@ -277,6 +277,36 @@ fn validate_snapshot_data(nodes: &[SnapshotNode], edges: &[SnapshotEdge]) -> Res
         }
     }
     Ok(())
+}
+
+/// Produces a canonical byte representation of a `SnapshotSchema` for
+/// cross-snapshot equality comparison. `collect_schema()` reads from
+/// `HashMap::values()` so raw vec ordering varies across runs; sort
+/// each inner Vec by its primary name field before encoding.
+fn normalize_schema_bytes(schema: &SnapshotSchema) -> Vec<u8> {
+    let mut node_types = schema.node_types.clone();
+    node_types.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut edge_types = schema.edge_types.clone();
+    edge_types.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut graph_types = schema.graph_types.clone();
+    graph_types.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut procedures = schema.procedures.clone();
+    procedures.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut schemas = schema.schemas.clone();
+    schemas.sort();
+    let mut bindings = schema.graph_type_bindings.clone();
+    bindings.sort();
+
+    let normalized = SnapshotSchema {
+        node_types,
+        edge_types,
+        graph_types,
+        procedures,
+        schemas,
+        graph_type_bindings: bindings,
+    };
+    bincode::serde::encode_to_vec(&normalized, bincode::config::standard())
+        .expect("encoding a SnapshotSchema cannot fail")
 }
 
 /// Validates that node IDs and edge IDs are disjoint across all
@@ -1144,6 +1174,16 @@ impl super::GrafeoDB {
         }
 
         validate_snapshot_set(&decoded)?;
+
+        let canonical = normalize_schema_bytes(&decoded[0].schema);
+        for (idx, snap) in decoded.iter().enumerate().skip(1) {
+            if normalize_schema_bytes(&snap.schema) != canonical {
+                return Err(Error::Internal(format!(
+                    "snapshot[{idx}] schema does not match snapshot[0] schema; \
+                     all snapshots passed to open_multi must declare the same schema"
+                )));
+            }
+        }
 
         // Reject any snapshot carrying named graphs or RDF triples for
         // now — `open_multi` does not yet merge those payloads, and
