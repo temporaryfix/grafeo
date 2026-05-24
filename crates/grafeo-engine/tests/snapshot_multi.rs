@@ -117,7 +117,7 @@ fn open_multi_rejects_duplicate_node_id_across_snapshots() {
         Err(e) => {
             let message = e.to_string();
             assert!(
-                message.contains("duplicate") && message.contains("node"),
+                message.contains("duplicate") && message.contains("NodeId"),
                 "error must name the conflict; got: {message}"
             );
         }
@@ -228,7 +228,7 @@ fn open_multi_rejects_duplicate_edge_id_across_snapshots() {
         Err(e) => {
             let message = e.to_string();
             assert!(
-                message.contains("duplicate") && message.contains("edge"),
+                message.contains("duplicate") && message.contains("EdgeId"),
                 "error must name the conflict; got: {message}"
             );
         }

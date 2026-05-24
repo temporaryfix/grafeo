@@ -7,7 +7,7 @@ use std::path::Path;
 use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
 use grafeo_common::utils::error::{Error, Result};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 use crate::config::Config;
 
@@ -318,6 +318,77 @@ fn normalize_schema_bytes(schema: &SnapshotSchema) -> Vec<u8> {
         .expect("encoding a SnapshotSchema cannot fail")
 }
 
+/// Origin information for a node observed during cross-snapshot
+/// validation. Captured the first time a NodeId is seen so collision
+/// errors can name BOTH conflicting sides.
+#[derive(Debug, Clone)]
+struct NodeOrigin {
+    snapshot_idx: usize,
+    /// Sorted to match `collect_snapshot_nodes`' canonical ordering;
+    /// safe to compare across runs.
+    labels: Vec<String>,
+    /// The external `id` property value if present — gives the operator
+    /// a domain handle when debugging a collision (e.g. `concept:bitter`).
+    id_prop: Option<String>,
+}
+
+impl NodeOrigin {
+    fn from_node(snapshot_idx: usize, node: &SnapshotNode) -> Self {
+        let id_prop = node.properties.iter().find_map(|(key, history)| {
+            if key != "id" {
+                return None;
+            }
+            history.last().and_then(|(_, value)| match value {
+                Value::String(s) => Some(s.to_string()),
+                _ => None,
+            })
+        });
+        Self {
+            snapshot_idx,
+            labels: node.labels.clone(),
+            id_prop,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let labels = if self.labels.is_empty() {
+            String::from("[]")
+        } else {
+            format!("[{}]", self.labels.join(","))
+        };
+        match &self.id_prop {
+            Some(id) => format!("snapshot[{}] (labels={labels}, id={id:?})", self.snapshot_idx),
+            None => format!("snapshot[{}] (labels={labels})", self.snapshot_idx),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EdgeOrigin {
+    snapshot_idx: usize,
+    edge_type: String,
+    src: NodeId,
+    dst: NodeId,
+}
+
+impl EdgeOrigin {
+    fn from_edge(snapshot_idx: usize, edge: &SnapshotEdge) -> Self {
+        Self {
+            snapshot_idx,
+            edge_type: edge.edge_type.clone(),
+            src: edge.src,
+            dst: edge.dst,
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "snapshot[{}] ({}→{} :{})",
+            self.snapshot_idx, self.src, self.dst, self.edge_type
+        )
+    }
+}
+
 /// Validates that node IDs and edge IDs are disjoint across all
 /// snapshots, and that every edge endpoint resolves somewhere in the
 /// union of all snapshots' nodes.
@@ -326,42 +397,63 @@ fn normalize_schema_bytes(schema: &SnapshotSchema) -> Vec<u8> {
 /// `validate_snapshot_ids` (multi-snapshot path) or
 /// `validate_snapshot_data` (single-snapshot path) and runs first.
 fn validate_snapshot_set(snapshots: &[Snapshot]) -> Result<()> {
-    let mut all_node_ids: HashSet<NodeId> =
-        HashSet::with_capacity(snapshots.iter().map(|s| s.nodes.len()).sum());
+    let mut node_origins: HashMap<NodeId, NodeOrigin> = HashMap::with_capacity(
+        snapshots.iter().map(|s| s.nodes.len()).sum(),
+    );
+
     for (idx, snap) in snapshots.iter().enumerate() {
         for node in &snap.nodes {
-            if !all_node_ids.insert(node.id) {
-                return Err(Error::Internal(format!(
-                    "snapshot[{idx}] introduces duplicate node ID {} \
-                     already present in an earlier snapshot",
-                    node.id
-                )));
+            match node_origins.entry(node.id) {
+                hashbrown::hash_map::Entry::Occupied(existing) => {
+                    return Err(Error::Internal(format!(
+                        "duplicate NodeId {id} is claimed by {prev} and by {curr}; \
+                         open_multi requires NodeIds to be disjoint across \
+                         snapshots — extract sibling chunks from a single \
+                         source DB to preserve a shared ID namespace",
+                        id = node.id,
+                        prev = existing.get().describe(),
+                        curr = NodeOrigin::from_node(idx, node).describe(),
+                    )));
+                }
+                hashbrown::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(NodeOrigin::from_node(idx, node));
+                }
             }
         }
     }
 
-    let mut all_edge_ids: HashSet<EdgeId> =
-        HashSet::with_capacity(snapshots.iter().map(|s| s.edges.len()).sum());
+    let mut edge_origins: HashMap<EdgeId, EdgeOrigin> = HashMap::with_capacity(
+        snapshots.iter().map(|s| s.edges.len()).sum(),
+    );
+
     for (idx, snap) in snapshots.iter().enumerate() {
         for edge in &snap.edges {
-            if !all_edge_ids.insert(edge.id) {
-                return Err(Error::Internal(format!(
-                    "snapshot[{idx}] introduces duplicate edge ID {} \
-                     already present in an earlier snapshot",
-                    edge.id
-                )));
+            match edge_origins.entry(edge.id) {
+                hashbrown::hash_map::Entry::Occupied(existing) => {
+                    return Err(Error::Internal(format!(
+                        "duplicate EdgeId {id} is claimed by {prev} and by {curr}; \
+                         open_multi requires EdgeIds to be disjoint across \
+                         snapshots",
+                        id = edge.id,
+                        prev = existing.get().describe(),
+                        curr = EdgeOrigin::from_edge(idx, edge).describe(),
+                    )));
+                }
+                hashbrown::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(EdgeOrigin::from_edge(idx, edge));
+                }
             }
-            if !all_node_ids.contains(&edge.src) {
+            if !node_origins.contains_key(&edge.src) {
                 return Err(Error::Internal(format!(
-                    "snapshot[{idx}] edge {} references non-existent source node {} \
-                     (not present in any snapshot)",
+                    "snapshot[{idx}] edge {} references non-existent source \
+                     node {} (not present in any snapshot)",
                     edge.id, edge.src
                 )));
             }
-            if !all_node_ids.contains(&edge.dst) {
+            if !node_origins.contains_key(&edge.dst) {
                 return Err(Error::Internal(format!(
-                    "snapshot[{idx}] edge {} references non-existent destination node {} \
-                     (not present in any snapshot)",
+                    "snapshot[{idx}] edge {} references non-existent \
+                     destination node {} (not present in any snapshot)",
                     edge.id, edge.dst
                 )));
             }
