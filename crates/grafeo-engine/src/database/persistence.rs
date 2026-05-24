@@ -347,8 +347,8 @@ pub(super) fn load_snapshot_into_store(
     Ok(())
 }
 
-/// Populates a store from snapshot refs (borrowed, for single-file loading).
-#[cfg(feature = "grafeo-file")]
+/// Populates a store from snapshot refs (borrowed). Used by `open_multi`
+/// and by the single-file loader.
 fn populate_store_from_snapshot_ref(
     store: &grafeo_core::graph::lpg::LpgStore,
     nodes: &[SnapshotNode],
@@ -1010,6 +1010,88 @@ impl super::GrafeoDB {
 
         // Restore indexes (must come after data population)
         restore_indexes_from_snapshot(&db, &snapshot.indexes);
+
+        Ok(db)
+    }
+
+    /// Creates a new in-memory database by merging multiple binary snapshots.
+    ///
+    /// Each blob in `snapshots` must have been produced by
+    /// [`export_snapshot()`](Self::export_snapshot). Snapshots are unioned
+    /// into one database:
+    /// - Nodes and edges are preserved with their producer-allocated IDs.
+    /// - A NodeId (or EdgeId) appearing in two snapshots is rejected as a
+    ///   producer bug; the caller is responsible for emitting disjoint
+    ///   subsets.
+    /// - Every edge endpoint must exist somewhere in the union, so a chunk
+    ///   may carry edges whose endpoints belong to a different chunk.
+    /// - All snapshots must declare the same schema (after canonical
+    ///   ordering). Differing schemas are rejected.
+    /// - Indexes are unioned; the epoch is the maximum across inputs.
+    /// - At most one snapshot may carry named graphs or RDF triples.
+    ///
+    /// All validation runs before any data is inserted; a rejection
+    /// leaves no partial database behind (the function never publishes
+    /// `self`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `snapshots` is empty, any blob fails to
+    /// decode, any cross-snapshot validation fails, or population fails.
+    pub fn open_multi(snapshots: &[&[u8]]) -> Result<Self> {
+        if snapshots.is_empty() {
+            return Err(Error::Internal(
+                "open_multi requires at least one snapshot blob".to_string(),
+            ));
+        }
+
+        // Decode every blob first so any version / bincode failure
+        // surfaces before we touch a target database.
+        let decoded: Vec<Snapshot> = snapshots
+            .iter()
+            .enumerate()
+            .map(|(idx, bytes)| {
+                decode_snapshot_bytes(bytes).map_err(|e| {
+                    Error::Internal(format!("snapshot[{idx}]: {e}"))
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        // Per-snapshot internal validation (duplicate node IDs within
+        // a single snapshot, edge endpoints inside that snapshot etc.).
+        // Cross-snapshot validation runs next.
+        for (idx, snap) in decoded.iter().enumerate() {
+            validate_snapshot_data(&snap.nodes, &snap.edges).map_err(|e| {
+                Error::Internal(format!("snapshot[{idx}]: {e}"))
+            })?;
+        }
+
+        // Build the merged database from the decoded snapshots.
+        let db = Self::new_in_memory();
+        for snap in &decoded {
+            populate_store_from_snapshot_ref(db.lpg_store(), &snap.nodes, &snap.edges)?;
+        }
+
+        // Restore epoch as max across snapshots.
+        #[cfg(feature = "temporal")]
+        {
+            let max_epoch = decoded
+                .iter()
+                .map(|s| s.epoch)
+                .max()
+                .unwrap_or(0);
+            let epoch = EpochId::new(max_epoch);
+            db.lpg_store().sync_epoch(epoch);
+            db.transaction_manager.sync_epoch(epoch);
+        }
+
+        // Restore schema from the first snapshot. Later tasks add the
+        // cross-snapshot schema-equality check.
+        restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &decoded[0].schema);
+
+        // Restore indexes from the first snapshot's metadata. Later
+        // tasks extend this to the union across all snapshots.
+        restore_indexes_from_snapshot(&db, &decoded[0].indexes);
 
         Ok(db)
     }
