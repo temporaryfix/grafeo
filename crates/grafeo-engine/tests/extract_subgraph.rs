@@ -63,9 +63,7 @@ fn extract_subgraph_preserves_node_ids_and_carries_all_outgoing_edges() {
     // merged via `open_multi`.
     source.create_edge(c, b, "RELATED");
 
-    let target = source
-        .extract_subgraph(&[c, a])
-        .expect("extract_subgraph");
+    let target = source.extract_subgraph(&[c, a]).expect("extract_subgraph");
 
     // Only the two requested nodes are carried; b is not.
     assert_eq!(target.node_count(), 2);
@@ -110,9 +108,7 @@ fn extract_subgraph_preserves_property_history() {
 
     // tx1: create the node with score=1.
     session.begin_transaction().unwrap();
-    session
-        .execute("INSERT (:Tracked {score: 1})")
-        .unwrap();
+    session.execute("INSERT (:Tracked {score: 1})").unwrap();
     session.commit().unwrap();
 
     // tx2: advance to score=2; capture epoch after this commit.
@@ -182,7 +178,7 @@ use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
 struct GraphSpec {
-    nodes: Vec<(String, String)>, // (label, id_prop)
+    nodes: Vec<(String, String)>,       // (label, id_prop)
     edges: Vec<(usize, usize, String)>, // (src_index, dst_index, type)
 }
 
@@ -190,10 +186,7 @@ fn graph_spec() -> impl Strategy<Value = GraphSpec> {
     // Small graphs only — proptest enumerates ~64 cases by default and
     // each one builds + extracts + merges + queries, so keep it cheap.
     let nodes = prop::collection::vec(
-        (
-            prop_oneof![Just("A"), Just("B"), Just("C")],
-            "[a-z]{1,4}",
-        )
+        (prop_oneof![Just("A"), Just("B"), Just("C")], "[a-z]{1,4}")
             .prop_map(|(l, id)| (l.to_string(), id)),
         1..8usize,
     );
@@ -203,8 +196,7 @@ fn graph_spec() -> impl Strategy<Value = GraphSpec> {
             (
                 0..n,
                 0..n,
-                prop_oneof![Just("R1"), Just("R2"), Just("R3")]
-                    .prop_map(|s| s.to_string()),
+                prop_oneof![Just("R1"), Just("R2"), Just("R3")].prop_map(|s| s.to_string()),
             ),
             0..8usize,
         );
@@ -249,9 +241,7 @@ fn build_graph(spec: &GraphSpec) -> (GrafeoDB, Vec<NodeId>) {
 }
 
 /// Bag of (src.id, dst.id, type) triples over all edges in a DB.
-fn edge_triples_bag(
-    db: &GrafeoDB,
-) -> std::collections::BTreeMap<(String, String, String), usize> {
+fn edge_triples_bag(db: &GrafeoDB) -> std::collections::BTreeMap<(String, String, String), usize> {
     let result = db
         .session()
         .execute("MATCH (a)-[r]->(b) RETURN a.id, b.id, type(r)")
@@ -267,11 +257,7 @@ fn edge_triples_bag(
         let Value::String(rel_type) = &row[2] else {
             continue;
         };
-        let key = (
-            src_id.to_string(),
-            dst_id.to_string(),
-            rel_type.to_string(),
-        );
+        let key = (src_id.to_string(), dst_id.to_string(), rel_type.to_string());
         *bag.entry(key).or_insert(0) += 1;
     }
     bag

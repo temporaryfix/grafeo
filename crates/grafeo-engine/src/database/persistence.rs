@@ -5,9 +5,9 @@ use std::path::Path;
 
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
 use grafeo_common::grafeo_warn;
-use grafeo_common::{grafeo_debug_span, grafeo_info, grafeo_info_span};
 use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
 use grafeo_common::utils::error::{Error, Result};
+use grafeo_common::{grafeo_debug_span, grafeo_info, grafeo_info_span};
 use hashbrown::{HashMap, HashSet};
 
 use crate::config::Config;
@@ -447,8 +447,8 @@ fn merge_snapshot_schemas(
                         hashbrown::hash_map::Entry::Occupied(existing) => {
                             let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
                                 .expect("schema entry encode");
-                            let def_bytes =
-                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            let def_bytes = bincode::serde::encode_to_vec(def, cfg)
+                                .expect("schema entry encode");
                             if existing_bytes != def_bytes {
                                 return Err(Error::Internal(format!(
                                     "snapshot[{idx}] redefines NodeType {:?} with \
@@ -467,8 +467,8 @@ fn merge_snapshot_schemas(
                         hashbrown::hash_map::Entry::Occupied(existing) => {
                             let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
                                 .expect("schema entry encode");
-                            let def_bytes =
-                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            let def_bytes = bincode::serde::encode_to_vec(def, cfg)
+                                .expect("schema entry encode");
                             if existing_bytes != def_bytes {
                                 return Err(Error::Internal(format!(
                                     "snapshot[{idx}] redefines EdgeType {:?} with \
@@ -487,8 +487,8 @@ fn merge_snapshot_schemas(
                         hashbrown::hash_map::Entry::Occupied(existing) => {
                             let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
                                 .expect("schema entry encode");
-                            let def_bytes =
-                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            let def_bytes = bincode::serde::encode_to_vec(def, cfg)
+                                .expect("schema entry encode");
                             if existing_bytes != def_bytes {
                                 return Err(Error::Internal(format!(
                                     "snapshot[{idx}] redefines GraphType {:?} with \
@@ -507,8 +507,8 @@ fn merge_snapshot_schemas(
                         hashbrown::hash_map::Entry::Occupied(existing) => {
                             let existing_bytes = bincode::serde::encode_to_vec(existing.get(), cfg)
                                 .expect("schema entry encode");
-                            let def_bytes =
-                                bincode::serde::encode_to_vec(def, cfg).expect("schema entry encode");
+                            let def_bytes = bincode::serde::encode_to_vec(def, cfg)
+                                .expect("schema entry encode");
                             if existing_bytes != def_bytes {
                                 return Err(Error::Internal(format!(
                                     "snapshot[{idx}] redefines Procedure {:?} with \
@@ -605,7 +605,10 @@ impl NodeOrigin {
             format!("[{}]", self.labels.join(","))
         };
         match &self.id_prop {
-            Some(id) => format!("snapshot[{}] (labels={labels}, id={id:?})", self.snapshot_idx),
+            Some(id) => format!(
+                "snapshot[{}] (labels={labels}, id={id:?})",
+                self.snapshot_idx
+            ),
             None => format!("snapshot[{}] (labels={labels})", self.snapshot_idx),
         }
     }
@@ -645,9 +648,8 @@ impl EdgeOrigin {
 /// `validate_snapshot_ids` (multi-snapshot path) or
 /// `validate_snapshot_data` (single-snapshot path) and runs first.
 fn validate_snapshot_set(snapshots: &[Snapshot]) -> Result<()> {
-    let mut node_origins: HashMap<NodeId, NodeOrigin> = HashMap::with_capacity(
-        snapshots.iter().map(|s| s.nodes.len()).sum(),
-    );
+    let mut node_origins: HashMap<NodeId, NodeOrigin> =
+        HashMap::with_capacity(snapshots.iter().map(|s| s.nodes.len()).sum());
 
     for (idx, snap) in snapshots.iter().enumerate() {
         for node in &snap.nodes {
@@ -670,9 +672,8 @@ fn validate_snapshot_set(snapshots: &[Snapshot]) -> Result<()> {
         }
     }
 
-    let mut edge_origins: HashMap<EdgeId, EdgeOrigin> = HashMap::with_capacity(
-        snapshots.iter().map(|s| s.edges.len()).sum(),
-    );
+    let mut edge_origins: HashMap<EdgeId, EdgeOrigin> =
+        HashMap::with_capacity(snapshots.iter().map(|s| s.edges.len()).sum());
 
     for (idx, snap) in snapshots.iter().enumerate() {
         for edge in &snap.edges {
@@ -1427,7 +1428,9 @@ impl super::GrafeoDB {
         // history is restored under `temporal`; otherwise just the
         // current value.
         for &id in &requested {
-            let Some(node) = store.get_node(id) else { continue };
+            let Some(node) = store.get_node(id) else {
+                continue;
+            };
             let label_refs: Vec<&str> = node.labels.iter().map(|s| &**s).collect();
             target_store
                 .create_node_with_id(id, &label_refs)
@@ -1475,14 +1478,13 @@ impl super::GrafeoDB {
             for (_dst_id, edge_id) in
                 store.edges_from(src_id, grafeo_core::graph::Direction::Outgoing)
             {
-                let Some(edge) = store.get_edge(edge_id) else { continue };
+                let Some(edge) = store.get_edge(edge_id) else {
+                    continue;
+                };
                 target_store
                     .create_edge_with_id(edge.id, edge.src, edge.dst, &edge.edge_type)
                     .map_err(|e| {
-                        Error::Internal(format!(
-                            "extract_subgraph: create edge {}: {e}",
-                            edge.id
-                        ))
+                        Error::Internal(format!("extract_subgraph: create edge {}: {e}", edge.id))
                     })?;
 
                 #[cfg(feature = "temporal")]
@@ -1524,11 +1526,11 @@ impl super::GrafeoDB {
         // would prevent the natural "extract many, merge into one"
         // workflow.
         let schema = collect_schema(&self.catalog);
-        restore_schema_from_snapshot(&target_store, &target.catalog, &schema);
+        restore_schema_from_snapshot(target_store, &target.catalog, &schema);
 
         // Carry index metadata. Index *data* is rebuilt over the
         // populated nodes/edges by `restore_indexes_from_snapshot`.
-        let indexes = collect_index_metadata(&store);
+        let indexes = collect_index_metadata(store);
         restore_indexes_from_snapshot(&target, &indexes);
 
         Ok(target)
@@ -1742,6 +1744,11 @@ impl super::GrafeoDB {
     /// # Errors
     ///
     /// Same conditions as [`open_multi`](Self::open_multi).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `snapshots` is empty (validated immediately before any
+    /// database is touched, so the panic message is actionable).
     pub fn open_multi_with<I, B>(snapshots: I, options: OpenMultiOptions) -> Result<Self>
     where
         I: IntoIterator<Item = B>,
@@ -1821,11 +1828,7 @@ impl super::GrafeoDB {
                         .create_graph(&graph.name)
                         .map_err(|e| Error::Internal(e.to_string()))?;
                     if let Some(graph_store) = db.lpg_store().graph(&graph.name) {
-                        populate_store_from_snapshot_ref(
-                            &graph_store,
-                            &graph.nodes,
-                            &graph.edges,
-                        )?;
+                        populate_store_from_snapshot_ref(&graph_store, &graph.nodes, &graph.edges)?;
                     }
                 }
             }
