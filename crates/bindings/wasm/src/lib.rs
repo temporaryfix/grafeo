@@ -289,6 +289,18 @@ impl Database {
         self.inner.edge_count()
     }
 
+    /// Deletes every edge whose destination node does not exist in this
+    /// database. Returns the number of edges deleted.
+    ///
+    /// Use after a server-side `extract_subgraph` produces a snapshot
+    /// that carries dangling-dst edges (source-side ownership semantic);
+    /// stripping orphans makes the snapshot self-consistent so
+    /// `Database.open()` / `importSnapshot()` accepts it.
+    #[wasm_bindgen(js_name = "removeOrphanEdges")]
+    pub fn remove_orphan_edges(&self) -> usize {
+        self.inner.remove_orphan_edges()
+    }
+
     /// Clears all cached query plans.
     ///
     /// Forces re-parsing and re-optimization on next execution.

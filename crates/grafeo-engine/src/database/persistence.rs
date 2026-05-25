@@ -1536,6 +1536,42 @@ impl super::GrafeoDB {
         Ok(target)
     }
 
+    /// Delete every edge whose destination node does not exist in this
+    /// database. Returns the number of edges deleted.
+    ///
+    /// Intended use: after [`extract_subgraph`](Self::extract_subgraph),
+    /// the resulting database carries every outgoing edge from in-set
+    /// source nodes (source-side ownership), including edges to dst
+    /// nodes outside the subgraph. Those dangling-dst edges fail
+    /// [`import_snapshot`](Self::import_snapshot) validation at reopen.
+    /// Call `remove_orphan_edges()` before
+    /// [`export_snapshot`](Self::export_snapshot) to make the subgraph
+    /// self-consistent.
+    ///
+    /// Symmetric semantic: only DST is checked. Source nodes of any
+    /// carried edge are always in-set by `extract_subgraph`'s
+    /// source-side ownership contract.
+    pub fn remove_orphan_edges(&self) -> usize {
+        let store = self.lpg_store();
+
+        // Two-pass: collect orphan EdgeIds first, then delete. Walking
+        // the edge iterator and mutating the store mid-iteration would
+        // hold a borrow on `store` that conflicts with `delete_edge`.
+        let orphans: Vec<EdgeId> = self
+            .iter_edges()
+            .filter(|edge| store.get_node(edge.dst).is_none())
+            .map(|edge| edge.id)
+            .collect();
+
+        let mut deleted = 0usize;
+        for edge_id in orphans {
+            if self.delete_edge(edge_id) {
+                deleted += 1;
+            }
+        }
+        deleted
+    }
+
     // =========================================================================
     // ADMIN API: Snapshot Export/Import
     // =========================================================================
@@ -2231,6 +2267,48 @@ mod tests {
         let types: Vec<_> = edges.iter().map(|e| e.edge_type.as_ref()).collect();
         assert!(types.contains(&"R1"));
         assert!(types.contains(&"R2"));
+    }
+
+    // --- remove_orphan_edges() ---
+
+    #[test]
+    fn remove_orphan_edges_drops_dangling_dst_edges() {
+        let db = GrafeoDB::new_in_memory();
+        let a = db.create_node(&["A"]);
+        let b = db.create_node(&["B"]);
+        db.create_edge(a, b, "MAPS_TO");
+        assert_eq!(db.edge_count(), 1);
+
+        // extract_subgraph carries every outgoing edge from `a`
+        // (source-side ownership), including a->b even though `b` is
+        // not in the request set. Result: 1 node, 1 dangling-dst edge.
+        let sub = db.extract_subgraph(&[a]).expect("extract");
+        assert_eq!(sub.node_count(), 1);
+        assert_eq!(
+            sub.edge_count(),
+            1,
+            "extract_subgraph carries the dangling a->b edge"
+        );
+
+        let deleted = sub.remove_orphan_edges();
+        assert_eq!(deleted, 1, "the dangling a->b edge should be deleted");
+        assert_eq!(sub.edge_count(), 0);
+
+        // The subgraph is now self-consistent; export/import round-trips
+        // through the per-snapshot validator that previously rejected
+        // dangling-dst edges.
+        let bytes = sub.export_snapshot().expect("export");
+        let _reopened = GrafeoDB::import_snapshot(&bytes).expect("self-consistent");
+    }
+
+    #[test]
+    fn remove_orphan_edges_returns_zero_when_no_orphans() {
+        let db = GrafeoDB::new_in_memory();
+        let a = db.create_node(&["A"]);
+        let b = db.create_node(&["B"]);
+        db.create_edge(a, b, "MAPS_TO");
+        assert_eq!(db.remove_orphan_edges(), 0);
+        assert_eq!(db.edge_count(), 1, "closed graph unchanged");
     }
 
     // --- restore_snapshot() validation ---

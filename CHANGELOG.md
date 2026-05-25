@@ -50,6 +50,15 @@ Thanks to [@jakeboone02](https://github.com/jakeboone02) for the `notRegex()` pr
     partition of a source DB, `extract_subgraph` of each half plus
     `open_multi` reconstructs the source's `(src.id, dst.id, type)`
     edge bag exactly.
+- **`Database::remove_orphan_edges() -> usize`** for cleaning up
+  dangling-dst edges after `extract_subgraph` (source-side ownership
+  carries every outgoing edge from in-set sources, including edges to
+  dst nodes outside the subgraph; those edges fail `import_snapshot`
+  validation at reopen). Iterates edges, deletes those whose dst is
+  not a present node, returns the count. Exposed as
+  `removeOrphanEdges()` in WASM bindings. Cypher
+  `MATCH (a)-[r]->(b) WHERE b IS NULL DELETE r` is a no-op for this
+  case because MATCH requires the endpoint to exist.
 - `index::vector::rabitq` — RaBitQ 1-bit vector quantization codec with a two-stage search (RaBitQ coarse pass + int8 rerank), zero-copy blob serialization, and a `RabitqCodec` WASM binding (behind the `rabitq-codec` feature on the wasm crate).
 - `codec::fsst` — Fast Static Symbol Table string compression codec with O(1) random-access decode, a new `ColumnCodec::Fsst` variant for compact-store string columns (serialization deferred to sub-plan 2d), and an `FsstCodec` WASM binding (behind the `fsst-codec` feature on the wasm crate).
 - `codec::webgraph` — Static compressed adjacency codec (gap coding + Elias gamma codes + per-node bit-offset index) with streaming successor iteration in-place, and a `WebGraphCodec` WASM binding (behind the `webgraph-codec` feature on the wasm crate). The `webgraph` crate from `crates.io` was evaluated and rejected for `wasm32-unknown-unknown` due to incompatible transitive dependencies (`mmap-rs`, `rayon-core`, `getrandom v0.3`).
