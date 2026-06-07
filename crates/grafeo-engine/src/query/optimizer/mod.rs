@@ -1245,6 +1245,42 @@ impl Optimizer {
                 Self::collect_output_variables_recursive(&join.left, vars);
                 Self::collect_output_variables_recursive(&join.right, vars);
             }
+            // A LeftJoin outputs every variable from its (required) left input
+            // plus the (optional) variables introduced on the right — those are
+            // real output columns even when NULL-padded. Without this arm,
+            // chained OPTIONAL MATCH (nested LeftJoins) reported an EMPTY var
+            // set for every outer join, so `propagate_join_predicates` found no
+            // shared join key and only mirrored the anchor filter to the
+            // innermost optional. The 2nd+ OPTIONAL MATCH then re-scanned the
+            // whole graph instead of reusing the indexed anchor.
+            LogicalOperator::LeftJoin(join) => {
+                Self::collect_output_variables_recursive(&join.left, vars);
+                Self::collect_output_variables_recursive(&join.right, vars);
+            }
+            // Apply (lateral join) outputs the outer input's variables plus
+            // whatever the per-row subplan binds; mirror the same shape so
+            // correlated / OPTIONAL CALL patterns expose their join keys too.
+            LogicalOperator::Apply(apply) => {
+                Self::collect_output_variables_recursive(&apply.input, vars);
+                Self::collect_output_variables_recursive(&apply.subplan, vars);
+            }
+            // Unwind preserves the input row's variables and binds one new
+            // element variable (plus optional ordinality / offset variables).
+            LogicalOperator::Unwind(unwind) => {
+                Self::collect_output_variables_recursive(&unwind.input, vars);
+                vars.insert(unwind.variable.clone());
+                if let Some(ord) = &unwind.ordinality_var {
+                    vars.insert(ord.clone());
+                }
+                if let Some(off) = &unwind.offset_var {
+                    vars.insert(off.clone());
+                }
+            }
+            // An AntiJoin (MINUS) emits only its left input's columns; the right
+            // side is used purely to exclude and contributes no output columns.
+            LogicalOperator::AntiJoin(join) => {
+                Self::collect_output_variables_recursive(&join.left, vars);
+            }
             LogicalOperator::Aggregate(agg) => {
                 for expr in &agg.group_by {
                     Self::collect_variables(expr, vars);
@@ -1433,8 +1469,8 @@ mod tests {
     use super::*;
     use crate::query::plan::{
         AggregateExpr, AggregateFunction, AggregateOp, BinaryOp, DistinctOp, ExpandDirection,
-        ExpandOp, JoinOp, JoinType, LimitOp, NodeScanOp, PathMode, ProjectOp, Projection,
-        ReturnItem, ReturnOp, SkipOp, SortKey, SortOp, SortOrder, UnaryOp,
+        ExpandOp, JoinOp, JoinType, LeftJoinOp, LimitOp, NodeScanOp, PathMode, ProjectOp,
+        Projection, ReturnItem, ReturnOp, SkipOp, SortKey, SortOp, SortOrder, UnaryOp,
     };
     use grafeo_common::types::Value;
 
@@ -2055,6 +2091,120 @@ mod tests {
             return;
         }
         panic!("Expected Filter -> Join structure");
+    }
+
+    /// Regression: chained OPTIONAL MATCH (nested LeftJoins) must mirror the
+    /// shared-anchor filter to EVERY optional right-side, not just the
+    /// innermost one. Before the `collect_output_variables` LeftJoin arm was
+    /// added, outer LeftJoins reported an empty var set, so the 2nd+ optional
+    /// re-scanned the whole graph instead of reusing the constrained anchor.
+    #[test]
+    fn test_chained_optional_match_propagates_anchor_to_all_sides() {
+        // MATCH (o:Order) WHERE o.business_id = 'b1'
+        // OPTIONAL MATCH (o)-[:R1]->(a)
+        // OPTIONAL MATCH (o)-[:R2]->(c)
+        let bid_filter = LogicalExpression::Binary {
+            left: Box::new(LogicalExpression::Property {
+                variable: "o".to_string(),
+                property: "business_id".to_string(),
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(LogicalExpression::Literal(Value::String("b1".into()))),
+        };
+        let optional_expand = |to: &str, etype: &str| {
+            LogicalOperator::Expand(ExpandOp {
+                from_variable: "o".to_string(),
+                to_variable: to.to_string(),
+                edge_variable: None,
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec![etype.to_string()],
+                min_hops: 1,
+                max_hops: Some(1),
+                // Optional right-sides re-derive `o` from a bare scan — exactly
+                // the shape that re-scanned the whole graph before the fix.
+                input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "o".to_string(),
+                    label: None,
+                    input: None,
+                })),
+                path_alias: None,
+                path_mode: PathMode::Walk,
+            })
+        };
+        let inner = LogicalOperator::LeftJoin(LeftJoinOp {
+            left: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "o".to_string(),
+                label: Some("Order".to_string()),
+                input: None,
+            })),
+            right: Box::new(optional_expand("a", "R1")),
+            condition: None,
+        });
+        let outer = LogicalOperator::LeftJoin(LeftJoinOp {
+            left: Box::new(inner),
+            right: Box::new(optional_expand("c", "R2")),
+            condition: None,
+        });
+        let plan = LogicalPlan::new(LogicalOperator::Filter(FilterOp {
+            predicate: bid_filter,
+            pushdown_hint: None,
+            input: Box::new(outer),
+        }));
+
+        let optimized = Optimizer::new().optimize(plan).unwrap();
+
+        // A predicate is the anchor filter if it constrains o.business_id.
+        fn is_bid(expr: &LogicalExpression) -> bool {
+            match expr {
+                LogicalExpression::Binary { left, right, .. } => is_bid(left) || is_bid(right),
+                LogicalExpression::Property { variable, property } => {
+                    variable == "o" && property == "business_id"
+                }
+                _ => false,
+            }
+        }
+        fn subtree_has_bid(op: &LogicalOperator) -> bool {
+            match op {
+                LogicalOperator::Filter(f) => is_bid(&f.predicate) || subtree_has_bid(&f.input),
+                LogicalOperator::Expand(e) => subtree_has_bid(&e.input),
+                LogicalOperator::LeftJoin(j) => {
+                    subtree_has_bid(&j.left) || subtree_has_bid(&j.right)
+                }
+                LogicalOperator::Join(j) => subtree_has_bid(&j.left) || subtree_has_bid(&j.right),
+                LogicalOperator::Project(p) => subtree_has_bid(&p.input),
+                LogicalOperator::Return(r) => subtree_has_bid(&r.input),
+                LogicalOperator::NodeScan(s) => {
+                    s.input.as_deref().is_some_and(subtree_has_bid)
+                }
+                _ => false,
+            }
+        }
+        // Every LeftJoin's optional right-side must carry the anchor filter.
+        fn every_left_join_right_constrained(op: &LogicalOperator) -> bool {
+            match op {
+                LogicalOperator::LeftJoin(j) => {
+                    subtree_has_bid(&j.right)
+                        && every_left_join_right_constrained(&j.left)
+                        && every_left_join_right_constrained(&j.right)
+                }
+                LogicalOperator::Filter(f) => every_left_join_right_constrained(&f.input),
+                LogicalOperator::Expand(e) => every_left_join_right_constrained(&e.input),
+                LogicalOperator::Project(p) => every_left_join_right_constrained(&p.input),
+                LogicalOperator::Return(r) => every_left_join_right_constrained(&r.input),
+                LogicalOperator::Join(j) => {
+                    every_left_join_right_constrained(&j.left)
+                        && every_left_join_right_constrained(&j.right)
+                }
+                _ => true,
+            }
+        }
+
+        assert!(
+            every_left_join_right_constrained(&optimized.root),
+            "anchor filter o.business_id must be mirrored into every OPTIONAL MATCH \
+             right-side; an outer optional was left unconstrained (full re-scan): {:#?}",
+            optimized.root
+        );
     }
 
     // Variable extraction tests
