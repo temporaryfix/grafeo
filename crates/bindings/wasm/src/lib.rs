@@ -21,7 +21,11 @@ mod signed_snapshot;
 mod types;
 mod utils;
 
-#[cfg(any(feature = "rabitq-codec", feature = "fsst-codec", feature = "webgraph-codec"))]
+#[cfg(any(
+    feature = "rabitq-codec",
+    feature = "fsst-codec",
+    feature = "webgraph-codec"
+))]
 pub mod codecs;
 
 use std::cell::{Cell, RefCell};

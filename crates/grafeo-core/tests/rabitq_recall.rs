@@ -70,11 +70,7 @@ fn clustered_dataset(
 }
 
 /// Exact brute-force Euclidean k-NN — the recall oracle.
-fn brute_force(
-    vectors: &[(NodeId, Vec<f32>)],
-    query: &[f32],
-    k: usize,
-) -> Vec<NodeId> {
+fn brute_force(vectors: &[(NodeId, Vec<f32>)], query: &[f32], k: usize) -> Vec<NodeId> {
     let mut scored: Vec<(NodeId, f32)> = vectors
         .iter()
         .map(|(id, v)| {

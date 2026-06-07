@@ -54,7 +54,10 @@ fn brute_force_top_k(vectors: &[(NodeId, Vec<f32>)], query: &[f32]) -> Vec<NodeI
     let mut s: Vec<(NodeId, f32)> = vectors
         .iter()
         .map(|(id, v)| {
-            (*id, v.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum())
+            (
+                *id,
+                v.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum(),
+            )
         })
         .collect();
     s.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -72,14 +75,19 @@ fn bench(c: &mut Criterion) {
 
     // RaBitQ two-stage.
     let rabitq = TwoStageVectorIndex::build(&vectors, DIM, 1);
-    let rabitq_hits: Vec<NodeId> =
-        rabitq.search(&query, K, 16).into_iter().map(|(id, _)| id).collect();
+    let rabitq_hits: Vec<NodeId> = rabitq
+        .search(&query, K, 16)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
 
     // PQ baseline: 32 subvectors, asymmetric distance scan.
     let refs: Vec<&[f32]> = vectors.iter().map(|(_, v)| v.as_slice()).collect();
     let pq = ProductQuantizer::train(&refs, 32, 256, 10);
-    let pq_codes: Vec<(NodeId, Vec<u8>)> =
-        vectors.iter().map(|(id, v)| (*id, pq.quantize(v))).collect();
+    let pq_codes: Vec<(NodeId, Vec<u8>)> = vectors
+        .iter()
+        .map(|(id, v)| (*id, pq.quantize(v)))
+        .collect();
     let pq_search = |q: &[f32]| -> Vec<NodeId> {
         let table = pq.build_distance_table(q);
         let mut s: Vec<(NodeId, f32)> = pq_codes

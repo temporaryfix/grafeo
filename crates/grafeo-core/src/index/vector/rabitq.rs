@@ -942,10 +942,12 @@ impl RabitqView {
         let int8_offset = read_u64(buf, &mut pos)? as usize;
 
         // ScalarQuantizer — decoded once into owned storage.
-        let quant_slice = buf.get(pos..pos + quant_len).ok_or(RabitqError::Truncated {
-            need: pos + quant_len,
-            have: buf.len(),
-        })?;
+        let quant_slice = buf
+            .get(pos..pos + quant_len)
+            .ok_or(RabitqError::Truncated {
+                need: pos + quant_len,
+                have: buf.len(),
+            })?;
         let (scalar, _): (ScalarQuantizer, usize) =
             bincode::serde::decode_from_slice(quant_slice, bincode::config::standard())
                 .map_err(|e| RabitqError::Quantizer(e.to_string()))?;
@@ -980,12 +982,13 @@ impl RabitqView {
                 have: buf.len(),
             });
         }
-        let int8_end = int8_offset
-            .checked_add(count.saturating_mul(dim))
-            .ok_or(RabitqError::Truncated {
-                need: usize::MAX,
-                have: buf.len(),
-            })?;
+        let int8_end =
+            int8_offset
+                .checked_add(count.saturating_mul(dim))
+                .ok_or(RabitqError::Truncated {
+                    need: usize::MAX,
+                    have: buf.len(),
+                })?;
         if int8_end > buf.len() {
             return Err(RabitqError::Truncated {
                 need: int8_end,
@@ -1057,9 +1060,7 @@ impl RabitqView {
         if self.is_empty() || k == 0 {
             return Vec::new();
         }
-        let candidate_n = k
-            .saturating_mul(rerank_factor.max(1))
-            .min(self.count);
+        let candidate_n = k.saturating_mul(rerank_factor.max(1)).min(self.count);
 
         // Coarse pass: encode the query, then iterate stored codes.
         let q = self.rotation_quantizer.encode_query(query);
@@ -1376,11 +1377,7 @@ mod tests {
     #[test]
     fn view_rejects_bad_magic() {
         use grafeo_common::types::NodeId;
-        let owned = TwoStageVectorIndex::build(
-            &[(NodeId::new(1), vec![1.0f32; 8])],
-            8,
-            1,
-        );
+        let owned = TwoStageVectorIndex::build(&[(NodeId::new(1), vec![1.0f32; 8])], 8, 1);
         let mut bad = owned.to_bytes();
         bad[0] = b'X';
         assert!(matches!(

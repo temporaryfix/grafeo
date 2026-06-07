@@ -207,9 +207,7 @@ impl SymbolTable {
         while i < compressed.len() {
             let c = compressed[i];
             if c == ESCAPE {
-                let literal = *compressed
-                    .get(i + 1)
-                    .ok_or(FsstError::TruncatedEscape(i))?;
+                let literal = *compressed.get(i + 1).ok_or(FsstError::TruncatedEscape(i))?;
                 out.push(literal);
                 i += 2;
             } else if let Some(sym) = self.symbol(c) {
@@ -332,11 +330,7 @@ impl FsstCodec {
     /// Panics if `offsets` is empty or the last offset exceeds
     /// `compressed.len()`.
     #[must_use]
-    pub(crate) fn from_parts(
-        table: SymbolTable,
-        compressed: Vec<u8>,
-        offsets: Vec<u32>,
-    ) -> Self {
+    pub(crate) fn from_parts(table: SymbolTable, compressed: Vec<u8>, offsets: Vec<u32>) -> Self {
         assert!(
             !offsets.is_empty(),
             "offsets must contain at least the terminal length"
@@ -469,8 +463,7 @@ impl FsstCodec {
         pad_to(&mut buf, 4);
 
         // Patch the three offsets.
-        buf[offsets_pos..offsets_pos + 8]
-            .copy_from_slice(&table_offset.to_le_bytes());
+        buf[offsets_pos..offsets_pos + 8].copy_from_slice(&table_offset.to_le_bytes());
         buf[offsets_pos + 8..offsets_pos + 16]
             .copy_from_slice(&offsets_section_offset.to_le_bytes());
         buf[offsets_pos + 16..offsets_pos + 24]
@@ -515,15 +508,21 @@ impl FsstCodec {
         let mut pos = 8;
         let count = read_u32(buf, &mut pos)? as usize;
         let compressed_len = read_u32(buf, &mut pos)? as usize;
-        let table_offset = usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| {
-            FsstError::Truncated { need: usize::MAX, have: buf.len() }
-        })?;
-        let offsets_offset = usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| {
-            FsstError::Truncated { need: usize::MAX, have: buf.len() }
-        })?;
-        let compressed_offset = usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| {
-            FsstError::Truncated { need: usize::MAX, have: buf.len() }
-        })?;
+        let table_offset =
+            usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| FsstError::Truncated {
+                need: usize::MAX,
+                have: buf.len(),
+            })?;
+        let offsets_offset =
+            usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| FsstError::Truncated {
+                need: usize::MAX,
+                have: buf.len(),
+            })?;
+        let compressed_offset =
+            usize::try_from(read_u64(buf, &mut pos)?).map_err(|_| FsstError::Truncated {
+                need: usize::MAX,
+                have: buf.len(),
+            })?;
         let _reserved = read_u64(buf, &mut pos)?;
 
         debug_assert_eq!(pos, 48, "header end at offset 48");
@@ -574,12 +573,12 @@ impl FsstCodec {
 
         // Offsets.
         let offsets_byte_end = offsets_offset + 4 * (count + 1);
-        let offsets_bytes = buf
-            .get(offsets_offset..offsets_byte_end)
-            .ok_or(FsstError::Truncated {
-                need: offsets_byte_end,
-                have: buf.len(),
-            })?;
+        let offsets_bytes =
+            buf.get(offsets_offset..offsets_byte_end)
+                .ok_or(FsstError::Truncated {
+                    need: offsets_byte_end,
+                    have: buf.len(),
+                })?;
         let mut offsets = Vec::with_capacity(count + 1);
         for chunk in offsets_bytes.chunks_exact(4) {
             offsets.push(u32::from_le_bytes(chunk.try_into().expect("4 bytes")));
@@ -706,15 +705,19 @@ impl FsstView {
 
         // Symbol table — decoded once into owned SymbolTable.
         let lengths_end = table_offset + 256;
-        let lengths_slice = buf.get(table_offset..lengths_end).ok_or(FsstError::Truncated {
-            need: lengths_end,
-            have: buf.len(),
-        })?;
+        let lengths_slice = buf
+            .get(table_offset..lengths_end)
+            .ok_or(FsstError::Truncated {
+                need: lengths_end,
+                have: buf.len(),
+            })?;
         let bodies_end = lengths_end + 256 * MAX_SYMBOL_LEN;
-        let bodies_slice = buf.get(lengths_end..bodies_end).ok_or(FsstError::Truncated {
-            need: bodies_end,
-            have: buf.len(),
-        })?;
+        let bodies_slice = buf
+            .get(lengths_end..bodies_end)
+            .ok_or(FsstError::Truncated {
+                need: bodies_end,
+                have: buf.len(),
+            })?;
         let mut table = SymbolTable::default();
         for (code, &len_byte) in lengths_slice.iter().enumerate() {
             // reason: code 0..=255 fits u8 by construction
@@ -827,8 +830,8 @@ impl FsstView {
                 len: u64::from(self.compressed_len as u32),
             });
         }
-        let compressed = &self.blob.as_ref()
-            [self.compressed_offset + start..self.compressed_offset + end];
+        let compressed =
+            &self.blob.as_ref()[self.compressed_offset + start..self.compressed_offset + end];
         Ok(Some(self.table.decode(compressed)?))
     }
 }
@@ -851,7 +854,10 @@ mod tests {
     fn symbol_table_default_has_no_symbols() {
         let t = SymbolTable::default();
         for code in 1u8..=255 {
-            assert!(t.symbol(code).is_none(), "code {code} should have no symbol");
+            assert!(
+                t.symbol(code).is_none(),
+                "code {code} should have no symbol"
+            );
         }
     }
 
@@ -899,7 +905,7 @@ mod tests {
     fn symbol_table_set_overwrites_with_zero_fill() {
         let mut a = SymbolTable::default();
         a.set(1, b"abcdefgh"); // full 8-byte slot
-        a.set(1, b"x");        // overwrite with 1-byte symbol
+        a.set(1, b"x"); // overwrite with 1-byte symbol
 
         // Lookup returns the new shorter symbol.
         assert_eq!(a.symbol(1), Some(b"x" as &[u8]));
@@ -908,7 +914,10 @@ mod tests {
         // with a freshly-built table holding only "x" matches.
         let mut b = SymbolTable::default();
         b.set(1, b"x");
-        assert_eq!(a, b, "trailing body bytes from previous symbol must be zeroed");
+        assert_eq!(
+            a, b,
+            "trailing body bytes from previous symbol must be zeroed"
+        );
     }
 
     #[test]
@@ -920,18 +929,10 @@ mod tests {
     #[test]
     fn train_picks_frequent_substrings() {
         // Sample where "the " appears many times.
-        let strings: Vec<&[u8]> = vec![
-            b"the cat",
-            b"the dog",
-            b"the bird",
-            b"the rat",
-            b"the fox",
-        ];
+        let strings: Vec<&[u8]> = vec![b"the cat", b"the dog", b"the bird", b"the rat", b"the fox"];
         let table = SymbolTable::train(&strings);
         // The table should contain "the " (or a prefix of it) as a multi-byte symbol.
-        let has_the = (1u8..=255).any(|c| {
-            table.symbol(c).is_some_and(|s| s.starts_with(b"the"))
-        });
+        let has_the = (1u8..=255).any(|c| table.symbol(c).is_some_and(|s| s.starts_with(b"the")));
         assert!(has_the, "expected a symbol covering 'the'");
     }
 
@@ -940,7 +941,7 @@ mod tests {
         // Any byte in the sample is either matched by a symbol or escape-encoded —
         // we test the latter by checking the symbol table is buildable.
         let strings: Vec<&[u8]> = vec![b"hello", b"world", b""];
-        let _ = SymbolTable::train(&strings);  // does not panic on empty strings
+        let _ = SymbolTable::train(&strings); // does not panic on empty strings
     }
 
     #[test]
@@ -1028,7 +1029,10 @@ mod tests {
         let codec = FsstCodec::build(&refs);
         assert_eq!(codec.len(), 3);
         for i in 0..3 {
-            assert_eq!(codec.get(i).expect("get").expect("decode"), Vec::<u8>::new());
+            assert_eq!(
+                codec.get(i).expect("get").expect("decode"),
+                Vec::<u8>::new()
+            );
         }
     }
 
@@ -1088,17 +1092,15 @@ mod tests {
         let codec = FsstCodec::build(&[b"hello world"]);
         let blob = bytes::Bytes::from(codec.to_bytes());
         let reopened = FsstCodec::from_bytes_shared(blob).expect("from_bytes_shared");
-        assert_eq!(reopened.get(0).expect("get").expect("decode"), b"hello world");
+        assert_eq!(
+            reopened.get(0).expect("get").expect("decode"),
+            b"hello world"
+        );
     }
 
     #[test]
     fn view_get_matches_owned_get() {
-        let strings: Vec<&[u8]> = vec![
-            b"alpha",
-            b"beta gamma",
-            b"",
-            b"the quick brown fox",
-        ];
+        let strings: Vec<&[u8]> = vec![b"alpha", b"beta gamma", b"", b"the quick brown fox"];
         let owned = FsstCodec::build(&strings);
         let blob = bytes::Bytes::from(owned.to_bytes());
         let view = FsstView::open(blob).expect("open");
@@ -1142,7 +1144,11 @@ mod tests {
         blob[body_end..].copy_from_slice(&crc.to_le_bytes());
 
         match FsstCodec::from_bytes(&blob) {
-            Err(FsstError::BadOffset { index: 0, offset: 7, .. }) => {}
+            Err(FsstError::BadOffset {
+                index: 0,
+                offset: 7,
+                ..
+            }) => {}
             other => panic!("expected BadOffset{{index:0, offset:7, ...}}, got {other:?}"),
         }
     }

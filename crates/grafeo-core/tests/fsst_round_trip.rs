@@ -84,7 +84,7 @@ fn fsst_round_trip_realistic_names() {
         "Butch Coolidge",
         "Jules Winnfield",
         "Marsellus Wallace",
-        "Vincent Vega",  // duplicate
+        "Vincent Vega", // duplicate
         "Honey Bunny",
         "Pumpkin",
     ];

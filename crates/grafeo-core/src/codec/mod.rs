@@ -31,18 +31,18 @@
 
 pub mod bitpack;
 pub(crate) mod bitstream;
-pub mod webgraph;
 pub mod bitvec;
 pub mod block;
 pub mod delta;
 pub mod dictionary;
-pub mod fsst;
 #[cfg(feature = "tiered-storage")]
 pub mod epoch_store;
+pub mod fsst;
 pub mod runlength;
 pub mod selector;
 #[cfg(feature = "succinct-indexes")]
 pub mod succinct;
+pub mod webgraph;
 
 // Re-export commonly used types
 pub use bitpack::{BitPackedInts, DeltaBitPacked};
@@ -51,13 +51,11 @@ pub use block::{BlockEntry, DEFAULT_BLOCK_ROWS};
 pub use delta::{DeltaEncoding, zigzag_decode, zigzag_encode};
 pub use dictionary::{DictionaryBuilder, DictionaryEncoding};
 pub use fsst::{FsstCodec, FsstError, FsstView, SymbolTable};
-pub use webgraph::{
-    SuccessorIter, WebGraphBuilder, WebGraphCodec, WebGraphError, WebGraphView,
-};
 pub use runlength::{Run, RunLengthAnalyzer, RunLengthEncoding, SignedRunLengthEncoding};
 pub use selector::{
     CodecSelector, CompressedData, CompressionCodec, CompressionMetadata, TypeSpecificCompressor,
 };
+pub use webgraph::{SuccessorIter, WebGraphBuilder, WebGraphCodec, WebGraphError, WebGraphView};
 
 // Tiered storage exports (feature-gated)
 #[cfg(feature = "tiered-storage")]

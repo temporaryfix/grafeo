@@ -57,11 +57,7 @@ fn dict_size_bytes(strings: &[Vec<u8>]) -> usize {
         }
     }
     let dict: grafeo_core::codec::DictionaryEncoding = builder.build();
-    let dict_bytes: usize = dict
-        .dictionary()
-        .iter()
-        .map(|s: &Arc<str>| s.len())
-        .sum();
+    let dict_bytes: usize = dict.dictionary().iter().map(|s: &Arc<str>| s.len()).sum();
     let codes_bytes = dict.codes_bytes().len();
     // Plus a small fixed header (4-byte counts × 2 = 8 bytes; rounded up).
     dict_bytes + codes_bytes + 16
@@ -79,10 +75,15 @@ fn report_fsst(label: &str, strings: &[Vec<u8>]) {
     println!();
     println!("─── FSST: {label} ({} strings) ───", strings.len());
     println!("  raw (bytes + offsets):    {raw:>9}");
-    println!("  DictionaryEncoding:       {dict_size:>9}  ({:.2}× vs raw)", raw as f64 / dict_size as f64);
-    println!("  FSST blob:                {fsst_size:>9}  ({:.2}× vs raw, {:.2}× vs Dict)",
+    println!(
+        "  DictionaryEncoding:       {dict_size:>9}  ({:.2}× vs raw)",
+        raw as f64 / dict_size as f64
+    );
+    println!(
+        "  FSST blob:                {fsst_size:>9}  ({:.2}× vs raw, {:.2}× vs Dict)",
         raw as f64 / fsst_size as f64,
-        dict_size as f64 / fsst_size as f64);
+        dict_size as f64 / fsst_size as f64
+    );
 }
 
 fn measure_fsst_random_ascii() {
@@ -100,25 +101,108 @@ fn measure_fsst_name_like() {
     // Names with realistic repetition: 50 first names × 50 last names, 2000 rows
     // (≈ 1.5 rows per name pair).
     let firsts = [
-        "Vincent", "Mia", "Butch", "Jules", "Marsellus", "Honey", "Pumpkin",
-        "Lance", "Jody", "Esmeralda", "Winston", "Captain", "Floyd", "Pete",
-        "Marvin", "Brett", "Roger", "Ringo", "Yolanda", "Raquel",
-        "Antwan", "Jimmie", "Bonnie", "Maynard", "Zed", "Trudi", "Fabienne",
-        "Paul", "English", "Wolf", "Smith", "Jones", "Brown", "Lee",
-        "Walker", "Lewis", "Robinson", "Green", "Adams", "Nelson",
-        "Carter", "Mitchell", "Roberts", "Phillips", "Campbell", "Parker",
-        "Evans", "Edwards", "Collins", "Stewart",
+        "Vincent",
+        "Mia",
+        "Butch",
+        "Jules",
+        "Marsellus",
+        "Honey",
+        "Pumpkin",
+        "Lance",
+        "Jody",
+        "Esmeralda",
+        "Winston",
+        "Captain",
+        "Floyd",
+        "Pete",
+        "Marvin",
+        "Brett",
+        "Roger",
+        "Ringo",
+        "Yolanda",
+        "Raquel",
+        "Antwan",
+        "Jimmie",
+        "Bonnie",
+        "Maynard",
+        "Zed",
+        "Trudi",
+        "Fabienne",
+        "Paul",
+        "English",
+        "Wolf",
+        "Smith",
+        "Jones",
+        "Brown",
+        "Lee",
+        "Walker",
+        "Lewis",
+        "Robinson",
+        "Green",
+        "Adams",
+        "Nelson",
+        "Carter",
+        "Mitchell",
+        "Roberts",
+        "Phillips",
+        "Campbell",
+        "Parker",
+        "Evans",
+        "Edwards",
+        "Collins",
+        "Stewart",
     ];
     let lasts = [
-        "Vega", "Wallace", "Coolidge", "Winnfield", "Bunny", "Marvin",
-        "Wolf", "Maximus", "Cooper", "Lockhart", "Spencer", "Hayes",
-        "Bryant", "Henderson", "Murphy", "Sullivan", "Foster", "Webb",
-        "Hardy", "Stokes", "Russo", "Ferraro", "Dimitri", "Kowalski",
-        "Petrov", "Yamamoto", "Chen", "Patel", "Singh", "Tanaka",
-        "Garcia", "Lopez", "Hernandez", "Gomez", "Martinez", "Rivera",
-        "Schmidt", "Müller", "Schneider", "Weber", "Fischer", "Becker",
-        "Kowalski", "Nowak", "Wójcik", "Krawczyk", "Lewandowski",
-        "Andersen", "Olsen", "Johansen",
+        "Vega",
+        "Wallace",
+        "Coolidge",
+        "Winnfield",
+        "Bunny",
+        "Marvin",
+        "Wolf",
+        "Maximus",
+        "Cooper",
+        "Lockhart",
+        "Spencer",
+        "Hayes",
+        "Bryant",
+        "Henderson",
+        "Murphy",
+        "Sullivan",
+        "Foster",
+        "Webb",
+        "Hardy",
+        "Stokes",
+        "Russo",
+        "Ferraro",
+        "Dimitri",
+        "Kowalski",
+        "Petrov",
+        "Yamamoto",
+        "Chen",
+        "Patel",
+        "Singh",
+        "Tanaka",
+        "Garcia",
+        "Lopez",
+        "Hernandez",
+        "Gomez",
+        "Martinez",
+        "Rivera",
+        "Schmidt",
+        "Müller",
+        "Schneider",
+        "Weber",
+        "Fischer",
+        "Becker",
+        "Kowalski",
+        "Nowak",
+        "Wójcik",
+        "Krawczyk",
+        "Lewandowski",
+        "Andersen",
+        "Olsen",
+        "Johansen",
     ];
     let mut rng = Rng::new(99);
     let strings: Vec<Vec<u8>> = (0..2000)
@@ -133,12 +217,21 @@ fn measure_fsst_name_like() {
 
 fn measure_fsst_url_like() {
     let hosts = [
-        "api.example.com", "cdn.example.com", "assets.example.com",
-        "static.example.com", "www.acme.com", "store.acme.com",
+        "api.example.com",
+        "cdn.example.com",
+        "assets.example.com",
+        "static.example.com",
+        "www.acme.com",
+        "store.acme.com",
     ];
     let paths = [
-        "/v1/users/", "/v1/posts/", "/v1/comments/", "/v2/profile/",
-        "/static/images/", "/assets/css/", "/api/search?q=",
+        "/v1/users/",
+        "/v1/posts/",
+        "/v1/comments/",
+        "/v2/profile/",
+        "/static/images/",
+        "/assets/css/",
+        "/api/search?q=",
     ];
     let mut rng = Rng::new(77);
     let strings: Vec<Vec<u8>> = (0..1000)
@@ -171,10 +264,18 @@ fn report_webgraph(label: &str, num_nodes: u64, edges: &[(u64, u64)]) {
     let bits_per_edge_raw = (raw_size as f64 * 8.0) / edges.len() as f64;
 
     println!();
-    println!("─── WebGraph: {label} ({} nodes, {} edges) ───", num_nodes, edges.len());
-    println!("  raw (u64 dst + u64 offsets): {raw_size:>9} bytes  ({bits_per_edge_raw:>5.1} bits/edge)");
-    println!("  WebGraph blob:               {blob_size:>9} bytes  ({bits_per_edge_blob:>5.1} bits/edge,  {:.2}× vs raw)",
-        raw_size as f64 / blob_size as f64);
+    println!(
+        "─── WebGraph: {label} ({} nodes, {} edges) ───",
+        num_nodes,
+        edges.len()
+    );
+    println!(
+        "  raw (u64 dst + u64 offsets): {raw_size:>9} bytes  ({bits_per_edge_raw:>5.1} bits/edge)"
+    );
+    println!(
+        "  WebGraph blob:               {blob_size:>9} bytes  ({bits_per_edge_blob:>5.1} bits/edge,  {:.2}× vs raw)",
+        raw_size as f64 / blob_size as f64
+    );
 }
 
 fn measure_webgraph_random() {

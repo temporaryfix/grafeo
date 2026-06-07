@@ -14,10 +14,7 @@ use proptest::prelude::*;
 // ── FSST parity ──────────────────────────────────────────────────
 
 fn string_set() -> impl Strategy<Value = Vec<Vec<u8>>> {
-    proptest::collection::vec(
-        proptest::collection::vec(any::<u8>(), 0..=32),
-        0..=16,
-    )
+    proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..=32), 0..=16)
 }
 
 proptest! {

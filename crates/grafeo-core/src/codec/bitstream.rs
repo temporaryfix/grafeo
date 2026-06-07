@@ -89,10 +89,7 @@ impl BitWriter {
         let folded: u64 = if n >= 0 {
             (n as u64).checked_mul(2).expect("zigzag overflow") + 1
         } else {
-            ((-(n + 1)) as u64)
-                .checked_mul(2)
-                .expect("zigzag overflow")
-                + 2
+            ((-(n + 1)) as u64).checked_mul(2).expect("zigzag overflow") + 2
         };
         self.write_gamma(folded);
     }

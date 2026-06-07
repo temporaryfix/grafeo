@@ -378,10 +378,8 @@ impl WebGraphCodec {
         pad_to(&mut buf, 4);
 
         // Patch the two offsets.
-        buf[offsets_pos..offsets_pos + 8]
-            .copy_from_slice(&offsets_offset.to_le_bytes());
-        buf[offsets_pos + 8..offsets_pos + 16]
-            .copy_from_slice(&bits_offset.to_le_bytes());
+        buf[offsets_pos..offsets_pos + 8].copy_from_slice(&offsets_offset.to_le_bytes());
+        buf[offsets_pos + 8..offsets_pos + 16].copy_from_slice(&bits_offset.to_le_bytes());
         // The third and fourth u64s stay zero (reserved).
 
         let crc = crc32fast::hash(&buf);
@@ -439,12 +437,12 @@ impl WebGraphCodec {
         #[allow(clippy::cast_possible_truncation)]
         let n_offsets = num_nodes as usize + 1;
         let offsets_byte_end = offsets_offset + 8 * n_offsets;
-        let offsets_bytes = buf
-            .get(offsets_offset..offsets_byte_end)
-            .ok_or(WebGraphError::Truncated {
-                need: offsets_byte_end,
-                have: buf.len(),
-            })?;
+        let offsets_bytes =
+            buf.get(offsets_offset..offsets_byte_end)
+                .ok_or(WebGraphError::Truncated {
+                    need: offsets_byte_end,
+                    have: buf.len(),
+                })?;
         let mut offsets = Vec::with_capacity(n_offsets);
         for chunk in offsets_bytes.chunks_exact(8) {
             offsets.push(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
@@ -582,12 +580,12 @@ impl WebGraphView {
         // reason: num_nodes is bounded by available memory
         let n_offsets = num_nodes as usize + 1;
         let offsets_byte_end = offsets_offset + 8 * n_offsets;
-        let offsets_bytes = buf
-            .get(offsets_offset..offsets_byte_end)
-            .ok_or(WebGraphError::Truncated {
-                need: offsets_byte_end,
-                have: buf.len(),
-            })?;
+        let offsets_bytes =
+            buf.get(offsets_offset..offsets_byte_end)
+                .ok_or(WebGraphError::Truncated {
+                    need: offsets_byte_end,
+                    have: buf.len(),
+                })?;
         let mut offsets = Vec::with_capacity(n_offsets);
         for chunk in offsets_bytes.chunks_exact(8) {
             offsets.push(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
@@ -754,10 +752,7 @@ mod tests {
             b.add_edge(s, d).unwrap();
         }
         let codec = b.build();
-        assert_eq!(
-            codec.successors(0).collect::<Vec<_>>(),
-            vec![1, 3, 5]
-        );
+        assert_eq!(codec.successors(0).collect::<Vec<_>>(), vec![1, 3, 5]);
         assert_eq!(codec.successors(1).collect::<Vec<_>>(), Vec::<u64>::new());
         assert_eq!(codec.successors(2).collect::<Vec<_>>(), vec![0, 4]);
         assert_eq!(codec.successors(5).collect::<Vec<_>>(), vec![5]);
@@ -784,11 +779,18 @@ mod tests {
     fn blob_round_trip_preserves_adjacency() {
         let mut b = WebGraphBuilder::new(20);
         let edges = [
-            (0u64, 1), (0, 5), (0, 17),
-            (1, 0), (1, 2),
+            (0u64, 1),
+            (0, 5),
+            (0, 17),
+            (1, 0),
+            (1, 2),
             (3, 3),
-            (5, 18), (5, 19),
-            (10, 0), (10, 5), (10, 11), (10, 12),
+            (5, 18),
+            (5, 19),
+            (10, 0),
+            (10, 5),
+            (10, 11),
+            (10, 12),
             (19, 0),
         ];
         for &(s, d) in &edges {
@@ -845,9 +847,14 @@ mod tests {
     fn view_successors_matches_owned() {
         let mut b = WebGraphBuilder::new(15);
         let edges = [
-            (0u64, 1), (0, 5), (0, 14),
-            (3, 0), (3, 3),
-            (10, 7), (10, 8), (10, 9),
+            (0u64, 1),
+            (0, 5),
+            (0, 14),
+            (3, 0),
+            (3, 3),
+            (10, 7),
+            (10, 8),
+            (10, 9),
             (14, 0),
         ];
         for &(s, d) in &edges {

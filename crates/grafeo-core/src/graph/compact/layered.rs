@@ -3518,8 +3518,7 @@ mod tests {
         let first = persons[0];
 
         // Capture the base-tier outgoing edges before any promotion.
-        let base_outgoing: Vec<(NodeId, EdgeId)> =
-            layered.edges_from(first, Direction::Outgoing);
+        let base_outgoing: Vec<(NodeId, EdgeId)> = layered.edges_from(first, Direction::Outgoing);
         assert!(
             !base_outgoing.is_empty(),
             "test fixture should give the first Person a base edge"
@@ -3545,9 +3544,7 @@ mod tests {
         // source node becomes dirty.
         for (target, eid) in &base_outgoing {
             assert!(
-                outgoing
-                    .iter()
-                    .any(|(t, e)| t == target && e == eid),
+                outgoing.iter().any(|(t, e)| t == target && e == eid),
                 "base edge {eid:?} (→ {target:?}) must remain visible after promotion"
             );
         }
@@ -3605,7 +3602,9 @@ mod tests {
             .expect("pre-promotion fixture has a base LIVES_IN edge");
 
         assert!(
-            post_out.iter().any(|(t, e)| *t == amsterdam && *e == base_eid),
+            post_out
+                .iter()
+                .any(|(t, e)| *t == amsterdam && *e == base_eid),
             "base LIVES_IN edge must remain visible via edges_from(src, Outgoing) after src is promoted"
         );
         assert!(

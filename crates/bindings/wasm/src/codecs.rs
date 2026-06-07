@@ -118,9 +118,7 @@ impl FsstCodec {
     pub fn encode(flat: &[u8], lengths: &[u32]) -> Result<Vec<u8>, JsError> {
         let total: u64 = lengths.iter().map(|&l| u64::from(l)).sum();
         if total != flat.len() as u64 {
-            return Err(JsError::new(
-                "sum of lengths must equal flat.length",
-            ));
+            return Err(JsError::new("sum of lengths must equal flat.length"));
         }
         let mut strings: Vec<&[u8]> = Vec::with_capacity(lengths.len());
         let mut cursor = 0usize;

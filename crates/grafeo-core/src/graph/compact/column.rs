@@ -396,11 +396,11 @@ impl ColumnCodec {
             // corrupt stream) to None, and `from_utf8(...).ok()` does the
             // same for non-UTF-8 bytes. Both match the Dict variant's
             // get-returns-None-on-failure contract.
-            Self::Fsst(fsst) => fsst
-                .get(index)
-                .ok()
-                .flatten()
-                .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| Value::String(ArcStr::from(s)))),
+            Self::Fsst(fsst) => fsst.get(index).ok().flatten().and_then(|bytes| {
+                std::str::from_utf8(&bytes)
+                    .ok()
+                    .map(|s| Value::String(ArcStr::from(s)))
+            }),
             Self::Bitmap(bv) => bv.get(index).map(Value::Bool),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
@@ -1050,8 +1050,8 @@ impl ColumnCodec {
                     return Err("truncated Fsst body");
                 }
                 let body = &bytes[*pos..*pos + body_len];
-                let fsst = crate::codec::FsstCodec::from_bytes(body)
-                    .map_err(|_| "malformed Fsst blob")?;
+                let fsst =
+                    crate::codec::FsstCodec::from_bytes(body).map_err(|_| "malformed Fsst blob")?;
                 *pos += body_len;
                 Ok(Self::Fsst(fsst))
             }
@@ -3901,12 +3901,7 @@ mod tests {
     fn column_codec_fsst_round_trip() {
         use crate::codec::FsstCodec;
 
-        let strings: Vec<&[u8]> = vec![
-            b"Vincent",
-            b"Mia",
-            b"Vincent",
-            b"Butch",
-        ];
+        let strings: Vec<&[u8]> = vec![b"Vincent", b"Mia", b"Vincent", b"Butch"];
         let codec = FsstCodec::build(&strings);
         let col = ColumnCodec::Fsst(codec);
 
