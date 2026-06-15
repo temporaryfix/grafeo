@@ -772,6 +772,17 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
+## Task 5b: Savepoint-aware property delta (regression fix)
+
+**Why (discovered during execution):** Task 4b moved transactional property writes into the per-tx buffered delta, bypassing the property undo log. `Session::savepoint` / `rollback_to_savepoint` (`session/mod.rs` ~4310 / ~4356) record `property_undo_log_position` and replay via `rollback_transaction_properties_to`, which no longer sees buffered writes. Result: 3 tests in `crates/grafeo-engine/tests/savepoint_undo.rs` fail (`test_savepoint_rolls_back_set_property`, `test_savepoint_rolls_back_new_property`, `test_savepoint_preserves_pre_savepoint_changes`) — a post-savepoint `SET` is not undone by `ROLLBACK TO savepoint`. The plan's Task 3 deferred savepoint granularity "unless a test forces it"; these tests force it. This file is `--features full`-gated and so was invisible to the `--all-features` gate (see Task 7's strengthened gate).
+
+**Fix (snapshot/restore the delta at savepoints):**
+- Add `LpgStore::tx_overlay_snapshot(tx) -> <clone of the tx's delta entry>` and `tx_overlay_restore(tx, snapshot)` (clone / replace the tx's entry in `tx_property_overlay`), exposed as `GraphStoreMut` trait methods (defaults: return an empty snapshot / no-op — write-through stores have nothing to snapshot).
+- Add an `overlay_snapshot` field to `GraphSavepoint`; set it in `savepoint()` via `store.tx_overlay_snapshot(tx_id)`; restore it in `rollback_to_savepoint()` via `store.tx_overlay_restore(tx_id, gs.overlay_snapshot)`, alongside the existing `rollback_transaction_properties_to` call (which still handles labels/deletes via the undo log).
+- **Acceptance:** `CARGO_INCREMENTAL=0 cargo test --features full -p grafeo-engine --test savepoint_undo` green (all 6 pass); the isolation probes stay green; no other regression.
+
+---
+
 ## Task 6: Wrapper delegation + completeness sweep
 
 **Files:**
