@@ -211,6 +211,7 @@ impl PropertySource {
                     return Value::Null;
                 };
                 // Try node ID first, then edge ID, then map value
+                // TODO(unified-mvcc): source property read via committed get_node; a value buffered earlier in the same tx is not reflected (read-your-writes gap, deferred).
                 if let Some(node_id) = col.get_node_id(row) {
                     store
                         .get_node(node_id)

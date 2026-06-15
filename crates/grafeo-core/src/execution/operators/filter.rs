@@ -869,6 +869,7 @@ impl ExpressionPredicate {
                 let col_idx = *self.variable_columns.get(variable)?;
                 let col = chunk.column(col_idx)?;
                 let node_id = col.get_node_id(row)?;
+                // TODO(unified-mvcc): label reads use the committed node; an uncommitted label add/remove in the writing tx is not reflected (label snapshot reads deferred to increment 2).
                 let node = self.resolve_node(node_id)?;
                 // Sort labels so sets with the same members always produce
                 // the same list, regardless of internal storage order.
@@ -1812,6 +1813,7 @@ impl ExpressionPredicate {
                 if let FilterExpression::Variable(var) = &args[0] {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
+                    // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
                     if let Some(nid) = col.get_node_id(row)
                         && let Some(node) = self.resolve_node(nid)
                     {
@@ -2110,6 +2112,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 // keys(n) on a node variable: get property keys from the store
+                // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
                 if let FilterExpression::Variable(var) = &args[0] {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
@@ -2144,6 +2147,7 @@ impl ExpressionPredicate {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     if let Some(node_id) = col.get_node_id(row) {
+                        // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
                         let node = self.resolve_node(node_id)?;
                         let map: std::collections::BTreeMap<PropertyKey, Value> = node
                             .properties
@@ -2173,6 +2177,7 @@ impl ExpressionPredicate {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     if let Some(node_id) = col.get_node_id(row) {
+                        // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
                         let node = self.resolve_node(node_id)?;
                         let vals: Vec<Value> =
                             node.properties.iter().map(|(_, v)| v.clone()).collect();
