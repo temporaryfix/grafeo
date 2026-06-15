@@ -494,7 +494,46 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-## Task 4: Route transactional property writes into the delta (flips Probe 3)
+## Task 4a: Make whole-node/edge materialization (`RETURN n`) delta-aware
+
+**Why this exists (discovered during execution, not in the original plan):** `Session::with_auto_commit` wraps **every** mutation statement in an implicit transaction (`begin_transaction_inner` → run operators → `commit_inner`), so operators run with `Some(transaction_id)` even in auto-commit. Task 2 routed single-property reads (`RETURN n.k` via `PropertyAccess`) but deliberately deferred whole-entity materialization. `project.rs`'s `ProjectExpr::NodeResolve` (lines ~307-336) and `EdgeResolve` (~338-367) materialize `RETURN n` / `RETURN e` by resolving existence with `get_node_versioned(node_id, ep, tx)` and then building a map from the node's **committed** properties (`node_to_map(&n)`). Once Task 4b buffers writes, that map would NOT reflect the transaction's own buffered writes — breaking read-your-writes for the ubiquitous `CREATE (n {..}) RETURN n` and `MATCH ... SET ... RETURN n`. So whole-entity materialization must become delta-aware first. Behavior-preserving here (the delta is still empty until 4b), exactly like Task 2.
+
+**Files:**
+- Modify: `crates/grafeo-core/src/graph/lpg/store/property_ops.rs` (whole-entity accessor)
+- Modify: `crates/grafeo-core/src/graph/traits.rs` (defaulted trait methods)
+- Modify: `crates/grafeo-core/src/graph/lpg/store/graph_store_impl.rs` (`LpgStore` override)
+- Modify: `crates/grafeo-core/src/execution/operators/project.rs` (`NodeResolve`/`EdgeResolve`)
+- Test: `crates/grafeo-core/src/graph/lpg/store/tests.rs`
+
+- [ ] **Step 1: Add the whole-entity accessor (inherent on `LpgStore`)**
+
+Add `read_node_properties_visible(&self, id: NodeId, epoch: EpochId, transaction_id: Option<TransactionId>) -> FxHashMap<PropertyKey, Value>`: start from the committed property map — non-temporal `self.node_properties.get_all(id)`, temporal the at-epoch equivalent — then if `transaction_id` is `Some(tx)` and `self.tx_property_overlay` has an entry for `tx`, apply that delta's `node_props` ops for this `id` (`PropOp::Set(v)` → `insert(key, v)`, `PropOp::Remove` → `remove(key)`). Add the edge twin `read_edge_properties_visible`. (This is the whole-entity form of the per-property accessor; it is what the design's `read_node(id, snapshot) -> NodeView` calls for. Keep `#[doc(hidden)]`.)
+
+- [ ] **Step 2: Add defaulted trait methods + `LpgStore` override**
+
+On `GraphStore`: `read_node_properties_visible` / `read_edge_properties_visible` with defaults that ignore isolation and return the committed whole-property map (`self.get_nodes_properties_batch(&[id]).pop().unwrap_or_default()` or the existing whole-property read — match what `node_to_map` consumes). Override both on `LpgStore` in `graph_store_impl.rs` delegating to the inherent methods.
+
+- [ ] **Step 3: Route `NodeResolve` / `EdgeResolve`**
+
+In `project.rs`, keep the `get_node_versioned`/`get_node_at_epoch`/`get_node` call for **existence + labels**, but build the materialized map's **properties** from `store.read_node_properties_visible(node_id, snap_epoch, tx_id)` (with `snap_epoch = epoch.unwrap_or_else(|| store.current_epoch())`) rather than from the node's own committed property map. Inspect `node_to_map`/`edge_to_map`; either add a variant that takes an explicit property map, or overlay the merged properties onto the resolved node before mapping. Preserve labels/id/type exactly (labels stay from the resolved node — uncommitted label changes are out of scope for this increment). Do the same for `EdgeResolve`.
+
+- [ ] **Step 4: Sweep for any other whole-entity materialization**
+
+```bash
+grep -rn "node_to_map\|edge_to_map\|get_all(\|get_nodes_properties_batch\|get_edges_properties" crates/grafeo-core/src/execution --include="*.rs" | grep -v test
+```
+Route any other site that builds a returned node/edge's full property set through the new accessor. List any you leave and why.
+
+- [ ] **Step 5: Test + gate**
+
+Add a store-level test in `tests.rs`: buffer a `Set` and a `Remove` for a node via `set_node_property_buffered`/`remove_node_property_buffered`, then assert `read_node_properties_visible(id, epoch, Some(tx))` reflects both (changed key present with new value, removed key absent) while `read_node_properties_visible(id, epoch, None)` returns the committed map unchanged.
+Gate (behavior unchanged, delta empty for query paths): `CARGO_INCREMENTAL=0 cargo test --all-features -p grafeo-core -p grafeo-engine` — green. The isolation probes stay RED (writes not buffered yet). Commit (message ends with the `Co-Authored-By: Claude Fable 5` line).
+
+---
+
+## Task 4b: Route transactional property writes into the delta (flips Probe 3)
+
+**Depends on Task 4a:** with both single-property (`PropertyAccess`, Task 2) and whole-entity (`NodeResolve`/`EdgeResolve`, Task 4a) reads now delta-aware, flipping writes to buffered preserves read-your-writes within the writing transaction while isolating other sessions.
 
 **Files:**
 - Modify: `crates/grafeo-core/src/execution/operators/mutation.rs`
