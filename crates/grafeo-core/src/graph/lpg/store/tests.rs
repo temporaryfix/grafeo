@@ -1692,3 +1692,26 @@ fn copy_graph_self_copy_is_a_noop() {
         "self-copy must not duplicate"
     );
 }
+
+#[test]
+fn finalize_entities_by_id_scopes_to_named_entities() {
+    use grafeo_common::types::EpochId;
+    let store = LpgStore::new().unwrap();
+    let tx = TransactionId::new(2);
+    // Two nodes created by the same transaction at PENDING (invisible until finalized).
+    let n1 = store.create_node_versioned(&["A"], EpochId::new(0), tx);
+    let n2 = store.create_node_versioned(&["A"], EpochId::new(0), tx);
+    let commit_epoch = EpochId::new(5);
+
+    // Finalize only n1.
+    store.finalize_entities_by_id(tx, commit_epoch, &[n1], &[]);
+
+    assert!(
+        store.is_node_visible_at_epoch(n1, commit_epoch),
+        "finalized node must be visible at the commit epoch"
+    );
+    assert!(
+        !store.is_node_visible_at_epoch(n2, commit_epoch),
+        "an un-finalized node must remain PENDING (invisible)"
+    );
+}

@@ -191,6 +191,53 @@ impl LpgStore {
         self.sync_epoch(commit_epoch);
     }
 
+    /// Finalizes PENDING epochs for the named entities only (write-set-scoped).
+    ///
+    /// Commit-time analogue of [`discard_entities_by_id`](Self::discard_entities_by_id):
+    /// finalizes only the version chains of `node_ids`/`edge_ids` instead of
+    /// scanning every chain, turning O(all entities) commit into O(entities
+    /// written). The temporal property/label `finalize_pending` stays bulk
+    /// (per-entity property finalize is part of the Wave 2b storage restructure).
+    #[cfg(not(feature = "tiered-storage"))]
+    #[doc(hidden)]
+    pub fn finalize_entities_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+        edge_ids: &[EdgeId],
+    ) {
+        if !node_ids.is_empty() {
+            let mut nodes = self.nodes.write();
+            for &nid in node_ids {
+                if let Some(chain) = nodes.get_mut(&nid) {
+                    chain.finalize_epochs(transaction_id, commit_epoch);
+                }
+            }
+        }
+        if !edge_ids.is_empty() {
+            let mut edges = self.edges.write();
+            for &eid in edge_ids {
+                if let Some(chain) = edges.get_mut(&eid) {
+                    chain.finalize_epochs(transaction_id, commit_epoch);
+                }
+            }
+        }
+
+        // Finalize PENDING epochs in property and label version logs (bulk).
+        #[cfg(feature = "temporal")]
+        {
+            self.node_properties.finalize_pending(commit_epoch);
+            self.edge_properties.finalize_pending(commit_epoch);
+            let mut labels = self.node_labels.write();
+            for log in labels.values_mut() {
+                log.finalize_pending(commit_epoch);
+            }
+        }
+
+        self.sync_epoch(commit_epoch);
+    }
+
     /// Finalizes PENDING epochs for all versions created by a transaction.
     /// (Tiered storage version, also syncs the store epoch.)
     #[cfg(feature = "tiered-storage")]
@@ -210,6 +257,47 @@ impl LpgStore {
         }
 
         // Finalize PENDING epochs in property and label version logs
+        #[cfg(feature = "temporal")]
+        {
+            self.node_properties.finalize_pending(commit_epoch);
+            self.edge_properties.finalize_pending(commit_epoch);
+            let mut labels = self.node_labels.write();
+            for log in labels.values_mut() {
+                log.finalize_pending(commit_epoch);
+            }
+        }
+
+        self.sync_epoch(commit_epoch);
+    }
+
+    /// Finalizes PENDING epochs for the named entities only (write-set-scoped).
+    /// (Tiered storage version.)
+    #[cfg(feature = "tiered-storage")]
+    #[doc(hidden)]
+    pub fn finalize_entities_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+        edge_ids: &[EdgeId],
+    ) {
+        if !node_ids.is_empty() {
+            let mut versions = self.node_versions.write();
+            for &nid in node_ids {
+                if let Some(index) = versions.get_mut(&nid) {
+                    index.finalize_epochs(transaction_id, commit_epoch);
+                }
+            }
+        }
+        if !edge_ids.is_empty() {
+            let mut versions = self.edge_versions.write();
+            for &eid in edge_ids {
+                if let Some(index) = versions.get_mut(&eid) {
+                    index.finalize_epochs(transaction_id, commit_epoch);
+                }
+            }
+        }
+
         #[cfg(feature = "temporal")]
         {
             self.node_properties.finalize_pending(commit_epoch);
