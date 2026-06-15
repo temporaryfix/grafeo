@@ -1405,7 +1405,10 @@ impl super::GrafeoDB {
     /// Returns an error if any `node_ids` entry does not exist in
     /// `self`, or if copy operations fail.
     pub fn extract_subgraph(&self, node_ids: &[NodeId]) -> Result<Self> {
-        let store = self.lpg_store();
+        // Tier-merged read view: after compact() the base-tier nodes/edges are
+        // invisible to lpg_store() (overlay only), which made base nodes error
+        // as "does not exist" and dropped promoted nodes' base edges.
+        let store = self.read_graph_view();
 
         // Dedup the request set — caller convenience; duplicates here
         // would otherwise cause `create_node_with_id` to error on the
@@ -1438,9 +1441,21 @@ impl super::GrafeoDB {
 
             #[cfg(feature = "temporal")]
             {
-                for (key, entries) in store.node_property_history(id) {
-                    for (epoch, value) in entries {
-                        target_store.set_node_property_at_epoch(id, key.as_str(), value, epoch);
+                // Per-property history is retained only by the mutable LpgStore
+                // tier; the compacted columnar base has flattened to current
+                // values. Copy full history when the entity still has it
+                // (un-compacted, or promoted into the overlay), else the
+                // merged-view current values so base nodes keep their data.
+                let history = self.lpg_store().node_property_history(id);
+                if history.is_empty() {
+                    for (key, value) in node.properties {
+                        target_store.set_node_property(id, key.as_str(), value);
+                    }
+                } else {
+                    for (key, entries) in history {
+                        for (epoch, value) in entries {
+                            target_store.set_node_property_at_epoch(id, key.as_str(), value, epoch);
+                        }
                     }
                 }
             }
@@ -1489,14 +1504,23 @@ impl super::GrafeoDB {
 
                 #[cfg(feature = "temporal")]
                 {
-                    for (key, entries) in store.edge_property_history(edge.id) {
-                        for (epoch, value) in entries {
-                            target_store.set_edge_property_at_epoch(
-                                edge.id,
-                                key.as_str(),
-                                value,
-                                epoch,
-                            );
+                    // See the node branch above: history lives in the mutable
+                    // tier; fall back to current values for flattened base edges.
+                    let history = self.lpg_store().edge_property_history(edge.id);
+                    if history.is_empty() {
+                        for (key, value) in edge.properties {
+                            target_store.set_edge_property(edge.id, key.as_str(), value);
+                        }
+                    } else {
+                        for (key, entries) in history {
+                            for (epoch, value) in entries {
+                                target_store.set_edge_property_at_epoch(
+                                    edge.id,
+                                    key.as_str(),
+                                    value,
+                                    epoch,
+                                );
+                            }
                         }
                     }
                 }
@@ -1530,7 +1554,8 @@ impl super::GrafeoDB {
 
         // Carry index metadata. Index *data* is rebuilt over the
         // populated nodes/edges by `restore_indexes_from_snapshot`.
-        let indexes = collect_index_metadata(store);
+        // Index definitions live on the concrete store, not the merged view.
+        let indexes = collect_index_metadata(self.lpg_store());
         restore_indexes_from_snapshot(&target, &indexes);
 
         Ok(target)
@@ -1552,7 +1577,9 @@ impl super::GrafeoDB {
     /// carried edge are always in-set by `extract_subgraph`'s
     /// source-side ownership contract.
     pub fn remove_orphan_edges(&self) -> usize {
-        let store = self.lpg_store();
+        // Tier-merged read view so a base-tier dst node post-compact is not
+        // mistaken for a missing node (which would delete a valid edge).
+        let store = self.read_graph_view();
 
         // Two-pass: collect orphan EdgeIds first, then delete. Walking
         // the edge iterator and mutating the store mid-iteration would

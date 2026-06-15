@@ -210,6 +210,28 @@ impl GrafeoDB {
         )
     }
 
+    /// Returns the active **read** graph view, tier-merged.
+    ///
+    /// After [`compact()`](Self::compact) this is the `LayeredStore`
+    /// (columnar base + overlay); otherwise the built-in `LpgStore`. Use this
+    /// for whole-graph reads that must see both tiers (`extract_subgraph`,
+    /// `remove_orphan_edges`) — `lpg_store()` alone is overlay-only
+    /// post-compact, so base-tier nodes/edges are invisible to it.
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
+    fn read_graph_view(&self) -> &dyn grafeo_core::graph::GraphStore {
+        if let Some(ref layered) = self.layered_store {
+            &**layered
+        } else {
+            &**self.lpg_store()
+        }
+    }
+
+    /// Non-compact builds: the read view is always the built-in store.
+    #[cfg(all(not(feature = "compact-store"), feature = "lpg"))]
+    fn read_graph_view(&self) -> &dyn grafeo_core::graph::GraphStore {
+        &**self.lpg_store()
+    }
+
     /// Returns a borrowed reference to the active graph store.
     ///
     /// In layered mode (after [`compact()`](Self::compact)), returns the
