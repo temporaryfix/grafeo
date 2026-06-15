@@ -1796,22 +1796,17 @@ impl super::GrafeoDB {
     /// into one database:
     /// - Nodes and edges are preserved with their producer-allocated IDs.
     /// - A NodeId (or EdgeId) appearing in two snapshots is rejected as a
-    ///   producer bug; the caller is responsible for emitting disjoint
-    ///   subsets. (Cross-snapshot dedup validation is not yet enforced;
-    ///   see Task 5 of the open_multi plan.)
-    /// - Every edge endpoint must exist somewhere in the union, so a chunk
-    ///   may carry edges whose endpoints belong to a different chunk.
-    ///   (Endpoint resolution across the union is not yet enforced; see
-    ///   Task 5–7 of the open_multi plan.)
-    /// - All snapshots must declare the same schema (after canonical
-    ///   ordering). Differing schemas are rejected. (Schema-equality
-    ///   check is not yet enforced; see Task 10 of the open_multi plan.)
-    /// - Indexes are unioned; the epoch is the maximum across inputs.
-    ///   (Currently restored from the first snapshot only; index union
-    ///   lands in Task 12 of the open_multi plan.)
+    ///   producer bug; the caller must emit disjoint subsets.
+    /// - Every edge endpoint must exist somewhere in the union; a chunk may
+    ///   carry edges whose endpoints belong to a different chunk.
+    /// - Schema catalogs are reconciled per
+    ///   [`OpenMultiOptions::schema_policy`] (default
+    ///   [`SchemaMergePolicy::UnionWithConflictCheck`]): same-named types
+    ///   must match; incompatible definitions are rejected.
+    /// - Indexes are unioned across snapshots; a conflicting configuration
+    ///   for the same `(label, property)` is rejected. The epoch is the
+    ///   maximum across inputs.
     /// - At most one snapshot may carry named graphs or RDF triples.
-    ///   (Currently rejected outright; full single-owner policy lands in
-    ///   Task 11 of the open_multi plan.)
     ///
     /// All validation runs before any data is inserted; a rejection
     /// leaves no partial database behind (the function never publishes
@@ -1841,12 +1836,8 @@ impl super::GrafeoDB {
     ///
     /// # Errors
     ///
-    /// Same conditions as [`open_multi`](Self::open_multi).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `snapshots` is empty (validated immediately before any
-    /// database is touched, so the panic message is actionable).
+    /// Returns an error if `snapshots` is empty, in addition to the
+    /// conditions listed on [`open_multi`](Self::open_multi).
     pub fn open_multi_with<I, B>(snapshots: I, options: OpenMultiOptions) -> Result<Self>
     where
         I: IntoIterator<Item = B>,
