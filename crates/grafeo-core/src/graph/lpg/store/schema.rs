@@ -4,7 +4,7 @@ use super::{LpgStore, PropertyUndoEntry};
 #[cfg(feature = "temporal")]
 use grafeo_common::types::EpochId;
 use grafeo_common::types::{NodeId, TransactionId};
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 
 impl LpgStore {
     /// Adds a label to a node.
@@ -552,5 +552,70 @@ impl LpgStore {
             });
 
         true
+    }
+
+    /// Looks up the numeric label id for a given name.
+    ///
+    /// Returns `None` if the label has never been interned.  Use this to
+    /// check membership without creating a new registry entry.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn label_id(&self, name: &str) -> Option<u32> {
+        self.label_registry.read().get_id(name)
+    }
+
+    /// Snapshot-consistent node label set: committed labels merged with the
+    /// writing transaction's buffered label ops.
+    ///
+    /// With `transaction_id = Some(tx)` the writer's buffered `Add` ops are
+    /// inserted and buffered `Remove` ops are deleted before returning.  With
+    /// `transaction_id = None` (another session or auto-commit) only the
+    /// committed set is returned.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: grafeo_common::types::EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashSet<u32> {
+        // Committed base.
+        #[cfg(not(feature = "temporal"))]
+        let mut labels: FxHashSet<u32> = self
+            .node_labels
+            .read()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        #[cfg(feature = "temporal")]
+        let mut labels: FxHashSet<u32> = self
+            .node_labels
+            .read()
+            .get(&id)
+            .and_then(|log| log.at(epoch).cloned())
+            .unwrap_or_default();
+        // Suppress the unused-variable warning for `epoch` under non-temporal.
+        #[cfg(not(feature = "temporal"))]
+        let _ = epoch;
+
+        // Merge the writing transaction's buffered label delta.
+        if let Some(tx) = transaction_id {
+            let overlay = self.tx_property_overlay.read();
+            if let Some(delta) = overlay.get(&tx) {
+                for ((nid, label_id), op) in &delta.node_labels {
+                    if *nid == id {
+                        match op {
+                            super::LabelOp::Add => {
+                                labels.insert(*label_id);
+                            }
+                            super::LabelOp::Remove => {
+                                labels.remove(label_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        labels
     }
 }

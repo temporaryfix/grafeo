@@ -131,6 +131,15 @@ pub(super) enum PropOp {
     Remove,
 }
 
+/// A buffered label change for a transaction's delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LabelOp {
+    /// Add this label to the node.
+    Add,
+    /// Remove this label from the node.
+    Remove,
+}
+
 /// A transaction's uncommitted property writes — the per-transaction MVCC delta
 /// (first increment: properties only; labels and deletes follow). Read-merged
 /// over the committed column for the writing transaction's own reads; applied to
@@ -146,6 +155,8 @@ pub struct TxDelta {
     pub(super) node_props: FxHashMap<(NodeId, PropertyKey), PropOp>,
     /// Uncommitted edge property writes, keyed by (edge, property).
     pub(super) edge_props: FxHashMap<(EdgeId, PropertyKey), PropOp>,
+    /// Uncommitted node label changes, keyed by (node, label_id).
+    pub(super) node_labels: FxHashMap<(NodeId, u32), LabelOp>,
 }
 
 /// Compares two values for ordering (used for range checks).

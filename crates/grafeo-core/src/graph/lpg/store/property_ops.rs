@@ -1132,6 +1132,37 @@ impl LpgStore {
         }
     }
 
+    /// Buffers an uncommitted label add into the transaction's delta.
+    ///
+    /// Uses the same `get_or_create_label_id` path as `add_label` so the
+    /// buffered `u32` id agrees with `label_index` / `node_labels`.
+    #[doc(hidden)]
+    pub fn add_label_buffered(&self, id: NodeId, label: &str, transaction_id: TransactionId) {
+        let label_id = self.get_or_create_label_id(label);
+        self.tx_property_overlay
+            .write()
+            .entry(transaction_id)
+            .or_default()
+            .node_labels
+            .insert((id, label_id), super::LabelOp::Add);
+    }
+
+    /// Buffers an uncommitted label remove into the transaction's delta.
+    ///
+    /// If the label name is not yet in the registry (has never been used) the
+    /// remove is a no-op: there is nothing to remove.
+    #[doc(hidden)]
+    pub fn remove_label_buffered(&self, id: NodeId, label: &str, transaction_id: TransactionId) {
+        if let Some(label_id) = self.label_registry.read().get_id(label) {
+            self.tx_property_overlay
+                .write()
+                .entry(transaction_id)
+                .or_default()
+                .node_labels
+                .insert((id, label_id), super::LabelOp::Remove);
+        }
+    }
+
     /// Applies a transaction's buffered property delta to the committed column
     /// (commit), then drops the delta.
     #[doc(hidden)]
@@ -1151,6 +1182,21 @@ impl LpgStore {
                     super::PropOp::Set(v) => self.set_edge_property(id, key.as_str(), v),
                     super::PropOp::Remove => {
                         self.remove_edge_property(id, key.as_str());
+                    }
+                }
+            }
+            // Promote buffered label ops through the normal committed paths so
+            // that both `node_labels` and `label_index` update consistently.
+            for ((id, label_id), op) in delta.node_labels {
+                let label_name = self.label_registry.read().get_name(label_id).cloned();
+                if let Some(name) = label_name {
+                    match op {
+                        super::LabelOp::Add => {
+                            self.add_label(id, name.as_str());
+                        }
+                        super::LabelOp::Remove => {
+                            self.remove_label(id, name.as_str());
+                        }
                     }
                 }
             }
@@ -1184,7 +1230,10 @@ impl LpgStore {
     #[doc(hidden)]
     pub fn tx_overlay_restore(&self, transaction_id: TransactionId, snapshot: super::TxDelta) {
         let mut overlay = self.tx_property_overlay.write();
-        if snapshot.node_props.is_empty() && snapshot.edge_props.is_empty() {
+        if snapshot.node_props.is_empty()
+            && snapshot.edge_props.is_empty()
+            && snapshot.node_labels.is_empty()
+        {
             overlay.remove(&transaction_id);
         } else {
             overlay.insert(transaction_id, snapshot);

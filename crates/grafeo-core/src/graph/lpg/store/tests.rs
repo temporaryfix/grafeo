@@ -1845,3 +1845,44 @@ fn whole_entity_accessor_merges_delta_for_writer() {
         Some(&Value::Int64(3))
     );
 }
+
+#[test]
+fn label_delta_isolates_buffered_label_ops() {
+    let store = LpgStore::new().unwrap();
+    let n = store.create_node(&["Person"]);
+    let tx = TransactionId::new(7);
+    let person_id = store.label_id("Person").unwrap();
+
+    // Buffer add :Secret and remove :Person for tx.
+    store.add_label_buffered(n, "Secret", tx);
+    store.remove_label_buffered(n, "Person", tx);
+
+    let secret_id = store.label_id("Secret").unwrap();
+    let writer_view =
+        store.read_node_labels_visible(n, grafeo_common::types::EpochId::new(0), Some(tx));
+    assert!(writer_view.contains(&secret_id), "writer sees buffered add");
+    assert!(
+        !writer_view.contains(&person_id),
+        "writer sees buffered remove"
+    );
+
+    // Other readers (None) see committed labels unchanged.
+    let committed_view =
+        store.read_node_labels_visible(n, grafeo_common::types::EpochId::new(0), None);
+    assert!(
+        committed_view.contains(&person_id),
+        "others see committed :Person"
+    );
+    assert!(
+        !committed_view.contains(&secret_id),
+        "others do NOT see uncommitted :Secret"
+    );
+
+    // Apply promotes.
+    store.apply_tx_overlay(tx);
+    let after = store.read_node_labels_visible(n, grafeo_common::types::EpochId::new(0), None);
+    assert!(
+        after.contains(&secret_id) && !after.contains(&person_id),
+        "commit applied label ops"
+    );
+}
