@@ -1715,3 +1715,45 @@ fn finalize_entities_by_id_scopes_to_named_entities() {
         "an un-finalized node must remain PENDING (invisible)"
     );
 }
+
+#[test]
+fn tx_property_overlay_isolates_uncommitted_writes() {
+    use grafeo_common::types::PropertyKey;
+    let store = LpgStore::new().unwrap();
+    let n = store.create_node(&["P"]);
+    store.set_node_property(n, "age", Value::from(30i64)); // committed
+    let tx = TransactionId::new(2);
+    let key = PropertyKey::new("age");
+    let epoch = store.current_epoch();
+
+    // Uncommitted write goes to the transaction's delta, not the committed column.
+    store.set_node_property_buffered(n, "age", Value::from(99i64), tx);
+
+    // The writing transaction sees its own uncommitted value (read-your-writes).
+    assert_eq!(
+        store.read_node_property_visible(n, &key, epoch, Some(tx)),
+        Some(Value::Int64(99))
+    );
+    // Any other reader (no transaction) sees only the committed value (no dirty read).
+    assert_eq!(
+        store.read_node_property_visible(n, &key, epoch, None),
+        Some(Value::Int64(30))
+    );
+    // The committed column is untouched while the write is buffered.
+    assert_eq!(store.get_node_property(n, &key), Some(Value::Int64(30)));
+
+    // Apply (commit) promotes the value to the committed column.
+    store.apply_tx_overlay(tx);
+    assert_eq!(store.get_node_property(n, &key), Some(Value::Int64(99)));
+
+    // A buffered remove tombstones for own-reads; drop (rollback) discards it.
+    let tx2 = TransactionId::new(3);
+    store.remove_node_property_buffered(n, "age", tx2);
+    assert_eq!(store.read_node_property_visible(n, &key, epoch, Some(tx2)), None);
+    assert_eq!(
+        store.read_node_property_visible(n, &key, epoch, None),
+        Some(Value::Int64(99))
+    );
+    store.drop_tx_overlay(tx2);
+    assert_eq!(store.get_node_property(n, &key), Some(Value::Int64(99)));
+}

@@ -985,4 +985,165 @@ impl LpgStore {
     pub fn node_properties_mark_spilled(&self, key: &PropertyKey) {
         self.node_properties.mark_column_spilled(key);
     }
+
+    // === Unified-MVCC first increment: per-transaction property delta ===
+    //
+    // Uncommitted property writes are buffered into a transaction's delta instead
+    // of write-through to the committed column, and merged over it by the
+    // snapshot-aware read accessor. This is the "hot tier / one read accessor"
+    // foundation of the unified MVCC design. These methods are additive: the
+    // existing write-through/undo-log path is unchanged until callers are routed
+    // through the accessor in a later increment.
+
+    /// Buffers an uncommitted node property write into the transaction's delta.
+    #[doc(hidden)]
+    pub fn set_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.tx_property_overlay
+            .write()
+            .entry(transaction_id)
+            .or_default()
+            .node_props
+            .insert((id, PropertyKey::new(key)), super::PropOp::Set(value));
+    }
+
+    /// Buffers an uncommitted node property removal (tombstone) into the delta.
+    #[doc(hidden)]
+    pub fn remove_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        transaction_id: TransactionId,
+    ) {
+        self.tx_property_overlay
+            .write()
+            .entry(transaction_id)
+            .or_default()
+            .node_props
+            .insert((id, PropertyKey::new(key)), super::PropOp::Remove);
+    }
+
+    /// Buffers an uncommitted edge property write into the transaction's delta.
+    #[doc(hidden)]
+    pub fn set_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.tx_property_overlay
+            .write()
+            .entry(transaction_id)
+            .or_default()
+            .edge_props
+            .insert((id, PropertyKey::new(key)), super::PropOp::Set(value));
+    }
+
+    /// Snapshot-consistent node property read (the unified-MVCC read accessor).
+    ///
+    /// For the writing transaction the delta wins (read-your-writes): a buffered
+    /// `Set` returns the value, a buffered `Remove` returns `None`. For everyone
+    /// else (`transaction_id == None` — another session or auto-commit) it reads
+    /// the committed column exactly as before, so uncommitted writes are never
+    /// visible (no dirty reads).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: grafeo_common::types::EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        if let Some(tx) = transaction_id {
+            let overlay = self.tx_property_overlay.read();
+            if let Some(delta) = overlay.get(&tx)
+                && let Some(op) = delta.node_props.get(&(id, key.clone()))
+            {
+                return match op {
+                    super::PropOp::Set(v) => Some(v.clone()),
+                    super::PropOp::Remove => None,
+                };
+            }
+        }
+        #[cfg(not(feature = "temporal"))]
+        {
+            let _ = epoch;
+            self.node_properties.get(id, key)
+        }
+        #[cfg(feature = "temporal")]
+        {
+            self.node_properties.get_at(id, key, epoch)
+        }
+    }
+
+    /// Snapshot-consistent edge property read. See
+    /// [`read_node_property_visible`](Self::read_node_property_visible).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: grafeo_common::types::EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        if let Some(tx) = transaction_id {
+            let overlay = self.tx_property_overlay.read();
+            if let Some(delta) = overlay.get(&tx)
+                && let Some(op) = delta.edge_props.get(&(id, key.clone()))
+            {
+                return match op {
+                    super::PropOp::Set(v) => Some(v.clone()),
+                    super::PropOp::Remove => None,
+                };
+            }
+        }
+        #[cfg(not(feature = "temporal"))]
+        {
+            let _ = epoch;
+            self.edge_properties.get(id, key)
+        }
+        #[cfg(feature = "temporal")]
+        {
+            self.edge_properties.get_at(id, key, epoch)
+        }
+    }
+
+    /// Applies a transaction's buffered property delta to the committed column
+    /// (commit), then drops the delta.
+    #[doc(hidden)]
+    pub fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        let delta = self.tx_property_overlay.write().remove(&transaction_id);
+        if let Some(delta) = delta {
+            for ((id, key), op) in delta.node_props {
+                match op {
+                    super::PropOp::Set(v) => self.set_node_property(id, key.as_str(), v),
+                    super::PropOp::Remove => {
+                        self.remove_node_property(id, key.as_str());
+                    }
+                }
+            }
+            for ((id, key), op) in delta.edge_props {
+                match op {
+                    super::PropOp::Set(v) => self.set_edge_property(id, key.as_str(), v),
+                    super::PropOp::Remove => {
+                        self.remove_edge_property(id, key.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops a transaction's buffered property delta (rollback) without applying.
+    #[doc(hidden)]
+    pub fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        self.tx_property_overlay.write().remove(&transaction_id);
+    }
 }

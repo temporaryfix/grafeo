@@ -118,6 +118,31 @@ pub enum PropertyUndoEntry {
     },
 }
 
+/// A single buffered (uncommitted) property mutation in a transaction's overlay.
+///
+/// Part of the unified-MVCC first increment: uncommitted property writes are
+/// recorded here (the "hot delta") instead of write-through to the committed
+/// column, and merged over it by [`LpgStore::read_node_property_visible`].
+#[derive(Debug, Clone)]
+pub(super) enum PropOp {
+    /// Set the property to a value.
+    Set(Value),
+    /// Remove the property (tombstone — hides the committed value for own-reads).
+    Remove,
+}
+
+/// A transaction's uncommitted property writes — the per-transaction MVCC delta
+/// (first increment: properties only; labels and deletes follow). Read-merged
+/// over the committed column for the writing transaction's own reads; applied to
+/// the committed column on commit; dropped on rollback.
+#[derive(Debug, Default)]
+pub(super) struct TxDelta {
+    /// Uncommitted node property writes, keyed by (node, property).
+    pub(super) node_props: FxHashMap<(NodeId, PropertyKey), PropOp>,
+    /// Uncommitted edge property writes, keyed by (edge, property).
+    pub(super) edge_props: FxHashMap<(EdgeId, PropertyKey), PropOp>,
+}
+
 /// Compares two values for ordering (used for range checks).
 pub(super) fn compare_values_for_range(a: &Value, b: &Value) -> Option<CmpOrdering> {
     match (a, b) {
@@ -476,6 +501,13 @@ pub struct LpgStore {
     /// operator-level write tracking which MERGE/LOAD DATA bypass. Cleared when the
     /// transaction commits or rolls back.
     pending_tx_creates: RwLock<FxHashMap<TransactionId, (Vec<NodeId>, Vec<EdgeId>)>>,
+
+    /// Per-transaction uncommitted property delta (the "hot tier" of the unified
+    /// MVCC model, first increment). Uncommitted property writes land here and are
+    /// merged over the committed column for the writing transaction's own reads;
+    /// applied to the committed column on commit, dropped on rollback. Other
+    /// sessions never see it. Lock order: after `pending_tx_creates`.
+    tx_property_overlay: RwLock<FxHashMap<TransactionId, TxDelta>>,
 }
 
 impl LpgStore {
@@ -540,6 +572,7 @@ impl LpgStore {
             named_graphs: RwLock::new(FxHashMap::default()),
             property_undo_log: RwLock::new(FxHashMap::default()),
             pending_tx_creates: RwLock::new(FxHashMap::default()),
+            tx_property_overlay: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -654,6 +687,7 @@ impl LpgStore {
         // Level 5: Undo log
         self.property_undo_log.write().clear();
         self.pending_tx_creates.write().clear();
+        self.tx_property_overlay.write().clear();
     }
 
     /// Returns whether backward adjacency (incoming edge index) is available.
