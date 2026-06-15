@@ -82,6 +82,24 @@ impl GraphStore for LpgStore {
         LpgStore::read_edge_property_visible(self, id, key, epoch, transaction_id)
     }
 
+    fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        LpgStore::read_node_properties_visible(self, id, epoch, transaction_id)
+    }
+
+    fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        LpgStore::read_edge_properties_visible(self, id, epoch, transaction_id)
+    }
+
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
         LpgStore::get_node_property_batch(self, ids, key)
     }

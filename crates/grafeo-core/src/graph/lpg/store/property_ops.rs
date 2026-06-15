@@ -1162,4 +1162,94 @@ impl LpgStore {
     pub fn drop_tx_overlay(&self, transaction_id: TransactionId) {
         self.tx_property_overlay.write().remove(&transaction_id);
     }
+
+    /// Snapshot-consistent whole-node property map (whole-entity MVCC accessor).
+    ///
+    /// Returns all committed properties for `id`, then overlays the writing
+    /// transaction's buffered delta for this node (`PropOp::Set` → insert,
+    /// `PropOp::Remove` → remove).  When `transaction_id` is `None` (another
+    /// session or auto-commit) the delta is never consulted, so the returned map
+    /// is byte-for-byte what `node_properties.get_all(id)` returns today.
+    ///
+    /// This is the whole-entity form of [`read_node_property_visible`](Self::read_node_property_visible)
+    /// used by `RETURN n` / `NodeResolve` materialization so that a writing
+    /// transaction sees its own buffered writes in the materialized map.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: grafeo_common::types::EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        // Start from the committed whole-property map.
+        #[cfg(not(feature = "temporal"))]
+        let mut props = {
+            let _ = epoch;
+            self.node_properties.get_all(id)
+        };
+        #[cfg(feature = "temporal")]
+        let mut props = self.node_properties.get_all_at(id, epoch);
+
+        // Overlay the writing transaction's buffered delta for this node.
+        if let Some(tx) = transaction_id {
+            let overlay = self.tx_property_overlay.read();
+            if let Some(delta) = overlay.get(&tx) {
+                for ((node_id, key), op) in &delta.node_props {
+                    if *node_id == id {
+                        match op {
+                            super::PropOp::Set(v) => {
+                                props.insert(key.clone(), v.clone());
+                            }
+                            super::PropOp::Remove => {
+                                props.remove(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        props
+    }
+
+    /// Snapshot-consistent whole-edge property map (whole-entity MVCC accessor).
+    ///
+    /// Edge twin of [`read_node_properties_visible`](Self::read_node_properties_visible).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: grafeo_common::types::EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        // Start from the committed whole-property map.
+        #[cfg(not(feature = "temporal"))]
+        let mut props = {
+            let _ = epoch;
+            self.edge_properties.get_all(id)
+        };
+        #[cfg(feature = "temporal")]
+        let mut props = self.edge_properties.get_all_at(id, epoch);
+
+        // Overlay the writing transaction's buffered delta for this edge.
+        if let Some(tx) = transaction_id {
+            let overlay = self.tx_property_overlay.read();
+            if let Some(delta) = overlay.get(&tx) {
+                for ((edge_id, key), op) in &delta.edge_props {
+                    if *edge_id == id {
+                        match op {
+                            super::PropOp::Set(v) => {
+                                props.insert(key.clone(), v.clone());
+                            }
+                            super::PropOp::Remove => {
+                                props.remove(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        props
+    }
 }

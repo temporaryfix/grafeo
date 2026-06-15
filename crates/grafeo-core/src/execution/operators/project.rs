@@ -6,6 +6,7 @@ use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
 use crate::graph::lpg::{Edge, Node};
 use grafeo_common::types::{EpochId, LogicalType, PropertyKey, TransactionId, Value};
+use grafeo_common::utils::hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -321,6 +322,8 @@ impl Operator for ProjectOperator {
                     let tx_id = self.transaction_id;
                     for row in input.selected_indices() {
                         let value = if let Some(node_id) = input_col.get_node_id(row) {
+                            let snap_epoch = epoch.unwrap_or_else(|| store.current_epoch());
+                            // Resolve existence + labels from the committed version chain.
                             let node = if let (Some(ep), Some(tx)) = (epoch, tx_id) {
                                 store.get_node_versioned(node_id, ep, tx)
                             } else if let Some(ep) = epoch {
@@ -328,7 +331,16 @@ impl Operator for ProjectOperator {
                             } else {
                                 store.get_node(node_id)
                             };
-                            node.map_or(Value::Null, |n| node_to_map(&n))
+                            // Build properties from the delta-aware accessor so that
+                            // a writing transaction sees its own buffered writes
+                            // (read-your-writes for RETURN n). When the delta is empty
+                            // this returns exactly the committed property map — behavior
+                            // is preserved until Task 4b buffers writes.
+                            node.map_or(Value::Null, |n| {
+                                let props =
+                                    store.read_node_properties_visible(node_id, snap_epoch, tx_id);
+                                node_to_map_with_properties(&n, props)
+                            })
                         } else {
                             Value::Null
                         };
@@ -352,6 +364,8 @@ impl Operator for ProjectOperator {
                     let tx_id = self.transaction_id;
                     for row in input.selected_indices() {
                         let value = if let Some(edge_id) = input_col.get_edge_id(row) {
+                            let snap_epoch = epoch.unwrap_or_else(|| store.current_epoch());
+                            // Resolve existence + type from the committed version chain.
                             let edge = if let (Some(ep), Some(tx)) = (epoch, tx_id) {
                                 store.get_edge_versioned(edge_id, ep, tx)
                             } else if let Some(ep) = epoch {
@@ -359,7 +373,12 @@ impl Operator for ProjectOperator {
                             } else {
                                 store.get_edge(edge_id)
                             };
-                            edge.map_or(Value::Null, |e| edge_to_map(&e))
+                            // Build properties from the delta-aware accessor.
+                            edge.map_or(Value::Null, |e| {
+                                let props =
+                                    store.read_edge_properties_visible(edge_id, snap_epoch, tx_id);
+                                edge_to_map_with_properties(&e, props)
+                            })
                         } else {
                             Value::Null
                         };
@@ -410,9 +429,14 @@ impl Operator for ProjectOperator {
 
 /// Converts a [`Node`] to a `Value::Map` with metadata and properties.
 ///
-/// The map contains `_id` (integer), `_labels` (list of strings), and
-/// all node properties at the top level.
-fn node_to_map(node: &Node) -> Value {
+/// Builds a `Value::Map` for a node using a supplied (snapshot-merged) property
+/// map instead of the node's own committed `properties` field.
+///
+/// Preserves `_id` and `_labels` from the resolved `node` (which carries the
+/// correct committed labels), but uses `props` for the property key/value pairs.
+/// This is the delta-aware companion to `node_to_map` used by `NodeResolve`
+/// so that `RETURN n` reflects a writing transaction's buffered property writes.
+fn node_to_map_with_properties(node: &Node, props: FxHashMap<PropertyKey, Value>) -> Value {
     let mut map = BTreeMap::new();
     // reason: entity IDs stored as i64, standard encoding
     #[allow(clippy::cast_possible_wrap)]
@@ -424,17 +448,17 @@ fn node_to_map(node: &Node) -> Value {
         .map(|l| Value::String(l.clone()))
         .collect();
     map.insert(PropertyKey::new("_labels"), Value::List(labels.into()));
-    for (key, value) in &node.properties {
-        map.insert(key.clone(), value.clone());
+    for (key, value) in props {
+        map.insert(key, value);
     }
     Value::Map(Arc::new(map))
 }
 
-/// Converts an [`Edge`] to a `Value::Map` with metadata and properties.
+/// Builds a `Value::Map` for an edge using a supplied (snapshot-merged) property
+/// map instead of the edge's own committed `properties` field.
 ///
-/// The map contains `_id`, `_type`, `_source`, `_target`, and all edge
-/// properties at the top level.
-fn edge_to_map(edge: &Edge) -> Value {
+/// Edge twin of [`node_to_map_with_properties`].
+fn edge_to_map_with_properties(edge: &Edge, props: FxHashMap<PropertyKey, Value>) -> Value {
     let mut map = BTreeMap::new();
     // reason: entity IDs stored as i64, standard encoding
     #[allow(clippy::cast_possible_wrap)]
@@ -452,8 +476,8 @@ fn edge_to_map(edge: &Edge) -> Value {
     );
     map.insert(PropertyKey::new("_source"), Value::Int64(src_id_i64));
     map.insert(PropertyKey::new("_target"), Value::Int64(dst_id_i64));
-    for (key, value) in &edge.properties {
-        map.insert(key.clone(), value.clone());
+    for (key, value) in props {
+        map.insert(key, value);
     }
     Value::Map(Arc::new(map))
 }

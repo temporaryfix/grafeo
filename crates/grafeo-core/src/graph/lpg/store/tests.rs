@@ -1797,3 +1797,51 @@ fn trait_accessor_isolates_buffered_writes() {
         Some(Value::Int64(99))
     );
 }
+
+#[test]
+fn whole_entity_accessor_merges_delta_for_writer() {
+    use grafeo_common::types::{PropertyKey, TransactionId};
+
+    let store = LpgStore::new().unwrap();
+    let n = store.create_node(&["Thing"]);
+    store.set_node_property(n, "keep", Value::Int64(1));
+    store.set_node_property(n, "change", Value::Int64(2));
+    store.set_node_property(n, "remove_me", Value::Int64(3));
+
+    let tx = TransactionId::new(42);
+    let epoch = store.current_epoch();
+
+    // Buffer: change one key, remove another.
+    store.set_node_property_buffered(n, "change", Value::Int64(99), tx);
+    store.remove_node_property_buffered(n, "remove_me", tx);
+
+    // Writer sees merged map: keep=1, change=99; remove_me absent.
+    let writer_map = store.read_node_properties_visible(n, epoch, Some(tx));
+    assert_eq!(
+        writer_map.get(&PropertyKey::new("keep")),
+        Some(&Value::Int64(1))
+    );
+    assert_eq!(
+        writer_map.get(&PropertyKey::new("change")),
+        Some(&Value::Int64(99))
+    );
+    assert!(
+        !writer_map.contains_key(&PropertyKey::new("remove_me")),
+        "remove_me must be absent for writer"
+    );
+
+    // Reader (tx=None) sees committed map: keep=1, change=2, remove_me=3.
+    let reader_map = store.read_node_properties_visible(n, epoch, None);
+    assert_eq!(
+        reader_map.get(&PropertyKey::new("keep")),
+        Some(&Value::Int64(1))
+    );
+    assert_eq!(
+        reader_map.get(&PropertyKey::new("change")),
+        Some(&Value::Int64(2))
+    );
+    assert_eq!(
+        reader_map.get(&PropertyKey::new("remove_me")),
+        Some(&Value::Int64(3))
+    );
+}

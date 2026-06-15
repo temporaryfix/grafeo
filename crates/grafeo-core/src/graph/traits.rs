@@ -112,6 +112,42 @@ pub trait GraphStore: Send + Sync {
         self.get_edge_property(id, key)
     }
 
+    /// Snapshot-consistent whole-node property map (whole-entity MVCC accessor).
+    ///
+    /// Default: ignores isolation and returns the committed whole-property map —
+    /// safe for stores without a per-transaction delta. `LpgStore` overrides this
+    /// to merge its buffered delta for the writing transaction, so `RETURN n`
+    /// reflects buffered writes (read-your-writes for whole-entity projections).
+    fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        let _ = (epoch, transaction_id);
+        self.get_nodes_properties_batch(&[id])
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot-consistent whole-edge property map. See [`read_node_properties_visible`](Self::read_node_properties_visible).
+    fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        let _ = (epoch, transaction_id);
+        self.get_edge(id)
+            .map(|e| {
+                e.properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Gets a property for multiple nodes in a single batch operation.
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>>;
 
