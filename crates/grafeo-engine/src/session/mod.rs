@@ -4011,11 +4011,16 @@ impl Session {
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
             Ok(epoch) => epoch,
             Err(e) => {
-                // Conflict detected: rollback the data changes
+                // Conflict detected: discard the transaction's uncommitted
+                // (PENDING) versions and replay its property undo log, then mark
+                // it aborted. rollback_transaction_properties alone leaks the
+                // PENDING node/edge versions; skipping abort leaves the tx Active
+                // forever, pinning min_active_epoch and stalling MVCC GC.
                 for graph_name in &touched {
                     let store = self.resolve_store(graph_name);
-                    store.rollback_transaction_properties(transaction_id);
+                    store.discard_uncommitted_versions(transaction_id);
                 }
+                let _ = self.transaction_manager.abort(transaction_id);
                 #[cfg(feature = "triple-store")]
                 self.rollback_rdf_transaction(transaction_id);
                 // Discard buffered CDC events on conflict rollback
@@ -5387,6 +5392,44 @@ mod tests {
     use super::parse_default_literal;
     use crate::database::GrafeoDB;
     use grafeo_common::types::Value;
+
+    #[test]
+    fn failed_commit_aborts_tx_and_does_not_pin_gc() {
+        // Two transactions begin at the same epoch. T1 writes+commits. T2 then
+        // writes the same entity (admitted, since T1 is no longer Active) and
+        // commits -> commit-time write-write conflict. The failed commit MUST
+        // abort the transaction; leaving it Active pins min_active_epoch and
+        // stalls MVCC GC forever.
+        let db = GrafeoDB::new_in_memory();
+        let mut s1 = db.session();
+        s1.execute("CREATE (:Acct {id: 1, bal: 100})").unwrap();
+
+        let mut s2 = db.session();
+        s1.begin_transaction().unwrap();
+        s2.begin_transaction().unwrap();
+
+        s1.execute("MATCH (a:Acct {id: 1}) SET a.bal = 50").unwrap();
+        s1.commit().unwrap();
+
+        s2.execute("MATCH (a:Acct {id: 1}) SET a.bal = 60").unwrap();
+        let r = s2.commit();
+        assert!(r.is_err(), "expected a commit-time write-write conflict");
+
+        // White-box: no zombie Active transaction left behind.
+        assert_eq!(
+            s2.transaction_manager.active_count(),
+            0,
+            "failed commit left a zombie Active transaction (GC-pinning leak)"
+        );
+
+        // Data is consistent: T1's committed value is visible exactly once.
+        let s3 = db.session();
+        let q = s3
+            .execute("MATCH (a:Acct {id: 1}) RETURN a.bal")
+            .unwrap();
+        assert_eq!(q.row_count(), 1);
+        assert_eq!(q.rows()[0][0], Value::Int64(50));
+    }
 
     // -----------------------------------------------------------------------
     // parse_default_literal
