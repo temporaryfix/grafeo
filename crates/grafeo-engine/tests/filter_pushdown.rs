@@ -470,3 +470,32 @@ fn committed_tx_nodes_visible_in_pushdown() {
     assert_eq!(result.rows().len(), 1);
     assert_eq!(result.rows()[0][0], Value::from("Frank"));
 }
+
+#[test]
+fn conjuncts_split_and_anchor_on_their_own_scans() {
+    // MATCH (a:Person),(b:City) WHERE a.name = 'Ann' AND b.name = 'Rome'
+    // The conjunction must be split so each predicate anchors on its own scan,
+    // instead of one combined AND filter sitting above a cartesian product.
+    let db = GrafeoDB::new_in_memory();
+    let s = db.session();
+    s.execute("CREATE (:Person {name: 'Ann'})").unwrap();
+    s.execute("CREATE (:Person {name: 'Bob'})").unwrap();
+    s.execute("CREATE (:City {name: 'Rome'})").unwrap();
+    s.execute("CREATE (:City {name: 'Oslo'})").unwrap();
+
+    // Correctness is unchanged: exactly one (Ann, Rome) row.
+    let r = s
+        .execute("MATCH (a:Person),(b:City) WHERE a.name = 'Ann' AND b.name = 'Rome' RETURN a.name, b.name")
+        .unwrap();
+    assert_eq!(r.row_count(), 1);
+
+    // Structure: the combined "And" filter is gone; conjuncts are split.
+    let plan = s
+        .execute("EXPLAIN MATCH (a:Person),(b:City) WHERE a.name = 'Ann' AND b.name = 'Rome' RETURN a.name, b.name")
+        .unwrap();
+    let text = format!("{:?}", plan.rows());
+    assert!(
+        !text.contains(" And "),
+        "conjuncts should be split into per-scan filters, not kept as one AND; plan:\n{text}"
+    );
+}

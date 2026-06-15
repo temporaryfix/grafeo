@@ -22,7 +22,8 @@ pub use cost::{Cost, CostModel};
 pub use join_order::{BitSet, DPccp, JoinGraph, JoinGraphBuilder, JoinPlan};
 
 use crate::query::plan::{
-    FilterOp, JoinCondition, LogicalExpression, LogicalOperator, LogicalPlan, MultiWayJoinOp,
+    BinaryOp, FilterOp, JoinCondition, LogicalExpression, LogicalOperator, LogicalPlan,
+    MultiWayJoinOp,
 };
 use grafeo_common::grafeo_debug_span;
 use grafeo_common::utils::error::Result;
@@ -909,10 +910,17 @@ impl Optimizer {
     /// as possible to reduce the amount of data processed by upper operators.
     fn push_filters_down(&self, op: LogicalOperator) -> LogicalOperator {
         match op {
-            // For Filter operators, try to push the predicate into the child
+            // For Filter operators, split the top-level AND chain into individual
+            // conjuncts and push each independently. A conjunct that can anchor on
+            // one relation no longer rides above a cartesian product just because
+            // it shares a Filter with a conjunct on another relation. Conjuncts
+            // that cannot be pushed re-stack as filters via try_push_filter_into.
             LogicalOperator::Filter(filter) => {
-                let optimized_input = self.push_filters_down(*filter.input);
-                self.try_push_filter_into(filter.predicate, optimized_input)
+                let mut current = self.push_filters_down(*filter.input);
+                for conjunct in split_conjuncts(filter.predicate) {
+                    current = self.try_push_filter_into(conjunct, current);
+                }
+                current
             }
             // Recursively optimize children for other operators
             LogicalOperator::Return(mut ret) => {
@@ -1485,6 +1493,26 @@ impl Default for Optimizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Splits a top-level conjunctive (AND-chain) predicate into individual conjuncts.
+fn split_conjuncts(expr: LogicalExpression) -> Vec<LogicalExpression> {
+    fn go(expr: LogicalExpression, out: &mut Vec<LogicalExpression>) {
+        if let LogicalExpression::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } = expr
+        {
+            go(*left, out);
+            go(*right, out);
+        } else {
+            out.push(expr);
+        }
+    }
+    let mut out = Vec::new();
+    go(expr, &mut out);
+    out
 }
 
 #[cfg(test)]
