@@ -52,6 +52,25 @@ conflict detection — see below); it is tracked for a later sub-unit.
 
 ## Design
 
+> **Revised during implementation (store-level scoping).** The
+> transaction-manager write-set described below proved **fragile** as a scoping
+> source: it is populated by operator-level `record_write`, which the **MERGE**
+> and **LOAD DATA** operators bypass entirely (they call `create_*_versioned`
+> directly). A scoped commit driven by the write-set silently dropped
+> MERGE/LOAD-DATA-created entities — caught by the `coverage_patterns` suite
+> under `--all-features`. The shipped design instead uses a **store-level
+> per-transaction pending-create index** (`LpgStore::pending_tx_creates`),
+> recorded inside `create_node_versioned`/`create_edge_versioned` — the single
+> chokepoint every PENDING chain passes through. This is **complete by
+> construction** for every creation path (query operators, MERGE, LOAD DATA,
+> session-direct APIs). Commit/rollback take the per-transaction list per touched
+> graph (`take_pending_creates`) and finalize/discard exactly those entities;
+> property/label/delete changes remain covered by the bulk temporal finalize and
+> the property undo log. `TransactionManager::record_entity` (committed as a
+> primitive) is retained but unused by this design; it remains available for the
+> separately-tracked session-direct conflict-detection gap. The sections below
+> describe the original (superseded) write-set approach for context.
+
 ### Make the write-set complete (behavior-preserving)
 
 Add `TransactionManager::record_entity(tx, entity)` — a conflict-free insert into
