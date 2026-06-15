@@ -15,6 +15,8 @@
 /// (63 zeros + 64-bit binary).
 pub(crate) const GAMMA_MAX: u64 = u64::MAX >> 1;
 
+use crate::codec::delta::{zigzag_decode, zigzag_encode};
+
 /// A growable bit-packed write buffer.
 ///
 /// Bits are appended MSB-first within each byte; a `BitReader` over the
@@ -82,15 +84,18 @@ impl BitWriter {
         self.write_bits(n, bits_needed);
     }
 
-    /// Appends `zigzag_gamma(n)`: maps `n` to non-negative, then gamma.
-    #[allow(clippy::cast_sign_loss)] // n >= 0 arm: safe reinterpret; n < 0 arm: -(n+1) >= 0
+    /// Appends `zigzag_gamma(n)`: folds `n` to non-negative via the canonical
+    /// zig-zag map, then gamma-codes `folded + 1` (gamma needs `>= 1`).
+    ///
+    /// Supported domain: `|n|` up to roughly `2^62` (bounded by `GAMMA_MAX`),
+    /// far beyond any graph's first-gap (which is bounded by the node count).
+    /// `i64::MIN` folds to `u64::MAX` and panics with a clear message rather
+    /// than silently corrupting the stream; values past `GAMMA_MAX` hit
+    /// [`Self::write_gamma`]'s own bound assertion.
     pub(crate) fn write_zigzag_gamma(&mut self, n: i64) {
-        // n >= 0 -> 2n + 1; n < 0 -> -2n. Always yields a positive u64.
-        let folded: u64 = if n >= 0 {
-            (n as u64).checked_mul(2).expect("zigzag overflow") + 1
-        } else {
-            ((-(n + 1)) as u64).checked_mul(2).expect("zigzag overflow") + 2
-        };
+        let folded = zigzag_encode(n)
+            .checked_add(1)
+            .expect("zigzag-gamma overflow: gap == i64::MIN is unreachable for in-memory graphs");
         self.write_gamma(folded);
     }
 
@@ -178,23 +183,55 @@ impl<'a> BitReader<'a> {
 
     /// Reads one zigzag-gamma-encoded signed integer.
     pub(crate) fn read_zigzag_gamma(&mut self) -> Option<i64> {
+        // read_gamma returns >= 1, so folded - 1 >= 0 is a valid zig-zag code.
         let folded = self.read_gamma()?;
-        // odd -> non-negative, even -> negative.
-        Some(if folded & 1 == 1 {
-            // reason: folded - 1 is even, half fits i64 in practice
-            #[allow(clippy::cast_possible_wrap)]
-            (((folded - 1) >> 1) as i64)
-        } else {
-            // reason: folded is even and >= 2, half fits i64
-            #[allow(clippy::cast_possible_wrap)]
-            (-((folded >> 1) as i64))
-        })
+        Some(zigzag_decode(folded - 1))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zigzag_gamma_round_trips_representable_domain() {
+        // gamma caps at GAMMA_MAX = 2^63-1, so zigzag-gamma represents roughly
+        // |n| <= 2^62-1 — far beyond any graph's first-gap (bounded by node
+        // count). Exercise the full representable range including its edges.
+        let max_repr = (1i64 << 62) - 1;
+        let cases = [
+            0i64,
+            1,
+            -1,
+            2,
+            -2,
+            1000,
+            -1000,
+            max_repr,
+            -max_repr,
+            i32::MIN as i64,
+            i32::MAX as i64,
+            1i64 << 40,
+            -(1i64 << 40),
+        ];
+        for &n in &cases {
+            let mut w = BitWriter::new();
+            w.write_zigzag_gamma(n);
+            let (bytes, bits) = w.into_bytes();
+            let mut r = BitReader::new(&bytes, bits);
+            assert_eq!(r.read_zigzag_gamma(), Some(n), "round-trip failed for {n}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "zigzag-gamma overflow")]
+    fn zigzag_gamma_i64_min_panics_clearly() {
+        // i64::MIN cannot fit gamma's [1, 2^64-1] domain; it requires a graph
+        // of > 2^63 nodes (unreachable in memory). Defined panic, not silent
+        // stream corruption.
+        let mut w = BitWriter::new();
+        w.write_zigzag_gamma(i64::MIN);
+    }
 
     #[test]
     fn bits_round_trip_msb_first() {
