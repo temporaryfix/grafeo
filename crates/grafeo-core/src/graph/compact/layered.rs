@@ -7,8 +7,8 @@
 //!
 //! Requires both `compact-store` and `lpg` features.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use arcstr::ArcStr;
@@ -17,9 +17,9 @@ use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::CompactStore;
-use crate::graph::Direction;
 use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
+use crate::graph::Direction;
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
@@ -1019,6 +1019,116 @@ impl GraphStore for LayeredStore {
         }
         Vec::new()
     }
+
+    // --- Task 6: snapshot-aware read delegation (unified-MVCC) ---
+    //
+    // The per-transaction property delta lives in the overlay LpgStore. For
+    // nodes/edges that are dirty (promoted into the overlay), we delegate
+    // entirely to the overlay's snapshot-aware accessor. For base-only
+    // entities, the overlay has no entry, so we fall back to the base's
+    // committed properties (no delta possible for base-only entities — any
+    // transactional write will have promoted the entity to the overlay first
+    // via ensure_in_overlay / ensure_edge_in_overlay before calling
+    // *_buffered). No event/log side effects exist here.
+
+    fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        if self.is_node_deleted_from_base(id) {
+            return None;
+        }
+        if self.is_node_dirty(id) {
+            // Node is in the overlay; the delta (if any) is there too.
+            return self
+                .overlay
+                .load()
+                .read_node_property_visible(id, key, epoch, transaction_id);
+        }
+        // Base-only node: the overlay has no entry and no delta. Fall through
+        // to the base's committed value (same as get_node_property for base).
+        self.base
+            .load()
+            .get_node_property(id, key)
+            .or_else(|| self.overlay.load().get_node_property(id, key))
+    }
+
+    fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        if self.is_edge_deleted_from_base(id) {
+            return None;
+        }
+        if self.is_edge_dirty(id) {
+            return self
+                .overlay
+                .load()
+                .read_edge_property_visible(id, key, epoch, transaction_id);
+        }
+        self.base
+            .load()
+            .get_edge_property(id, key)
+            .or_else(|| self.overlay.load().get_edge_property(id, key))
+    }
+
+    fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        if self.is_node_deleted_from_base(id) {
+            return FxHashMap::default();
+        }
+        if self.is_node_dirty(id) {
+            return self
+                .overlay
+                .load()
+                .read_node_properties_visible(id, epoch, transaction_id);
+        }
+        // Base-only: return the committed property map from the base (no delta).
+        self.get_node(id)
+            .map(|n| {
+                n.properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        if self.is_edge_deleted_from_base(id) {
+            return FxHashMap::default();
+        }
+        if self.is_edge_dirty(id) {
+            return self
+                .overlay
+                .load()
+                .read_edge_properties_visible(id, epoch, transaction_id);
+        }
+        // Base-only: return the committed property map from the base (no delta).
+        self.get_edge(id)
+            .map(|e| {
+                e.properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl GraphStoreSearch for LayeredStore {
@@ -1391,6 +1501,95 @@ impl GraphStoreMut for LayeredStore {
         self.overlay
             .load()
             .remove_label_versioned(node_id, label, transaction_id)
+    }
+
+    // --- Task 6: full delta delegation (unified-MVCC) ---
+    //
+    // The LayeredStore has no event/log side effects, so ALL new MVCC methods
+    // are delegated directly to the overlay LpgStore. The overlay is the sole
+    // holder of the per-transaction property delta; commit/rollback in the
+    // session already operates on the overlay's write-set, so delegation is
+    // end-to-end correct.
+
+    fn set_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        let _guard = self.merge_guard.read();
+        self.ensure_in_overlay(id);
+        self.overlay
+            .load()
+            .set_node_property_buffered(id, key, value, transaction_id);
+    }
+
+    fn remove_node_property_buffered(&self, id: NodeId, key: &str, transaction_id: TransactionId) {
+        let _guard = self.merge_guard.read();
+        self.ensure_in_overlay(id);
+        self.overlay
+            .load()
+            .remove_node_property_buffered(id, key, transaction_id);
+    }
+
+    fn set_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        let _guard = self.merge_guard.read();
+        self.ensure_edge_in_overlay(id);
+        self.overlay
+            .load()
+            .set_edge_property_buffered(id, key, value, transaction_id);
+    }
+
+    fn remove_edge_property_buffered(&self, id: EdgeId, key: &str, transaction_id: TransactionId) {
+        let _guard = self.merge_guard.read();
+        self.ensure_edge_in_overlay(id);
+        self.overlay
+            .load()
+            .remove_edge_property_buffered(id, key, transaction_id);
+    }
+
+    fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        self.overlay.load().apply_tx_overlay(transaction_id);
+    }
+
+    fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        self.overlay.load().drop_tx_overlay(transaction_id);
+    }
+
+    fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        self.overlay
+            .load()
+            .finalize_deletes_by_id(transaction_id, commit_epoch, node_ids);
+    }
+
+    fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.overlay.load().take_pending_deletes(transaction_id)
+    }
+
+    fn tx_overlay_snapshot(&self, transaction_id: TransactionId) -> crate::graph::lpg::TxDelta {
+        self.overlay.load().tx_overlay_snapshot(transaction_id)
+    }
+
+    fn tx_overlay_restore(
+        &self,
+        transaction_id: TransactionId,
+        snapshot: crate::graph::lpg::TxDelta,
+    ) {
+        self.overlay
+            .load()
+            .tx_overlay_restore(transaction_id, snapshot);
     }
 }
 
@@ -1776,22 +1975,18 @@ mod tests {
         let first = persons[0];
 
         // Node has "age" property in the base.
-        assert!(
-            layered
-                .get_node_property(first, &PropertyKey::new("age"))
-                .is_some()
-        );
+        assert!(layered
+            .get_node_property(first, &PropertyKey::new("age"))
+            .is_some());
 
         // Remove it (promotes to overlay first).
         let removed = layered.remove_node_property(first, "age");
         assert!(removed.is_some());
 
         // Should be gone now.
-        assert!(
-            layered
-                .get_node_property(first, &PropertyKey::new("age"))
-                .is_none()
-        );
+        assert!(layered
+            .get_node_property(first, &PropertyKey::new("age"))
+            .is_none());
     }
 
     #[test]
@@ -1806,11 +2001,9 @@ mod tests {
         assert!(removed.is_some());
 
         // Should be gone now.
-        assert!(
-            layered
-                .get_edge_property(eid, &PropertyKey::new("since"))
-                .is_none()
-        );
+        assert!(layered
+            .get_edge_property(eid, &PropertyKey::new("since"))
+            .is_none());
     }
 
     #[test]
@@ -1999,11 +2192,9 @@ mod tests {
         assert!(layered.get_node(target).is_none());
 
         // get_node_property should also return None.
-        assert!(
-            layered
-                .get_node_property(target, &PropertyKey::new("name"))
-                .is_none()
-        );
+        assert!(layered
+            .get_node_property(target, &PropertyKey::new("name"))
+            .is_none());
     }
 
     #[test]
@@ -2757,16 +2948,12 @@ mod tests {
         );
 
         // Endpoints' existing properties are intact through the layered view.
-        assert!(
-            layered
-                .get_node_property(persons[0], &PropertyKey::new("name"))
-                .is_some()
-        );
-        assert!(
-            layered
-                .get_node_property(target_dst, &PropertyKey::new("name"))
-                .is_some()
-        );
+        assert!(layered
+            .get_node_property(persons[0], &PropertyKey::new("name"))
+            .is_some());
+        assert!(layered
+            .get_node_property(target_dst, &PropertyKey::new("name"))
+            .is_some());
     }
 
     /// Setting a property on a base-only node marks the node dirty. Directly
@@ -3374,11 +3561,9 @@ mod tests {
             removed,
             Some(Value::String(ArcStr::from("mia@example.com")))
         );
-        assert!(
-            layered
-                .get_node_property(mia, &PropertyKey::new("email"))
-                .is_none()
-        );
+        assert!(layered
+            .get_node_property(mia, &PropertyKey::new("email"))
+            .is_none());
     }
 
     #[test]
@@ -3394,11 +3579,9 @@ mod tests {
 
         let removed = layered.remove_edge_property_versioned(eid, "year", txn_id);
         assert_eq!(removed, Some(Value::Int64(2024)));
-        assert!(
-            layered
-                .get_edge_property(eid, &PropertyKey::new("year"))
-                .is_none()
-        );
+        assert!(layered
+            .get_edge_property(eid, &PropertyKey::new("year"))
+            .is_none());
     }
 
     #[test]
@@ -3497,7 +3680,9 @@ mod tests {
 
         // ...but neighbors() must agree: no target reachable only via a deleted edge.
         assert!(
-            !layered.neighbors(person, Direction::Outgoing).contains(&target),
+            !layered
+                .neighbors(person, Direction::Outgoing)
+                .contains(&target),
             "neighbors() reported a target whose only edge was deleted"
         );
     }
@@ -3514,9 +3699,14 @@ mod tests {
 
         // Delete it. Every read path must agree it is gone.
         assert!(layered.delete_edge(eid));
-        assert!(layered.get_edge(eid).is_none(), "deleted promoted edge still resolves");
+        assert!(
+            layered.get_edge(eid).is_none(),
+            "deleted promoted edge still resolves"
+        );
         assert!(layered.edges_from(person, Direction::Outgoing).is_empty());
-        assert!(!layered.neighbors(person, Direction::Outgoing).contains(&target));
+        assert!(!layered
+            .neighbors(person, Direction::Outgoing)
+            .contains(&target));
         // Idempotent: nothing left to delete.
         assert!(!layered.delete_edge(eid));
     }
@@ -3531,7 +3721,10 @@ mod tests {
         assert!(layered.is_node_dirty(person));
 
         assert!(layered.delete_node(person));
-        assert!(layered.get_node(person).is_none(), "deleted promoted node still resolves");
+        assert!(
+            layered.get_node(person).is_none(),
+            "deleted promoted node still resolves"
+        );
         // Its base edges must not resurface through the deleted node.
         assert!(layered.edges_from(person, Direction::Outgoing).is_empty());
     }
@@ -3767,8 +3960,8 @@ mod tests {
     /// the test stays bounded.
     #[test]
     fn jules_concurrent_readers_survive_repeated_base_swaps() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         use std::thread;
 
         let layered = Arc::new(build_test_layered());
@@ -3819,8 +4012,8 @@ mod tests {
     /// remain visible after the test.
     #[test]
     fn shosanna_concurrent_writes_survive_periodic_merge() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
         use std::thread;
 
         let layered = Arc::new(build_test_layered());
@@ -3939,5 +4132,115 @@ mod tests {
         layered.overlay_store().create_property_index("name");
         assert!(layered.has_property_index("name"));
         assert!(!layered.has_property_index("age"));
+    }
+
+    // ── Task 6: snapshot-aware property isolation at LayeredStore level ──
+    //
+    // These tests verify that full MVCC delegation works end-to-end through
+    // the LayeredStore wrapper — using the store API directly with explicit
+    // TransactionId / EpochId (no full session required).
+
+    #[test]
+    fn layered_store_buffered_set_is_invisible_to_committed_reads() {
+        use crate::graph::traits::{GraphStore, GraphStoreMut};
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+
+        // Committed age should be 30 (from the base fixture).
+        let key = PropertyKey::new("age");
+        let epoch = EpochId::new(0);
+        let tx = TransactionId::new(42);
+
+        // Buffer an uncommitted write via the trait: writer sees 99.
+        layered.set_node_property_buffered(target, "age", Value::Int64(99), tx);
+        assert_eq!(
+            layered.read_node_property_visible(target, &key, epoch, Some(tx)),
+            Some(Value::Int64(99)),
+            "writer must see its own buffered write"
+        );
+
+        // Committed read (tx = None) must still see the original value.
+        assert_eq!(
+            layered.read_node_property_visible(target, &key, epoch, None),
+            Some(Value::Int64(30)),
+            "uncommitted buffered SET must not be visible as a committed read"
+        );
+
+        // Apply the overlay: committed read now sees 99.
+        layered.apply_tx_overlay(tx);
+        assert_eq!(
+            layered.read_node_property_visible(target, &key, epoch, None),
+            Some(Value::Int64(99)),
+            "committed read must see 99 after apply_tx_overlay"
+        );
+    }
+
+    #[test]
+    fn layered_store_buffered_set_is_dropped_on_rollback() {
+        use crate::graph::traits::{GraphStore, GraphStoreMut};
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+
+        let key = PropertyKey::new("age");
+        let epoch = EpochId::new(0);
+        let tx = TransactionId::new(7);
+
+        layered.set_node_property_buffered(target, "age", Value::Int64(999), tx);
+        // Drop the overlay (rollback).
+        layered.drop_tx_overlay(tx);
+
+        // Committed read must still see the original value (30), not 999.
+        assert_eq!(
+            layered.read_node_property_visible(target, &key, epoch, None),
+            Some(Value::Int64(30)),
+            "drop_tx_overlay must discard the buffered write"
+        );
+    }
+
+    #[test]
+    fn layered_store_whole_entity_properties_visible_merges_delta() {
+        use crate::graph::traits::{GraphStore, GraphStoreMut};
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+
+        let epoch = EpochId::new(0);
+        let tx = TransactionId::new(5);
+
+        // Buffer a Set and a Remove.
+        layered.set_node_property_buffered(target, "age", Value::Int64(55), tx);
+        layered.remove_node_property_buffered(target, "name", tx);
+
+        // Writer's whole-entity view must reflect both operations.
+        let writer_view = layered.read_node_properties_visible(target, epoch, Some(tx));
+        assert_eq!(
+            writer_view.get(&PropertyKey::new("age")),
+            Some(&Value::Int64(55)),
+            "writer's whole-entity view must contain the buffered age"
+        );
+        assert!(
+            !writer_view.contains_key(&PropertyKey::new("name")),
+            "writer's whole-entity view must NOT contain the removed name"
+        );
+
+        // Committed view must remain unchanged.
+        let committed_view = layered.read_node_properties_visible(target, epoch, None);
+        assert_eq!(
+            committed_view.get(&PropertyKey::new("age")),
+            Some(&Value::Int64(30)),
+            "committed whole-entity view must retain original age"
+        );
+        assert!(
+            committed_view.contains_key(&PropertyKey::new("name")),
+            "committed whole-entity view must still have the name"
+        );
     }
 }

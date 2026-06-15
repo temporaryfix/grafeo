@@ -95,7 +95,11 @@ impl CdcGraphStore {
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.clone()))
             .collect();
-        if map.is_empty() { None } else { Some(map) }
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     }
 
     /// Collects all properties of an edge as a `HashMap` for before/after snapshots.
@@ -106,7 +110,11 @@ impl CdcGraphStore {
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.clone()))
             .collect();
-        if map.is_empty() { None } else { Some(map) }
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
     }
 
     /// Collects labels for a node.
@@ -382,6 +390,55 @@ impl GraphStore for CdcGraphStore {
 
     fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
         self.inner.get_edge_history(id)
+    }
+
+    // --- Task 6: snapshot-aware read delegation (unified-MVCC) ---
+    //
+    // Reads have no CDC event or log side effects, so we can safely delegate
+    // to the inner store's snapshot-aware accessors. The per-transaction
+    // property delta lives in the inner LpgStore (or another LpgStore beneath
+    // the CDC wrapper), so these delegates route through the real delta.
+
+    fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        self.inner
+            .read_node_property_visible(id, key, epoch, transaction_id)
+    }
+
+    fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        self.inner
+            .read_edge_property_visible(id, key, epoch, transaction_id)
+    }
+
+    fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        self.inner
+            .read_node_properties_visible(id, epoch, transaction_id)
+    }
+
+    fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        self.inner
+            .read_edge_properties_visible(id, epoch, transaction_id)
     }
 }
 
@@ -938,6 +995,63 @@ impl GraphStoreMut for CdcGraphStore {
             self.buffer_event(event);
         }
         removed
+    }
+
+    // --- Task 6: overlay lifecycle delegation (unified-MVCC) ---
+    //
+    // `*_buffered` write methods: NOT overridden here (Option B).
+    // The trait defaults call `self.set_node_property_versioned(...)` etc.,
+    // which is *this* CDC wrapper's `set_node_property_versioned` — that
+    // already buffers the CDC event AND delegates the write to the inner
+    // store. Overriding `*_buffered` to bypass that would LOSE CDC events.
+    //
+    // TODO(unified-mvcc): transactional property isolation for CDC-wrapped
+    // stores is deferred — buffering would need to record CDC events for
+    // buffered writes and flush at commit. The default write-through
+    // preserves CDC event recording at the cost of not deferring the
+    // committed column write until commit.
+    //
+    // Overlay lifecycle methods (apply/drop/snapshot/restore/finalize) ARE
+    // delegated: they have no CDC event side effects and must reach the
+    // inner LpgStore so the delta is actually committed or discarded.
+
+    fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        self.inner.apply_tx_overlay(transaction_id);
+    }
+
+    fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        self.inner.drop_tx_overlay(transaction_id);
+    }
+
+    fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        self.inner
+            .finalize_deletes_by_id(transaction_id, commit_epoch, node_ids);
+    }
+
+    fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.inner.take_pending_deletes(transaction_id)
+    }
+
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_snapshot(
+        &self,
+        transaction_id: TransactionId,
+    ) -> grafeo_core::graph::lpg::TxDelta {
+        self.inner.tx_overlay_snapshot(transaction_id)
+    }
+
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_restore(
+        &self,
+        transaction_id: TransactionId,
+        snapshot: grafeo_core::graph::lpg::TxDelta,
+    ) {
+        self.inner.tx_overlay_restore(transaction_id, snapshot);
     }
 }
 
