@@ -261,13 +261,12 @@ impl HashJoinOperator {
             for row in chunk.selected_indices() {
                 let key = self.extract_key(&chunk, row, &self.build_keys)?;
 
-                // Skip null keys for inner/semi/anti joins
-                if matches!(key, HashKey::Null)
-                    && !matches!(
-                        self.join_type,
-                        JoinType::Left | JoinType::Right | JoinType::Full
-                    )
-                {
+                // NULL never equals NULL in a join key (three-valued logic), so
+                // NULL keys are never inserted into the hash table for any join
+                // type. Outer-join unmatched rows are still emitted via the
+                // build_matched/probe_matched tracking and the no-match null-pad
+                // path, neither of which depends on NULL being in the table.
+                if matches!(key, HashKey::Null) {
                     continue;
                 }
 
@@ -1034,6 +1033,74 @@ mod tests {
             builder.advance_row();
         }
         builder.finish()
+    }
+
+    fn create_nullable_int_chunk(values: &[Option<i64>]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Int64]);
+        for v in values {
+            match v {
+                Some(x) => builder.column_mut(0).unwrap().push_int64(*x),
+                None => builder.column_mut(0).unwrap().push_value(Value::Null),
+            }
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn create_nullable_int_chunk_2col(rows: &[(Option<i64>, Option<i64>)]) -> DataChunk {
+        let mut b = DataChunkBuilder::new(&[LogicalType::Int64, LogicalType::Int64]);
+        for (k, p) in rows {
+            match k {
+                Some(x) => b.column_mut(0).unwrap().push_int64(*x),
+                None => b.column_mut(0).unwrap().push_value(Value::Null),
+            }
+            match p {
+                Some(x) => b.column_mut(1).unwrap().push_int64(*x),
+                None => b.column_mut(1).unwrap().push_value(Value::Null),
+            }
+            b.advance_row();
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn test_hash_join_left_outer_null_key_is_null_padded_not_matched() {
+        // Left keys: [1, NULL]; Right rows: [(key=1, payload=100), (key=NULL, payload=999)].
+        // LEFT join must emit (1 -> matched 100) and (NULL -> null-padded). The
+        // distinguishing payload column proves the NULL left row is null-padded
+        // (payload NULL), NOT matched to the right's NULL key (payload 999).
+        let left = MockOperator::new(vec![create_nullable_int_chunk(&[Some(1), None])]);
+        let right = MockOperator::new(vec![create_nullable_int_chunk_2col(&[
+            (Some(1), Some(100)),
+            (None, Some(999)),
+        ])]);
+        let output_schema = vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64];
+        let mut join = HashJoinOperator::new(
+            Box::new(left),
+            Box::new(right),
+            vec![0],
+            vec![0],
+            JoinType::Left,
+            output_schema,
+        );
+
+        let mut total = 0;
+        let mut payload_for_null_left: Option<Option<Value>> = None;
+        while let Some(chunk) = join.next().unwrap() {
+            for row in chunk.selected_indices() {
+                total += 1;
+                let lk = chunk.column(0).unwrap().get_value(row);
+                if matches!(lk, None | Some(Value::Null)) {
+                    payload_for_null_left = Some(chunk.column(2).unwrap().get_value(row));
+                }
+            }
+        }
+        assert_eq!(total, 2, "LEFT join must emit each left row exactly once");
+        let p = payload_for_null_left.expect("null-key left row must be present");
+        assert!(
+            matches!(p, None | Some(Value::Null)),
+            "NULL left key must be null-padded, not matched to a NULL right key; got {p:?}"
+        );
     }
 
     #[test]
