@@ -1163,6 +1163,34 @@ impl LpgStore {
         self.tx_property_overlay.write().remove(&transaction_id);
     }
 
+    /// Clones a transaction's buffered property delta for savepoint capture.
+    ///
+    /// Returns a clone of the current `TxDelta` for `transaction_id`, or an
+    /// empty default delta if no overlay exists for this transaction yet.
+    #[doc(hidden)]
+    pub fn tx_overlay_snapshot(&self, transaction_id: TransactionId) -> super::TxDelta {
+        self.tx_property_overlay
+            .read()
+            .get(&transaction_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Restores a transaction's buffered property delta from a savepoint snapshot.
+    ///
+    /// Replaces the current overlay entry for `transaction_id` with `snapshot`.
+    /// If the snapshot is empty (default), removes the entry entirely so that
+    /// a subsequent `apply_tx_overlay` finds nothing buffered.
+    #[doc(hidden)]
+    pub fn tx_overlay_restore(&self, transaction_id: TransactionId, snapshot: super::TxDelta) {
+        let mut overlay = self.tx_property_overlay.write();
+        if snapshot.node_props.is_empty() && snapshot.edge_props.is_empty() {
+            overlay.remove(&transaction_id);
+        } else {
+            overlay.insert(transaction_id, snapshot);
+        }
+    }
+
     /// Snapshot-consistent whole-node property map (whole-entity MVCC accessor).
     ///
     /// Returns all committed properties for `id`, then overlays the writing

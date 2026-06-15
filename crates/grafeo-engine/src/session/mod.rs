@@ -24,6 +24,7 @@ use grafeo_common::{grafeo_info_span, grafeo_warn};
 use grafeo_core::graph::Direction;
 #[cfg(feature = "lpg")]
 use grafeo_core::graph::lpg::LpgStore;
+use grafeo_core::graph::lpg::TxDelta;
 #[cfg(feature = "lpg")]
 use grafeo_core::graph::lpg::{Edge, Node};
 #[cfg(feature = "triple-store")]
@@ -239,6 +240,14 @@ struct GraphSavepoint {
     next_node_id: u64,
     next_edge_id: u64,
     undo_log_position: usize,
+    /// Snapshot of the per-transaction property delta at savepoint creation.
+    ///
+    /// `rollback_to_savepoint` replaces the live delta with this clone so that
+    /// buffered property writes made *after* the savepoint are discarded.
+    /// Labels and entity deletes still flow through the undo log; this only
+    /// covers the buffered property overlay introduced in the unified-MVCC
+    /// first increment.
+    overlay_snapshot: TxDelta,
 }
 
 /// Savepoint state: name + per-graph snapshots + the graph that was active.
@@ -4327,6 +4336,7 @@ impl Session {
                     next_node_id: store.peek_next_node_id(),
                     next_edge_id: store.peek_next_edge_id(),
                     undo_log_position: store.property_undo_log_position(tx_id),
+                    overlay_snapshot: store.tx_overlay_snapshot(tx_id),
                 }
             })
             .collect();
@@ -4382,14 +4392,19 @@ impl Session {
         savepoints.truncate(pos);
         drop(savepoints);
 
-        // TODO(unified-mvcc): buffered property delta is tx-granular; savepoint partial-rollback of buffered writes is deferred (delta keys would need savepoint stamping).
-
         // Roll back each graph that was captured in the savepoint.
         for gs in &sp_state.graph_snapshots {
             let store = self.resolve_store(&gs.graph_name);
 
             // Replay property/label undo entries recorded after the savepoint
+            // (handles labels and entity deletions via the undo log).
             store.rollback_transaction_properties_to(transaction_id, gs.undo_log_position);
+
+            // Restore the buffered property delta to the savepoint snapshot.
+            // This discards any buffered property writes made after the savepoint,
+            // including SET/REMOVE on existing properties and newly added properties.
+            // Labels and deletes are still handled via the undo log above.
+            store.tx_overlay_restore(transaction_id, gs.overlay_snapshot.clone());
 
             // Discard entities created after the savepoint
             let current_next_node = store.peek_next_node_id();

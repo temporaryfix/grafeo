@@ -21,6 +21,8 @@
 
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
+#[cfg(feature = "lpg")]
+use crate::graph::lpg::TxDelta;
 use crate::graph::lpg::{Edge, Node};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
@@ -722,6 +724,24 @@ pub trait GraphStoreMut: GraphStoreSearch {
     /// Drops a transaction's buffered property delta (rollback). Default: no-op.
     fn drop_tx_overlay(&self, transaction_id: TransactionId) {
         let _ = transaction_id;
+    }
+
+    /// Clones a transaction's buffered property delta for savepoint capture.
+    ///
+    /// Default returns an empty (default) snapshot; write-through stores have
+    /// no overlay, so restoring the default is a no-op.
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_snapshot(&self, transaction_id: TransactionId) -> TxDelta {
+        let _ = transaction_id;
+        TxDelta::default()
+    }
+
+    /// Restores a transaction's buffered property delta from a savepoint snapshot.
+    ///
+    /// Default is a no-op; write-through stores have no overlay to restore.
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_restore(&self, transaction_id: TransactionId, snapshot: TxDelta) {
+        let _ = (transaction_id, snapshot);
     }
 
     /// Finalizes PENDING node deletes for a committed transaction: stamps

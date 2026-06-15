@@ -135,8 +135,13 @@ pub(super) enum PropOp {
 /// (first increment: properties only; labels and deletes follow). Read-merged
 /// over the committed column for the writing transaction's own reads; applied to
 /// the committed column on commit; dropped on rollback.
-#[derive(Debug, Default)]
-pub(super) struct TxDelta {
+///
+/// Also used as the savepoint snapshot type returned by
+/// [`LpgStore::tx_overlay_snapshot`] and consumed by
+/// [`LpgStore::tx_overlay_restore`].
+#[doc(hidden)]
+#[derive(Debug, Default, Clone)]
+pub struct TxDelta {
     /// Uncommitted node property writes, keyed by (node, property).
     pub(super) node_props: FxHashMap<(NodeId, PropertyKey), PropOp>,
     /// Uncommitted edge property writes, keyed by (edge, property).

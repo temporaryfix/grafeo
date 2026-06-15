@@ -600,6 +600,18 @@ impl GraphStoreMut for LpgStore {
         LpgStore::drop_tx_overlay(self, transaction_id);
     }
 
+    fn tx_overlay_snapshot(&self, transaction_id: TransactionId) -> crate::graph::lpg::TxDelta {
+        LpgStore::tx_overlay_snapshot(self, transaction_id)
+    }
+
+    fn tx_overlay_restore(
+        &self,
+        transaction_id: TransactionId,
+        snapshot: crate::graph::lpg::TxDelta,
+    ) {
+        LpgStore::tx_overlay_restore(self, transaction_id, snapshot);
+    }
+
     fn finalize_deletes_by_id(
         &self,
         transaction_id: TransactionId,
