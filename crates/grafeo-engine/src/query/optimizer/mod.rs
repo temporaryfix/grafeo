@@ -673,8 +673,31 @@ impl Optimizer {
                 true
             }
             LogicalOperator::Filter(filter) => {
-                // A filter on a base relation is still part of the join tree
-                self.collect_join_tree(&filter.input, relations, conditions)
+                // A filter wrapping a single base relation rides along with that
+                // relation through reordering: record the whole Filter(relation)
+                // as the relation entry so its predicate is never lost. If the
+                // filter sits above a join (spans relations), decline to flatten
+                // (return false) so reordering is skipped and the original,
+                // predicate-bearing plan is kept intact.
+                match filter.input.as_ref() {
+                    LogicalOperator::NodeScan(scan) => {
+                        relations.push((scan.variable.clone(), op.clone()));
+                        true
+                    }
+                    LogicalOperator::EdgeScan(scan) => {
+                        relations.push((scan.variable.clone(), op.clone()));
+                        true
+                    }
+                    LogicalOperator::Expand(expand) => {
+                        relations.push((expand.to_variable.clone(), op.clone()));
+                        true
+                    }
+                    #[cfg(feature = "triple-store")]
+                    LogicalOperator::TripleScan(_) => {
+                        self.collect_join_tree(&filter.input, relations, conditions)
+                    }
+                    _ => false,
+                }
             }
             LogicalOperator::Expand(expand) => {
                 // Expand is a special case - it's like a join with the adjacency
@@ -1473,6 +1496,60 @@ mod tests {
         Projection, ReturnItem, ReturnOp, SkipOp, SortKey, SortOp, SortOrder, UnaryOp,
     };
     use grafeo_common::types::Value;
+
+    #[test]
+    fn test_reorder_preserves_filter_on_relation() {
+        // Join(Filter(a.age > 30, NodeScan a:Person), NodeScan b:Person) ON a.id = b.id.
+        // Join reorder must NOT drop the a.age predicate when flattening the tree.
+        let plan = LogicalPlan::new(LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::Variable("a".to_string()),
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(LogicalOperator::Join(JoinOp {
+                left: Box::new(LogicalOperator::Filter(FilterOp {
+                    predicate: LogicalExpression::Binary {
+                        left: Box::new(LogicalExpression::Property {
+                            variable: "a".to_string(),
+                            property: "age".to_string(),
+                        }),
+                        op: BinaryOp::Gt,
+                        right: Box::new(LogicalExpression::Literal(Value::Int64(30))),
+                    },
+                    input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                        variable: "a".to_string(),
+                        label: Some("Person".to_string()),
+                        input: None,
+                    })),
+                    pushdown_hint: None,
+                })),
+                right: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "b".to_string(),
+                    label: Some("Person".to_string()),
+                    input: None,
+                })),
+                join_type: JoinType::Inner,
+                conditions: vec![JoinCondition {
+                    left: LogicalExpression::Property {
+                        variable: "a".to_string(),
+                        property: "id".to_string(),
+                    },
+                    right: LogicalExpression::Property {
+                        variable: "b".to_string(),
+                        property: "id".to_string(),
+                    },
+                }],
+            })),
+        }));
+
+        let optimized = Optimizer::new().optimize(plan).unwrap();
+        let tree = optimized.root.explain_tree();
+        assert!(
+            tree.contains("age"),
+            "join reorder dropped the a.age filter predicate; plan was:\n{tree}"
+        );
+    }
 
     #[test]
     fn test_optimizer_filter_pushdown_simple() {
