@@ -323,7 +323,7 @@ impl CreateNodeOperator {
         if let Some(tid) = self.transaction_id {
             for (name, value) in resolved_props.iter() {
                 self.store
-                    .set_node_property_versioned(node_id, name, value.clone(), tid);
+                    .set_node_property_buffered(node_id, name, value.clone(), tid);
             }
         } else {
             for (name, value) in resolved_props.iter() {
@@ -669,7 +669,7 @@ impl Operator for CreateEdgeOperator {
                 if let Some(tid) = self.transaction_id {
                     for (name, value) in resolved_props {
                         self.store
-                            .set_edge_property_versioned(edge_id, &name, value, tid);
+                            .set_edge_property_buffered(edge_id, &name, value, tid);
                     }
                 } else {
                     for (name, value) in resolved_props {
@@ -1510,7 +1510,7 @@ impl Operator for SetPropertyOperator {
                                             .collect();
                                         for key in keys {
                                             if let Some(tid) = tx_id {
-                                                self.store.remove_edge_property_versioned(
+                                                self.store.remove_edge_property_buffered(
                                                     EdgeId(entity_id),
                                                     &key,
                                                     tid,
@@ -1529,7 +1529,7 @@ impl Operator for SetPropertyOperator {
                                         .collect();
                                     for key in keys {
                                         if let Some(tid) = tx_id {
-                                            self.store.remove_node_property_versioned(
+                                            self.store.remove_node_property_buffered(
                                                 NodeId(entity_id),
                                                 &key,
                                                 tid,
@@ -1547,7 +1547,7 @@ impl Operator for SetPropertyOperator {
                                     // Null in SET += removes the property (Cypher/GQL semantics)
                                     if self.is_edge {
                                         if let Some(tid) = tx_id {
-                                            self.store.remove_edge_property_versioned(
+                                            self.store.remove_edge_property_buffered(
                                                 EdgeId(entity_id),
                                                 key.as_str(),
                                                 tid,
@@ -1559,7 +1559,7 @@ impl Operator for SetPropertyOperator {
                                             );
                                         }
                                     } else if let Some(tid) = tx_id {
-                                        self.store.remove_node_property_versioned(
+                                        self.store.remove_node_property_buffered(
                                             NodeId(entity_id),
                                             key.as_str(),
                                             tid,
@@ -1570,7 +1570,7 @@ impl Operator for SetPropertyOperator {
                                     }
                                 } else if self.is_edge {
                                     if let Some(tid) = tx_id {
-                                        self.store.set_edge_property_versioned(
+                                        self.store.set_edge_property_buffered(
                                             EdgeId(entity_id),
                                             key.as_str(),
                                             val.clone(),
@@ -1584,7 +1584,7 @@ impl Operator for SetPropertyOperator {
                                         );
                                     }
                                 } else if let Some(tid) = tx_id {
-                                    self.store.set_node_property_versioned(
+                                    self.store.set_node_property_buffered(
                                         NodeId(entity_id),
                                         key.as_str(),
                                         val.clone(),
@@ -1601,7 +1601,7 @@ impl Operator for SetPropertyOperator {
                         }
                     } else if self.is_edge {
                         if let Some(tid) = tx_id {
-                            self.store.set_edge_property_versioned(
+                            self.store.set_edge_property_buffered(
                                 EdgeId(entity_id),
                                 &prop_name,
                                 value,
@@ -1612,7 +1612,7 @@ impl Operator for SetPropertyOperator {
                                 .set_edge_property(EdgeId(entity_id), &prop_name, value);
                         }
                     } else if let Some(tid) = tx_id {
-                        self.store.set_node_property_versioned(
+                        self.store.set_node_property_buffered(
                             NodeId(entity_id),
                             &prop_name,
                             value,

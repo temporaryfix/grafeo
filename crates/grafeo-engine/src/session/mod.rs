@@ -5015,8 +5015,14 @@ impl Session {
         let tid = transaction_id.unwrap_or(TransactionId::SYSTEM);
         let store = self.active_lpg_store();
         let eid = store.create_edge_versioned(src, dst, edge_type, epoch, tid);
-        for (key, value) in &props {
-            store.set_edge_property_versioned(eid, key, value.clone(), tid);
+        if let Some(tid) = transaction_id {
+            for (key, value) in &props {
+                store.set_edge_property_buffered(eid, key, value.clone(), tid);
+            }
+        } else {
+            for (key, value) in &props {
+                store.set_edge_property(eid, key, value.clone());
+            }
         }
 
         #[cfg(feature = "wal")]
@@ -5054,7 +5060,7 @@ impl Session {
 
         if let Some(tid) = transaction_id {
             self.active_lpg_store()
-                .set_node_property_versioned(id, key, value, tid);
+                .set_node_property_buffered(id, key, value, tid);
         } else {
             self.active_lpg_store().set_node_property(id, key, value);
         }
@@ -5089,7 +5095,7 @@ impl Session {
 
         if let Some(tid) = transaction_id {
             self.active_lpg_store()
-                .set_edge_property_versioned(id, key, value, tid);
+                .set_edge_property_buffered(id, key, value, tid);
         } else {
             self.active_lpg_store().set_edge_property(id, key, value);
         }

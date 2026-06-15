@@ -399,9 +399,7 @@ pub(crate) fn resolved_column_name(expr: &LogicalExpression) -> String {
 /// one place so predictive callers (e.g. the heap top-K rewrite) cannot drift
 /// from the actual planner.
 pub(crate) fn output_column_name(alias: Option<&str>, expr: &LogicalExpression) -> String {
-    alias
-        .map(str::to_string)
-        .unwrap_or_else(|| expression_to_string(expr))
+    alias.map_or_else(|| expression_to_string(expr), str::to_string)
 }
 
 /// Resolves a logical expression to a column index in the given variable-column map.

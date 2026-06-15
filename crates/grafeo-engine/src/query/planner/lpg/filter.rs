@@ -79,9 +79,14 @@ impl super::Planner {
             return self.plan_count_as_apply(&filter.input, subquery, op, threshold, remaining);
         }
 
-        // Check zone maps for simple property predicates before scanning
-        // If zone map says "definitely no matches", we can short-circuit
-        if let Some(false) = self.check_zone_map_for_predicate(&filter.predicate) {
+        // Check zone maps for simple property predicates before scanning.
+        // Zone maps only reflect the committed store; buffered (uncommitted) writes
+        // are invisible to them. Skip this optimisation when a writing transaction is
+        // active so the writer can see its own uncommitted SET values via the
+        // delta-aware FilterOperator below.
+        if self.transaction_id.is_none()
+            && let Some(false) = self.check_zone_map_for_predicate(&filter.predicate)
+        {
             // Zone map says no matches possible - return empty result
             let (_, columns) = self.plan_operator(&filter.input)?;
             let schema = self.derive_schema_from_columns(&columns);
@@ -872,6 +877,18 @@ impl super::Planner {
         &self,
         filter: &FilterOp,
     ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // When a writing transaction is active, buffered property writes are NOT
+        // reflected in the committed property store or the property index (those
+        // are updated at commit via apply_tx_overlay). Using the index or the
+        // committed store here would make the writer miss its own uncommitted SET.
+        // Fall through to the FilterOperator path, which reads through
+        // read_node_property_visible and IS delta-aware.
+        //
+        // Other sessions (transaction_id == None) keep using the index as before.
+        if self.transaction_id.is_some() {
+            return Ok(None);
+        }
+
         // Only optimize if input is a simple NodeScan (not nested)
         let (scan_variable, scan_label) = match filter.input.as_ref() {
             LogicalOperator::NodeScan(scan) if scan.input.is_none() => {
@@ -993,6 +1010,13 @@ impl super::Planner {
         &self,
         filter: &FilterOp,
     ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // Buffered (uncommitted) writes are not reflected in the property index.
+        // Skip the index-based rewrite for writing transactions so the writer's
+        // own uncommitted SET values are visible (the FilterOperator is delta-aware).
+        if self.transaction_id.is_some() {
+            return Ok(None);
+        }
+
         // Only optimize if input is a simple NodeScan (not nested).
         let (scan_variable, scan_label) = match filter.input.as_ref() {
             LogicalOperator::NodeScan(scan) if scan.input.is_none() => {
@@ -1244,6 +1268,14 @@ impl super::Planner {
         &self,
         filter: &FilterOp,
     ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // Buffered (uncommitted) writes are not reflected in the committed
+        // property column that backs find_nodes_in_range_iter. Skip this
+        // optimization for writing transactions so they see their own
+        // buffered writes via the FilterOperator (which is delta-aware).
+        if self.transaction_id.is_some() {
+            return Ok(None);
+        }
+
         // Only optimize if input is a simple NodeScan (not nested)
         let (scan_variable, scan_label) = match filter.input.as_ref() {
             LogicalOperator::NodeScan(scan) if scan.input.is_none() => {

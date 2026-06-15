@@ -288,12 +288,25 @@ impl MergeOperator {
             }
 
             let has_all_props = resolved_match_props.iter().all(|(key, expected_value)| {
-                let prop = node.properties.get(&PropertyKey::new(key.as_str()));
+                // Use the delta-aware read so that properties buffered by this
+                // transaction (via set_node_property_buffered) are visible here.
+                // Absent a transaction context fall back to the committed store.
+                let prop_key = PropertyKey::new(key.as_str());
+                let prop = match (self.viewing_epoch, self.transaction_id) {
+                    (Some(epoch), Some(tid)) => {
+                        self.store
+                            .read_node_property_visible(node_id, &prop_key, epoch, Some(tid))
+                    }
+                    _ => {
+                        let p = node.properties.get(&prop_key);
+                        p.cloned()
+                    }
+                };
                 if expected_value.is_null() {
                     // Null in a MERGE pattern matches both absent and explicitly null properties
-                    prop.map_or(true, |v| v.is_null())
+                    prop.as_ref().map_or(true, |v| v.is_null())
                 } else {
-                    prop.is_some_and(|v| v == expected_value)
+                    prop.as_ref().is_some_and(|v| v == expected_value)
                 }
             });
 
@@ -331,7 +344,7 @@ impl MergeOperator {
         if let Some(tid) = self.transaction_id {
             for (key, value) in props {
                 self.store
-                    .set_node_property_versioned(id, key.as_str(), value.clone(), tid);
+                    .set_node_property_buffered(id, key.as_str(), value.clone(), tid);
             }
         } else {
             for (key, value) in props {
@@ -505,7 +518,7 @@ impl MergeOperator {
             }
             if let Some(tid) = self.transaction_id {
                 self.store
-                    .set_node_property_versioned(node_id, key.as_str(), value.clone(), tid);
+                    .set_node_property_buffered(node_id, key.as_str(), value.clone(), tid);
             } else {
                 self.store
                     .set_node_property(node_id, key.as_str(), value.clone());
@@ -827,7 +840,7 @@ impl MergeRelationshipOperator {
         if let Some(tid) = self.transaction_id {
             for (key, value) in props {
                 self.store
-                    .set_edge_property_versioned(id, key.as_str(), value.clone(), tid);
+                    .set_edge_property_buffered(id, key.as_str(), value.clone(), tid);
             }
         } else {
             for (key, value) in props {
@@ -930,7 +943,7 @@ impl MergeRelationshipOperator {
             }
             if let Some(tid) = self.transaction_id {
                 self.store
-                    .set_edge_property_versioned(edge_id, key.as_str(), value.clone(), tid);
+                    .set_edge_property_buffered(edge_id, key.as_str(), value.clone(), tid);
             } else {
                 self.store
                     .set_edge_property(edge_id, key.as_str(), value.clone());
