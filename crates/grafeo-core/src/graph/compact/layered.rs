@@ -1192,17 +1192,17 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_node(&self, id: NodeId) -> bool {
         let _guard = self.merge_guard.read();
-        if self.is_node_dirty(id) {
-            // Node is in the overlay: delete from overlay.
-            return self.overlay.load().delete_node(id);
+        // Delete the overlay copy if present, and independently tombstone the
+        // base copy if present. A promoted node lives in both tiers (its base
+        // adjacency stays in the base), so both must happen; a fresh
+        // overlay-only node has no base copy.
+        let overlay_removed = self.overlay.load().delete_node(id);
+        let base_tombstoned = self.base.load().get_node(id).is_some()
+            && self.deleted_from_base_nodes.write().insert(id);
+        if base_tombstoned {
+            self.deletions_dirty.store(true, Ordering::Release);
         }
-        if self.base.load().get_node(id).is_some() {
-            if self.deleted_from_base_nodes.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-            }
-            return true;
-        }
-        false
+        overlay_removed || base_tombstoned
     }
 
     fn delete_node_versioned(
@@ -1212,19 +1212,16 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
-        if self.is_node_dirty(id) {
-            return self
-                .overlay
-                .load()
-                .delete_node_versioned(id, epoch, transaction_id);
+        let overlay_removed = self
+            .overlay
+            .load()
+            .delete_node_versioned(id, epoch, transaction_id);
+        let base_tombstoned = self.base.load().get_node(id).is_some()
+            && self.deleted_from_base_nodes.write().insert(id);
+        if base_tombstoned {
+            self.deletions_dirty.store(true, Ordering::Release);
         }
-        if self.base.load().get_node(id).is_some() {
-            if self.deleted_from_base_nodes.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-            }
-            return true;
-        }
-        false
+        overlay_removed || base_tombstoned
     }
 
     fn delete_node_edges(&self, node_id: NodeId) {
@@ -1249,16 +1246,16 @@ impl GraphStoreMut for LayeredStore {
 
     fn delete_edge(&self, id: EdgeId) -> bool {
         let _guard = self.merge_guard.read();
-        if self.is_edge_dirty(id) {
-            return self.overlay.load().delete_edge(id);
+        // Delete the overlay copy if present, and independently tombstone the
+        // base copy if present. A promoted edge lives in both tiers, so both
+        // must happen; a fresh overlay-only edge has no base copy.
+        let overlay_removed = self.overlay.load().delete_edge(id);
+        let base_tombstoned = self.base.load().get_edge(id).is_some()
+            && self.deleted_from_base_edges.write().insert(id);
+        if base_tombstoned {
+            self.deletions_dirty.store(true, Ordering::Release);
         }
-        if self.base.load().get_edge(id).is_some() {
-            if self.deleted_from_base_edges.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-            }
-            return true;
-        }
-        false
+        overlay_removed || base_tombstoned
     }
 
     fn delete_edge_versioned(
@@ -1268,19 +1265,16 @@ impl GraphStoreMut for LayeredStore {
         transaction_id: TransactionId,
     ) -> bool {
         let _guard = self.merge_guard.read();
-        if self.is_edge_dirty(id) {
-            return self
-                .overlay
-                .load()
-                .delete_edge_versioned(id, epoch, transaction_id);
+        let overlay_removed = self
+            .overlay
+            .load()
+            .delete_edge_versioned(id, epoch, transaction_id);
+        let base_tombstoned = self.base.load().get_edge(id).is_some()
+            && self.deleted_from_base_edges.write().insert(id);
+        if base_tombstoned {
+            self.deletions_dirty.store(true, Ordering::Release);
         }
-        if self.base.load().get_edge(id).is_some() {
-            if self.deleted_from_base_edges.write().insert(id) {
-                self.deletions_dirty.store(true, Ordering::Release);
-            }
-            return true;
-        }
-        false
+        overlay_removed || base_tombstoned
     }
 
     fn set_node_property(&self, id: NodeId, key: &str, value: Value) {
@@ -3506,6 +3500,40 @@ mod tests {
             !layered.neighbors(person, Direction::Outgoing).contains(&target),
             "neighbors() reported a target whose only edge was deleted"
         );
+    }
+
+    #[test]
+    fn delete_promoted_edge_tombstones_base() {
+        let layered = build_test_layered();
+        let person = layered.nodes_by_label("Person")[0];
+        let (target, eid) = layered.edges_from(person, Direction::Outgoing)[0];
+
+        // Promote the edge into the overlay (copies it; base copy remains).
+        layered.set_edge_property(eid, "weight", Value::Int64(5));
+        assert!(layered.is_edge_dirty(eid));
+
+        // Delete it. Every read path must agree it is gone.
+        assert!(layered.delete_edge(eid));
+        assert!(layered.get_edge(eid).is_none(), "deleted promoted edge still resolves");
+        assert!(layered.edges_from(person, Direction::Outgoing).is_empty());
+        assert!(!layered.neighbors(person, Direction::Outgoing).contains(&target));
+        // Idempotent: nothing left to delete.
+        assert!(!layered.delete_edge(eid));
+    }
+
+    #[test]
+    fn delete_promoted_node_tombstones_base() {
+        let layered = build_test_layered();
+        let person = layered.nodes_by_label("Person")[0];
+
+        // Promote the node (labels/properties copied to overlay; base adjacency stays).
+        layered.set_node_property(person, "nick", Value::from("x"));
+        assert!(layered.is_node_dirty(person));
+
+        assert!(layered.delete_node(person));
+        assert!(layered.get_node(person).is_none(), "deleted promoted node still resolves");
+        // Its base edges must not resurface through the deleted node.
+        assert!(layered.edges_from(person, Direction::Outgoing).is_empty());
     }
 
     #[test]
