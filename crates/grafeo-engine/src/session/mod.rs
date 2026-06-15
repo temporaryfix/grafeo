@@ -6709,8 +6709,18 @@ mod tests {
             let db = GrafeoDB::new_in_memory();
             let session = db.session();
 
+            // SERIALIZABLE is rejected until real SSI lands (Wave 2); it must not
+            // silently downgrade to Snapshot Isolation.
+            assert!(
+                session
+                    .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                    .is_err()
+            );
+            assert!(!session.in_transaction());
+
+            // A supported isolation level still starts a transaction.
             session
-                .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute("START TRANSACTION ISOLATION LEVEL READ COMMITTED")
                 .unwrap();
             assert!(session.in_transaction());
             session.execute("ROLLBACK").unwrap();
