@@ -163,6 +163,7 @@ impl LpgStore {
 
         let chain = VersionChain::with_initial(record, version_epoch, transaction_id);
         self.nodes.write().insert(id, chain);
+        self.record_pending_node(transaction_id, id);
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
         id
     }
@@ -216,6 +217,8 @@ impl LpgStore {
         } else {
             versions.insert(id, VersionIndex::with_initial(hot_ref));
         }
+        drop(versions);
+        self.record_pending_node(transaction_id, id);
 
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
         id

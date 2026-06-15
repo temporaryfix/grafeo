@@ -4027,7 +4027,10 @@ impl Session {
                 // forever, pinning min_active_epoch and stalling MVCC GC.
                 for graph_name in &touched {
                     let store = self.resolve_store(graph_name);
-                    store.discard_uncommitted_versions(transaction_id);
+                    let (pending_nodes, pending_edges) =
+                        store.take_pending_creates(transaction_id);
+                    store.discard_entities_by_id(transaction_id, &pending_nodes, &pending_edges);
+                    store.rollback_transaction_properties(transaction_id);
                 }
                 let _ = self.transaction_manager.abort(transaction_id);
                 #[cfg(feature = "triple-store")]
@@ -4058,10 +4061,20 @@ impl Session {
             }
         };
 
-        // Finalize PENDING epochs: make uncommitted versions visible at the commit epoch.
+        // Finalize PENDING epochs: make uncommitted versions visible at the commit
+        // epoch. Write-set-scoped via the store's per-transaction pending-create
+        // index (complete by construction — every PENDING chain is recorded at
+        // create_*_versioned): only the entities this transaction created are
+        // finalized, instead of scanning every version chain.
         for graph_name in &touched {
             let store = self.resolve_store(graph_name);
-            store.finalize_version_epochs(transaction_id, commit_epoch);
+            let (pending_nodes, pending_edges) = store.take_pending_creates(transaction_id);
+            store.finalize_entities_by_id(
+                transaction_id,
+                commit_epoch,
+                &pending_nodes,
+                &pending_edges,
+            );
         }
 
         // Commit succeeded: discard undo logs (make changes permanent)
@@ -4214,11 +4227,16 @@ impl Session {
         // Reset read-only flag
         *self.read_only_tx.lock() = self.db_read_only;
 
-        // Discard uncommitted versions in ALL touched LPG stores (cross-graph atomicity).
+        // Discard uncommitted versions in ALL touched LPG stores (cross-graph
+        // atomicity). Write-set-scoped via the store's pending-create index:
+        // discard only the entities this transaction created, then replay the
+        // property/label undo log (which covers sets, labels, and deletes).
         let touched = self.touched_graphs.lock().clone();
         for graph_name in &touched {
             let store = self.resolve_store(graph_name);
-            store.discard_uncommitted_versions(transaction_id);
+            let (pending_nodes, pending_edges) = store.take_pending_creates(transaction_id);
+            store.discard_entities_by_id(transaction_id, &pending_nodes, &pending_edges);
+            store.rollback_transaction_properties(transaction_id);
         }
 
         // Discard pending operations in the RDF store
@@ -5438,6 +5456,82 @@ mod tests {
             .unwrap();
         assert_eq!(q.row_count(), 1);
         assert_eq!(q.rows()[0][0], Value::Int64(50));
+    }
+
+    #[test]
+    fn writeset_scoped_commit_finalizes_query_and_session_direct_paths() {
+        // The store-level pending-create index must finalize entities touched via
+        // BOTH the query (execute) path and the session-direct mutation APIs. A
+        // gap surfaces here as committed-but-invisible data. (MERGE/LOAD DATA
+        // coverage is provided by the coverage_patterns suite under all-features.)
+        let db = GrafeoDB::new_in_memory();
+        let mut s = db.session();
+        s.begin_transaction().unwrap();
+
+        s.execute("CREATE (:QPath {name: 'q'})").unwrap();
+        let n1 = s.create_node(&["Direct"]);
+        s.set_node_property(n1, "k", Value::Int64(42)).unwrap();
+        let n2 = s.create_node(&["Direct"]);
+        let _e = s.create_edge(n1, n2, "REL");
+
+        s.commit().unwrap();
+
+        let r = db.session();
+        assert_eq!(
+            r.execute("MATCH (:QPath) RETURN count(*) AS c")
+                .unwrap()
+                .rows()[0][0],
+            Value::Int64(1),
+            "query-path create must be finalized"
+        );
+        assert_eq!(
+            r.execute("MATCH (n:Direct) RETURN count(n) AS c")
+                .unwrap()
+                .rows()[0][0],
+            Value::Int64(2),
+            "session-direct creates must be finalized"
+        );
+        assert_eq!(
+            r.execute("MATCH ()-[e:REL]->() RETURN count(e) AS c")
+                .unwrap()
+                .rows()[0][0],
+            Value::Int64(1),
+            "session-direct edge must be finalized"
+        );
+        assert_eq!(
+            r.execute("MATCH (n:Direct) WHERE n.k = 42 RETURN count(n) AS c")
+                .unwrap()
+                .rows()[0][0],
+            Value::Int64(1),
+            "session-direct property must be finalized"
+        );
+    }
+
+    #[test]
+    fn writeset_scoped_rollback_discards_both_paths() {
+        let db = GrafeoDB::new_in_memory();
+        let mut s = db.session();
+        s.begin_transaction().unwrap();
+        s.execute("CREATE (:QPath2 {name: 'q'})").unwrap();
+        let _n1 = s.create_node(&["Direct2"]);
+        let _n2 = s.create_node(&["Direct2"]);
+        s.rollback().unwrap();
+
+        let r = db.session();
+        assert_eq!(
+            r.execute("MATCH (:QPath2) RETURN count(*) AS c")
+                .unwrap()
+                .rows()[0][0],
+            Value::Int64(0),
+            "query-path create must be discarded on rollback"
+        );
+        assert_eq!(
+            r.execute("MATCH (:Direct2) RETURN count(*) AS c")
+                .unwrap()
+                .rows()[0][0],
+            Value::Int64(0),
+            "session-direct creates must be discarded on rollback"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -468,6 +468,14 @@ pub struct LpgStore {
     /// simply discarded.
     /// Lock order: 10 (after named_graphs, independent of other locks)
     property_undo_log: RwLock<FxHashMap<TransactionId, Vec<PropertyUndoEntry>>>,
+
+    /// Per-transaction lists of entities created with PENDING versions, recorded
+    /// at `create_*_versioned` — the single chokepoint every PENDING chain passes
+    /// through (query operators, MERGE, LOAD DATA, and session-direct APIs alike).
+    /// Used for write-set-scoped commit/rollback: complete by construction, unlike
+    /// operator-level write tracking which MERGE/LOAD DATA bypass. Cleared when the
+    /// transaction commits or rolls back.
+    pending_tx_creates: RwLock<FxHashMap<TransactionId, (Vec<NodeId>, Vec<EdgeId>)>>,
 }
 
 impl LpgStore {
@@ -531,6 +539,7 @@ impl LpgStore {
             needs_stats_recompute: AtomicBool::new(false),
             named_graphs: RwLock::new(FxHashMap::default()),
             property_undo_log: RwLock::new(FxHashMap::default()),
+            pending_tx_creates: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -644,6 +653,7 @@ impl LpgStore {
 
         // Level 5: Undo log
         self.property_undo_log.write().clear();
+        self.pending_tx_creates.write().clear();
     }
 
     /// Returns whether backward adjacency (incoming edge index) is available.
@@ -882,5 +892,46 @@ impl LpgStore {
         if type_id < counts.len() as u32 {
             counts[type_id as usize] -= 1;
         }
+    }
+
+    /// Records a node created with a PENDING version under a transaction, for
+    /// write-set-scoped commit/rollback. No-op for the system transaction
+    /// (non-transactional creates are immediately visible, never PENDING).
+    pub(super) fn record_pending_node(&self, transaction_id: TransactionId, id: NodeId) {
+        if transaction_id != TransactionId::SYSTEM {
+            self.pending_tx_creates
+                .write()
+                .entry(transaction_id)
+                .or_default()
+                .0
+                .push(id);
+        }
+    }
+
+    /// Records an edge created with a PENDING version under a transaction. See
+    /// [`record_pending_node`](Self::record_pending_node).
+    pub(super) fn record_pending_edge(&self, transaction_id: TransactionId, id: EdgeId) {
+        if transaction_id != TransactionId::SYSTEM {
+            self.pending_tx_creates
+                .write()
+                .entry(transaction_id)
+                .or_default()
+                .1
+                .push(id);
+        }
+    }
+
+    /// Takes (removes and returns) the pending-create lists for a transaction.
+    /// Called by write-set-scoped commit/rollback, which then finalizes or
+    /// discards exactly these entities and leaves the map empty for the tx.
+    #[doc(hidden)]
+    pub fn take_pending_creates(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        self.pending_tx_creates
+            .write()
+            .remove(&transaction_id)
+            .unwrap_or_default()
     }
 }

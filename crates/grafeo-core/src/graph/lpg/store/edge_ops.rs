@@ -74,6 +74,7 @@ impl LpgStore {
         };
         let chain = VersionChain::with_initial(record, version_epoch, transaction_id);
         self.edges.write().insert(id, chain);
+        self.record_pending_edge(transaction_id, id);
 
         // Update adjacency
         self.forward_adj.add_edge(src, dst, id);
@@ -130,6 +131,8 @@ impl LpgStore {
         } else {
             versions.insert(id, VersionIndex::with_initial(hot_ref));
         }
+        drop(versions);
+        self.record_pending_edge(transaction_id, id);
 
         // Update adjacency
         self.forward_adj.add_edge(src, dst, id);
