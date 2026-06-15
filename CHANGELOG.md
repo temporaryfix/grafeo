@@ -19,6 +19,10 @@ Gremlin `notRegex()` predicate plus a planner fix for `ORDER BY` + `LIMIT` over 
 Thanks to [@jakeboone02](https://github.com/jakeboone02) for the `notRegex()` predicate, and to [@temporaryfix](https://github.com/temporaryfix) for the precise root-cause analysis on [#335](https://github.com/GrafeoDB/grafeo/issues/335) — the side-effect interaction between `try_heap_topk_rewrite`'s probe and `plan_return_projection` was subtle, and the write-up made the follow-up extension to `collect_vars` straightforward.
 ## [Unreleased]
 
+### Fixed
+
+- **Uncommitted property writes and node deletes were visible to other sessions (dirty reads)** — the read path honored MVCC for node/edge *existence* but read property/label *data* at "latest", and transactional `DELETE` marked version chains at the real epoch with eager label-index removal, so other sessions observed uncommitted `SET`/`REMOVE`/`DELETE` in both temporal and non-temporal builds. Transactional property writes now buffer into a per-transaction MVCC delta read through a single snapshot-aware accessor — the committed columnar store is left untouched, preserving compression/spill/zone-maps — and node deletes stamp `deleted_epoch = PENDING` with deferred label-index removal finalized at commit. The writing transaction sees its own changes (read-your-writes, including whole-entity `RETURN n` materialization and the indexed/zone-map filter fast paths); every other session sees only committed data. Commit promotes the delta, rollback drops it, and savepoints snapshot/restore it. (Unified-MVCC isolation, increment 1; foundational change to the storage/visibility primitive.)
+
 ### Added
 
 - **`GrafeoDB::open_multi` / `open_multi_with` + `GrafeoDB::extract_subgraph`**
