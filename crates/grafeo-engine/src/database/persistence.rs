@@ -880,14 +880,14 @@ fn collect_schema(catalog: &std::sync::Arc<crate::catalog::Catalog>) -> Snapshot
 ///
 /// Must be called after all nodes/edges have been populated, since index
 /// creation scans existing data.
-fn restore_indexes_from_snapshot(db: &super::GrafeoDB, indexes: &SnapshotIndexes) {
+fn restore_indexes_from_snapshot(db: &super::GrafeoDB, indexes: &SnapshotIndexes) -> Result<()> {
     for name in &indexes.property_indexes {
         db.lpg_store().create_property_index(name);
     }
 
     #[cfg(feature = "vector-index")]
     for vi in &indexes.vector_indexes {
-        if let Err(err) = db.create_vector_index(
+        db.create_vector_index(
             &vi.label,
             &vi.property,
             Some(vi.dimensions),
@@ -895,25 +895,25 @@ fn restore_indexes_from_snapshot(db: &super::GrafeoDB, indexes: &SnapshotIndexes
             Some(vi.m),
             Some(vi.ef_construction),
             None,
-        ) {
-            grafeo_warn!(
-                "Failed to restore vector index :{label}({property}): {err}",
-                label = vi.label,
-                property = vi.property,
-            );
-        }
+        )
+        .map_err(|err| {
+            Error::Internal(format!(
+                "restore vector index :{}({}): {err}",
+                vi.label, vi.property
+            ))
+        })?;
     }
 
     #[cfg(feature = "text-index")]
     for ti in &indexes.text_indexes {
-        if let Err(err) = db.create_text_index(&ti.label, &ti.property) {
-            grafeo_warn!(
-                "Failed to restore text index :{label}({property}): {err}",
-                label = ti.label,
-                property = ti.property,
-            );
-        }
+        db.create_text_index(&ti.label, &ti.property).map_err(|err| {
+            Error::Internal(format!(
+                "restore text index :{}({}): {err}",
+                ti.label, ti.property
+            ))
+        })?;
     }
+    Ok(())
 }
 
 /// Decode a snapshot blob into the in-memory `Snapshot` struct after
@@ -991,7 +991,7 @@ fn collect_index_metadata(store: &grafeo_core::graph::lpg::LpgStore) -> Snapshot
 /// for vector indexes) so the lead snapshot drives index parameters —
 /// callers needing identical configs across chunks should produce them
 /// from the same source.
-fn union_index_metadata(snapshots: &[Snapshot]) -> SnapshotIndexes {
+fn union_index_metadata(snapshots: &[Snapshot]) -> Result<SnapshotIndexes> {
     let mut property_index_set: HashSet<String> = HashSet::new();
     let mut property_indexes = Vec::new();
     for snap in snapshots {
@@ -1002,14 +1002,46 @@ fn union_index_metadata(snapshots: &[Snapshot]) -> SnapshotIndexes {
         }
     }
 
+    // Vector indexes union by (label, property), first occurrence preserved
+    // in order. A later snapshot declaring the same key with ANY differing
+    // config field is a conflict (an index cannot hold two dimensionalities /
+    // metrics), rejected before any data is built — matching how
+    // merge_snapshot_schemas rejects incompatible type definitions.
     #[cfg(feature = "vector-index")]
-    let mut vector_keys: HashSet<(String, String)> = HashSet::new();
+    let mut vector_seen: HashMap<(String, String), usize> = HashMap::new();
     #[cfg(feature = "vector-index")]
-    let mut vector_indexes = Vec::new();
+    let mut vector_indexes: Vec<SnapshotVectorIndex> = Vec::new();
     #[cfg(feature = "vector-index")]
-    for snap in snapshots {
+    for (snap_idx, snap) in snapshots.iter().enumerate() {
         for vi in &snap.indexes.vector_indexes {
-            if vector_keys.insert((vi.label.clone(), vi.property.clone())) {
+            let key = (vi.label.clone(), vi.property.clone());
+            if let Some(&existing_idx) = vector_seen.get(&key) {
+                let existing = &vector_indexes[existing_idx];
+                if existing.dimensions != vi.dimensions
+                    || existing.metric.name() != vi.metric.name()
+                    || existing.m != vi.m
+                    || existing.ef_construction != vi.ef_construction
+                {
+                    return Err(Error::Internal(format!(
+                        "open_multi: vector index :{}({}) declared with conflicting \
+                         configuration across snapshots (existing \
+                         dims={}/metric={}/m={}/ef={}; snapshot[{}] \
+                         dims={}/metric={}/m={}/ef={})",
+                        vi.label,
+                        vi.property,
+                        existing.dimensions,
+                        existing.metric.name(),
+                        existing.m,
+                        existing.ef_construction,
+                        snap_idx,
+                        vi.dimensions,
+                        vi.metric.name(),
+                        vi.m,
+                        vi.ef_construction,
+                    )));
+                }
+            } else {
+                vector_seen.insert(key, vector_indexes.len());
                 vector_indexes.push(SnapshotVectorIndex {
                     label: vi.label.clone(),
                     property: vi.property.clone(),
@@ -1042,11 +1074,11 @@ fn union_index_metadata(snapshots: &[Snapshot]) -> SnapshotIndexes {
     #[cfg(not(feature = "text-index"))]
     let text_indexes = Vec::new();
 
-    SnapshotIndexes {
+    Ok(SnapshotIndexes {
         property_indexes,
         vector_indexes,
         text_indexes,
-    }
+    })
 }
 
 impl super::GrafeoDB {
@@ -1748,8 +1780,11 @@ impl super::GrafeoDB {
         // Restore schema
         restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &snapshot.schema);
 
-        // Restore indexes (must come after data population)
-        restore_indexes_from_snapshot(&db, &snapshot.indexes);
+        // Restore indexes (must come after data population). Single-snapshot
+        // import stays lenient: a failed index rebuild is logged, not fatal.
+        if let Err(e) = restore_indexes_from_snapshot(&db, &snapshot.indexes) {
+            grafeo_warn!("index restore: {e}");
+        }
 
         Ok(db)
     }
@@ -1944,7 +1979,7 @@ impl super::GrafeoDB {
             restore_schema_from_snapshot(db.lpg_store(), &db.catalog, &merged_schema);
 
             // Restore indexes from the union of all snapshots' metadata.
-            restore_indexes_from_snapshot(&db, &union_index_metadata(&decoded));
+            restore_indexes_from_snapshot(&db, &union_index_metadata(&decoded)?)?;
         }
 
         grafeo_info!(

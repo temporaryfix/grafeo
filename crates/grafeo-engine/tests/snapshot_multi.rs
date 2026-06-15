@@ -482,3 +482,32 @@ fn open_multi_accepts_vec_of_vecs_and_array_of_slices() {
     let m3 = GrafeoDB::open_multi(&[bytes.as_slice()]).expect("slice of slices works");
     assert_eq!(m3.node_count(), 1);
 }
+
+#[test]
+#[cfg(feature = "vector-index")]
+fn open_multi_rejects_conflicting_vector_index_dimensions() {
+    fn blob_with_vector_index(dims: usize) -> Vec<u8> {
+        let db = GrafeoDB::new_in_memory();
+        db.create_vector_index("Doc", "embedding", Some(dims), None, None, None, None)
+            .expect("create vector index");
+        db.export_snapshot().expect("export")
+    }
+
+    // Same (label, property) index, different dimensions across snapshots.
+    let a = blob_with_vector_index(4);
+    let b = blob_with_vector_index(8);
+    let err = match GrafeoDB::open_multi([a, b]) {
+        Ok(_) => panic!("conflicting vector index dimensions must be rejected"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("conflicting") && msg.contains("embedding"),
+        "error must name the conflicting index, got: {msg}"
+    );
+
+    // Identical configs still merge cleanly (the sibling-extract case).
+    let c = blob_with_vector_index(4);
+    let d = blob_with_vector_index(4);
+    GrafeoDB::open_multi([c, d]).expect("identical vector index configs must merge");
+}
