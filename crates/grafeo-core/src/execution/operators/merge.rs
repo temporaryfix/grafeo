@@ -256,6 +256,13 @@ impl MergeOperator {
             .iter()
             .any(|(k, v)| !v.is_null() && self.store.has_property_index(k));
 
+        // Candidate set comes from the committed property index only. The per-node
+        // check below routes through read_node_property_visible and IS delta-aware, so
+        // MERGE matching on a *pre-existing committed* node whose property was SET in
+        // this transaction is handled correctly. Known gap (deferred): a node CREATEd
+        // within this same transaction (properties only in the buffered overlay) is
+        // absent from this index and will not appear as a candidate, so MERGE on such a
+        // node may create a duplicate. Fix requires a delta-aware find_nodes_by_properties.
         let candidates: Vec<NodeId> = if use_index {
             let conditions: Vec<(&str, Value)> = resolved_match_props
                 .iter()
@@ -298,6 +305,8 @@ impl MergeOperator {
                             .read_node_property_visible(node_id, &prop_key, epoch, Some(tid))
                     }
                     _ => {
+                        // Reached only when no transaction context was set (viewing_epoch/transaction_id
+                        // are always both Some together in production planner paths); reads committed.
                         let p = node.properties.get(&prop_key);
                         p.cloned()
                     }
@@ -808,6 +817,11 @@ impl MergeRelationshipOperator {
                     continue;
                 }
 
+                // TODO(unified-mvcc): this reads committed edge properties via edge.get_property,
+                // NOT the per-tx delta — asymmetric with find_matching_node's read_node_property_visible
+                // routing. A MERGE relationship matching on an edge property SET earlier in the same
+                // transaction would see the committed value. Route through read_edge_property_visible
+                // (needs epoch+tid threaded here) in a follow-up; no probe exercises this yet.
                 let has_all_props = resolved_match_props
                     .iter()
                     .all(|(key, expected)| edge.get_property(key).is_some_and(|v| v == expected));
