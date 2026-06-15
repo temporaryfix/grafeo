@@ -3,8 +3,6 @@
 #[cfg(any(feature = "wal", feature = "grafeo-file"))]
 use std::path::Path;
 
-#[cfg(any(feature = "vector-index", feature = "text-index"))]
-use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
 use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::{grafeo_debug_span, grafeo_info, grafeo_info_span};
@@ -1783,7 +1781,7 @@ impl super::GrafeoDB {
         // Restore indexes (must come after data population). Single-snapshot
         // import stays lenient: a failed index rebuild is logged, not fatal.
         if let Err(e) = restore_indexes_from_snapshot(&db, &snapshot.indexes) {
-            grafeo_warn!("index restore: {e}");
+            grafeo_info!("index restore: {e}");
         }
 
         Ok(db)
