@@ -1630,3 +1630,65 @@ fn test_clear() {
     assert_eq!(store.node_count(), 1);
     assert!(store.get_node(n3).is_some());
 }
+
+#[test]
+fn copy_graph_deep_copies_nodes_edges_props_labels_and_index() {
+    let store = LpgStore::new().expect("arena");
+    let src = store.graph_or_create("src").expect("src graph");
+    let a = src.create_node_with_props(
+        &["Person"],
+        [("name", Value::from("Ann")), ("age", Value::from(30i64))],
+    );
+    let b = src.create_node_with_props(&["Person"], [("name", Value::from("Bob"))]);
+    src.create_edge_with_props(a, b, "KNOWS", [("since", Value::from(2020i64))]);
+    src.create_property_index("name");
+
+    store.copy_graph(Some("src"), Some("dst")).expect("copy");
+    let dst = store.graph("dst").expect("dst graph created");
+
+    // Counts, labels, props.
+    assert_eq!(dst.node_count(), 2);
+    assert_eq!(dst.edge_count(), 1);
+    let ann_ids = dst.find_nodes_by_property("name", &Value::from("Ann"));
+    assert_eq!(ann_ids.len(), 1, "property index must work on the copy");
+    let ann = dst.get_node(ann_ids[0]).unwrap();
+    assert!(ann.labels.iter().any(|l| l.as_str() == "Person"));
+    assert_eq!(
+        ann.properties.get(&PropertyKey::new("age")),
+        Some(&Value::Int64(30))
+    );
+
+    // Edge: type, remapped endpoints, and property carried.
+    let edges: Vec<_> = dst.all_edges().collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].edge_type.as_str(), "KNOWS");
+    assert_eq!(
+        edges[0].properties.get(&PropertyKey::new("since")),
+        Some(&Value::Int64(2020))
+    );
+
+    // Deep copy: mutating the copy does not affect the source.
+    dst.set_node_property(ann_ids[0], "age", Value::from(99i64));
+    let src_ann = src.find_nodes_by_property("name", &Value::from("Ann"));
+    assert_eq!(
+        src.get_node(src_ann[0])
+            .unwrap()
+            .properties
+            .get(&PropertyKey::new("age")),
+        Some(&Value::Int64(30)),
+        "source must be unchanged by mutations to the copy"
+    );
+}
+
+#[test]
+fn copy_graph_self_copy_is_a_noop() {
+    let store = LpgStore::new().expect("arena");
+    let g = store.graph_or_create("g").expect("g");
+    g.create_node(&["X"]);
+    store.copy_graph(Some("g"), Some("g")).expect("self-copy ok");
+    assert_eq!(
+        store.graph("g").unwrap().node_count(),
+        1,
+        "self-copy must not duplicate"
+    );
+}

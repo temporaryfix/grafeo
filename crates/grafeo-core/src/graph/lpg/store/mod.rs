@@ -25,6 +25,7 @@ mod versioning;
 mod tests;
 
 use super::PropertyStorage;
+use crate::graph::lpg::{Edge, Node};
 #[cfg(not(feature = "tiered-storage"))]
 use super::{EdgeRecord, NodeRecord};
 use crate::index::adjacency::ChunkedAdjacency;
@@ -753,14 +754,73 @@ impl LpgStore {
     ///
     /// Returns [`AllocError`] if the destination store cannot be allocated.
     pub fn copy_graph(&self, source: Option<&str>, dest: Option<&str>) -> Result<(), AllocError> {
-        let _src = match source {
-            Some(n) => self.graph(n),
-            None => None, // default graph
+        // Self-copy guard: copying a store onto itself would iterate the
+        // destination while mutating it. Both-None (default->default) or equal
+        // names resolve to the same store.
+        let same = match (source, dest) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
+            _ => false,
         };
-        let _dest_graph = dest.map(|n| self.graph_or_create(n)).transpose()?;
-        // Full graph copy is complex (requires iterating all entities).
-        // For now, this creates the destination graph structure.
-        // Full entity-level copy will be implemented when needed.
+        if same {
+            return Ok(());
+        }
+
+        // Resolve the source store (None = this default store). A missing named
+        // source has nothing to copy.
+        let src_arc;
+        let src: &LpgStore = match source {
+            Some(name) => match self.graph(name) {
+                Some(g) => {
+                    src_arc = g;
+                    &src_arc
+                }
+                None => return Ok(()),
+            },
+            None => self,
+        };
+
+        // Snapshot source data into owned vectors so the source is not borrowed
+        // while the destination is written.
+        let nodes: Vec<Node> = src.all_nodes().collect();
+        let edges: Vec<Edge> = src.all_edges().collect();
+        let index_keys = src.property_index_keys();
+
+        // Resolve-or-create the destination store (None = this default store).
+        let dst_arc;
+        let dst: &LpgStore = match dest {
+            Some(name) => {
+                dst_arc = self.graph_or_create(name)?;
+                &dst_arc
+            }
+            None => self,
+        };
+
+        // Copy nodes, recording an old -> new id mapping for edge endpoints.
+        let mut id_map: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+        for node in nodes {
+            let labels: Vec<&str> = node.labels.iter().map(|l| l.as_str()).collect();
+            let new_id = dst.create_node_with_props(&labels, node.properties);
+            id_map.insert(node.id, new_id);
+        }
+
+        // Copy edges with remapped endpoints.
+        for edge in edges {
+            let (Some(&new_src), Some(&new_dst)) =
+                (id_map.get(&edge.src), id_map.get(&edge.dst))
+            else {
+                continue; // endpoint not copied (should not happen for live edges)
+            };
+            dst.create_edge_with_props(new_src, new_dst, edge.edge_type.as_str(), edge.properties);
+        }
+
+        // Re-create property indexes on the destination. Vector/text indexes are
+        // not carried by the copy (they would require re-embedding / re-tokenizing
+        // every value); recreate them on the destination if needed.
+        for key in index_keys {
+            dst.create_property_index(&key);
+        }
+
         Ok(())
     }
 
