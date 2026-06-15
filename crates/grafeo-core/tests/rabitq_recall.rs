@@ -152,3 +152,20 @@ fn recall_floor_survives_blob_round_trip() {
     let truth = brute_force(&vectors, &query, 10);
     assert!(recall(&truth, &reopened.search(&query, 10, 16)) >= RECALL_FLOOR);
 }
+
+#[test]
+fn search_preserves_node_ids_above_u32_max() {
+    // Guards the value the WASM binding must not truncate: the core returns
+    // the full u64 NodeId, and f64 (the JS surface) represents it exactly
+    // below 2^53. The pre-fix wasm cast `id.as_u64() as u32` silently lost it.
+    let big = u64::from(u32::MAX) + 5; // 4_294_967_300
+    let vectors = vec![
+        (NodeId::new(big), vec![1.0f32, 0.0, 0.0, 0.0]),
+        (NodeId::new(big + 1), vec![0.0f32, 1.0, 0.0, 0.0]),
+    ];
+    let index = TwoStageVectorIndex::build(&vectors, 4, 42);
+    let hits = index.search(&[1.0, 0.0, 0.0, 0.0], 1, 8);
+    assert_eq!(hits[0].0, NodeId::new(big), "core must preserve the full u64 id");
+    // f64 round-trips this id exactly (< 2^53), so the JS surface is lossless.
+    assert_eq!(hits[0].0.as_u64() as f64 as u64, big);
+}

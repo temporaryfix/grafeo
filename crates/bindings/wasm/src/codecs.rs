@@ -66,17 +66,19 @@ impl RabitqCodec {
     }
 
     /// Searches for the `k` nearest neighbours of `query`. Returns node ids
-    /// nearest-first. `rerank_factor` controls the recall/latency trade-off
-    /// (8–16 is typical).
+    /// nearest-first as a `Float64Array`. Node ids are exact for any value
+    /// below 2^53 (every realistic node count); `as u32` truncation here
+    /// silently corrupted ids built by the native API above that. `rerank_factor`
+    /// controls the recall/latency trade-off (8–16 is typical).
     #[wasm_bindgen(js_name = "search")]
     #[must_use]
-    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<u32> {
-        // reason: node ids in a snapshot fit u32 for the JS surface
-        #[allow(clippy::cast_possible_truncation)]
+    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<f64> {
+        // reason: f64 holds any node id below 2^53 exactly — lossless for the JS surface
+        #[allow(clippy::cast_precision_loss)]
         self.inner
             .search(query, k, rerank_factor)
             .into_iter()
-            .map(|(id, _)| id.as_u64() as u32)
+            .map(|(id, _)| id.as_u64() as f64)
             .collect()
     }
 
@@ -218,48 +220,55 @@ impl WebGraphCodec {
         Ok(Self { inner })
     }
 
-    /// Returns the successors of `node` as a `Uint32Array`.
+    /// Returns the successors of `node` as a `Float64Array` (ids exact below 2^53).
     #[wasm_bindgen(js_name = "successors")]
     #[must_use]
-    pub fn successors(&self, node: u32) -> Vec<u32> {
-        // reason: snapshot node ids fit u32 for the JS surface
-        #[allow(clippy::cast_possible_truncation)]
+    pub fn successors(&self, node: f64) -> Vec<f64> {
+        // reason: f64 holds any node id below 2^53 exactly
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         self.inner
-            .successors(u64::from(node))
-            .map(|d| d as u32)
+            .successors(node as u64)
+            .map(|d| d as f64)
             .collect()
     }
 
     /// Out-degree of `node`.
     #[wasm_bindgen(js_name = "outDegree")]
     #[must_use]
-    pub fn out_degree(&self, node: u32) -> u32 {
-        // reason: degree fits u32 for any practical snapshot
-        #[allow(clippy::cast_possible_truncation)]
+    pub fn out_degree(&self, node: f64) -> f64 {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         {
-            self.inner.out_degree(u64::from(node)) as u32
+            self.inner.out_degree(node as u64) as f64
         }
     }
 
     /// Number of nodes.
     #[wasm_bindgen(js_name = "numNodes")]
     #[must_use]
-    pub fn num_nodes(&self) -> u32 {
-        // reason: snapshot node count fits u32
-        #[allow(clippy::cast_possible_truncation)]
+    pub fn num_nodes(&self) -> f64 {
+        // reason: f64 holds any node count below 2^53 exactly
+        #[allow(clippy::cast_precision_loss)]
         {
-            self.inner.num_nodes() as u32
+            self.inner.num_nodes() as f64
         }
     }
 
     /// Number of edges.
     #[wasm_bindgen(js_name = "numEdges")]
     #[must_use]
-    pub fn num_edges(&self) -> u32 {
-        // reason: snapshot edge count fits u32
-        #[allow(clippy::cast_possible_truncation)]
+    pub fn num_edges(&self) -> f64 {
+        // reason: f64 holds any edge count below 2^53 exactly
+        #[allow(clippy::cast_precision_loss)]
         {
-            self.inner.num_edges() as u32
+            self.inner.num_edges() as f64
         }
     }
 }

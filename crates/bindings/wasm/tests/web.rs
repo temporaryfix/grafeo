@@ -572,7 +572,8 @@ fn rabitq_codec_encode_open_search_round_trip() {
     let hits = codec.search(&query, 5, 8);
     assert_eq!(hits.len(), 5);
     for id in hits {
-        assert!(id <= 20, "expected cluster-0 hit, got id {id}");
+        // ids cross to JS as f64 (exact below 2^53).
+        assert!(id <= 20.0, "expected cluster-0 hit, got id {id}");
     }
 }
 
@@ -612,9 +613,10 @@ fn webgraph_codec_encode_open_successors_round_trip() {
     assert_eq!(&blob[0..4], b"GWBG");
 
     let codec = WebGraphCodec::open(&blob).expect("open");
-    assert_eq!(codec.num_nodes(), 6);
-    assert_eq!(codec.num_edges(), 4);
-    assert_eq!(codec.successors(0), vec![1u32, 2, 3]);
-    assert_eq!(codec.successors(1), Vec::<u32>::new());
-    assert_eq!(codec.successors(5), vec![5u32]);
+    // Ids/counts cross to JS as f64 (exact below 2^53).
+    assert_eq!(codec.num_nodes(), 6.0);
+    assert_eq!(codec.num_edges(), 4.0);
+    assert_eq!(codec.successors(0.0), vec![1.0, 2.0, 3.0]);
+    assert_eq!(codec.successors(1.0), Vec::<f64>::new());
+    assert_eq!(codec.successors(5.0), vec![5.0]);
 }
