@@ -240,6 +240,23 @@ impl<T> VersionChain<T> {
         }
     }
 
+    /// Finalizes PENDING `deleted_epoch`s for versions deleted by the given
+    /// transaction. Called at commit to make a delete visible at the real
+    /// commit epoch instead of `EpochId::PENDING`.
+    pub fn finalize_deleted_epochs(
+        &mut self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+    ) {
+        for version in &mut self.versions {
+            if version.info.deleted_by == Some(transaction_id)
+                && version.info.deleted_epoch == Some(EpochId::PENDING)
+            {
+                version.info.deleted_epoch = Some(commit_epoch);
+            }
+        }
+    }
+
     /// Checks if there's a concurrent modification conflict.
     ///
     /// A conflict exists if another transaction modified this entity
@@ -376,29 +393,40 @@ impl OptionalEpochId {
     /// Represents no epoch (deleted_epoch = None).
     pub const NONE: Self = Self(u32::MAX);
 
+    /// Represents a PENDING epoch (delete/create not yet committed).
+    /// Uses `u32::MAX - 1` as sentinel (distinct from NONE = `u32::MAX`).
+    /// Mirrors `EpochId::PENDING` (u64::MAX) but fits in the compact u32 layout.
+    pub const PENDING: Self = Self(u32::MAX - 1);
+
     /// Creates an `OptionalEpochId` from an epoch.
     ///
+    /// For PENDING epochs, use [`OptionalEpochId::PENDING`] directly instead.
+    ///
     /// # Panics
-    /// Panics if epoch exceeds u32::MAX - 1 (4,294,967,294).
+    /// Panics if epoch exceeds u32::MAX - 2 (4,294,967,293).
     #[must_use]
     pub fn some(epoch: EpochId) -> Self {
         assert!(
-            epoch.as_u64() < u64::from(u32::MAX),
+            epoch.as_u64() < u64::from(u32::MAX) - 1,
             "epoch {} exceeds OptionalEpochId capacity (max {})",
             epoch.as_u64(),
-            u32::MAX as u64 - 1
+            u32::MAX as u64 - 2
         );
-        // reason: the assert above guarantees epoch < u32::MAX
+        // reason: the assert above guarantees epoch < u32::MAX - 1
         #[allow(clippy::cast_possible_truncation)]
         Self(epoch.as_u64() as u32)
     }
 
-    /// Returns the contained epoch, or `None` if this is `NONE`.
+    /// Returns the contained epoch, or `None` if this is `NONE` or `PENDING`.
+    ///
+    /// Returns `Some(EpochId::PENDING)` when this is [`OptionalEpochId::PENDING`].
     #[inline]
     #[must_use]
     pub fn get(self) -> Option<EpochId> {
         if self.0 == u32::MAX {
             None
+        } else if self.0 == u32::MAX - 1 {
+            Some(EpochId::PENDING)
         } else {
             Some(EpochId::new(u64::from(self.0)))
         }
@@ -476,8 +504,14 @@ impl HotVersionRef {
     }
 
     /// Marks this version as deleted by a specific transaction.
+    ///
+    /// Accepts `EpochId::PENDING` to represent an uncommitted (deferred) delete.
     pub fn mark_deleted(&mut self, epoch: EpochId, deleted_by: TransactionId) {
-        self.deleted_epoch = OptionalEpochId::some(epoch);
+        self.deleted_epoch = if epoch == EpochId::PENDING {
+            OptionalEpochId::PENDING
+        } else {
+            OptionalEpochId::some(epoch)
+        };
         self.deleted_by = Some(deleted_by);
     }
 
@@ -771,7 +805,11 @@ impl VersionIndex {
         // Check cold versions (rare case)
         for v in &mut self.cold {
             if v.deleted_epoch.is_none() {
-                v.deleted_epoch = OptionalEpochId::some(delete_epoch);
+                v.deleted_epoch = if delete_epoch == EpochId::PENDING {
+                    OptionalEpochId::PENDING
+                } else {
+                    OptionalEpochId::some(delete_epoch)
+                };
                 v.deleted_by = Some(deleted_by);
                 return true;
             }
@@ -827,6 +865,31 @@ impl VersionIndex {
         for v in &mut self.hot {
             if v.created_by == transaction_id && v.epoch == EpochId::PENDING {
                 v.epoch = commit_epoch;
+            }
+        }
+        self.recalculate_latest_epoch();
+    }
+
+    /// Finalizes PENDING `deleted_epoch`s for versions deleted by the given
+    /// transaction. Called at commit to make a delete visible at the real
+    /// commit epoch instead of `EpochId::PENDING`.
+    pub fn finalize_deleted_epochs(
+        &mut self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+    ) {
+        for v in &mut self.hot {
+            if v.deleted_by == Some(transaction_id)
+                && v.deleted_epoch.get() == Some(EpochId::PENDING)
+            {
+                v.deleted_epoch = OptionalEpochId::some(commit_epoch);
+            }
+        }
+        for v in &mut self.cold {
+            if v.deleted_by == Some(transaction_id)
+                && v.deleted_epoch.get() == Some(EpochId::PENDING)
+            {
+                v.deleted_epoch = OptionalEpochId::some(commit_epoch);
             }
         }
         self.recalculate_latest_epoch();
@@ -1074,6 +1137,30 @@ mod tests {
         // Should see v1 before deletion, nothing after
         assert_eq!(chain.visible_at(EpochId::new(4)), Some(&"v1"));
         assert_eq!(chain.visible_at(EpochId::new(5)), None);
+        assert_eq!(chain.visible_at(EpochId::new(10)), None);
+    }
+
+    #[test]
+    fn pending_delete_is_invisible_to_deleter_visible_to_others() {
+        let mut v = VersionInfo::new(EpochId::new(1), TransactionId::new(1));
+        let deleter = TransactionId::new(7);
+        v.mark_deleted(EpochId::PENDING, deleter);
+
+        // Deleter sees its own delete (node gone for it).
+        assert!(!v.is_visible_to(EpochId::new(5), deleter));
+        // Everyone else still sees the node (delete not committed).
+        assert!(v.is_visible_to(EpochId::new(5), TransactionId::new(8)));
+        assert!(v.is_visible_at(EpochId::new(5)));
+    }
+
+    #[test]
+    fn finalize_deleted_epochs_makes_delete_visible_at_commit() {
+        let mut chain = VersionChain::with_initial("v1", EpochId::new(1), TransactionId::new(1));
+        let deleter = TransactionId::new(7);
+        chain.mark_deleted(EpochId::PENDING, deleter);
+        chain.finalize_deleted_epochs(deleter, EpochId::new(10));
+        // After finalize at epoch 10: visible before 10, gone at/after 10.
+        assert_eq!(chain.visible_at(EpochId::new(9)), Some(&"v1"));
         assert_eq!(chain.visible_at(EpochId::new(10)), None);
     }
 }

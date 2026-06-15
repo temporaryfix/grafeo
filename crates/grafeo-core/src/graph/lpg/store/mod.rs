@@ -25,9 +25,9 @@ mod versioning;
 mod tests;
 
 use super::PropertyStorage;
-use crate::graph::lpg::{Edge, Node};
 #[cfg(not(feature = "tiered-storage"))]
 use super::{EdgeRecord, NodeRecord};
+use crate::graph::lpg::{Edge, Node};
 use crate::index::adjacency::ChunkedAdjacency;
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
@@ -508,6 +508,13 @@ pub struct LpgStore {
     /// applied to the committed column on commit, dropped on rollback. Other
     /// sessions never see it. Lock order: after `pending_tx_creates`.
     tx_property_overlay: RwLock<FxHashMap<TransactionId, TxDelta>>,
+
+    /// Per-transaction lists of node IDs deleted with a PENDING `deleted_epoch`,
+    /// recorded at `delete_node_transactional` — the chokepoint that defers
+    /// label-index/adjacency removal until commit. Finalized by
+    /// `finalize_deletes_by_id`, dropped on rollback.
+    /// Lock order: after `tx_property_overlay`.
+    pub(crate) pending_tx_deletes: RwLock<FxHashMap<TransactionId, Vec<NodeId>>>,
 }
 
 impl LpgStore {
@@ -573,6 +580,7 @@ impl LpgStore {
             property_undo_log: RwLock::new(FxHashMap::default()),
             pending_tx_creates: RwLock::new(FxHashMap::default()),
             tx_property_overlay: RwLock::new(FxHashMap::default()),
+            pending_tx_deletes: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -850,8 +858,7 @@ impl LpgStore {
 
         // Copy edges with remapped endpoints.
         for edge in edges {
-            let (Some(&new_src), Some(&new_dst)) =
-                (id_map.get(&edge.src), id_map.get(&edge.dst))
+            let (Some(&new_src), Some(&new_dst)) = (id_map.get(&edge.src), id_map.get(&edge.dst))
             else {
                 continue; // endpoint not copied (should not happen for live edges)
             };

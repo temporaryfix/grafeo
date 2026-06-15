@@ -611,12 +611,22 @@ impl LpgStore {
         }
     }
 
-    /// Deletes a node within a transaction, capturing undo information for rollback.
+    /// Deletes a node within a transaction using PENDING-epoch isolation.
     ///
     /// Unlike `delete_node_at_epoch`, this method:
-    /// 1. Captures labels and properties before deletion (for undo log)
-    /// 2. Marks the version with `deleted_by` = transaction_id (for rollback)
-    /// 3. Pushes a `NodeDeleted` undo entry so rollback can restore the node
+    /// 1. Marks the version with `deleted_epoch = EpochId::PENDING` so the deleting
+    ///    transaction sees the node as gone (read-your-writes), while all other
+    ///    sessions still see it (PENDING > any real epoch in `is_visible_at`).
+    /// 2. Does NOT eagerly strip label-index or properties — deferred to commit
+    ///    via `finalize_deletes_by_id`.
+    /// 3. Records the node ID in `pending_tx_deletes` so commit can finalize and
+    ///    rollback can clear the deferred set (calling `unmark_deleted_by` via
+    ///    `rollback_pending_deletes`).
+    ///
+    /// NOTE: `DETACH DELETE` edge adjacency tombstones still use `TransactionId::SYSTEM`
+    /// with eager marking (see `delete_node_edges`). Deferring adjacency isolation for
+    /// nodes-with-edges is tracked separately.
+    /// TODO(unified-mvcc): defer adjacency tombstones for transactional DETACH.
     #[cfg(not(feature = "tiered-storage"))]
     pub(crate) fn delete_node_transactional(
         &self,
@@ -634,82 +644,17 @@ impl LpgStore {
                 return false;
             }
 
-            // Mark deleted with transaction tracking
-            chain.mark_deleted(epoch, transaction_id);
-
-            // Capture labels for undo log
-            let registry = self.label_registry.read();
-            let node_labels_map = self.node_labels.read();
-
-            #[cfg(not(feature = "temporal"))]
-            let label_names: Vec<String> = node_labels_map
-                .get(&id)
-                .map(|label_ids| {
-                    label_ids
-                        .iter()
-                        .filter_map(|&lid| registry.get_name(lid).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            #[cfg(feature = "temporal")]
-            let label_names: Vec<String> = node_labels_map
-                .get(&id)
-                .and_then(|log| log.latest())
-                .map(|label_ids| {
-                    label_ids
-                        .iter()
-                        .filter_map(|&lid| registry.get_name(lid).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            drop(registry);
-            drop(node_labels_map);
-
-            // Capture properties for undo log
+            // Stamp PENDING so the deleter sees it gone, others still see it.
+            chain.mark_deleted(EpochId::PENDING, transaction_id);
             drop(nodes);
-            let properties: Vec<(PropertyKey, Value)> =
-                self.node_properties.get_all(id).into_iter().collect();
 
-            // Remove from label index (will be restored on rollback)
-            let mut index = self.label_index.write();
-            let mut node_labels_w = self.node_labels.write();
-            if let Some(removed) = node_labels_w.remove(&id) {
-                #[cfg(not(feature = "temporal"))]
-                let label_ids = removed;
-                #[cfg(feature = "temporal")]
-                let label_ids = removed.latest().cloned().unwrap_or_default();
-                for label_id in label_ids {
-                    if let Some(set) = index.get_mut(label_id as usize) {
-                        set.remove(&id);
-                    }
-                }
-            }
-            drop(index);
-            drop(node_labels_w);
-
-            // Remove from text indexes
-            #[cfg(feature = "text-index")]
-            self.remove_from_all_text_indexes(id);
-
-            // Remove properties (will be restored on rollback)
-            #[cfg(not(feature = "temporal"))]
-            self.node_properties.remove_all(id);
-            #[cfg(feature = "temporal")]
-            self.node_properties.remove_all(id, self.current_epoch());
-            self.live_node_count.fetch_sub(1, Ordering::Relaxed);
-
-            // Record undo entry for rollback
-            self.property_undo_log
+            // Record for deferred finalize/rollback — label-index/property removal
+            // is deferred to `finalize_deletes_by_id` at commit time.
+            self.pending_tx_deletes
                 .write()
                 .entry(transaction_id)
                 .or_default()
-                .push(super::PropertyUndoEntry::NodeDeleted {
-                    node_id: id,
-                    labels: label_names,
-                    properties,
-                });
+                .push(id);
 
             true
         } else {
@@ -717,8 +662,13 @@ impl LpgStore {
         }
     }
 
-    /// Deletes a node within a transaction, capturing undo information for rollback.
+    /// Deletes a node within a transaction using PENDING-epoch isolation.
     /// (Tiered storage version)
+    ///
+    /// Stamps `deleted_epoch = EpochId::PENDING` so other sessions still see
+    /// the node while the delete is uncommitted. Label-index and property removal
+    /// are deferred to `finalize_deletes_by_id` at commit time.
+    /// TODO(unified-mvcc): defer adjacency tombstones for transactional DETACH.
     #[cfg(feature = "tiered-storage")]
     pub(crate) fn delete_node_transactional(
         &self,
@@ -740,82 +690,16 @@ impl LpgStore {
                 return false;
             }
 
-            // Mark deleted with transaction tracking
-            index.mark_deleted(epoch, transaction_id);
-
-            // Capture labels for undo log
-            let registry = self.label_registry.read();
-            let node_labels_map = self.node_labels.read();
-
-            #[cfg(not(feature = "temporal"))]
-            let label_names: Vec<String> = node_labels_map
-                .get(&id)
-                .map(|label_ids| {
-                    label_ids
-                        .iter()
-                        .filter_map(|&lid| registry.get_name(lid).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            #[cfg(feature = "temporal")]
-            let label_names: Vec<String> = node_labels_map
-                .get(&id)
-                .and_then(|log| log.latest())
-                .map(|label_ids| {
-                    label_ids
-                        .iter()
-                        .filter_map(|&lid| registry.get_name(lid).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            drop(registry);
-            drop(node_labels_map);
-
-            // Capture properties for undo log
+            // Stamp PENDING so the deleter sees it gone, others still see it.
+            index.mark_deleted(EpochId::PENDING, transaction_id);
             drop(versions);
-            let properties: Vec<(PropertyKey, Value)> =
-                self.node_properties.get_all(id).into_iter().collect();
 
-            // Remove from label index
-            let mut label_index = self.label_index.write();
-            let mut node_labels_w = self.node_labels.write();
-            if let Some(removed) = node_labels_w.remove(&id) {
-                #[cfg(not(feature = "temporal"))]
-                let label_ids = removed;
-                #[cfg(feature = "temporal")]
-                let label_ids = removed.latest().cloned().unwrap_or_default();
-                for label_id in label_ids {
-                    if let Some(set) = label_index.get_mut(label_id as usize) {
-                        set.remove(&id);
-                    }
-                }
-            }
-            drop(label_index);
-            drop(node_labels_w);
-
-            // Remove from text indexes
-            #[cfg(feature = "text-index")]
-            self.remove_from_all_text_indexes(id);
-
-            // Remove properties
-            #[cfg(not(feature = "temporal"))]
-            self.node_properties.remove_all(id);
-            #[cfg(feature = "temporal")]
-            self.node_properties.remove_all(id, self.current_epoch());
-            self.live_node_count.fetch_sub(1, Ordering::Relaxed);
-
-            // Record undo entry for rollback
-            self.property_undo_log
+            // Record for deferred finalize/rollback.
+            self.pending_tx_deletes
                 .write()
                 .entry(transaction_id)
                 .or_default()
-                .push(super::PropertyUndoEntry::NodeDeleted {
-                    node_id: id,
-                    labels: label_names,
-                    properties,
-                });
+                .push(id);
 
             true
         } else {
@@ -1238,5 +1122,161 @@ impl LpgStore {
         let mut ids: Vec<NodeId> = self.node_versions.read().keys().copied().collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Finalizes PENDING deletes for a committed transaction: stamps each
+    /// deleted version's `deleted_epoch` PENDING→`commit_epoch` and applies the
+    /// deferred label-index/property removal now that the delete is committed.
+    #[cfg(not(feature = "tiered-storage"))]
+    pub(crate) fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        if node_ids.is_empty() {
+            return;
+        }
+        {
+            let mut nodes = self.nodes.write();
+            for &id in node_ids {
+                if let Some(chain) = nodes.get_mut(&id) {
+                    chain.finalize_deleted_epochs(transaction_id, commit_epoch);
+                }
+            }
+        }
+        // Apply the deferred label-index removal now that the delete is committed.
+        let mut node_labels_w = self.node_labels.write();
+        let mut index = self.label_index.write();
+        for &id in node_ids {
+            if let Some(removed) = node_labels_w.remove(&id) {
+                #[cfg(not(feature = "temporal"))]
+                let label_ids = removed;
+                #[cfg(feature = "temporal")]
+                let label_ids = removed.latest().cloned().unwrap_or_default();
+                for label_id in label_ids {
+                    if let Some(set) = index.get_mut(label_id as usize) {
+                        set.remove(&id);
+                    }
+                }
+            }
+        }
+        drop(index);
+        drop(node_labels_w);
+
+        // Remove from text indexes
+        #[cfg(feature = "text-index")]
+        for &id in node_ids {
+            self.remove_from_all_text_indexes(id);
+        }
+
+        // Remove properties now that the delete is committed.
+        for &id in node_ids {
+            #[cfg(not(feature = "temporal"))]
+            self.node_properties.remove_all(id);
+            #[cfg(feature = "temporal")]
+            self.node_properties.remove_all(id, commit_epoch);
+
+            self.live_node_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Finalizes PENDING deletes for a committed transaction.
+    /// (Tiered storage version)
+    #[cfg(feature = "tiered-storage")]
+    pub(crate) fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        if node_ids.is_empty() {
+            return;
+        }
+        {
+            let mut versions = self.node_versions.write();
+            for &id in node_ids {
+                if let Some(index) = versions.get_mut(&id) {
+                    index.finalize_deleted_epochs(transaction_id, commit_epoch);
+                }
+            }
+        }
+        // Apply the deferred label-index removal now that the delete is committed.
+        let mut node_labels_w = self.node_labels.write();
+        let mut label_index = self.label_index.write();
+        for &id in node_ids {
+            if let Some(removed) = node_labels_w.remove(&id) {
+                #[cfg(not(feature = "temporal"))]
+                let label_ids = removed;
+                #[cfg(feature = "temporal")]
+                let label_ids = removed.latest().cloned().unwrap_or_default();
+                for label_id in label_ids {
+                    if let Some(set) = label_index.get_mut(label_id as usize) {
+                        set.remove(&id);
+                    }
+                }
+            }
+        }
+        drop(label_index);
+        drop(node_labels_w);
+
+        // Remove from text indexes
+        #[cfg(feature = "text-index")]
+        for &id in node_ids {
+            self.remove_from_all_text_indexes(id);
+        }
+
+        // Remove properties now that the delete is committed.
+        for &id in node_ids {
+            #[cfg(not(feature = "temporal"))]
+            self.node_properties.remove_all(id);
+            #[cfg(feature = "temporal")]
+            self.node_properties.remove_all(id, commit_epoch);
+
+            self.live_node_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Rolls back PENDING deletes for a transaction: clears the PENDING
+    /// `deleted_epoch` on each node's version chain so the node is visible again.
+    /// Labels and properties were never removed (deferred path), so no restoration
+    /// is needed — just unmark the version chain.
+    #[cfg(not(feature = "tiered-storage"))]
+    #[doc(hidden)]
+    pub fn rollback_pending_deletes(&self, transaction_id: TransactionId, node_ids: &[NodeId]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut nodes = self.nodes.write();
+        for &id in node_ids {
+            if let Some(chain) = nodes.get_mut(&id) {
+                chain.unmark_deleted_by(transaction_id);
+            }
+        }
+    }
+
+    /// Rolls back PENDING deletes for a transaction.
+    /// (Tiered storage version)
+    #[cfg(feature = "tiered-storage")]
+    #[doc(hidden)]
+    pub fn rollback_pending_deletes(&self, transaction_id: TransactionId, node_ids: &[NodeId]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut versions = self.node_versions.write();
+        for &id in node_ids {
+            if let Some(index) = versions.get_mut(&id) {
+                index.unmark_deleted_by(transaction_id);
+            }
+        }
+    }
+
+    /// Takes (removes and returns) the pending delete list for a transaction.
+    #[doc(hidden)]
+    pub fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.pending_tx_deletes
+            .write()
+            .remove(&transaction_id)
+            .unwrap_or_default()
     }
 }

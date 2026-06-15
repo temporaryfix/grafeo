@@ -158,3 +158,42 @@ fn writer_sees_own_set_via_filter_not_just_projection() {
     );
     w.rollback().unwrap();
 }
+
+/// Uncommitted DETACH DELETE of a node WITH edges must not tombstone edges for
+/// other readers (edge-adjacency isolation).
+///
+/// Currently `delete_node_edges` uses `TransactionId::SYSTEM` with eager
+/// `batch_mark_deleted`, so the adjacency tombstone is immediately visible to
+/// other sessions regardless of the deleting transaction's commit status.
+/// Fixing this requires threading `transaction_id` into `delete_node_edges` and
+/// deferring adjacency removal — left as a follow-up (unified-mvcc increment 2).
+///
+/// TODO(unified-mvcc): defer adjacency tombstones for transactional DETACH.
+#[test]
+#[ignore = "known bug: delete_node_edges uses eager adjacency tombstones (TransactionId::SYSTEM); adjacency isolation deferred to unified-mvcc increment 2"]
+fn uncommitted_detach_delete_edges_invisible_to_other_sessions() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    writer
+        .execute("CREATE (:Person {name: 'Ann'})-[:KNOWS]->(:Person {name: 'Bob'})")
+        .unwrap();
+
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("MATCH (p:Person {name: 'Ann'}) DETACH DELETE p")
+        .unwrap();
+
+    // Another session must still see Ann's edges (delete not committed).
+    let reader = db.session();
+    let r = reader
+        .execute("MATCH (:Person {name: 'Bob'})<-[:KNOWS]-(p) RETURN p.name")
+        .unwrap();
+
+    writer.rollback().unwrap();
+
+    assert_eq!(
+        r.row_count(),
+        1,
+        "uncommitted DETACH DELETE must not tombstone edges for other sessions"
+    );
+}

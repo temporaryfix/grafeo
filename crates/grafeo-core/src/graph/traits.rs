@@ -724,6 +724,25 @@ pub trait GraphStoreMut: GraphStoreSearch {
         let _ = transaction_id;
     }
 
+    /// Finalizes PENDING node deletes for a committed transaction: stamps
+    /// `deleted_epoch` PENDING→`commit_epoch` and applies deferred label-index
+    /// and property removal. Default: no-op (non-LPG stores have no pending deletes).
+    fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        let _ = (transaction_id, commit_epoch, node_ids);
+    }
+
+    /// Takes (removes and returns) the pending delete list for a transaction.
+    /// Default: empty vec (non-LPG stores have no pending deletes).
+    fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        let _ = transaction_id;
+        Vec::new()
+    }
+
     // --- Label mutation ---
 
     /// Adds a label to a node. Returns `true` if the label was new.
