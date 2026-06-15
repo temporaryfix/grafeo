@@ -253,7 +253,11 @@ impl GrafeoDB {
         } else {
             #[cfg(feature = "lpg")]
             {
-                &**self.lpg_store()
+                // Merged tier view: post-compact, the LayeredStore's search
+                // methods (vector/text/property) filter deleted_from_base
+                // tombstones that the overlay index alone would leak as stale
+                // hits. lpg_store() (overlay only) skips that filter.
+                self.read_graph_view()
             }
             #[cfg(not(feature = "lpg"))]
             unreachable!("no graph store available: enable the `lpg` feature or use with_store()")
@@ -2140,6 +2144,15 @@ impl GrafeoDB {
     /// This provides the [`GraphStoreSearch`] interface (graph-structure reads
     /// plus text/vector search capabilities) for code that only needs read
     /// operations. For write access, use [`graph_store_mut()`](Self::graph_store_mut).
+    ///
+    /// **Tiering caveat:** this returns the built-in (overlay) `LpgStore`, not
+    /// the tier-merged `LayeredStore`, so after [`compact()`](Self::compact) it
+    /// does not see base-tier-only data or apply base-deletion tombstones. The
+    /// query path uses the `LayeredStore` via the session store override; the
+    /// remaining index-management callers (`database::index`) building indexes
+    /// over a compacted store is a separate, deeper correctness question
+    /// (index completeness across tiers) tracked outside this change. For
+    /// tier-correct whole-graph *reads*, prefer `read_graph_view`.
     #[must_use]
     pub fn graph_store(&self) -> Arc<dyn GraphStoreSearch> {
         if let Some(ref ext_read) = self.external_read_store {
