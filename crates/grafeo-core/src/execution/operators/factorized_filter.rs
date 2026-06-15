@@ -229,7 +229,7 @@ impl FactorizedPredicate for ColumnPredicate {
 ///
 /// # Performance
 ///
-/// Uses direct property lookup via `LpgStore::get_node_property()` which is
+/// Uses snapshot-aware property lookup via `read_node_property_visible()` which is
 /// O(1) per entity. This avoids the O(properties) overhead of loading all
 /// properties when only one is needed.
 pub struct PropertyPredicate {
@@ -355,29 +355,28 @@ impl FactorizedPredicate for PropertyPredicate {
             return false;
         };
 
-        // Try as node first - use direct property lookup (O(1) vs O(properties))
+        // TODO(unified-mvcc): thread snapshot — PropertyPredicate has no transaction_id field;
+        // passing None means a writing transaction will not see its own uncommitted writes
+        // in factorized filter predicates. Add transaction_id to PropertyPredicate to fix.
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+
+        // Try as node first - use snapshot-aware property accessor (O(1) vs O(properties))
         if let Some(node_id) = column.get_node_id_physical(physical_idx) {
-            let prop_val = if let Some(epoch) = self.viewing_epoch {
+            let prop_val =
                 self.store
-                    .get_node_at_epoch(node_id, epoch)
-                    .and_then(|n| n.get_property(self.property.as_str()).cloned())
-            } else {
-                self.store.get_node_property(node_id, &self.property)
-            };
+                    .read_node_property_visible(node_id, &self.property, snap_epoch, None);
             if let Some(val) = prop_val {
                 return self.compare_values(&val);
             }
         }
 
-        // Try as edge - use direct property lookup
+        // Try as edge - use snapshot-aware property accessor
         if let Some(edge_id) = column.get_edge_id_physical(physical_idx) {
-            let prop_val = if let Some(epoch) = self.viewing_epoch {
+            let prop_val =
                 self.store
-                    .get_edge_at_epoch(edge_id, epoch)
-                    .and_then(|e| e.get_property(self.property.as_str()).cloned())
-            } else {
-                self.store.get_edge_property(edge_id, &self.property)
-            };
+                    .read_edge_property_visible(edge_id, &self.property, snap_epoch, None);
             if let Some(val) = prop_val {
                 return self.compare_values(&val);
             }
@@ -407,30 +406,35 @@ impl FactorizedPredicate for PropertyPredicate {
 
         let count = level_data.physical_value_count();
 
-        // Evaluate all at once using direct property lookups
+        // TODO(unified-mvcc): thread snapshot — PropertyPredicate has no transaction_id field;
+        // passing None means a writing transaction will not see its own uncommitted writes
+        // in factorized filter predicates. Add transaction_id to PropertyPredicate to fix.
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+
+        // Evaluate all at once using snapshot-aware property accessors
         LevelSelection::from_predicate(count, |idx| {
             // Try as node first
             if let Some(node_id) = column.get_node_id_physical(idx) {
-                let val = if let Some(epoch) = self.viewing_epoch {
-                    self.store
-                        .get_node_at_epoch(node_id, epoch)
-                        .and_then(|n| n.get_property(self.property.as_str()).cloned())
-                } else {
-                    self.store.get_node_property(node_id, &self.property)
-                };
+                let val = self.store.read_node_property_visible(
+                    node_id,
+                    &self.property,
+                    snap_epoch,
+                    None,
+                );
                 if let Some(v) = val {
                     return self.compare_values(&v);
                 }
             }
             // Try as edge
             if let Some(edge_id) = column.get_edge_id_physical(idx) {
-                let val = if let Some(epoch) = self.viewing_epoch {
-                    self.store
-                        .get_edge_at_epoch(edge_id, epoch)
-                        .and_then(|e| e.get_property(self.property.as_str()).cloned())
-                } else {
-                    self.store.get_edge_property(edge_id, &self.property)
-                };
+                let val = self.store.read_edge_property_visible(
+                    edge_id,
+                    &self.property,
+                    snap_epoch,
+                    None,
+                );
                 if let Some(v) = val {
                     return self.compare_values(&v);
                 }

@@ -75,6 +75,9 @@ impl HorizontalAggregateOperator {
     /// Looks up a property value for an entity ID.
     fn get_property_value(&self, entity_value: &Value) -> Option<Value> {
         let prop_key = PropertyKey::new(&self.property);
+        // TODO(unified-mvcc): thread snapshot — HorizontalAggregateOperator has no
+        // viewing_epoch or transaction_id field; reads committed value only.
+        let snap_epoch = self.store.current_epoch();
         match self.entity_kind {
             EntityKind::Edge => {
                 let id = match entity_value {
@@ -83,7 +86,8 @@ impl HorizontalAggregateOperator {
                     Value::Int64(i) => EdgeId(*i as u64),
                     _ => return None,
                 };
-                self.store.get_edge_property(id, &prop_key)
+                self.store
+                    .read_edge_property_visible(id, &prop_key, snap_epoch, None)
             }
             EntityKind::Node => {
                 let id = match entity_value {
@@ -92,7 +96,8 @@ impl HorizontalAggregateOperator {
                     Value::Int64(i) => NodeId(*i as u64),
                     _ => return None,
                 };
-                self.store.get_node_property(id, &prop_key)
+                self.store
+                    .read_node_property_visible(id, &prop_key, snap_epoch, None)
             }
         }
     }

@@ -235,15 +235,20 @@ impl VectorJoinOperator {
         }
 
         // Entity-to-entity: fetch from left entity's property
+        // TODO(unified-mvcc): thread snapshot — VectorJoinOperator has no viewing_epoch or
+        // transaction_id field; reads committed value only.
         if let (Some(chunk), Some(col_idx), Some(prop)) = (
             &self.current_left_chunk,
             self.left_node_column,
             &self.left_property,
         ) && let Some(col) = chunk.column(col_idx)
             && let Some(node_id) = col.get_node_id(self.current_left_row)
-            && let Some(Value::Vector(vec)) = self
-                .store
-                .get_node_property(node_id, &PropertyKey::new(prop))
+            && let Some(Value::Vector(vec)) = self.store.read_node_property_visible(
+                node_id,
+                &PropertyKey::new(prop),
+                self.store.current_epoch(),
+                None,
+            )
         {
             return Some(vec.to_vec());
         }
@@ -276,12 +281,21 @@ impl VectorJoinOperator {
             None => self.store.node_ids(),
         };
 
+        // TODO(unified-mvcc): thread snapshot — VectorJoinOperator has no viewing_epoch or
+        // transaction_id field; reads committed value only.
+        let snap_epoch = self.store.current_epoch();
+
         // Collect vectors from node properties
         let vectors: Vec<(NodeId, Vec<f32>)> = node_ids
             .into_iter()
             .filter_map(|id| {
                 self.store
-                    .get_node_property(id, &PropertyKey::new(&self.right_property))
+                    .read_node_property_visible(
+                        id,
+                        &PropertyKey::new(&self.right_property),
+                        snap_epoch,
+                        None,
+                    )
                     .and_then(|v| {
                         if let Value::Vector(vec) = v {
                             Some((id, vec.to_vec()))

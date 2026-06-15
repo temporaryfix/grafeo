@@ -616,22 +616,32 @@ impl ExpressionPredicate {
             FilterExpression::Property { variable, property } => {
                 let col_idx = *self.variable_columns.get(variable)?;
                 let col = chunk.column(col_idx)?;
+                let prop_key = grafeo_common::types::PropertyKey::new(property.as_str());
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let tx = self.transaction_id;
                 // Try as node first
-                if let Some(node_id) = col.get_node_id(row)
-                    && let Some(node) = self.resolve_node(node_id)
-                {
-                    return node.get_property(property).cloned();
+                if let Some(node_id) = col.get_node_id(row) {
+                    if let result @ Some(_) = self
+                        .store
+                        .read_node_property_visible(node_id, &prop_key, snap_epoch, tx)
+                    {
+                        return result;
+                    }
                 }
-                // Try as edge if node lookup failed
-                if let Some(edge_id) = col.get_edge_id(row)
-                    && let Some(edge) = self.resolve_edge(edge_id)
-                {
-                    return edge.get_property(property).cloned();
+                // Try as edge if node lookup returned nothing
+                if let Some(edge_id) = col.get_edge_id(row) {
+                    if let result @ Some(_) = self
+                        .store
+                        .read_edge_property_visible(edge_id, &prop_key, snap_epoch, tx)
+                    {
+                        return result;
+                    }
                 }
                 // Try as map value (e.g. from UNWIND with map elements)
                 if let Some(Value::Map(map)) = col.get_value(row) {
-                    let key = grafeo_common::types::PropertyKey::new(property);
-                    return map.get(&key).cloned();
+                    return map.get(&prop_key).cloned();
                 }
                 None
             }
@@ -734,15 +744,26 @@ impl ExpressionPredicate {
                             && let Some(&col_idx) = self.variable_columns.get(var)
                             && let Some(col) = chunk.column(col_idx)
                         {
-                            if let Some(node_id) = col.get_node_id(row)
-                                && let Some(node) = self.resolve_node(node_id)
-                            {
-                                return node.get_property(key.as_str()).cloned();
+                            let prop_key = grafeo_common::types::PropertyKey::new(key.as_str());
+                            let snap_epoch = self
+                                .viewing_epoch
+                                .unwrap_or_else(|| self.store.current_epoch());
+                            let tx = self.transaction_id;
+                            if let Some(node_id) = col.get_node_id(row) {
+                                if let result @ Some(_) = self
+                                    .store
+                                    .read_node_property_visible(node_id, &prop_key, snap_epoch, tx)
+                                {
+                                    return result;
+                                }
                             }
-                            if let Some(edge_id) = col.get_edge_id(row)
-                                && let Some(edge) = self.resolve_edge(edge_id)
-                            {
-                                return edge.get_property(key.as_str()).cloned();
+                            if let Some(edge_id) = col.get_edge_id(row) {
+                                if let result @ Some(_) = self
+                                    .store
+                                    .read_edge_property_visible(edge_id, &prop_key, snap_epoch, tx)
+                                {
+                                    return result;
+                                }
                             }
                         }
                         None
