@@ -4027,10 +4027,10 @@ impl Session {
                 // forever, pinning min_active_epoch and stalling MVCC GC.
                 for graph_name in &touched {
                     let store = self.resolve_store(graph_name);
-                    let (pending_nodes, pending_edges) =
-                        store.take_pending_creates(transaction_id);
+                    let (pending_nodes, pending_edges) = store.take_pending_creates(transaction_id);
                     store.discard_entities_by_id(transaction_id, &pending_nodes, &pending_edges);
                     store.rollback_transaction_properties(transaction_id);
+                    store.drop_tx_overlay(transaction_id);
                 }
                 let _ = self.transaction_manager.abort(transaction_id);
                 #[cfg(feature = "triple-store")]
@@ -4075,6 +4075,7 @@ impl Session {
                 &pending_nodes,
                 &pending_edges,
             );
+            store.apply_tx_overlay(transaction_id);
         }
 
         // Commit succeeded: discard undo logs (make changes permanent)
@@ -4237,6 +4238,7 @@ impl Session {
             let (pending_nodes, pending_edges) = store.take_pending_creates(transaction_id);
             store.discard_entities_by_id(transaction_id, &pending_nodes, &pending_edges);
             store.rollback_transaction_properties(transaction_id);
+            store.drop_tx_overlay(transaction_id);
         }
 
         // Discard pending operations in the RDF store
@@ -4367,6 +4369,8 @@ impl Session {
         // Remove this savepoint and all later ones
         savepoints.truncate(pos);
         drop(savepoints);
+
+        // TODO(unified-mvcc): buffered property delta is tx-granular; savepoint partial-rollback of buffered writes is deferred (delta keys would need savepoint stamping).
 
         // Roll back each graph that was captured in the savepoint.
         for gs in &sp_state.graph_snapshots {
@@ -5451,9 +5455,7 @@ mod tests {
 
         // Data is consistent: T1's committed value is visible exactly once.
         let s3 = db.session();
-        let q = s3
-            .execute("MATCH (a:Acct {id: 1}) RETURN a.bal")
-            .unwrap();
+        let q = s3.execute("MATCH (a:Acct {id: 1}) RETURN a.bal").unwrap();
         assert_eq!(q.row_count(), 1);
         assert_eq!(q.rows()[0][0], Value::Int64(50));
     }
