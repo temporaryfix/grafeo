@@ -622,22 +622,20 @@ impl ExpressionPredicate {
                     .unwrap_or_else(|| self.store.current_epoch());
                 let tx = self.transaction_id;
                 // Try as node first
-                if let Some(node_id) = col.get_node_id(row) {
-                    if let result @ Some(_) = self
+                if let Some(node_id) = col.get_node_id(row)
+                    && let result @ Some(_) = self
                         .store
                         .read_node_property_visible(node_id, &prop_key, snap_epoch, tx)
-                    {
-                        return result;
-                    }
+                {
+                    return result;
                 }
                 // Try as edge if node lookup returned nothing
-                if let Some(edge_id) = col.get_edge_id(row) {
-                    if let result @ Some(_) = self
+                if let Some(edge_id) = col.get_edge_id(row)
+                    && let result @ Some(_) = self
                         .store
                         .read_edge_property_visible(edge_id, &prop_key, snap_epoch, tx)
-                    {
-                        return result;
-                    }
+                {
+                    return result;
                 }
                 // Try as map value (e.g. from UNWIND with map elements)
                 if let Some(Value::Map(map)) = col.get_value(row) {
@@ -749,21 +747,19 @@ impl ExpressionPredicate {
                                 .viewing_epoch
                                 .unwrap_or_else(|| self.store.current_epoch());
                             let tx = self.transaction_id;
-                            if let Some(node_id) = col.get_node_id(row) {
-                                if let result @ Some(_) = self
+                            if let Some(node_id) = col.get_node_id(row)
+                                && let result @ Some(_) = self
                                     .store
                                     .read_node_property_visible(node_id, &prop_key, snap_epoch, tx)
-                                {
-                                    return result;
-                                }
+                            {
+                                return result;
                             }
-                            if let Some(edge_id) = col.get_edge_id(row) {
-                                if let result @ Some(_) = self
+                            if let Some(edge_id) = col.get_edge_id(row)
+                                && let result @ Some(_) = self
                                     .store
                                     .read_edge_property_visible(edge_id, &prop_key, snap_epoch, tx)
-                                {
-                                    return result;
-                                }
+                            {
+                                return result;
                             }
                         }
                         None
