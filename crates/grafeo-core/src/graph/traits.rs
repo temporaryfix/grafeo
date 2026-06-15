@@ -84,6 +84,34 @@ pub trait GraphStore: Send + Sync {
     /// Gets a single property from an edge without loading all properties.
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value>;
 
+    /// Snapshot-consistent node property read (unified-MVCC accessor).
+    ///
+    /// Default: ignores isolation and returns the committed value — safe for
+    /// stores without a per-transaction delta. `LpgStore` overrides this to
+    /// merge its delta for the writing transaction.
+    fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        let _ = (epoch, transaction_id);
+        self.get_node_property(id, key)
+    }
+
+    /// Snapshot-consistent edge property read. See [`read_node_property_visible`](Self::read_node_property_visible).
+    fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        let _ = (epoch, transaction_id);
+        self.get_edge_property(id, key)
+    }
+
     /// Gets a property for multiple nodes in a single batch operation.
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>>;
 
@@ -619,6 +647,45 @@ pub trait GraphStoreMut: GraphStoreSearch {
         _transaction_id: TransactionId,
     ) -> Option<Value> {
         self.remove_edge_property(id, key)
+    }
+
+    /// Buffers an uncommitted node property write into the transaction's delta.
+    /// Default: falls back to write-through (`set_node_property_versioned`).
+    fn set_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.set_node_property_versioned(id, key, value, transaction_id);
+    }
+    /// Buffers an uncommitted node property removal. Default: write-through.
+    fn remove_node_property_buffered(&self, id: NodeId, key: &str, transaction_id: TransactionId) {
+        self.remove_node_property_versioned(id, key, transaction_id);
+    }
+    /// Buffers an uncommitted edge property write. Default: write-through.
+    fn set_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.set_edge_property_versioned(id, key, value, transaction_id);
+    }
+    /// Buffers an uncommitted edge property removal. Default: write-through.
+    fn remove_edge_property_buffered(&self, id: EdgeId, key: &str, transaction_id: TransactionId) {
+        self.remove_edge_property_versioned(id, key, transaction_id);
+    }
+    /// Promotes a transaction's buffered property delta to the committed store
+    /// (commit). Default: no-op (write-through stores have nothing buffered).
+    fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        let _ = transaction_id;
+    }
+    /// Drops a transaction's buffered property delta (rollback). Default: no-op.
+    fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        let _ = transaction_id;
     }
 
     // --- Label mutation ---

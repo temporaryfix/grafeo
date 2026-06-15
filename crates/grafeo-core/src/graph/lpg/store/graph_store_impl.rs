@@ -62,6 +62,26 @@ impl GraphStore for LpgStore {
         LpgStore::get_edge_property(self, id, key)
     }
 
+    fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        LpgStore::read_node_property_visible(self, id, key, epoch, transaction_id)
+    }
+
+    fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        LpgStore::read_edge_property_visible(self, id, key, epoch, transaction_id)
+    }
+
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
         LpgStore::get_node_property_batch(self, ids, key)
     }
@@ -524,6 +544,42 @@ impl GraphStoreMut for LpgStore {
         transaction_id: TransactionId,
     ) -> Option<Value> {
         LpgStore::remove_edge_property_versioned(self, id, key, transaction_id)
+    }
+
+    fn set_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        LpgStore::set_node_property_buffered(self, id, key, value, transaction_id);
+    }
+
+    fn remove_node_property_buffered(&self, id: NodeId, key: &str, transaction_id: TransactionId) {
+        LpgStore::remove_node_property_buffered(self, id, key, transaction_id);
+    }
+
+    fn set_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        LpgStore::set_edge_property_buffered(self, id, key, value, transaction_id);
+    }
+
+    fn remove_edge_property_buffered(&self, id: EdgeId, key: &str, transaction_id: TransactionId) {
+        LpgStore::remove_edge_property_buffered(self, id, key, transaction_id);
+    }
+
+    fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        LpgStore::apply_tx_overlay(self, transaction_id);
+    }
+
+    fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        LpgStore::drop_tx_overlay(self, transaction_id);
     }
 
     fn add_label(&self, node_id: NodeId, label: &str) -> bool {

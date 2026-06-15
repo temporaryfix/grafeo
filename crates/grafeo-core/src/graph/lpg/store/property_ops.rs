@@ -1045,6 +1045,22 @@ impl LpgStore {
             .insert((id, PropertyKey::new(key)), super::PropOp::Set(value));
     }
 
+    /// Buffers an uncommitted edge property removal (tombstone) into the delta.
+    #[doc(hidden)]
+    pub fn remove_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        transaction_id: TransactionId,
+    ) {
+        self.tx_property_overlay
+            .write()
+            .entry(transaction_id)
+            .or_default()
+            .edge_props
+            .insert((id, PropertyKey::new(key)), super::PropOp::Remove);
+    }
+
     /// Snapshot-consistent node property read (the unified-MVCC read accessor).
     ///
     /// For the writing transaction the delta wins (read-your-writes): a buffered

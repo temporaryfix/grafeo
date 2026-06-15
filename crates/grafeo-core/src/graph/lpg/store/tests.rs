@@ -1685,7 +1685,9 @@ fn copy_graph_self_copy_is_a_noop() {
     let store = LpgStore::new().expect("arena");
     let g = store.graph_or_create("g").expect("g");
     g.create_node(&["X"]);
-    store.copy_graph(Some("g"), Some("g")).expect("self-copy ok");
+    store
+        .copy_graph(Some("g"), Some("g"))
+        .expect("self-copy ok");
     assert_eq!(
         store.graph("g").unwrap().node_count(),
         1,
@@ -1749,11 +1751,49 @@ fn tx_property_overlay_isolates_uncommitted_writes() {
     // A buffered remove tombstones for own-reads; drop (rollback) discards it.
     let tx2 = TransactionId::new(3);
     store.remove_node_property_buffered(n, "age", tx2);
-    assert_eq!(store.read_node_property_visible(n, &key, epoch, Some(tx2)), None);
+    assert_eq!(
+        store.read_node_property_visible(n, &key, epoch, Some(tx2)),
+        None
+    );
     assert_eq!(
         store.read_node_property_visible(n, &key, epoch, None),
         Some(Value::Int64(99))
     );
     store.drop_tx_overlay(tx2);
     assert_eq!(store.get_node_property(n, &key), Some(Value::Int64(99)));
+}
+
+#[test]
+fn trait_accessor_isolates_buffered_writes() {
+    use crate::graph::traits::GraphStoreMut;
+    use grafeo_common::types::{PropertyKey, TransactionId};
+
+    let store = LpgStore::new().unwrap();
+    let n = store.create_node(&["Person"]);
+    store.set_node_property(n, "age", Value::Int64(30));
+
+    let tx = TransactionId::new(7);
+    let key = PropertyKey::new("age");
+
+    // Buffer an uncommitted write via the trait object.
+    let s: &dyn GraphStoreMut = &store;
+    s.set_node_property_buffered(n, "age", Value::Int64(99), tx);
+
+    // Writer (Some(tx)) sees its own write; everyone else (None) sees committed.
+    let epoch = store.current_epoch();
+    assert_eq!(
+        s.read_node_property_visible(n, &key, epoch, Some(tx)),
+        Some(Value::Int64(99))
+    );
+    assert_eq!(
+        s.read_node_property_visible(n, &key, epoch, None),
+        Some(Value::Int64(30))
+    );
+
+    // Apply promotes the delta to the committed store.
+    s.apply_tx_overlay(tx);
+    assert_eq!(
+        s.read_node_property_visible(n, &key, epoch, None),
+        Some(Value::Int64(99))
+    );
 }
