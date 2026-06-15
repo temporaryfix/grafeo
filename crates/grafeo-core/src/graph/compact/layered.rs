@@ -575,40 +575,20 @@ impl GraphStore for LayeredStore {
     }
 
     fn neighbors(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
-        let deleted_nodes = self.deleted_from_base_nodes.read();
-
-        let mut results = Vec::new();
-
-        // Base neighbors (minus deleted). `is_node_dirty` is not a reason
-        // to skip the base: `ensure_in_overlay` promotes a node's labels
-        // and properties but never copies its adjacency, so base edges
-        // remain authoritative for any dirty node that originated in the
-        // snapshot. Per-edge deletions are still respected via
-        // `deleted_from_base_edges` inside `edges_from`-style call sites,
-        // and `dedup` below collapses any overlap with promoted overlay
-        // adjacency.
-        if !deleted_nodes.contains(&node) {
-            for nid in self.base.load().neighbors(node, direction) {
-                if !deleted_nodes.contains(&nid) {
-                    results.push(nid);
-                }
-            }
-        }
-
-        // Overlay neighbors — always consulted. An edge created after
-        // `compact()` whose src is a base node records the base id in
-        // the overlay's adjacency even though the overlay has no
-        // corresponding node object; gating on `overlay.get_node(node)`
-        // would miss that case.
-        for nid in self.overlay.load().neighbors(node, direction) {
-            if !deleted_nodes.contains(&nid) {
-                results.push(nid);
-            }
-        }
-
-        results.sort_unstable();
-        results.dedup();
-        results
+        // Single source of truth for tier-merged adjacency: derive neighbors
+        // from edges_from so the node AND edge tombstone filters (and overlay
+        // promotion) are applied in exactly one place. A hand-rolled merge
+        // here previously filtered deleted_from_base_nodes but never
+        // deleted_from_base_edges, so a target reachable only via a deleted
+        // base edge was still reported.
+        let mut targets: Vec<NodeId> = self
+            .edges_from(node, direction)
+            .into_iter()
+            .map(|(target, _eid)| target)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
     }
 
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
@@ -3509,6 +3489,23 @@ mod tests {
         let incoming = layered.neighbors(amsterdam, Direction::Incoming);
         assert!(!incoming.contains(&persons[0]));
         assert_eq!(incoming.len(), 1);
+    }
+
+    #[test]
+    fn neighbors_excludes_target_of_deleted_base_edge() {
+        let layered = build_test_layered();
+        let person = layered.nodes_by_label("Person")[0];
+        let (target, eid) = layered.edges_from(person, Direction::Outgoing)[0];
+
+        // Delete the (un-promoted) base edge. edges_from already drops it...
+        assert!(layered.delete_edge(eid));
+        assert!(layered.edges_from(person, Direction::Outgoing).is_empty());
+
+        // ...but neighbors() must agree: no target reachable only via a deleted edge.
+        assert!(
+            !layered.neighbors(person, Direction::Outgoing).contains(&target),
+            "neighbors() reported a target whose only edge was deleted"
+        );
     }
 
     #[test]
