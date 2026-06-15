@@ -496,9 +496,8 @@ fn open_multi_rejects_conflicting_vector_index_dimensions() {
     // Same (label, property) index, different dimensions across snapshots.
     let a = blob_with_vector_index(4);
     let b = blob_with_vector_index(8);
-    let err = match GrafeoDB::open_multi([a, b]) {
-        Ok(_) => panic!("conflicting vector index dimensions must be rejected"),
-        Err(e) => e,
+    let Err(err) = GrafeoDB::open_multi([a, b]) else {
+        panic!("conflicting vector index dimensions must be rejected");
     };
     let msg = format!("{err}");
     assert!(

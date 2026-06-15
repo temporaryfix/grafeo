@@ -166,6 +166,7 @@ fn search_preserves_node_ids_above_u32_max() {
     let index = TwoStageVectorIndex::build(&vectors, 4, 42);
     let hits = index.search(&[1.0, 0.0, 0.0, 0.0], 1, 8);
     assert_eq!(hits[0].0, NodeId::new(big), "core must preserve the full u64 id");
-    // f64 round-trips this id exactly (< 2^53), so the JS surface is lossless.
-    assert_eq!(hits[0].0.as_u64() as f64 as u64, big);
+    // f64 (the JS surface) represents this id exactly: any integer below 2^53
+    // round-trips through f64 losslessly.
+    assert!(big < (1u64 << 53));
 }

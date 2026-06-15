@@ -1586,7 +1586,11 @@ impl super::GrafeoDB {
         // populated nodes/edges by `restore_indexes_from_snapshot`.
         // Index definitions live on the concrete store, not the merged view.
         let indexes = collect_index_metadata(self.lpg_store());
-        restore_indexes_from_snapshot(&target, &indexes);
+        // Lenient like the other local restore paths: a failed index rebuild on
+        // the extract is logged, not fatal (the merge side rebuilds anyway).
+        if let Err(e) = restore_indexes_from_snapshot(&target, &indexes) {
+            grafeo_info!("extract_subgraph index restore: {e}");
+        }
 
         Ok(target)
     }
@@ -1836,6 +1840,11 @@ impl super::GrafeoDB {
     ///
     /// Returns an error if `snapshots` is empty, in addition to the
     /// conditions listed on [`open_multi`](Self::open_multi).
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: the internal `.expect()` resolving the
+    /// maximum epoch is guarded by the empty-input check above it.
     pub fn open_multi_with<I, B>(snapshots: I, options: OpenMultiOptions) -> Result<Self>
     where
         I: IntoIterator<Item = B>,
@@ -2051,8 +2060,11 @@ impl super::GrafeoDB {
         // Restore schema
         restore_schema_from_snapshot(self.lpg_store(), &self.catalog, &snapshot.schema);
 
-        // Restore indexes (must come after data population)
-        restore_indexes_from_snapshot(self, &snapshot.indexes);
+        // Restore indexes (must come after data population). Lenient: a failed
+        // index rebuild is logged, not fatal (matches the import path).
+        if let Err(e) = restore_indexes_from_snapshot(self, &snapshot.indexes) {
+            grafeo_info!("index restore: {e}");
+        }
 
         Ok(())
     }
