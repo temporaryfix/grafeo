@@ -3924,6 +3924,15 @@ impl Session {
         self.transaction_start_edge_count
             .store(active.edge_count(), Ordering::Relaxed);
         let transaction_id = if let Some(level) = isolation_level {
+            if level == crate::transaction::IsolationLevel::Serializable {
+                return Err(grafeo_common::utils::error::Error::Transaction(
+                    grafeo_common::utils::error::TransactionError::InvalidState(
+                        "Serializable isolation is not yet supported; use SnapshotIsolation \
+                         (real SSI is tracked for the Wave 2 isolation rework)"
+                            .to_string(),
+                    ),
+                ));
+            }
             self.transaction_manager.begin_with_isolation(level)
         } else {
             self.transaction_manager.begin()

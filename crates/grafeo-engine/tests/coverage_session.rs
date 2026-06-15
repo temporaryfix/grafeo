@@ -447,15 +447,26 @@ fn test_begin_transaction_with_read_committed() {
 }
 
 #[test]
-fn test_begin_transaction_with_serializable() {
+fn test_begin_transaction_with_serializable_is_rejected() {
+    // Serializable currently behaves as Snapshot Isolation (record_read is never
+    // called, so SSI validation never fires). Until real SSI lands (Wave 2),
+    // begin must reject it rather than silently downgrade.
     let db = setup();
     let mut session = db.session();
-    session
-        .begin_transaction_with_isolation(grafeo_engine::transaction::IsolationLevel::Serializable)
-        .unwrap();
-    let r = session.execute("MATCH (p:Person) RETURN count(p)").unwrap();
-    assert_eq!(r.rows()[0][0], Value::Int64(2));
-    session.commit().unwrap();
+    let result = session
+        .begin_transaction_with_isolation(grafeo_engine::transaction::IsolationLevel::Serializable);
+    assert!(
+        result.is_err(),
+        "Serializable must be rejected until real SSI is implemented"
+    );
+
+    // SnapshotIsolation is unaffected.
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(
+        grafeo_engine::transaction::IsolationLevel::SnapshotIsolation,
+    )
+    .unwrap();
+    s2.commit().unwrap();
 }
 
 #[test]
