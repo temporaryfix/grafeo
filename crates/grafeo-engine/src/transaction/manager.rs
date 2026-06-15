@@ -217,6 +217,42 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Records a touched entity in the transaction's write-set **without**
+    /// conflict detection.
+    ///
+    /// Unlike [`record_write`](Self::record_write), this performs no
+    /// first-writer-wins check: it simply inserts the entity so the write-set is
+    /// a complete record of what the transaction touched (used by
+    /// write-set-scoped commit/rollback). Used by session-direct mutators and for
+    /// newly created entities, which allocate fresh ids and cannot
+    /// write-write-conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_entity(
+        &self,
+        transaction_id: TransactionId,
+        entity: impl Into<EntityId>,
+    ) -> Result<()> {
+        let entity = entity.into();
+        let mut txns = self.transactions.write();
+        let info = txns.get_mut(&transaction_id).ok_or_else(|| {
+            Error::Transaction(TransactionError::InvalidState(
+                "Transaction not found".to_string(),
+            ))
+        })?;
+
+        if info.state != TransactionState::Active {
+            return Err(Error::Transaction(TransactionError::InvalidState(
+                "Transaction is not active".to_string(),
+            )));
+        }
+
+        info.write_set.insert(entity);
+        Ok(())
+    }
+
     /// Records a read operation for the transaction (for serializable isolation).
     ///
     /// # Errors
@@ -753,6 +789,31 @@ mod tests {
 
         // tx2 should have a later start epoch
         assert!(start2.as_u64() > start1.as_u64());
+    }
+
+    #[test]
+    fn test_record_entity_no_conflict_and_in_write_set() {
+        let mgr = TransactionManager::new();
+        let tx1 = mgr.begin();
+        let tx2 = mgr.begin();
+        let entity = NodeId::new(7);
+
+        // record_entity adds to the write-set WITHOUT conflict detection: both
+        // transactions can record the same entity (record_write would reject the
+        // second). This keeps the write-set a complete scoping record.
+        mgr.record_entity(tx1, entity).unwrap();
+        mgr.record_entity(tx2, entity).unwrap();
+
+        assert!(
+            mgr.get_write_set(tx1)
+                .unwrap()
+                .contains(&EntityId::Node(entity))
+        );
+        assert!(
+            mgr.get_write_set(tx2)
+                .unwrap()
+                .contains(&EntityId::Node(entity))
+        );
     }
 
     #[test]
