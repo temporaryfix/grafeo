@@ -1259,33 +1259,40 @@ impl super::Planner {
             return Ok(None);
         }
 
-        // Predict the columns `sort.input` will produce. Currently only Return
-        // is predicted; other shapes (Filter/Project/Skip wrapping Return, etc.)
-        // could be added incrementally, falling through is always safe.
-        let Some(predicted_columns) = predict_subtree_columns(sort.input.as_ref()) else {
+        // Only a bare Return is predicted/fused. Other shapes (Filter/Project/
+        // Skip wrapping Return, etc.) fall through, which is always safe.
+        let LogicalOperator::Return(ret) = sort.input.as_ref() else {
             return Ok(None);
         };
+        // RETURN * expands from input columns inside plan_return_projection;
+        // its output count is unknown without planning the input — skip.
+        if ret.items.len() == 1
+            && matches!(&ret.items[0].expression, LogicalExpression::Variable(n) if n == "*")
+        {
+            return Ok(None);
+        }
 
-        // Build the same variable-column lookup `plan_sort` builds, including
-        // the property-alias entries (so `ORDER BY v.p` resolves to a Return
-        // item that materialises `v.p` under its human-readable column name).
-        // Without this, `RETURN n.title ORDER BY n.title LIMIT k` would skip
-        // the rewrite even though the unfused path handles it fine.
-        let mut variable_columns: HashMap<String, usize> = predicted_columns
+        // Match each sort key to a projected column by EXPRESSION identity, not
+        // formatted name — a user alias must never satisfy a sort key it does
+        // not actually project. If any key is absent, fall through with NO
+        // planner state mutated, to the (correct) unfused sort.
+        let projected: Vec<(LogicalExpression, usize)> = ret
+            .items
             .iter()
             .enumerate()
-            .map(|(i, n)| (n.clone(), i))
+            .map(|(i, item)| (item.expression.clone(), i))
             .collect();
-        register_return_property_sort_aliases(sort.input.as_ref(), &mut variable_columns);
-
-        // Resolve sort keys against the prediction. If any key fails to
-        // resolve, fall through with NO planner state mutated. Holding the
-        // result lets us skip a second resolve after planning — the
-        // `debug_assert_eq!` below proves the column indices are valid.
-        let Ok(physical_keys) = resolve_logical_to_physical_keys(&sort.keys, &variable_columns)
-        else {
+        let Some(physical_keys) = resolve_sort_keys_structurally(&sort.keys, &projected) else {
             return Ok(None);
         };
+
+        // Predicted output column names (for the operator schema + the
+        // post-plan drift check below).
+        let predicted_columns: Vec<String> = ret
+            .items
+            .iter()
+            .map(|item| output_column_name(item.alias.as_deref(), &item.expression))
+            .collect();
 
         // Commit: plan the input for real. State mutations now happen exactly
         // once, as part of the canonical plan we are about to return.
@@ -1303,35 +1310,6 @@ impl super::Planner {
             schema,
         ));
         Ok(Some((op, columns)))
-    }
-}
-
-/// Predicts the output column names of `op` without planning it.
-///
-/// Returns `None` when the shape is one we don't predict — callers must treat
-/// that as "skip the rewrite" and fall through to the canonical planning path.
-/// Each branch mirrors the column-naming rule used by the corresponding
-/// `plan_*` method. Adding more shapes here is purely a TopK-coverage
-/// improvement; the rewrite degrades to "skip" if a shape is missing.
-fn predict_subtree_columns(op: &LogicalOperator) -> Option<Vec<String>> {
-    match op {
-        LogicalOperator::Return(ret) => {
-            // `RETURN *` expands from input columns inside `plan_return_projection`,
-            // so the output column count depends on what the input produces.
-            // Without planning the input we can't know it — skip.
-            if ret.items.len() == 1
-                && matches!(&ret.items[0].expression, LogicalExpression::Variable(n) if n == "*")
-            {
-                return None;
-            }
-            Some(
-                ret.items
-                    .iter()
-                    .map(|item| output_column_name(item.alias.as_deref(), &item.expression))
-                    .collect(),
-            )
-        }
-        _ => None,
     }
 }
 
@@ -1368,49 +1346,60 @@ fn register_return_property_sort_aliases(
     }
 }
 
-/// Resolves logical sort keys to physical sort keys for `TopKOperator`.
-///
-/// For each logical key:
-///   - Looks up the column index via `common::resolve_expression_to_column`.
-///   - Maps `SortOrder` → physical `SortDirection`.
-///   - Maps `Option<NullsOrdering>` → physical `NullOrder` (default `NullsLast`,
-///     matching `SortKey::ascending`'s default).
-///
-/// Returns `Err` if any key fails to resolve in `variable_columns`.
-/// Callers translate that to `Ok(None)` to fall through to the unfused path.
-fn resolve_logical_to_physical_keys(
+/// Conservative structural equality for the two expression shapes the TopK
+/// rewrite can fuse on. Anything else returns false → the rewrite bails to the
+/// (correct) unfused sort. Deliberately does NOT compare aliases or formatted
+/// names, which is what let a user alias collide with a synthetic
+/// `{var}_{prop}` column name and fuse a sort on the wrong column.
+fn sort_key_matches_projection(key: &LogicalExpression, projected: &LogicalExpression) -> bool {
+    match (key, projected) {
+        (LogicalExpression::Variable(a), LogicalExpression::Variable(b)) => a == b,
+        (
+            LogicalExpression::Property {
+                variable: kv,
+                property: kp,
+            },
+            LogicalExpression::Property {
+                variable: pv,
+                property: pp,
+            },
+        ) => kv == pv && kp == pp,
+        _ => false,
+    }
+}
+
+/// Resolves sort keys to physical column indices by structural match against
+/// the projected expressions. Returns `None` (→ skip the rewrite, fall through
+/// to the correct unfused sort) if any key is not structurally present among
+/// the projected columns.
+fn resolve_sort_keys_structurally(
     keys: &[crate::query::plan::SortKey],
-    variable_columns: &HashMap<String, usize>,
-) -> Result<Vec<grafeo_core::execution::operators::SortKey>> {
+    projected: &[(LogicalExpression, usize)],
+) -> Option<Vec<grafeo_core::execution::operators::SortKey>> {
     use crate::query::plan::{NullsOrdering, SortOrder};
     use grafeo_core::execution::operators::{NullOrder, SortDirection, SortKey as PhysSortKey};
 
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        let col = crate::query::planner::common::resolve_expression_to_column(
-            &key.expression,
-            variable_columns,
-            " for ORDER BY",
-        )?;
-
+        let column = projected
+            .iter()
+            .find(|(expr, _)| sort_key_matches_projection(&key.expression, expr))
+            .map(|(_, idx)| *idx)?;
         let direction = match key.order {
             SortOrder::Ascending => SortDirection::Ascending,
             SortOrder::Descending => SortDirection::Descending,
         };
-
         let null_order = match key.nulls {
             Some(NullsOrdering::First) => NullOrder::NullsFirst,
-            Some(NullsOrdering::Last) => NullOrder::NullsLast,
-            None => NullOrder::NullsLast, // default, matches plan_sort
+            Some(NullsOrdering::Last) | None => NullOrder::NullsLast,
         };
-
         out.push(PhysSortKey {
-            column: col,
+            column,
             direction,
             null_order,
         });
     }
-    Ok(out)
+    Some(out)
 }
 
 /// Collects variable references from an expression tree.

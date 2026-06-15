@@ -422,3 +422,33 @@ fn order_by_limit_binary_key_yields_map() {
         );
     }
 }
+
+#[test]
+fn topk_alias_collision_orders_by_real_sort_key() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    // foo descends as age ascends, so a wrong-column sort is detectable.
+    for i in 0..10i64 {
+        session
+            .execute(&format!("INSERT (:P {{foo: {}, age: {}}})", 100 - i, i))
+            .unwrap();
+    }
+    // Alias "n_age" collides with resolved_column_name(n.age) = "n_age".
+    let result = session
+        .execute("MATCH (n:P) RETURN n.foo AS n_age ORDER BY n.age LIMIT 5")
+        .unwrap();
+    let got: Vec<i64> = result
+        .rows()
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int64(v) => *v,
+            other => panic!("expected Int64, got {other:?}"),
+        })
+        .collect();
+    // ORDER BY n.age ASC LIMIT 5 → ages 0..4 → their foo values 100..96.
+    assert_eq!(
+        got,
+        vec![100, 99, 98, 97, 96],
+        "rows must be ordered by n.age, not by the colliding alias column"
+    );
+}
