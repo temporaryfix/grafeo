@@ -408,6 +408,9 @@ impl RabitqIndex {
     /// estimate, sorted ascending (closest first).
     #[must_use]
     pub fn coarse_search(&self, query: &[f32], n: usize) -> Vec<(NodeId, f32)> {
+        if n == 0 {
+            return Vec::new();
+        }
         let q = self.quantizer.encode_query(query);
         let mut scored: Vec<(NodeId, f32)> = self
             .ids
@@ -415,8 +418,16 @@ impl RabitqIndex {
             .zip(&self.codes)
             .map(|(&id, code)| (id, self.quantizer.estimate_distance(&q, code)))
             .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(n);
+        let cmp = |a: &(NodeId, f32), b: &(NodeId, f32)| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        // Select the n smallest (unordered), then sort just those —
+        // O(N + n log n) instead of O(N log N).
+        if n < scored.len() {
+            scored.select_nth_unstable_by(n - 1, cmp);
+            scored.truncate(n);
+        }
+        scored.sort_unstable_by(cmp);
         scored
     }
 
@@ -1022,18 +1033,18 @@ impl RabitqView {
         self.count == 0
     }
 
-    /// Reads the bits of code at row `row` directly from `self.blob`,
-    /// returning a per-call `Vec<u64>` (one allocation of `words * 8`
-    /// bytes per coarse-search candidate).
-    fn read_code_bits(&self, row: usize) -> Vec<u64> {
+    /// Fills `buf` with the code words at `row`, reusing its allocation so the
+    /// coarse scan does not allocate a `Vec<u64>` per candidate.
+    fn read_code_bits_into(&self, row: usize, buf: &mut Vec<u64>) {
+        buf.clear();
         let start = self.codes_offset + row * self.code_stride;
-        let buf = self.blob.as_ref();
-        (0..self.words)
-            .map(|w| {
-                let pos = start + w * 8;
-                u64::from_le_bytes(buf[pos..pos + 8].try_into().expect("8 bytes"))
-            })
-            .collect()
+        let bytes = self.blob.as_ref();
+        for w in 0..self.words {
+            let pos = start + w * 8;
+            buf.push(u64::from_le_bytes(
+                bytes[pos..pos + 8].try_into().expect("8 bytes"),
+            ));
+        }
     }
 
     /// Reads the `dot_oo` and `norm` factors for the code at row `row`.
@@ -1062,19 +1073,31 @@ impl RabitqView {
         }
         let candidate_n = k.saturating_mul(rerank_factor.max(1)).min(self.count);
 
-        // Coarse pass: encode the query, then iterate stored codes.
+        // Coarse pass: one reused code buffer, no per-row allocation.
         let q = self.rotation_quantizer.encode_query(query);
-        let mut scored: Vec<(usize, f32)> = (0..self.count)
-            .map(|row| {
-                let bits = self.read_code_bits(row);
-                let (dot_oo, norm) = self.read_code_factors(row);
-                let code = RabitqCode { bits, dot_oo, norm };
-                let est = self.rotation_quantizer.estimate_distance(&q, &code);
-                (row, est)
-            })
-            .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(candidate_n);
+        let mut code = RabitqCode {
+            bits: Vec::with_capacity(self.words),
+            dot_oo: 0.0,
+            norm: 0.0,
+        };
+        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(self.count);
+        for row in 0..self.count {
+            self.read_code_bits_into(row, &mut code.bits);
+            let (dot_oo, norm) = self.read_code_factors(row);
+            code.dot_oo = dot_oo;
+            code.norm = norm;
+            let est = self.rotation_quantizer.estimate_distance(&q, &code);
+            scored.push((row, est));
+        }
+        let cmp = |a: &(usize, f32), b: &(usize, f32)| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        // Keep the candidate_n smallest, sorted — O(N + n log n) vs O(N log N).
+        if candidate_n < scored.len() {
+            scored.select_nth_unstable_by(candidate_n - 1, cmp);
+            scored.truncate(candidate_n);
+        }
+        scored.sort_unstable_by(cmp);
 
         // Rerank by int8.
         let mut reranked: Vec<(NodeId, f32)> = scored
@@ -1084,8 +1107,14 @@ impl RabitqView {
                 (self.ids[row], dist)
             })
             .collect();
-        reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        reranked.truncate(k);
+        let rcmp = |a: &(NodeId, f32), b: &(NodeId, f32)| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if k < reranked.len() {
+            reranked.select_nth_unstable_by(k - 1, rcmp);
+            reranked.truncate(k);
+        }
+        reranked.sort_unstable_by(rcmp);
         reranked
     }
 }
@@ -1226,6 +1255,30 @@ mod tests {
         }
         // The nearest hits should come from cluster A (ids 1..=10).
         assert!(hits[0].0.as_u64() <= 10, "nearest hit not from cluster A");
+    }
+
+    #[test]
+    fn coarse_search_selection_matches_full_sort_prefix() {
+        use grafeo_common::types::NodeId;
+
+        let mut index = RabitqIndex::new(16, 3);
+        for i in 0..40u64 {
+            let v: Vec<f32> = (0..16)
+                .map(|d| (d as f32 * 0.2).cos() + i as f32 * 0.05)
+                .collect();
+            index.insert(NodeId::new(i + 1), &v);
+        }
+        let query: Vec<f32> = (0..16).map(|d| (d as f32 * 0.2).cos()).collect();
+
+        let top = index.coarse_search(&query, 8);
+        let full = index.coarse_search(&query, index.len());
+        assert_eq!(top.len(), 8);
+        // select_nth must pick the same 8 smallest, in the same sorted order
+        // as a full sort + truncate.
+        assert_eq!(top, full[..8].to_vec());
+        for w in top.windows(2) {
+            assert!(w[0].1 <= w[1].1, "coarse_search not ascending");
+        }
     }
 
     #[test]
