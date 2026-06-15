@@ -71,13 +71,21 @@ pub enum FsstError {
 /// A 256-code symbol table. Code 0 is the escape marker; codes 1..=255 hold
 /// 1–8-byte symbols. Empty slots (length = 0) are absent symbols, looked up
 /// as [`None`] by [`Self::symbol`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SymbolTable {
     /// Symbol length per code (0 = absent). Index 0 is unused (escape).
     lengths: [u8; 256],
     /// Symbol bodies, 8 bytes per slot (right-padded with zeros). Index 0
     /// is unused.
     bodies: [[u8; MAX_SYMBOL_LEN]; 256],
+    /// Codes bucketed by their first byte, each bucket ordered longest-first
+    /// so `longest_match` returns the first full match. Derived state, rebuilt
+    /// by `rebuild_first_byte_index`; excluded from `PartialEq`.
+    first_byte_index: [Vec<u8>; 256],
+    /// True once `first_byte_index` reflects `lengths`/`bodies`. When false
+    /// (a raw `set` without a finalizing constructor), `longest_match` falls
+    /// back to the exhaustive scan.
+    index_built: bool,
 }
 
 impl Default for SymbolTable {
@@ -85,7 +93,17 @@ impl Default for SymbolTable {
         Self {
             lengths: [0u8; 256],
             bodies: [[0u8; MAX_SYMBOL_LEN]; 256],
+            first_byte_index: std::array::from_fn(|_| Vec::new()),
+            index_built: false,
         }
+    }
+}
+
+// Semantic equality is the symbol set only; the derived index/flag are
+// excluded so tables built via different paths compare equal.
+impl PartialEq for SymbolTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.lengths == other.lengths && self.bodies == other.bodies
     }
 }
 
@@ -131,14 +149,36 @@ impl SymbolTable {
         }
     }
 
-    /// Returns `(code, length)` of the longest symbol whose bytes are a
-    /// prefix of `input`. Ties on length break by the smaller code.
-    ///
-    /// O(255 × MAX_SYMBOL_LEN) worst case; for hot paths build a per-first-
-    /// byte index, but this scalar lookup is adequate for the codec's
-    /// expected string sizes.
+    /// Rebuilds `first_byte_index` from `lengths`/`bodies`. Call after a table
+    /// is fully assembled (train / build / from_bytes).
+    fn rebuild_first_byte_index(&mut self) {
+        for bucket in &mut self.first_byte_index {
+            bucket.clear();
+        }
+        for code in 1u8..=255 {
+            let len = self.lengths[code as usize] as usize;
+            if len == 0 {
+                continue;
+            }
+            self.first_byte_index[self.bodies[code as usize][0] as usize].push(code);
+        }
+        // Order each bucket longest-first (ties: smaller code first, matching
+        // the scan's tie-break) so the first full match is the longest.
+        for bucket in &mut self.first_byte_index {
+            bucket.sort_unstable_by(|&a, &b| {
+                self.lengths[b as usize]
+                    .cmp(&self.lengths[a as usize])
+                    .then(a.cmp(&b))
+            });
+        }
+        self.index_built = true;
+    }
+
+    /// Exhaustive O(255 × MAX_SYMBOL_LEN) longest-prefix scan. Correct fallback
+    /// when the first-byte index has not been built. Ties on length break by
+    /// the smaller code.
     #[must_use]
-    pub fn longest_match(&self, input: &[u8]) -> Option<(u8, usize)> {
+    pub fn longest_match_scan(&self, input: &[u8]) -> Option<(u8, usize)> {
         if input.is_empty() {
             return None;
         }
@@ -158,6 +198,30 @@ impl SymbolTable {
             }
         }
         best
+    }
+
+    /// Returns `(code, length)` of the longest symbol whose bytes are a prefix
+    /// of `input`, using the per-first-byte index (falling back to the scan if
+    /// it was not built). Ties on length break by the smaller code.
+    #[must_use]
+    pub fn longest_match(&self, input: &[u8]) -> Option<(u8, usize)> {
+        if input.is_empty() {
+            return None;
+        }
+        if !self.index_built {
+            return self.longest_match_scan(input);
+        }
+        let max_check = input.len().min(MAX_SYMBOL_LEN);
+        for &code in &self.first_byte_index[input[0] as usize] {
+            let len = self.lengths[code as usize] as usize;
+            if len > max_check {
+                continue; // longer symbol can't fit; shorter ones follow in-bucket
+            }
+            if self.bodies[code as usize][..len] == input[..len] {
+                return Some((code, len)); // bucket is longest-first
+            }
+        }
+        None
     }
 
     /// Returns the number of assigned symbols.
@@ -243,14 +307,14 @@ impl SymbolTable {
             return Self::default();
         }
 
-        // Count every substring of length 1..=MAX_SYMBOL_LEN in the sample.
-        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
+        // Count every substring of length 1..=MAX_SYMBOL_LEN in the sample,
+        // borrowing slices of the sample instead of allocating per occurrence.
+        let mut counts: HashMap<&[u8], u64> = HashMap::new();
         for s in sample {
             for start in 0..s.len() {
                 let max_end = (start + MAX_SYMBOL_LEN).min(s.len());
                 for end in (start + 1)..=max_end {
-                    let sub = &s[start..end];
-                    *counts.entry(sub.to_vec()).or_insert(0) += 1;
+                    *counts.entry(&s[start..end]).or_insert(0) += 1;
                 }
             }
         }
@@ -259,7 +323,7 @@ impl SymbolTable {
         // term lets length-1 substrings out-rank zero-frequency multi-byte
         // ones, preserving byte coverage for any byte that appears in the
         // sample at all.
-        let mut scored: Vec<(Vec<u8>, u64)> = counts
+        let mut scored: Vec<(&[u8], u64)> = counts
             .into_iter()
             .map(|(sub, freq)| {
                 let score = (sub.len() as u64 - 1) * freq + freq;
@@ -271,12 +335,13 @@ impl SymbolTable {
         let mut table = Self::default();
         let mut next_code: u8 = 1;
         for (sub, _) in scored.into_iter().take(255) {
-            table.set(next_code, &sub);
+            table.set(next_code, sub);
             if next_code == 255 {
                 break;
             }
             next_code += 1;
         }
+        table.rebuild_first_byte_index();
         table
     }
 }
@@ -330,7 +395,11 @@ impl FsstCodec {
     /// Panics if `offsets` is empty or the last offset exceeds
     /// `compressed.len()`.
     #[must_use]
-    pub(crate) fn from_parts(table: SymbolTable, compressed: Vec<u8>, offsets: Vec<u32>) -> Self {
+    pub(crate) fn from_parts(
+        mut table: SymbolTable,
+        compressed: Vec<u8>,
+        offsets: Vec<u32>,
+    ) -> Self {
         assert!(
             !offsets.is_empty(),
             "offsets must contain at least the terminal length"
@@ -339,6 +408,9 @@ impl FsstCodec {
             *offsets.last().unwrap() as usize <= compressed.len(),
             "terminal offset must not exceed compressed length"
         );
+        // Tables decoded via `set` (from_bytes) have no first-byte index yet;
+        // finalize so reads use the fast path. Idempotent for built tables.
+        table.rebuild_first_byte_index();
         Self {
             table,
             compressed,
@@ -942,6 +1014,24 @@ mod tests {
         // we test the latter by checking the symbol table is buildable.
         let strings: Vec<&[u8]> = vec![b"hello", b"world", b""];
         let _ = SymbolTable::train(&strings); // does not panic on empty strings
+    }
+
+    #[test]
+    fn longest_match_index_matches_scan() {
+        // The index-backed longest_match must equal the exhaustive scan for
+        // every suffix of the training sample.
+        let sample: Vec<&[u8]> = vec![b"banana", b"band", b"can", b"candy", b"a"];
+        let table = SymbolTable::train(&sample);
+        for s in &sample {
+            for i in 0..s.len() {
+                assert_eq!(
+                    table.longest_match(&s[i..]),
+                    table.longest_match_scan(&s[i..]),
+                    "index and scan disagree at suffix {:?}",
+                    &s[i..]
+                );
+            }
+        }
     }
 
     #[test]
