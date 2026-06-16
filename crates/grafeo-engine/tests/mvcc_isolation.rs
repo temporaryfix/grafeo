@@ -389,3 +389,68 @@ fn committed_detach_delete_edges_invisible_to_other_sessions() {
         "committed DETACH DELETE must remove the node for other sessions"
     );
 }
+
+/// Task 3b: edge-delete isolation for EXISTS/COUNT subquery fast paths.
+///
+/// `edge_matches` in the filter evaluator post-filters adjacency candidates for
+/// both `ExistsSubquery` (`WHERE EXISTS { (a)-[:R]->() }`) and `CountSubquery`
+/// (`RETURN COUNT { (a)-[:R]->() }`).  Before the fix it did NOT check edge
+/// visibility, so a writer that deleted an edge would still observe it through
+/// these paths (read-your-writes violation).
+#[test]
+fn deleted_edge_invisible_to_writer_via_exists_subquery() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    writer
+        .execute("CREATE (:N {id: 1})-[:R]->(:N {id: 2})")
+        .unwrap();
+
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) DELETE r")
+        .unwrap();
+
+    // Writer must NOT see the deleted edge via EXISTS { ... } (read-your-writes).
+    let own_exists = writer
+        .execute("MATCH (a:N {id: 1}) WHERE EXISTS { (a)-[:R]->() } RETURN a.id")
+        .unwrap();
+    assert_eq!(
+        own_exists.row_count(),
+        0,
+        "writer must not see its own pending-deleted edge via EXISTS subquery"
+    );
+
+    // Writer must NOT see the deleted edge via COUNT { ... } (read-your-writes).
+    let own_count = writer
+        .execute("MATCH (a:N {id: 1}) RETURN COUNT { (a)-[:R]->() } AS c")
+        .unwrap();
+    let count_val = own_count.rows()[0][0].clone();
+    assert_eq!(
+        count_val,
+        Value::Int64(0),
+        "writer must not see its own pending-deleted edge via COUNT subquery"
+    );
+
+    // Another session (no tx) must still see the edge (isolation for others).
+    let reader = db.session();
+    let reader_exists = reader
+        .execute("MATCH (a:N {id: 1}) WHERE EXISTS { (a)-[:R]->() } RETURN a.id")
+        .unwrap();
+    assert_eq!(
+        reader_exists.row_count(),
+        1,
+        "uncommitted edge delete must not be visible to other sessions via EXISTS"
+    );
+
+    let reader_count = reader
+        .execute("MATCH (a:N {id: 1}) RETURN COUNT { (a)-[:R]->() } AS c")
+        .unwrap();
+    let reader_count_val = reader_count.rows()[0][0].clone();
+    assert_eq!(
+        reader_count_val,
+        Value::Int64(1),
+        "uncommitted edge delete must not be visible to other sessions via COUNT"
+    );
+
+    writer.rollback().unwrap();
+}

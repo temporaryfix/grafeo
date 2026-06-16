@@ -557,6 +557,20 @@ impl ExpressionPredicate {
         edge_types: &[String],
         end_labels: &Option<Vec<String>>,
     ) -> bool {
+        // MVCC: a candidate edge from the (non-versioned) adjacency index must still be
+        // visible under the current snapshot — a writer's own PENDING-deleted edge must
+        // not satisfy EXISTS/COUNT (read-your-writes); mirrors the expand operators.
+        if let Some(epoch) = self.viewing_epoch {
+            let visible = if let Some(tx) = self.transaction_id {
+                self.store.is_edge_visible_versioned(edge_id, epoch, tx)
+            } else {
+                self.store.is_edge_visible_at_epoch(edge_id, epoch)
+            };
+            if !visible {
+                return false;
+            }
+        }
+
         // Check edge type if specified
         if !edge_types.is_empty() {
             let type_ok = if let Some(actual_type) = self.store.edge_type(edge_id) {
