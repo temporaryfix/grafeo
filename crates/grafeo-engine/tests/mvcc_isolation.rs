@@ -250,16 +250,13 @@ fn uncommitted_label_remove_is_invisible_to_other_sessions() {
     assert_eq!(after.row_count(), 1, ":Vip must be restored after rollback");
 }
 
-/// Uncommitted DETACH DELETE of a node WITH edges must not tombstone edges for
-/// other readers (edge-adjacency isolation).
+/// Uncommitted DETACH DELETE must not tombstone incident edges for other readers
+/// (edge-adjacency isolation, unified-MVCC increment 2b).
 ///
-/// Currently `delete_node_edges` uses `TransactionId::SYSTEM` with eager
-/// `batch_mark_deleted`, so the adjacency tombstone is immediately visible to
-/// other sessions regardless of the deleting transaction's commit status.
-/// Fixing this requires threading `transaction_id` into `delete_node_edges` and
-/// deferring adjacency removal — left as a follow-up (unified-mvcc increment 2).
-///
-/// TODO(unified-mvcc): defer adjacency tombstones for transactional DETACH.
+/// The DETACH operator threads `transaction_id` into edge deletion and stamps
+/// `deleted_epoch = PENDING`, deferring the adjacency tombstone to commit. This
+/// test is a regression guard: an uncommitted DETACH DELETE must leave the
+/// incident edge visible to concurrent readers.
 #[test]
 fn uncommitted_detach_delete_edges_invisible_to_other_sessions() {
     let db = GrafeoDB::new_in_memory();
@@ -352,4 +349,43 @@ fn committed_edge_delete_is_visible_to_other_sessions() {
         .execute("MATCH (:N {id: 1})-[r:R]->(b) RETURN b.id")
         .unwrap();
     assert_eq!(r.row_count(), 0, "committed edge delete must be visible");
+}
+
+/// A committed transactional DETACH DELETE must remove BOTH the node and its
+/// incident edges for every other session (MVCC increment 2b). This locks the
+/// node-finalize + edge-finalize interaction on commit: the DETACH operator
+/// deletes the incident edge transactionally (PENDING) before the node, and
+/// commit must finalize both so a fresh reader sees neither.
+#[test]
+fn committed_detach_delete_edges_invisible_to_other_sessions() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    writer
+        .execute("CREATE (:Person {name: 'Ann'})-[:KNOWS]->(:Person {name: 'Bob'})")
+        .unwrap();
+
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("MATCH (p:Person {name: 'Ann'}) DETACH DELETE p")
+        .unwrap();
+    writer.commit().unwrap();
+
+    // A fresh reader must see neither the edge nor Ann.
+    let reader = db.session();
+    let edge = reader
+        .execute("MATCH (:Person {name: 'Bob'})<-[:KNOWS]-(p) RETURN p.name")
+        .unwrap();
+    assert_eq!(
+        edge.row_count(),
+        0,
+        "committed DETACH DELETE must remove the incident edge for other sessions"
+    );
+    let node = reader
+        .execute("MATCH (p:Person {name: 'Ann'}) RETURN p")
+        .unwrap();
+    assert_eq!(
+        node.row_count(),
+        0,
+        "committed DETACH DELETE must remove the node for other sessions"
+    );
 }

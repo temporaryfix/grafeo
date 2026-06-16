@@ -4044,6 +4044,10 @@ impl Session {
                     // version chains so the nodes remain visible after conflict rollback.
                     let pending_deletes = store.take_pending_deletes(transaction_id);
                     store.rollback_pending_deletes(transaction_id, &pending_deletes);
+                    // Same for deferred pending EDGE deletes (MVCC increment 2b):
+                    // unmark so the edges remain visible after conflict rollback.
+                    let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
+                    store.rollback_pending_edge_deletes(transaction_id, &pending_edge_deletes);
                 }
                 let _ = self.transaction_manager.abort(transaction_id);
                 #[cfg(feature = "triple-store")]
@@ -4089,6 +4093,11 @@ impl Session {
                 &pending_edges,
             );
             store.apply_tx_overlay(transaction_id);
+            // Finalize PENDING edge deletes BEFORE nodes (DETACH deletes incident
+            // edges before the node): stamp commit epoch + apply deferred adjacency
+            // tombstone / property removal / count decrements (MVCC increment 2b).
+            let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
+            store.finalize_edge_deletes_by_id(transaction_id, commit_epoch, &pending_edge_deletes);
             // Finalize PENDING node deletes: stamp commit epoch + apply deferred
             // label-index/property removal (unified-MVCC increment 1).
             let pending_deletes = store.take_pending_deletes(transaction_id);
@@ -4260,6 +4269,10 @@ impl Session {
             // chains so the nodes remain visible after rollback.
             let pending_deletes = store.take_pending_deletes(transaction_id);
             store.rollback_pending_deletes(transaction_id, &pending_deletes);
+            // Same for deferred pending EDGE deletes (MVCC increment 2b): unmark
+            // their version chains so the edges remain visible after rollback.
+            let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
+            store.rollback_pending_edge_deletes(transaction_id, &pending_edge_deletes);
         }
 
         // Discard pending operations in the RDF store

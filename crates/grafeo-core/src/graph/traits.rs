@@ -812,6 +812,31 @@ pub trait GraphStoreMut: GraphStoreSearch {
         Vec::new()
     }
 
+    /// Finalizes PENDING edge deletes for a committed transaction: stamps
+    /// `deleted_epoch` PENDING→`commit_epoch` and applies the deferred adjacency
+    /// tombstone, edge-property removal, and live/edge-type count decrements.
+    /// Each tuple is `(src, edge, dst)`. Default: no-op (non-LPG stores have no
+    /// pending edge deletes).
+    fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        let _ = (transaction_id, commit_epoch, edges);
+    }
+
+    /// Takes (removes and returns) the pending edge-delete list for a transaction.
+    /// Each tuple is `(src, edge, dst)`. Default: empty vec (non-LPG stores have
+    /// no pending edge deletes).
+    fn take_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId, NodeId)> {
+        let _ = transaction_id;
+        Vec::new()
+    }
+
     // --- Label mutation ---
 
     /// Adds a label to a node. Returns `true` if the label was new.

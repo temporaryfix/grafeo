@@ -1,6 +1,6 @@
 use super::*;
-use crate::graph::lpg::property::CompareOp;
 use crate::graph::Direction;
+use crate::graph::lpg::property::CompareOp;
 use grafeo_common::types::TransactionId;
 
 #[test]
@@ -401,8 +401,8 @@ fn test_delete_node_edges_atomic_batch() {
     // A barrier ensures both threads start at the same time, and an
     // AtomicBool keeps the reader spinning until deletion finishes,
     // so the two threads are guaranteed to overlap.
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let barrier = Arc::new(Barrier::new(2));
     let done = Arc::new(AtomicBool::new(false));
@@ -1500,8 +1500,8 @@ fn test_delete_nonexistent_node() {
 /// produce identical results to the concrete methods.
 mod graph_store_traits {
     use super::*;
-    use crate::graph::traits::{GraphStore, GraphStoreMut};
     use crate::graph::Direction;
+    use crate::graph::traits::{GraphStore, GraphStoreMut};
 
     #[test]
     fn trait_object_safety() {
@@ -2165,5 +2165,99 @@ fn edge_delete_pending_isolates() {
         store.live_edge_count.load(Ordering::Relaxed),
         live_before - 1,
         "live-edge count must decrease by one at finalize"
+    );
+}
+
+/// Edge-delete rollback cleanliness (MVCC increment 2b, Task 3).
+///
+/// After a `delete_edge_transactional`, draining the pending set with
+/// `take_pending_edge_deletes` and replaying it through
+/// `rollback_pending_edge_deletes` must FULLY restore the edge — the chain is
+/// unmarked (not left PENDING), so the edge is visible again to the writer.
+/// Because the deferred model never touched adjacency, properties, or counts at
+/// delete time, those are untouched throughout. Finally the pending set must be
+/// drained (the `take` already emptied it). This is the only probe that
+/// distinguishes a real restore from leaked-PENDING state.
+#[test]
+fn edge_delete_rollback_restores() {
+    use grafeo_common::types::PropertyKey;
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["A"]);
+    let b = store.create_node(&["B"]);
+    // Edge with a property so we can assert it survives the rollback.
+    let eid = store.create_edge_with_props(a, b, "R", [("prop", Value::from(7i64))]);
+
+    let key = PropertyKey::new("prop");
+    let epoch = store.current_epoch();
+    let tx = TransactionId::new(2);
+
+    let live_before = store.live_edge_count.load(Ordering::Relaxed);
+
+    // Transactional delete: stamps PENDING deleted_epoch by `tx`.
+    assert!(store.delete_edge_transactional(eid, epoch, tx));
+    assert!(
+        !store.is_edge_visible_versioned(eid, epoch, tx),
+        "writer must not see its own deleted edge before rollback"
+    );
+
+    // Rollback: drain the pending set and unmark the chain.
+    let ed = store.take_pending_edge_deletes(tx);
+    assert_eq!(
+        ed,
+        vec![(a, eid, b)],
+        "pending edge-delete set must carry the (src, edge, dst) tuple"
+    );
+    store.rollback_pending_edge_deletes(tx, &ed);
+
+    // FULLY restored: chain unmarked, edge visible to the writer again (NOT a
+    // leaked-PENDING state — a leak would leave it invisible to `tx`).
+    assert!(
+        store.is_edge_visible_versioned(eid, epoch, tx),
+        "edge must be visible to the writer again after rollback (chain unmarked)"
+    );
+    assert!(
+        store.get_edge_versioned(eid, epoch, tx).is_some(),
+        "writer must read the restored edge after rollback"
+    );
+
+    // Adjacency was never touched (deferred path) — still present both directions.
+    assert!(
+        store
+            .forward_adj
+            .edges_from(a)
+            .iter()
+            .any(|(_, e)| *e == eid),
+        "forward adjacency must still contain the edge after rollback"
+    );
+    assert!(
+        store
+            .backward_adj
+            .as_ref()
+            .expect("default config enables backward adjacency")
+            .edges_from(b)
+            .iter()
+            .any(|(_, e)| *e == eid),
+        "backward adjacency must still contain the edge after rollback"
+    );
+
+    // Live-edge count unchanged (decrement was deferred, never applied).
+    assert_eq!(
+        store.live_edge_count.load(Ordering::Relaxed),
+        live_before,
+        "live-edge count must be unchanged after rollback"
+    );
+
+    // Property survives the rollback (removal was deferred, never applied).
+    assert_eq!(
+        store.edge_properties.get(eid, &key),
+        Some(Value::Int64(7)),
+        "edge property must survive the rollback"
+    );
+
+    // The pending set is drained — `take` already emptied it.
+    assert!(
+        store.take_pending_edge_deletes(tx).is_empty(),
+        "pending edge-delete set must be drained after take"
     );
 }

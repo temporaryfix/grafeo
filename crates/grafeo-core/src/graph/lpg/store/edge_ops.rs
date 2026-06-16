@@ -586,16 +586,10 @@ impl LpgStore {
     /// re-resolved from the chain (the eager path only decremented the counter, it
     /// never removed the type mapping), so the head version's `type_id` is still
     /// available even though the edge is now logically deleted.
-    // Called only by the test until the commit/rollback trait wiring lands (Task 3,
-    // mirroring node's `finalize_deletes_by_id` in `graph_store_impl.rs`). `expect`
-    // (not `allow`) so this is forced to be removed once that caller exists.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "wired by transactional-edge-delete trait impl in Task 3"
-        )
-    )]
+    ///
+    /// Wired into commit via the `GraphStoreMut::finalize_edge_deletes_by_id`
+    /// trait override (`graph_store_impl.rs`), mirroring node's
+    /// `finalize_deletes_by_id`.
     #[cfg(not(feature = "tiered-storage"))]
     pub(crate) fn finalize_edge_deletes_by_id(
         &self,
@@ -646,14 +640,8 @@ impl LpgStore {
 
     /// Finalizes PENDING edge deletes for a committed transaction.
     /// (Tiered storage version)
-    // See the non-tiered variant: caller lands in Task 3.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "wired by transactional-edge-delete trait impl in Task 3"
-        )
-    )]
+    // See the non-tiered variant: wired into commit via the
+    // `GraphStoreMut::finalize_edge_deletes_by_id` trait override.
     #[cfg(feature = "tiered-storage")]
     pub(crate) fn finalize_edge_deletes_by_id(
         &self,

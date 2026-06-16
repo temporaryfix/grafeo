@@ -642,6 +642,22 @@ impl GraphStoreMut for LpgStore {
         LpgStore::take_pending_deletes(self, transaction_id)
     }
 
+    fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        LpgStore::finalize_edge_deletes_by_id(self, transaction_id, commit_epoch, edges);
+    }
+
+    fn take_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId, NodeId)> {
+        LpgStore::take_pending_edge_deletes(self, transaction_id)
+    }
+
     fn add_label(&self, node_id: NodeId, label: &str) -> bool {
         LpgStore::add_label(self, node_id, label)
     }
