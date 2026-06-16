@@ -18,7 +18,7 @@ use super::{FactorizedOperator, FactorizedResult, LazyFactorizedChainOperator, O
 use crate::execution::chunk_state::{FactorizedSelection, LevelSelection};
 use crate::execution::factorized_chunk::FactorizedChunk;
 use crate::graph::GraphStoreSearch;
-use grafeo_common::types::{EpochId, PropertyKey, Value};
+use grafeo_common::types::{EpochId, PropertyKey, TransactionId, Value};
 
 /// A predicate that can be evaluated on factorized data at a specific level.
 ///
@@ -247,6 +247,8 @@ pub struct PropertyPredicate {
     store: Arc<dyn GraphStoreSearch>,
     /// Optional epoch for time-travel property reads.
     viewing_epoch: Option<EpochId>,
+    /// Optional transaction id for read-your-writes visibility.
+    transaction_id: Option<TransactionId>,
 }
 
 impl PropertyPredicate {
@@ -267,6 +269,7 @@ impl PropertyPredicate {
             value,
             store,
             viewing_epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -279,6 +282,20 @@ impl PropertyPredicate {
         store: Arc<dyn GraphStoreSearch>,
     ) -> Self {
         Self::new(level, column, property, CompareOp::Eq, value, store)
+    }
+
+    /// Sets the transaction context for MVCC-aware property lookups.
+    ///
+    /// Mirrors `FilterOperator::with_transaction_context`.
+    #[must_use]
+    pub fn with_transaction_context(
+        mut self,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.viewing_epoch = Some(epoch);
+        self.transaction_id = transaction_id;
+        self
     }
 
     fn compare_values(&self, left: &Value) -> bool {
@@ -355,18 +372,18 @@ impl FactorizedPredicate for PropertyPredicate {
             return false;
         };
 
-        // TODO(unified-mvcc): thread snapshot — PropertyPredicate has no transaction_id field;
-        // passing None means a writing transaction will not see its own uncommitted writes
-        // in factorized filter predicates. Add transaction_id to PropertyPredicate to fix.
         let snap_epoch = self
             .viewing_epoch
             .unwrap_or_else(|| self.store.current_epoch());
 
         // Try as node first - use snapshot-aware property accessor (O(1) vs O(properties))
         if let Some(node_id) = column.get_node_id_physical(physical_idx) {
-            let prop_val =
-                self.store
-                    .read_node_property_visible(node_id, &self.property, snap_epoch, None);
+            let prop_val = self.store.read_node_property_visible(
+                node_id,
+                &self.property,
+                snap_epoch,
+                self.transaction_id,
+            );
             if let Some(val) = prop_val {
                 return self.compare_values(&val);
             }
@@ -374,9 +391,12 @@ impl FactorizedPredicate for PropertyPredicate {
 
         // Try as edge - use snapshot-aware property accessor
         if let Some(edge_id) = column.get_edge_id_physical(physical_idx) {
-            let prop_val =
-                self.store
-                    .read_edge_property_visible(edge_id, &self.property, snap_epoch, None);
+            let prop_val = self.store.read_edge_property_visible(
+                edge_id,
+                &self.property,
+                snap_epoch,
+                self.transaction_id,
+            );
             if let Some(val) = prop_val {
                 return self.compare_values(&val);
             }
@@ -406,9 +426,6 @@ impl FactorizedPredicate for PropertyPredicate {
 
         let count = level_data.physical_value_count();
 
-        // TODO(unified-mvcc): thread snapshot — PropertyPredicate has no transaction_id field;
-        // passing None means a writing transaction will not see its own uncommitted writes
-        // in factorized filter predicates. Add transaction_id to PropertyPredicate to fix.
         let snap_epoch = self
             .viewing_epoch
             .unwrap_or_else(|| self.store.current_epoch());
@@ -421,7 +438,7 @@ impl FactorizedPredicate for PropertyPredicate {
                     node_id,
                     &self.property,
                     snap_epoch,
-                    None,
+                    self.transaction_id,
                 );
                 if let Some(v) = val {
                     return self.compare_values(&v);
@@ -433,7 +450,7 @@ impl FactorizedPredicate for PropertyPredicate {
                     edge_id,
                     &self.property,
                     snap_epoch,
-                    None,
+                    self.transaction_id,
                 );
                 if let Some(v) = val {
                     return self.compare_values(&v);
