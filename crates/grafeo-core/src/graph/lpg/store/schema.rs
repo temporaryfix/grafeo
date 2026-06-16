@@ -1,6 +1,7 @@
 //! Schema, label, edge-type, and property-key methods for [`LpgStore`].
 
 use super::{LpgStore, PropertyUndoEntry};
+use arcstr::ArcStr;
 #[cfg(feature = "temporal")]
 use grafeo_common::types::EpochId;
 use grafeo_common::types::{NodeId, TransactionId};
@@ -571,6 +572,10 @@ impl LpgStore {
     /// inserted and buffered `Remove` ops are deleted before returning.  With
     /// `transaction_id = None` (another session or auto-commit) only the
     /// committed set is returned.
+    ///
+    /// Returns label **names** (`ArcStr`) rather than numeric IDs so that the
+    /// `GraphStore` trait default (which delegates to `get_node`) and this
+    /// override agree on the return type and callers never receive an opaque ID.
     #[doc(hidden)]
     #[must_use]
     pub fn read_node_labels_visible(
@@ -578,17 +583,19 @@ impl LpgStore {
         id: NodeId,
         epoch: grafeo_common::types::EpochId,
         transaction_id: Option<TransactionId>,
-    ) -> FxHashSet<u32> {
+    ) -> FxHashSet<ArcStr> {
+        // --- Build the final id-set (committed base + buffered delta) ---
+
         // Committed base.
         #[cfg(not(feature = "temporal"))]
-        let mut labels: FxHashSet<u32> = self
+        let mut label_ids: FxHashSet<u32> = self
             .node_labels
             .read()
             .get(&id)
             .cloned()
             .unwrap_or_default();
         #[cfg(feature = "temporal")]
-        let mut labels: FxHashSet<u32> = self
+        let mut label_ids: FxHashSet<u32> = self
             .node_labels
             .read()
             .get(&id)
@@ -606,16 +613,22 @@ impl LpgStore {
                     if *nid == id {
                         match op {
                             super::LabelOp::Add => {
-                                labels.insert(*label_id);
+                                label_ids.insert(*label_id);
                             }
                             super::LabelOp::Remove => {
-                                labels.remove(label_id);
+                                label_ids.remove(label_id);
                             }
                         }
                     }
                 }
             }
         }
-        labels
+
+        // --- Convert numeric IDs → names via the registry ---
+        let reg = self.label_registry.read();
+        label_ids
+            .iter()
+            .filter_map(|&lid| reg.get_name(lid).cloned())
+            .collect()
     }
 }

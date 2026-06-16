@@ -19,11 +19,11 @@
 //!
 //! [`LpgStore`]: crate::graph::lpg::LpgStore
 
+use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 #[cfg(feature = "lpg")]
 use crate::graph::lpg::TxDelta;
 use crate::graph::lpg::{Edge, Node};
-use crate::graph::Direction;
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
@@ -152,23 +152,28 @@ pub trait GraphStore: Send + Sync {
 
     /// Snapshot-consistent node label set (unified-MVCC label accessor).
     ///
-    /// Returns the set of committed label IDs merged with the writing
+    /// Returns the set of committed label **names** merged with the writing
     /// transaction's buffered label ops. With `transaction_id = Some(tx)` the
     /// writer's buffered `Add` ops are inserted and buffered `Remove` ops are
     /// deleted before returning.  With `transaction_id = None` only the
     /// committed set is returned.
     ///
-    /// Default: ignores isolation and returns an empty set — safe for stores
-    /// without a per-transaction label delta or a label registry. `LpgStore`
-    /// overrides this to merge its delta for the writing transaction.
+    /// Default: returns the committed label names by loading the node via
+    /// [`get_node`](Self::get_node). This is correct-by-construction for stores
+    /// without a per-transaction label delta (WAL, CDC, Layered stores). The
+    /// `epoch` and `transaction_id` parameters are ignored in the default —
+    /// those stores have no uncommitted delta to merge. `LpgStore` overrides
+    /// this to merge its delta for the writing transaction.
     fn read_node_labels_visible(
         &self,
         id: NodeId,
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
-    ) -> FxHashSet<u32> {
-        let _ = (id, epoch, transaction_id);
-        FxHashSet::default()
+    ) -> FxHashSet<ArcStr> {
+        let _ = (epoch, transaction_id);
+        self.get_node(id)
+            .map(|n| n.labels.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Gets a property for multiple nodes in a single batch operation.
@@ -1088,12 +1093,16 @@ mod tests {
         let val = Value::Int64(30);
 
         assert!(store.find_nodes_by_property("age", &val).is_empty());
-        assert!(store
-            .find_nodes_by_properties(&[("age", val.clone())])
-            .is_empty());
-        assert!(store
-            .find_nodes_in_range("age", Some(&val), None, true, false)
-            .is_empty());
+        assert!(
+            store
+                .find_nodes_by_properties(&[("age", val.clone())])
+                .is_empty()
+        );
+        assert!(
+            store
+                .find_nodes_in_range("age", Some(&val), None, true, false)
+                .is_empty()
+        );
         assert!(!store.node_property_might_match(&key, CompareOp::Eq, &val));
         assert!(!store.edge_property_might_match(&key, CompareOp::Eq, &val));
     }
@@ -1121,12 +1130,16 @@ mod tests {
         assert!(!store.is_edge_visible_at_epoch(eid, epoch));
         assert!(!store.is_edge_visible_versioned(eid, epoch, txn));
 
-        assert!(store
-            .filter_visible_node_ids(&[nid, NodeId(2)], epoch)
-            .is_empty());
-        assert!(store
-            .filter_visible_node_ids_versioned(&[nid], epoch, txn)
-            .is_empty());
+        assert!(
+            store
+                .filter_visible_node_ids(&[nid, NodeId(2)], epoch)
+                .is_empty()
+        );
+        assert!(
+            store
+                .filter_visible_node_ids_versioned(&[nid], epoch, txn)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1465,9 +1478,11 @@ mod tests {
         store.set_node_property(node_id, "city", Value::from("Amsterdam"));
         let removed = store.remove_node_property_versioned(node_id, "city", txn);
         assert_eq!(removed, Some(Value::from("Amsterdam")));
-        assert!(store
-            .get_node_property(node_id, &PropertyKey::from("city"))
-            .is_none());
+        assert!(
+            store
+                .get_node_property(node_id, &PropertyKey::from("city"))
+                .is_none()
+        );
 
         let missing = store.remove_node_property_versioned(node_id, "absent", txn);
         assert!(missing.is_none());

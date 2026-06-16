@@ -105,7 +105,7 @@ impl GraphStore for LpgStore {
         id: NodeId,
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
-    ) -> FxHashSet<u32> {
+    ) -> FxHashSet<ArcStr> {
         LpgStore::read_node_labels_visible(self, id, epoch, transaction_id)
     }
 

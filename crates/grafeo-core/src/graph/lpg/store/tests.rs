@@ -1,6 +1,6 @@
 use super::*;
-use crate::graph::lpg::property::CompareOp;
 use crate::graph::Direction;
+use crate::graph::lpg::property::CompareOp;
 use grafeo_common::types::TransactionId;
 
 #[test]
@@ -401,8 +401,8 @@ fn test_delete_node_edges_atomic_batch() {
     // A barrier ensures both threads start at the same time, and an
     // AtomicBool keeps the reader spinning until deletion finishes,
     // so the two threads are guaranteed to overlap.
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let barrier = Arc::new(Barrier::new(2));
     let done = Arc::new(AtomicBool::new(false));
@@ -1500,8 +1500,8 @@ fn test_delete_nonexistent_node() {
 /// produce identical results to the concrete methods.
 mod graph_store_traits {
     use super::*;
-    use crate::graph::traits::{GraphStore, GraphStoreMut};
     use crate::graph::Direction;
+    use crate::graph::traits::{GraphStore, GraphStoreMut};
 
     #[test]
     fn trait_object_safety() {
@@ -1851,18 +1851,19 @@ fn label_delta_isolates_buffered_label_ops() {
     let store = LpgStore::new().unwrap();
     let n = store.create_node(&["Person"]);
     let tx = TransactionId::new(7);
-    let person_id = store.label_id("Person").unwrap();
 
     // Buffer add :Secret and remove :Person for tx.
     store.add_label_buffered(n, "Secret", tx);
     store.remove_label_buffered(n, "Person", tx);
 
-    let secret_id = store.label_id("Secret").unwrap();
     let writer_view =
         store.read_node_labels_visible(n, grafeo_common::types::EpochId::new(0), Some(tx));
-    assert!(writer_view.contains(&secret_id), "writer sees buffered add");
     assert!(
-        !writer_view.contains(&person_id),
+        writer_view.contains(&arcstr::ArcStr::from("Secret")),
+        "writer sees buffered add"
+    );
+    assert!(
+        !writer_view.contains(&arcstr::ArcStr::from("Person")),
         "writer sees buffered remove"
     );
 
@@ -1870,11 +1871,11 @@ fn label_delta_isolates_buffered_label_ops() {
     let committed_view =
         store.read_node_labels_visible(n, grafeo_common::types::EpochId::new(0), None);
     assert!(
-        committed_view.contains(&person_id),
+        committed_view.contains(&arcstr::ArcStr::from("Person")),
         "others see committed :Person"
     );
     assert!(
-        !committed_view.contains(&secret_id),
+        !committed_view.contains(&arcstr::ArcStr::from("Secret")),
         "others do NOT see uncommitted :Secret"
     );
 
@@ -1882,7 +1883,8 @@ fn label_delta_isolates_buffered_label_ops() {
     store.apply_tx_overlay(tx);
     let after = store.read_node_labels_visible(n, grafeo_common::types::EpochId::new(0), None);
     assert!(
-        after.contains(&secret_id) && !after.contains(&person_id),
+        after.contains(&arcstr::ArcStr::from("Secret"))
+            && !after.contains(&arcstr::ArcStr::from("Person")),
         "commit applied label ops"
     );
 }
@@ -1892,7 +1894,6 @@ fn label_delta_rollback_and_savepoint() {
     let store = LpgStore::new().unwrap();
     let n = store.create_node(&["Person"]);
     let epoch = grafeo_common::types::EpochId::new(0);
-    let person_id = store.label_id("Person").unwrap();
 
     // --- Rollback path ---
     // tx A buffers :Secret but is then dropped (rolled back).
@@ -1903,17 +1904,14 @@ fn label_delta_rollback_and_savepoint() {
     // After rollback the committed base must be unchanged — no :Secret visible.
     let after_rollback = store.read_node_labels_visible(n, epoch, None);
     assert!(
-        after_rollback.contains(&person_id),
+        after_rollback.contains(&arcstr::ArcStr::from("Person")),
         "committed :Person must survive rollback of tx A"
     );
     // :Secret must not have leaked into committed view.
-    let secret_id = store.label_id("Secret");
-    if let Some(sid) = secret_id {
-        assert!(
-            !after_rollback.contains(&sid),
-            "rolled-back :Secret must NOT be visible in committed view"
-        );
-    }
+    assert!(
+        !after_rollback.contains(&arcstr::ArcStr::from("Secret")),
+        "rolled-back :Secret must NOT be visible in committed view"
+    );
 
     // --- Savepoint path ---
     let tx_b = TransactionId::new(11);
@@ -1923,17 +1921,14 @@ fn label_delta_rollback_and_savepoint() {
     let snap = store.tx_overlay_snapshot(tx_b);
     store.add_label_buffered(n, "Temp", tx_b);
 
-    let vip_id = store.label_id("Vip").unwrap();
-    let temp_id = store.label_id("Temp").unwrap();
-
     // Before restore: writer sees both Vip and Temp.
     let before_restore = store.read_node_labels_visible(n, epoch, Some(tx_b));
     assert!(
-        before_restore.contains(&vip_id),
+        before_restore.contains(&arcstr::ArcStr::from("Vip")),
         "writer must see buffered :Vip before restore"
     );
     assert!(
-        before_restore.contains(&temp_id),
+        before_restore.contains(&arcstr::ArcStr::from("Temp")),
         "writer must see buffered :Temp before restore"
     );
 
@@ -1942,16 +1937,16 @@ fn label_delta_rollback_and_savepoint() {
 
     let after_restore = store.read_node_labels_visible(n, epoch, Some(tx_b));
     assert!(
-        after_restore.contains(&vip_id),
+        after_restore.contains(&arcstr::ArcStr::from("Vip")),
         "writer must still see :Vip after savepoint restore"
     );
     assert!(
-        !after_restore.contains(&temp_id),
+        !after_restore.contains(&arcstr::ArcStr::from("Temp")),
         "savepoint restore must discard :Temp — if this fails it is a real bug"
     );
     // The committed :Person must also be visible to the writer.
     assert!(
-        after_restore.contains(&person_id),
+        after_restore.contains(&arcstr::ArcStr::from("Person")),
         "committed :Person must be visible to writer after restore"
     );
 }
@@ -1969,33 +1964,30 @@ fn trait_label_accessor_isolates() {
 
     let n = dyn_store.create_node(&["Person"]);
     let tx = TransactionId::new(99);
-    let person_id = store.label_id("Person").unwrap();
 
     // Buffer add :Secret and remove :Person for tx — via the trait object.
     dyn_store.add_label_buffered(n, "Secret", tx);
     dyn_store.remove_label_buffered(n, "Person", tx);
 
-    let secret_id = store.label_id("Secret").unwrap();
-
     // Writer view (Some(tx)) through the trait object.
     let writer_view = dyn_store.read_node_labels_visible(n, EpochId::new(0), Some(tx));
     assert!(
-        writer_view.contains(&secret_id),
+        writer_view.contains(&arcstr::ArcStr::from("Secret")),
         "writer sees buffered add via trait"
     );
     assert!(
-        !writer_view.contains(&person_id),
+        !writer_view.contains(&arcstr::ArcStr::from("Person")),
         "writer sees buffered remove via trait"
     );
 
     // Other reader (None) sees only committed labels.
     let committed_view = dyn_store.read_node_labels_visible(n, EpochId::new(0), None);
     assert!(
-        committed_view.contains(&person_id),
+        committed_view.contains(&arcstr::ArcStr::from("Person")),
         "others see committed :Person via trait"
     );
     assert!(
-        !committed_view.contains(&secret_id),
+        !committed_view.contains(&arcstr::ArcStr::from("Secret")),
         "others do NOT see uncommitted :Secret via trait"
     );
 
@@ -2003,7 +1995,8 @@ fn trait_label_accessor_isolates() {
     dyn_store.apply_tx_overlay(tx);
     let after = dyn_store.read_node_labels_visible(n, EpochId::new(0), None);
     assert!(
-        after.contains(&secret_id) && !after.contains(&person_id),
+        after.contains(&arcstr::ArcStr::from("Secret"))
+            && !after.contains(&arcstr::ArcStr::from("Person")),
         "commit promoted label ops via trait"
     );
 }
