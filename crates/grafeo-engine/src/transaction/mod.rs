@@ -204,8 +204,10 @@ pub use manager::{
 pub use mvcc::{VersionChain, VersionInfo};
 #[cfg(feature = "lpg")]
 pub use prepared::{CommitInfo, PreparedCommit};
+pub use read_tracker::TransactionReadTracker;
 pub use write_tracker::TransactionWriteTracker;
 
+mod read_tracker;
 mod write_tracker;
 
 #[cfg(feature = "parallel")]

@@ -433,6 +433,15 @@ impl TransactionManager {
         Ok(info.write_set.clone())
     }
 
+    /// Returns a copy of the read-set of a transaction (serializable read tracking).
+    pub fn read_set(&self, transaction_id: TransactionId) -> HashSet<EntityId> {
+        self.transactions
+            .read()
+            .get(&transaction_id)
+            .map(|i| i.read_set.clone())
+            .unwrap_or_default()
+    }
+
     /// Replaces the write set of a transaction (used for savepoint rollback).
     ///
     /// # Errors
