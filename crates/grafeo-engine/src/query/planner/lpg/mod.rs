@@ -203,8 +203,7 @@ pub struct Planner {
     write_tracker: Option<grafeo_core::execution::operators::SharedWriteTracker>,
     /// Optional read tracker for SSI read-set recording (Serializable only).
     /// `None` for SnapshotIsolation and ReadCommitted — zero allocation on the fast path.
-    /// Threaded into read operators by later tasks (currently scaffolded).
-    #[allow(dead_code)]
+    /// Threaded into scan operators so every materialized node id is reported once.
     read_tracker: Option<grafeo_core::execution::operators::SharedReadTracker>,
     /// Session context for introspection functions (info, schema, current_schema, etc.).
     pub(super) session_context: grafeo_core::execution::operators::SessionContext,

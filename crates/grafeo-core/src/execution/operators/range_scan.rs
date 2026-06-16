@@ -44,7 +44,7 @@ use std::sync::Arc;
 use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashSet;
 
-use super::{Operator, OperatorResult};
+use super::{Operator, OperatorResult, SharedReadTracker};
 use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
 
@@ -64,6 +64,8 @@ pub struct RangeScanOperator {
     label_filter: Option<String>,
     /// Optional MVCC transaction context (epoch + tx).
     transaction_context: Option<(EpochId, TransactionId)>,
+    /// Optional read tracker for SSI read-set recording (Serializable only).
+    read_tracker: Option<SharedReadTracker>,
 
     /// Materialized result, lazily built on first `next()`.
     materialized: Option<Vec<NodeId>>,
@@ -97,6 +99,7 @@ impl RangeScanOperator {
             limit: None,
             label_filter: None,
             transaction_context: None,
+            read_tracker: None,
             materialized: None,
             position: 0,
         }
@@ -148,6 +151,17 @@ impl RangeScanOperator {
         self
     }
 
+    /// Attaches a read tracker for SSI read-set recording (Serializable only).
+    ///
+    /// When set, every node id that passes label + MVCC filtering is reported
+    /// to the tracker exactly once (during `ensure_materialized`, before any
+    /// chunk is emitted).
+    #[must_use]
+    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
+        self.read_tracker = Some(t);
+        self
+    }
+
     fn ensure_materialized(&mut self) {
         if self.materialized.is_some() {
             return;
@@ -189,6 +203,15 @@ impl RangeScanOperator {
                 && collected.len() >= n
             {
                 break;
+            }
+        }
+
+        // Record reads exactly once per materialization pass.
+        // `ensure_materialized` is guarded at the top by `if self.materialized.is_some()`
+        // so this block executes only the first time, regardless of chunk count.
+        if let (Some(tracker), Some((_, tid))) = (&self.read_tracker, self.transaction_context) {
+            for id in &collected {
+                tracker.record_node_read(tid, *id);
             }
         }
 

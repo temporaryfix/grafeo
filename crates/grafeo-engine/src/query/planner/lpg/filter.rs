@@ -1375,6 +1375,10 @@ impl super::Planner {
             op = op.with_limit(hint);
         }
 
+        if let Some(t) = &self.read_tracker {
+            op = op.with_read_tracker(Arc::clone(t));
+        }
+
         let columns = vec![scan_variable.to_string()];
         Ok(Some((Box::new(op), columns)))
     }
