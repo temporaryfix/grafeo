@@ -19,11 +19,7 @@ impl super::Planner {
         };
 
         // Apply MVCC context if available
-        let mut scan_op =
-            scan_op.with_transaction_context(self.viewing_epoch, self.transaction_id);
-        if let Some(t) = &self.read_tracker {
-            scan_op = scan_op.with_read_tracker(Arc::clone(t));
-        }
+        let scan_op = scan_op.with_transaction_context(self.viewing_epoch, self.transaction_id);
         let scan_operator: Box<dyn Operator> = Box::new(scan_op);
 
         // If there's an input, chain operators with a nested loop join (cross join)

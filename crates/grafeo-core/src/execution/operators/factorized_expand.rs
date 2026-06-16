@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use super::{FactorizedOperator, Operator, OperatorError, OperatorResult, SharedReadTracker};
+use super::{FactorizedOperator, Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::execution::factorized_chunk::FactorizedChunk;
 use crate::execution::vector::ValueVector;
@@ -68,8 +68,6 @@ pub struct FactorizedExpandOperator {
     exhausted: bool,
     /// Column names for the input (for tracking).
     input_column_names: Vec<String>,
-    /// Optional read tracker for SSI read-set recording (Serializable only).
-    read_tracker: Option<SharedReadTracker>,
 }
 
 impl FactorizedExpandOperator {
@@ -92,7 +90,6 @@ impl FactorizedExpandOperator {
             read_only: false,
             exhausted: false,
             input_column_names: Vec::new(),
-            read_tracker: None,
         }
     }
 
@@ -116,16 +113,6 @@ impl FactorizedExpandOperator {
     /// Sets the input column names for schema tracking.
     pub fn with_column_names(mut self, names: Vec<String>) -> Self {
         self.input_column_names = names;
-        self
-    }
-
-    /// Attaches a read tracker for SSI read-set recording (Serializable only).
-    ///
-    /// When set alongside a `transaction_id`, every visible edge id and neighbor
-    /// node id produced by the expand is reported to the tracker once per
-    /// visible neighbor.
-    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
-        self.read_tracker = Some(t);
         self
     }
 
@@ -192,11 +179,6 @@ impl FactorizedExpandOperator {
             let neighbors = self.get_neighbors(source_id);
 
             for (target_id, edge_id) in neighbors {
-                // Record reads for SSI (Serializable isolation only).
-                if let (Some(tracker), Some(tid)) = (&self.read_tracker, self.transaction_id) {
-                    tracker.record_edge_read(tid, edge_id);
-                    tracker.record_node_read(tid, target_id);
-                }
                 edge_ids.push_edge_id(edge_id);
                 target_ids.push_node_id(target_id);
             }
@@ -306,8 +288,6 @@ pub struct FactorizedExpandChain {
     viewing_epoch: Option<EpochId>,
     /// When true, skip versioned MVCC lookups (fast path for read-only queries).
     read_only: bool,
-    /// Optional read tracker for SSI read-set recording (Serializable only).
-    read_tracker: Option<SharedReadTracker>,
 }
 
 impl FactorizedExpandChain {
@@ -320,7 +300,6 @@ impl FactorizedExpandChain {
             transaction_id: None,
             viewing_epoch: None,
             read_only: false,
-            read_tracker: None,
         }
     }
 
@@ -338,12 +317,6 @@ impl FactorizedExpandChain {
     /// Marks this chain as read-only, enabling fast-path lookups.
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
-        self
-    }
-
-    /// Attaches a read tracker for SSI read-set recording (Serializable only).
-    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
-        self.read_tracker = Some(t);
         self
     }
 
@@ -379,9 +352,6 @@ impl FactorizedExpandChain {
 
                     if let Some(epoch) = self.viewing_epoch {
                         expand = expand.with_transaction_context(epoch, self.transaction_id);
-                    }
-                    if let Some(t) = &self.read_tracker {
-                        expand = expand.with_read_tracker(Arc::clone(t));
                     }
 
                     if let Some(result) = expand.next_factorized()? {
@@ -549,11 +519,6 @@ impl FactorizedExpandChain {
                 .collect();
 
             for (target_id, edge_id) in neighbors {
-                // Record reads for SSI (Serializable isolation only).
-                if let (Some(tracker), Some(tid)) = (&self.read_tracker, self.transaction_id) {
-                    tracker.record_edge_read(tid, edge_id);
-                    tracker.record_node_read(tid, target_id);
-                }
                 edge_ids.push_edge_id(edge_id);
                 target_ids.push_node_id(target_id);
             }
@@ -656,8 +621,6 @@ pub struct LazyFactorizedChainOperator {
     factorized_result: Option<FactorizedChunk>,
     /// Whether execution has completed.
     executed: bool,
-    /// Optional read tracker for SSI read-set recording (Serializable only).
-    read_tracker: Option<SharedReadTracker>,
 }
 
 impl LazyFactorizedChainOperator {
@@ -677,7 +640,6 @@ impl LazyFactorizedChainOperator {
             result: None,
             factorized_result: None,
             executed: false,
-            read_tracker: None,
         }
     }
 
@@ -698,16 +660,6 @@ impl LazyFactorizedChainOperator {
         self
     }
 
-    /// Attaches a read tracker for SSI read-set recording (Serializable only).
-    ///
-    /// When set alongside a `transaction_id`, every visible edge id and neighbor
-    /// node id produced by the chain is reported to the tracker once per visible
-    /// neighbor.
-    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
-        self.read_tracker = Some(t);
-        self
-    }
-
     /// Executes the chain and returns the factorized result.
     ///
     /// This is the key method for factorized aggregation - it returns the
@@ -724,9 +676,6 @@ impl LazyFactorizedChainOperator {
 
         if let Some(epoch) = self.viewing_epoch {
             chain = chain.with_transaction_context(epoch, self.transaction_id);
-        }
-        if let Some(t) = &self.read_tracker {
-            chain = chain.with_read_tracker(Arc::clone(t));
         }
 
         // Execute each expand step

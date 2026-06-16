@@ -408,9 +408,6 @@ impl super::Planner {
         } else {
             lazy_op = lazy_op.with_transaction_context(self.viewing_epoch, None);
         }
-        if let Some(t) = &self.read_tracker {
-            lazy_op = lazy_op.with_read_tracker(Arc::clone(t));
-        }
 
         // Convert logical aggregates to factorized aggregates
         let factorized_aggs: Vec<FactorizedAggregate> = agg

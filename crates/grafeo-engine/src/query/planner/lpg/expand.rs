@@ -73,10 +73,6 @@ impl super::Planner {
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_read_only(self.read_only);
 
-            if let Some(t) = &self.read_tracker {
-                expand_op = expand_op.with_read_tracker(Arc::clone(t));
-            }
-
             // If a path alias is set, enable path length and detail output
             if needs_path_details {
                 expand_op = expand_op
@@ -87,7 +83,7 @@ impl super::Planner {
             Box::new(expand_op)
         } else {
             // Use simple ExpandOperator for single-hop paths without named paths
-            let mut expand_op = ExpandOperator::new(
+            let expand_op = ExpandOperator::new(
                 Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                 input_op,
                 source_column,
@@ -96,9 +92,6 @@ impl super::Planner {
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_read_only(self.read_only);
-            if let Some(t) = &self.read_tracker {
-                expand_op = expand_op.with_read_tracker(Arc::clone(t));
-            }
             Box::new(expand_op)
         };
 
@@ -219,9 +212,6 @@ impl super::Planner {
             lazy_op = lazy_op.with_transaction_context(self.viewing_epoch, Some(transaction_id));
         } else {
             lazy_op = lazy_op.with_transaction_context(self.viewing_epoch, None);
-        }
-        if let Some(t) = &self.read_tracker {
-            lazy_op = lazy_op.with_read_tracker(Arc::clone(t));
         }
 
         Ok((Box::new(lazy_op), columns))

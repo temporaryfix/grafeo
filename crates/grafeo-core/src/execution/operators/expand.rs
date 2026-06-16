@@ -1,6 +1,6 @@
 //! Expand operator for relationship traversal.
 
-use super::{Operator, OperatorError, OperatorResult, SharedReadTracker};
+use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::Direction;
 use crate::graph::GraphStoreSearch;
@@ -42,8 +42,6 @@ pub struct ExpandOperator {
     /// present.  Safe for read-only queries where the transaction has no
     /// pending writes, avoiding the cost of walking version chains.
     read_only: bool,
-    /// Optional read tracker for SSI read-set recording (Serializable only).
-    read_tracker: Option<SharedReadTracker>,
 }
 
 impl ExpandOperator {
@@ -70,7 +68,6 @@ impl ExpandOperator {
             transaction_id: None,
             viewing_epoch: None,
             read_only: false,
-            read_tracker: None,
         }
     }
 
@@ -100,16 +97,6 @@ impl ExpandOperator {
     /// cheaper epoch-only visibility checks.
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
-        self
-    }
-
-    /// Attaches a read tracker for SSI read-set recording (Serializable only).
-    ///
-    /// When set alongside a `transaction_id`, every visible edge id and neighbor
-    /// node id produced by the expand is reported to the tracker (once per
-    /// visible result at emit time).
-    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
-        self.read_tracker = Some(t);
         self
     }
 
@@ -281,13 +268,6 @@ impl Operator for ExpandOperator {
             // Get the current edge
             let (target_id, edge_id) = self.current_edges[self.current_edge_idx];
 
-            // Record reads for SSI (Serializable isolation only).
-            // Guard: both tracker and transaction_id must be present.
-            if let (Some(tracker), Some(tid)) = (&self.read_tracker, self.transaction_id) {
-                tracker.record_edge_read(tid, edge_id);
-                tracker.record_node_read(tid, target_id);
-            }
-
             // Copy all input columns to output
             let input = self.current_input.as_ref().expect("input loaded above");
             for col_idx in 0..input_col_count {
@@ -342,9 +322,8 @@ impl Operator for ExpandOperator {
 #[cfg(all(test, feature = "lpg"))]
 mod tests {
     use super::*;
-    use crate::execution::operators::{ReadTracker, ScanOperator};
+    use crate::execution::operators::ScanOperator;
     use crate::graph::lpg::LpgStore;
-    use std::sync::Mutex;
 
     /// Creates a new `LpgStore` wrapped in an `Arc` and returns both the
     /// concrete handle (for mutation) and a trait-object handle (for operators).
@@ -627,113 +606,5 @@ mod tests {
         let op = ExpandOperator::new(Arc::clone(&dyn_store), scan, 0, Direction::Outgoing, vec![]);
         let any = Box::new(op).into_any();
         assert!(any.downcast::<ExpandOperator>().is_ok());
-    }
-
-    // ── read_tracker tests ────────────────────────────────────────────────────
-
-    /// Test double that records (node_id) and (edge_id) calls.
-    struct SpyReadTracker {
-        node_reads: Arc<Mutex<Vec<NodeId>>>,
-        edge_reads: Arc<Mutex<Vec<EdgeId>>>,
-    }
-
-    impl ReadTracker for SpyReadTracker {
-        fn record_node_read(&self, _tx: TransactionId, node_id: NodeId) {
-            self.node_reads.lock().unwrap().push(node_id);
-        }
-        fn record_edge_read(&self, _tx: TransactionId, edge_id: EdgeId) {
-            self.edge_reads.lock().unwrap().push(edge_id);
-        }
-    }
-
-    /// Expand with a transaction_id + tracker records the traversed edge id and
-    /// the neighbor node id for each visible result.
-    #[test]
-    fn test_expand_read_tracker_records_edge_and_neighbor() {
-        use crate::execution::operators::NodeListOperator;
-
-        let (store, dyn_store) = test_store();
-
-        // Create (a)-[r]->(b)
-        let a = store.create_node(&["Person"]);
-        let b = store.create_node(&["Person"]);
-        let r = store.create_edge(a, b, "KNOWS");
-
-        let node_reads: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let edge_reads: Arc<Mutex<Vec<EdgeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let spy = Arc::new(SpyReadTracker {
-            node_reads: Arc::clone(&node_reads),
-            edge_reads: Arc::clone(&edge_reads),
-        });
-
-        let tx_id = TransactionId::new(7);
-        let epoch = EpochId::new(1);
-
-        // Use NodeListOperator so only node 'a' is the source.
-        let source = Box::new(NodeListOperator::new(vec![a], 1024));
-
-        let mut expand = ExpandOperator::new(
-            Arc::clone(&dyn_store),
-            source,
-            0,
-            Direction::Outgoing,
-            vec![],
-        )
-        .with_transaction_context(epoch, Some(tx_id))
-        .with_read_tracker(spy as SharedReadTracker);
-
-        // Drain all output.
-        while expand.next().unwrap().is_some() {}
-
-        let nr = node_reads.lock().unwrap().clone();
-        let er = edge_reads.lock().unwrap().clone();
-
-        // The traversed edge r and neighbor b must be recorded.
-        assert!(er.contains(&r), "edge r must be recorded");
-        assert!(nr.contains(&b), "neighbor b must be recorded");
-    }
-
-    /// With transaction_id = None the tracker is never called.
-    #[test]
-    fn test_expand_read_tracker_no_tx_nothing_recorded() {
-        use crate::execution::operators::NodeListOperator;
-
-        let (store, dyn_store) = test_store();
-
-        let a = store.create_node(&["Person"]);
-        let b = store.create_node(&["Person"]);
-        store.create_edge(a, b, "KNOWS");
-
-        let node_reads: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let edge_reads: Arc<Mutex<Vec<EdgeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let spy = Arc::new(SpyReadTracker {
-            node_reads: Arc::clone(&node_reads),
-            edge_reads: Arc::clone(&edge_reads),
-        });
-
-        let epoch = EpochId::new(1);
-
-        // tracker present but transaction_id is None — must not record
-        let source = Box::new(NodeListOperator::new(vec![a], 1024));
-        let mut expand = ExpandOperator::new(
-            Arc::clone(&dyn_store),
-            source,
-            0,
-            Direction::Outgoing,
-            vec![],
-        )
-        .with_transaction_context(epoch, None)
-        .with_read_tracker(spy as SharedReadTracker);
-
-        while expand.next().unwrap().is_some() {}
-
-        assert!(
-            node_reads.lock().unwrap().is_empty(),
-            "no node recording when transaction_id is None"
-        );
-        assert!(
-            edge_reads.lock().unwrap().is_empty(),
-            "no edge recording when transaction_id is None"
-        );
     }
 }

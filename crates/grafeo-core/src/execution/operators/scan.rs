@@ -1,6 +1,6 @@
 //! Scan operator for reading data from storage.
 
-use super::{Operator, OperatorResult, SharedReadTracker};
+use super::{Operator, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
 use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId};
@@ -24,8 +24,6 @@ pub struct ScanOperator {
     transaction_id: Option<TransactionId>,
     /// Epoch for version visibility.
     viewing_epoch: Option<EpochId>,
-    /// Optional read tracker for SSI read-set recording (Serializable only).
-    read_tracker: Option<SharedReadTracker>,
 }
 
 impl ScanOperator {
@@ -40,7 +38,6 @@ impl ScanOperator {
             chunk_capacity: 2048,
             transaction_id: None,
             viewing_epoch: None,
-            read_tracker: None,
         }
     }
 
@@ -55,7 +52,6 @@ impl ScanOperator {
             chunk_capacity: 2048,
             transaction_id: None,
             viewing_epoch: None,
-            read_tracker: None,
         }
     }
 
@@ -75,16 +71,6 @@ impl ScanOperator {
     ) -> Self {
         self.viewing_epoch = Some(epoch);
         self.transaction_id = transaction_id;
-        self
-    }
-
-    /// Attaches a read tracker for SSI read-set recording (Serializable only).
-    ///
-    /// When set alongside a transaction_id, every node id materialized by the
-    /// visibility filter is reported to the tracker exactly once (at batch load
-    /// time, not per-chunk-emit).
-    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
-        self.read_tracker = Some(t);
         self
     }
 
@@ -126,15 +112,6 @@ impl ScanOperator {
 
         if self.batch.is_empty() {
             self.exhausted = true;
-        }
-
-        // Record reads once per scan (batch is populated exactly once per
-        // load_batch invocation; the guard at the top ensures this block
-        // does not execute again for subsequent chunk-emit calls).
-        if let (Some(tracker), Some(tid)) = (&self.read_tracker, self.transaction_id) {
-            for id in &self.batch {
-                tracker.record_node_read(tid, *id);
-            }
         }
     }
 }
@@ -188,27 +165,8 @@ impl Operator for ScanOperator {
 #[cfg(all(test, feature = "lpg"))]
 mod tests {
     use super::*;
-    use crate::execution::operators::ReadTracker;
     use crate::graph::GraphStoreMut;
     use crate::graph::lpg::LpgStore;
-    use std::sync::Mutex;
-
-    /// Test double: collects (tx, node) pairs reported to record_node_read.
-    struct SpyReadTracker {
-        recorded: Arc<Mutex<Vec<NodeId>>>,
-    }
-
-    impl ReadTracker for SpyReadTracker {
-        fn record_node_read(&self, _tx: TransactionId, node_id: NodeId) {
-            self.recorded.lock().unwrap().push(node_id);
-        }
-        fn record_edge_read(
-            &self,
-            _tx: TransactionId,
-            _edge_id: grafeo_common::types::EdgeId,
-        ) {
-        }
-    }
 
     #[test]
     fn test_scan_by_label() {
@@ -307,115 +265,5 @@ mod tests {
         let op = ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person");
         let any = Box::new(op).into_any();
         assert!(any.downcast::<ScanOperator>().is_ok());
-    }
-
-    /// read_tracker records exactly the visible node ids — once, not per chunk.
-    #[test]
-    fn test_scan_read_tracker_records_visible_node_ids() {
-        let store: Arc<dyn GraphStoreMut> = Arc::new(LpgStore::new().unwrap());
-
-        // Create three nodes committed at epoch 1 via the SYSTEM transaction so
-        // they have a real epoch (not PENDING) and are visible at epoch 1+.
-        let epoch1 = EpochId::new(1);
-        let tx_sys = TransactionId::SYSTEM;
-        let id1 = store.create_node_versioned(&["Person"], epoch1, tx_sys);
-        let id2 = store.create_node_versioned(&["Person"], epoch1, tx_sys);
-        let id3 = store.create_node_versioned(&["Animal"], epoch1, tx_sys);
-
-        let recorded: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let spy = Arc::new(SpyReadTracker {
-            recorded: Arc::clone(&recorded),
-        });
-
-        // Scan only "Person" nodes with a tx context so MVCC filter runs.
-        let tx_id = TransactionId::new(42);
-        let mut scan =
-            ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person")
-                .with_transaction_context(epoch1, Some(tx_id))
-                .with_read_tracker(spy as SharedReadTracker);
-
-        // Drain all chunks.
-        while scan.next().unwrap().is_some() {}
-
-        let mut got = recorded.lock().unwrap().clone();
-        got.sort_unstable();
-        let mut expected = vec![id1, id2];
-        expected.sort_unstable();
-
-        assert_eq!(
-            got, expected,
-            "tracker should record exactly the two visible Person nodes"
-        );
-
-        // id3 (Animal) must NOT appear.
-        assert!(
-            !got.contains(&id3),
-            "Animal node must not be recorded in a Person-label scan"
-        );
-    }
-
-    /// With no read tracker (or no transaction_id), nothing is recorded.
-    #[test]
-    fn test_scan_no_tracker_nothing_recorded() {
-        let store: Arc<dyn GraphStoreMut> = Arc::new(LpgStore::new().unwrap());
-        store.create_node(&["Person"]);
-
-        let recorded: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let spy = Arc::new(SpyReadTracker {
-            recorded: Arc::clone(&recorded),
-        });
-
-        // Tracker present but transaction_id is None — must not record.
-        let epoch = EpochId::new(1);
-        let mut scan =
-            ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person")
-                .with_transaction_context(epoch, None)
-                .with_read_tracker(spy as SharedReadTracker);
-
-        while scan.next().unwrap().is_some() {}
-
-        assert!(
-            recorded.lock().unwrap().is_empty(),
-            "no recording when transaction_id is None"
-        );
-    }
-
-    /// Batch is loaded once: resetting re-records but the batch re-population
-    /// guard ensures each distinct scan lifetime records ids exactly once.
-    #[test]
-    fn test_scan_read_tracker_records_once_per_load_not_per_chunk() {
-        let store: Arc<dyn GraphStoreMut> = Arc::new(LpgStore::new().unwrap());
-
-        let epoch1 = EpochId::new(1);
-        let tx_sys = TransactionId::SYSTEM;
-        for _ in 0..5 {
-            store.create_node_versioned(&["P"], epoch1, tx_sys);
-        }
-
-        let recorded: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
-        let spy = Arc::new(SpyReadTracker {
-            recorded: Arc::clone(&recorded),
-        });
-
-        let tx_id = TransactionId::new(7);
-        // Use a tiny chunk capacity (1) to force multiple next() calls.
-        let mut scan = ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "P")
-            .with_transaction_context(epoch1, Some(tx_id))
-            .with_read_tracker(spy as SharedReadTracker)
-            .with_chunk_capacity(1);
-
-        // Drain 5 chunks (capacity 1 → 5 next() calls returning Some).
-        let mut chunk_count = 0usize;
-        while scan.next().unwrap().is_some() {
-            chunk_count += 1;
-        }
-        assert_eq!(chunk_count, 5, "should emit 5 single-row chunks");
-
-        // Even with 5 chunk emissions, each node recorded exactly once.
-        assert_eq!(
-            recorded.lock().unwrap().len(),
-            5,
-            "each of the 5 nodes recorded exactly once, not once per chunk"
-        );
     }
 }
