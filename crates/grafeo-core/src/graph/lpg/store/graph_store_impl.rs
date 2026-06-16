@@ -165,6 +165,14 @@ impl GraphStore for LpgStore {
         LpgStore::nodes_by_label(self, label)
     }
 
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        LpgStore::nodes_by_label_visible(self, label, transaction_id)
+    }
+
     fn nodes_by_label_count(&self, label: &str) -> usize {
         LpgStore::nodes_by_label_count(self, label)
     }

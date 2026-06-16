@@ -1107,13 +1107,16 @@ impl Operator for AddLabelOperator {
                 // Add all labels
                 let mut row_count: i64 = 0;
                 for label in &self.labels {
-                    let added = if let Some(tid) = self.transaction_id {
-                        self.store.add_label_versioned(node_id, label, tid)
-                    } else {
-                        self.store.add_label(node_id, label)
-                    };
-                    if added {
+                    if let Some(tid) = self.transaction_id {
+                        // Buffer the label add into the tx delta — other sessions
+                        // cannot see it until commit (MVCC label isolation).
+                        self.store.add_label_buffered(node_id, label, tid);
                         row_count += 1;
+                    } else {
+                        let added = self.store.add_label(node_id, label);
+                        if added {
+                            row_count += 1;
+                        }
                     }
                 }
 
@@ -1252,13 +1255,16 @@ impl Operator for RemoveLabelOperator {
                 // Remove all labels
                 let mut row_count: i64 = 0;
                 for label in &self.labels {
-                    let removed = if let Some(tid) = self.transaction_id {
-                        self.store.remove_label_versioned(node_id, label, tid)
-                    } else {
-                        self.store.remove_label(node_id, label)
-                    };
-                    if removed {
+                    if let Some(tid) = self.transaction_id {
+                        // Buffer the label remove into the tx delta — other
+                        // sessions still see the label until commit.
+                        self.store.remove_label_buffered(node_id, label, tid);
                         row_count += 1;
+                    } else {
+                        let removed = self.store.remove_label(node_id, label);
+                        if removed {
+                            row_count += 1;
+                        }
                     }
                 }
 

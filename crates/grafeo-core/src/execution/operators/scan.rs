@@ -83,8 +83,15 @@ impl ScanOperator {
         // to include uncommitted/PENDING versions (nodes_by_label already
         // returns unfiltered IDs from the label index, but node_ids()
         // pre-filters by epoch which excludes PENDING nodes).
+        //
+        // For label scans with a writing transaction, use nodes_by_label_visible
+        // which merges the tx's buffered label delta (adds buffered-adds, drops
+        // buffered-removes) so the writer sees read-your-writes without
+        // polluting the committed label_index for other sessions.
         let all_ids = match &self.label {
-            Some(label) => self.store.nodes_by_label(label),
+            Some(label) => self
+                .store
+                .nodes_by_label_visible(label, self.transaction_id),
             None if self.viewing_epoch.is_some() => self.store.all_node_ids(),
             None => self.store.node_ids(),
         };

@@ -326,6 +326,103 @@ impl LpgStore {
         Vec::new()
     }
 
+    /// Returns committed nodes with `label` merged with this transaction's
+    /// buffered label delta — the writer-bypass for `MATCH (:Label)` scans.
+    ///
+    /// When `transaction_id` is `Some`, the result set starts from the
+    /// committed `label_index` (the same source as `nodes_by_label`), then:
+    /// - adds nodes for which this tx buffered a `LabelOp::Add` for this label;
+    /// - removes nodes for which this tx buffered a `LabelOp::Remove`.
+    ///
+    /// When `transaction_id` is `None`, this is equivalent to `nodes_by_label`.
+    ///
+    /// **MVCC contract:** uncommitted labels are never inserted into
+    /// `label_index` — the merge is a read-time view only.
+    #[doc(hidden)]
+    pub fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        // Committed base from label_index.
+        let reg = self.label_registry.read();
+        let Some(label_id) = reg.get_id(label) else {
+            // Label not in registry at all — but the tx might have buffered it
+            // (label id created by add_label_buffered via get_or_create_label_id).
+            // Re-check after releasing the registry read lock.
+            drop(reg);
+            // Attempt to merge delta-only (committed set empty).
+            if let Some(tx) = transaction_id {
+                let overlay = self.tx_property_overlay.read();
+                if let Some(delta) = overlay.get(&tx) {
+                    // Find if any delta entry uses this label name.
+                    // We must look up the id from the registry (now re-locked).
+                    let reg2 = self.label_registry.read();
+                    if let Some(lid) = reg2.get_id(label) {
+                        drop(reg2);
+                        let mut ids: Vec<NodeId> = delta
+                            .node_labels
+                            .iter()
+                            .filter_map(|((nid, l), op)| {
+                                if *l == lid {
+                                    if matches!(op, super::LabelOp::Add) {
+                                        Some(*nid)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        ids.sort_unstable();
+                        return ids;
+                    }
+                }
+            }
+            return Vec::new();
+        };
+        drop(reg);
+
+        let index = self.label_index.read();
+        let committed: std::collections::HashSet<NodeId> = index
+            .get(label_id as usize)
+            .map(|set| set.keys().copied().collect())
+            .unwrap_or_default();
+        drop(index);
+
+        // Short-circuit for non-writing sessions.
+        let Some(tx) = transaction_id else {
+            let mut ids: Vec<NodeId> = committed.into_iter().collect();
+            ids.sort_unstable();
+            return ids;
+        };
+
+        // Merge delta.
+        let mut visible: std::collections::HashSet<NodeId> = committed;
+        {
+            let overlay = self.tx_property_overlay.read();
+            if let Some(delta) = overlay.get(&tx) {
+                for ((nid, lid), op) in &delta.node_labels {
+                    if *lid == label_id {
+                        match op {
+                            super::LabelOp::Add => {
+                                visible.insert(*nid);
+                            }
+                            super::LabelOp::Remove => {
+                                visible.remove(nid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ids: Vec<NodeId> = visible.into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Returns the number of nodes with a specific label without allocating
     /// the full ID list. O(1) via the label index.
     #[must_use]

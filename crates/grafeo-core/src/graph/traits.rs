@@ -234,6 +234,29 @@ pub trait GraphStore: Send + Sync {
     /// Returns node IDs with a specific label.
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId>;
 
+    /// Returns node IDs with a specific label, merging the writing
+    /// transaction's buffered label delta.
+    ///
+    /// When `transaction_id` is `Some`, the result includes nodes that the tx
+    /// buffered `:label` onto (via `add_label_buffered`) and excludes nodes it
+    /// buffered `:label` off of (`remove_label_buffered`).  When
+    /// `transaction_id` is `None`, this is identical to `nodes_by_label`.
+    ///
+    /// The default (for stores without a per-tx label delta) ignores
+    /// `transaction_id` and delegates to `nodes_by_label`. `LpgStore`
+    /// overrides to perform the delta merge.
+    ///
+    /// **MVCC contract:** never inserts uncommitted labels into `label_index`
+    /// — the delta merge happens only in this read path.
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        let _ = transaction_id;
+        self.nodes_by_label(label)
+    }
+
     /// Returns the number of non-deleted nodes with a specific label.
     ///
     /// Default falls back to `self.nodes_by_label(label).len()`; stores that
