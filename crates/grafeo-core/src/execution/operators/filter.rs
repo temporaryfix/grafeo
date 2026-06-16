@@ -574,8 +574,21 @@ impl ExpressionPredicate {
         // Check end node labels if specified (e.g., (:Person)-[:KNOWS]->(n) requires
         // the other endpoint to have the Person label after direction flipping).
         if let Some(labels) = end_labels {
-            if let Some(node) = self.resolve_node(other_node_id) {
-                labels.iter().all(|l| node.has_label(l))
+            // Resolve existence first, then check labels via the snapshot-aware
+            // accessor so that uncommitted label ops in the writing transaction are
+            // reflected here (behavior-preserving until Task 4 buffers writes).
+            if self.resolve_node(other_node_id).is_some() {
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set = self.store.read_node_labels_visible(
+                    other_node_id,
+                    snap_epoch,
+                    self.transaction_id,
+                );
+                labels
+                    .iter()
+                    .all(|l| label_set.iter().any(|s| s.as_str() == l.as_str()))
             } else {
                 false
             }
@@ -869,16 +882,22 @@ impl ExpressionPredicate {
                 let col_idx = *self.variable_columns.get(variable)?;
                 let col = chunk.column(col_idx)?;
                 let node_id = col.get_node_id(row)?;
-                // TODO(unified-mvcc): label reads use the committed node; an uncommitted label add/remove in the writing tx is not reflected (label snapshot reads deferred to increment 2).
-                let node = self.resolve_node(node_id)?;
+                // Guard: skip if node does not exist (preserves prior None semantics).
+                self.resolve_node(node_id)?;
+                // Route through the snapshot-aware accessor so that uncommitted
+                // label ops in the writing transaction are reflected here.
+                // (Behavior-preserving: delta is empty until Task 4 buffers writes.)
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set =
+                    self.store
+                        .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
                 // Sort labels so sets with the same members always produce
                 // the same list, regardless of internal storage order.
-                let mut sorted: Vec<&arcstr::ArcStr> = node.labels.iter().collect();
+                let mut sorted: Vec<arcstr::ArcStr> = label_set.into_iter().collect();
                 sorted.sort();
-                let labels: Vec<Value> = sorted
-                    .into_iter()
-                    .map(|l| Value::String(l.clone()))
-                    .collect();
+                let labels: Vec<Value> = sorted.into_iter().map(Value::String).collect();
                 Some(Value::List(labels.into()))
             }
             FilterExpression::Type(variable) => {
@@ -1745,13 +1764,21 @@ impl ExpressionPredicate {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     let node_id = col.get_node_id(row)?;
-                    let node = self.resolve_node(node_id)?;
-                    let mut sorted: Vec<&arcstr::ArcStr> = node.labels.iter().collect();
+                    // Guard: skip if node does not exist.
+                    self.resolve_node(node_id)?;
+                    // Route through the snapshot-aware accessor so that uncommitted
+                    // label ops in the writing transaction are reflected here.
+                    let snap_epoch = self
+                        .viewing_epoch
+                        .unwrap_or_else(|| self.store.current_epoch());
+                    let label_set = self.store.read_node_labels_visible(
+                        node_id,
+                        snap_epoch,
+                        self.transaction_id,
+                    );
+                    let mut sorted: Vec<arcstr::ArcStr> = label_set.into_iter().collect();
                     sorted.sort();
-                    let labels: Vec<Value> = sorted
-                        .into_iter()
-                        .map(|l| Value::String(l.clone()))
-                        .collect();
+                    let labels: Vec<Value> = sorted.into_iter().map(Value::String).collect();
                     return Some(Value::List(labels.into()));
                 }
                 None
@@ -1852,9 +1879,16 @@ impl ExpressionPredicate {
                 let Value::String(label) = self.eval_expr(&args[1], chunk, row)? else {
                     return None;
                 };
-                // Check if the node has this label
-                let node = self.resolve_node(node_id)?;
-                let has_label = node.labels.iter().any(|l| l.as_str() == label.as_str());
+                // Check if the node has this label via the snapshot-aware accessor
+                // so uncommitted label ops in the writing transaction are reflected.
+                self.resolve_node(node_id)?;
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set =
+                    self.store
+                        .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
+                let has_label = label_set.iter().any(|l| l.as_str() == label.as_str());
                 Some(Value::Bool(has_label))
             }
             "issource" => {
@@ -3277,6 +3311,9 @@ impl ExpressionPredicate {
                 match val {
                     Value::Path { nodes, .. } => {
                         // Resolve Int64 node IDs to property maps for property access
+                        let snap_epoch = self
+                            .viewing_epoch
+                            .unwrap_or_else(|| self.store.current_epoch());
                         let resolved: Vec<Value> = nodes
                             .iter()
                             .map(|n| {
@@ -3292,11 +3329,16 @@ impl ExpressionPredicate {
                                             PropertyKey::new("_id"),
                                             Value::Int64(node.id.as_u64() as i64),
                                         );
-                                        let labels: Vec<Value> = node
-                                            .labels
-                                            .iter()
-                                            .map(|l| Value::String(l.clone()))
-                                            .collect();
+                                        // Route through the snapshot-aware accessor so that
+                                        // uncommitted label ops in the writing transaction
+                                        // are reflected here.
+                                        let label_set = self.store.read_node_labels_visible(
+                                            node_id,
+                                            snap_epoch,
+                                            self.transaction_id,
+                                        );
+                                        let labels: Vec<Value> =
+                                            label_set.into_iter().map(Value::String).collect();
                                         map.insert(
                                             PropertyKey::new("_labels"),
                                             Value::List(labels.into()),
@@ -3551,10 +3593,18 @@ impl ExpressionPredicate {
                     return None;
                 };
 
-                // Get the node's labels and try each for a text index match
-                let node = self.resolve_node(node_id)?;
-                let score = node
-                    .labels
+                // Guard: skip if node does not exist.
+                self.resolve_node(node_id)?;
+                // Route through the snapshot-aware accessor so that uncommitted
+                // label ops in the writing transaction are reflected here.
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set =
+                    self.store
+                        .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
+                // Try each label for a text index match.
+                let score = label_set
                     .iter()
                     .find_map(|label| self.store.score_text(node_id, label, property, query_str))?;
 

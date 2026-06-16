@@ -289,7 +289,20 @@ impl MergeOperator {
             };
             let Some(node) = node_opt else { continue };
 
-            let has_all_labels = self.config.labels.iter().all(|label| node.has_label(label));
+            // Route through the snapshot-aware accessor so that uncommitted label
+            // ops in the writing transaction are reflected here.
+            // (Behavior-preserving: delta is empty until Task 4 buffers writes.)
+            let snap_epoch = self
+                .viewing_epoch
+                .unwrap_or_else(|| self.store.current_epoch());
+            let label_set =
+                self.store
+                    .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
+            let has_all_labels = self
+                .config
+                .labels
+                .iter()
+                .all(|label| label_set.iter().any(|s| s.as_str() == label.as_str()));
             if !has_all_labels {
                 continue;
             }

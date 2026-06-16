@@ -331,15 +331,18 @@ impl Operator for ProjectOperator {
                             } else {
                                 store.get_node(node_id)
                             };
-                            // Build properties from the delta-aware accessor so that
-                            // a writing transaction sees its own buffered writes
-                            // (read-your-writes for RETURN n). When the delta is empty
-                            // this returns exactly the committed property map — behavior
-                            // is preserved until Task 4b buffers writes.
+                            // Build properties and labels from their respective
+                            // delta-aware accessors so that a writing transaction
+                            // sees its own buffered writes (read-your-writes for
+                            // RETURN n). When the delta is empty this returns exactly
+                            // the committed map — behavior is preserved until Task 4
+                            // buffers writes.
                             node.map_or(Value::Null, |n| {
                                 let props =
                                     store.read_node_properties_visible(node_id, snap_epoch, tx_id);
-                                node_to_map_with_properties(&n, props)
+                                let label_names =
+                                    store.read_node_labels_visible(node_id, snap_epoch, tx_id);
+                                node_to_map_with_properties(&n, props, label_names)
                             })
                         } else {
                             Value::Null
@@ -430,23 +433,26 @@ impl Operator for ProjectOperator {
 /// Converts a [`Node`] to a `Value::Map` with metadata and properties.
 ///
 /// Builds a `Value::Map` for a node using a supplied (snapshot-merged) property
-/// map instead of the node's own committed `properties` field.
+/// map instead of the node's own committed `properties` field, and a supplied
+/// snapshot-aware label name set instead of the node's committed `labels` field.
 ///
-/// Preserves `_id` and `_labels` from the resolved `node` (which carries the
-/// correct committed labels), but uses `props` for the property key/value pairs.
-/// This is the delta-aware companion to `node_to_map` used by `NodeResolve`
-/// so that `RETURN n` reflects a writing transaction's buffered property writes.
-fn node_to_map_with_properties(node: &Node, props: FxHashMap<PropertyKey, Value>) -> Value {
+/// Callers must obtain `label_names` from `store.read_node_labels_visible` so
+/// that a writing transaction's uncommitted label adds/removes are reflected here.
+/// When the delta is empty (all tasks before Task 4) the set matches the
+/// committed labels exactly — behavior is preserved.
+fn node_to_map_with_properties(
+    node: &Node,
+    props: FxHashMap<PropertyKey, Value>,
+    label_names: grafeo_common::utils::hash::FxHashSet<arcstr::ArcStr>,
+) -> Value {
     let mut map = BTreeMap::new();
     // reason: entity IDs stored as i64, standard encoding
     #[allow(clippy::cast_possible_wrap)]
     let node_id_i64 = node.id.as_u64() as i64;
     map.insert(PropertyKey::new("_id"), Value::Int64(node_id_i64));
-    let labels: Vec<Value> = node
-        .labels
-        .iter()
-        .map(|l| Value::String(l.clone()))
-        .collect();
+    // Use the snapshot-aware label set rather than node.labels so that
+    // uncommitted label ops in the writing transaction are reflected.
+    let labels: Vec<Value> = label_names.into_iter().map(Value::String).collect();
     map.insert(PropertyKey::new("_labels"), Value::List(labels.into()));
     for (key, value) in props {
         map.insert(key, value);
