@@ -2261,3 +2261,52 @@ fn edge_delete_rollback_restores() {
         "pending edge-delete set must be drained after take"
     );
 }
+
+/// Re-deleting an edge already deleted by the SAME transaction must be an
+/// idempotent no-op (MVCC increment 2b). The PENDING `deleted_epoch` is
+/// `u64::MAX`, so a naive `visible_at(epoch)` re-delete guard still sees the
+/// record and re-stamps it, pushing a DUPLICATE `(src, edge, dst)` into the
+/// pending set; `finalize_edge_deletes_by_id` would then decrement counts twice.
+/// The tx-aware guard (`visible_to`, which hides an edge from the tx that
+/// deleted it) makes the second call return `false` with no second push.
+#[test]
+fn edge_delete_transactional_is_idempotent_per_tx() {
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["A"]);
+    let b = store.create_node(&["B"]);
+    let eid = store.create_edge(a, b, "R");
+
+    let epoch = store.current_epoch();
+    let tx = TransactionId::new(2);
+    let live_before = store.live_edge_count.load(Ordering::Relaxed);
+
+    // First delete succeeds and records the edge once.
+    assert!(store.delete_edge_transactional(eid, epoch, tx));
+    // Second delete by the SAME tx is a no-op: the edge is already gone for `tx`.
+    assert!(
+        !store.delete_edge_transactional(eid, epoch, tx),
+        "re-delete by the same tx must be an idempotent no-op (return false)"
+    );
+
+    // The pending set must carry the edge exactly ONCE (not twice).
+    {
+        let pending = store.pending_tx_edge_deletes.read();
+        let entries = pending.get(&tx).map_or(0, |v| v.len());
+        assert_eq!(
+            entries, 1,
+            "pending edge-delete set must carry the edge exactly once after a re-delete"
+        );
+    }
+
+    // Finalize must decrement the live-edge count by exactly ONE (not two).
+    let commit_epoch = EpochId::new(5);
+    let pending = store.take_pending_edge_deletes(tx);
+    store.finalize_edge_deletes_by_id(tx, commit_epoch, &pending);
+    assert_eq!(
+        store.live_edge_count.load(Ordering::Relaxed),
+        live_before - 1,
+        "live-edge count must decrease by exactly one despite the duplicate delete attempt"
+    );
+}

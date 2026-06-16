@@ -454,3 +454,100 @@ fn deleted_edge_invisible_to_writer_via_exists_subquery() {
 
     writer.rollback().unwrap();
 }
+
+/// MERGE must not match the writer's own just-deleted edge (MVCC increment 2b).
+///
+/// `find_matching_edge` resolves adjacency candidates; under the deferred
+/// edge-delete model the candidate index still returns a PENDING-deleted edge,
+/// so MERGE must post-filter through tx-aware visibility. Otherwise a MERGE
+/// issued AFTER deleting that edge in the same tx matches the dead edge, creates
+/// nothing, and at commit the delete finalizes — leaving the edge MERGE was
+/// supposed to guarantee gone (read-your-writes + MERGE-contract violation).
+#[test]
+fn merge_does_not_match_writer_own_deleted_edge() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    writer
+        .execute("CREATE (:N {id: 1})-[:R]->(:N {id: 2})")
+        .unwrap();
+
+    writer.begin_transaction().unwrap();
+    // Delete the edge within the tx.
+    writer
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) DELETE r")
+        .unwrap();
+    // MERGE the same edge: it must NOT match the just-deleted candidate, so it
+    // creates a fresh one (read-your-writes).
+    writer
+        .execute("MATCH (a:N {id: 1}), (b:N {id: 2}) MERGE (a)-[:R]->(b)")
+        .unwrap();
+
+    // Within the tx the writer must now see exactly one such edge (the MERGE
+    // re-created it because the deleted edge did not match).
+    let own = writer
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) RETURN count(r) AS cnt")
+        .unwrap();
+    assert_eq!(
+        own.rows()[0][0].clone(),
+        Value::Int64(1),
+        "writer must see exactly one edge: MERGE must not match the deleted edge"
+    );
+
+    writer.commit().unwrap();
+
+    // A fresh reader must see exactly one edge persist: the original delete
+    // finalized AND the MERGE-created edge committed.
+    let reader = db.session();
+    let after = reader
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) RETURN count(r) AS cnt")
+        .unwrap();
+    assert_eq!(
+        after.rows()[0][0].clone(),
+        Value::Int64(1),
+        "exactly one edge must persist after commit (deleted finalized, merged kept)"
+    );
+}
+
+/// Re-deleting an edge already deleted by the same tx must not double-count
+/// (MVCC increment 2b). A self-loop `DETACH DELETE` walks the node's outgoing
+/// AND incoming adjacency with no self-loop dedup, so the loop edge is deleted
+/// twice by the same tx. The second delete must be an idempotent no-op so the
+/// pending set carries the edge once and finalize decrements counts once.
+///
+/// NOTE: this is an end-to-end path guard. The raw `live_edge_count` underflow
+/// from the duplicate decrement is masked at the query layer (`edge_count()`
+/// re-scans the version chains; the statistics counter is clamped with
+/// `.max(0)`), so the authoritative count-integrity RED witness lives at the
+/// store level (`edge_delete_transactional_is_idempotent_per_tx`). This test
+/// still locks the self-loop DETACH path end-to-end (no panic / mis-traversal).
+#[test]
+fn self_loop_detach_delete_counts_once() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    // Self-loop: an edge from a node back to itself.
+    writer.execute("CREATE (a:N {id: 1})-[:R]->(a)").unwrap();
+
+    // Sanity: exactly one edge exists.
+    let before = writer
+        .execute("MATCH ()-[r:R]->() RETURN count(r) AS cnt")
+        .unwrap();
+    assert_eq!(before.rows()[0][0].clone(), Value::Int64(1));
+
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("MATCH (a:N {id: 1}) DETACH DELETE a")
+        .unwrap();
+    writer.commit().unwrap();
+
+    // After commit the edge count must be exactly 0 (not under-counted / negative
+    // from a double decrement).
+    let reader = db.session();
+    let after = reader
+        .execute("MATCH ()-[r:R]->() RETURN count(r) AS cnt")
+        .unwrap();
+    assert_eq!(
+        after.rows()[0][0].clone(),
+        Value::Int64(0),
+        "self-loop DETACH DELETE must leave exactly zero edges (no double-count)"
+    );
+}

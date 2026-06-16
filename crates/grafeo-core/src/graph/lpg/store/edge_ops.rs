@@ -496,16 +496,16 @@ impl LpgStore {
     ) -> bool {
         let mut edges = self.edges.write();
         if let Some(chain) = edges.get_mut(&id) {
-            let (src, dst) = {
-                match chain.visible_at(epoch) {
-                    Some(record) => {
-                        if record.is_deleted() {
-                            return false;
-                        }
-                        (record.src, record.dst)
-                    }
-                    None => return false,
-                }
+            // Tx-aware re-delete guard: `visible_to` hides an edge from the tx
+            // that deleted it, so a PENDING delete by THIS tx returns `None`
+            // here and the call is an idempotent no-op (mirrors the eager path,
+            // which returned false on re-delete). A plain `visible_at(epoch)`
+            // check would still see the record (PENDING `deleted_epoch` =
+            // u64::MAX > epoch) and push a DUPLICATE pending entry, making
+            // `finalize_edge_deletes_by_id` double-decrement the counts.
+            let (src, dst) = match chain.visible_to(epoch, transaction_id) {
+                Some(record) => (record.src, record.dst),
+                None => return false,
             };
 
             // Stamp PENDING so the deleter sees it gone, others still see it.
@@ -543,20 +543,19 @@ impl LpgStore {
     ) -> bool {
         let mut versions = self.edge_versions.write();
         if let Some(index) = versions.get_mut(&id) {
-            let (src, dst) = {
-                match index.visible_at(epoch) {
-                    Some(version_ref) => {
-                        if let Some(record) = self.read_edge_record(&version_ref) {
-                            if record.is_deleted() {
-                                return false;
-                            }
-                            (record.src, record.dst)
-                        } else {
-                            return false;
-                        }
-                    }
+            // Tx-aware re-delete guard: `visible_to` hides an edge from the tx
+            // that deleted it, so a PENDING delete by THIS tx returns `None`
+            // here and the call is an idempotent no-op (mirrors the eager path,
+            // which returned false on re-delete). A plain `visible_at(epoch)`
+            // check would still see the record (PENDING `deleted_epoch` =
+            // u64::MAX > epoch) and push a DUPLICATE pending entry, making
+            // `finalize_edge_deletes_by_id` double-decrement the counts.
+            let (src, dst) = match index.visible_to(epoch, transaction_id) {
+                Some(version_ref) => match self.read_edge_record(&version_ref) {
+                    Some(record) => (record.src, record.dst),
                     None => return false,
-                }
+                },
+                None => return false,
             };
 
             // Stamp PENDING so the deleter sees it gone, others still see it.

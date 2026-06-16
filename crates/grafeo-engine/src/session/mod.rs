@@ -4411,6 +4411,12 @@ impl Session {
 
             // Replay property/label undo entries recorded after the savepoint
             // (handles labels and entity deletions via the undo log).
+            //
+            // NOTE: transactional node- and edge-DELETEs use the tx-granular
+            // pending-delete sets (`pending_tx_deletes` / `pending_tx_edge_deletes`),
+            // which are NOT drained here, so a DELETE issued after a savepoint is
+            // NOT undone by `ROLLBACK TO SAVEPOINT` — only a full rollback undoes
+            // it. This is an accepted limitation; edges mirror nodes exactly.
             store.rollback_transaction_properties_to(transaction_id, gs.undo_log_position);
 
             // Restore the buffered property delta to the savepoint snapshot.

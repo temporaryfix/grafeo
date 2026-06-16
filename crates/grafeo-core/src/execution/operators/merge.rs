@@ -825,7 +825,21 @@ impl MergeRelationshipOperator {
                 continue;
             }
 
-            if let Some(edge) = self.store.get_edge(edge_id) {
+            // The adjacency index is non-MVCC and still returns a PENDING-deleted
+            // edge as a candidate until commit, so resolve through tx-aware
+            // visibility (mirrors `filter.rs::resolve_edge` / `project.rs`).
+            // Without this, a MERGE issued after deleting the edge in the same tx
+            // would match the dead edge and create nothing (read-your-writes +
+            // MERGE-contract violation).
+            let resolved = if let (Some(ep), Some(tx)) = (self.viewing_epoch, self.transaction_id) {
+                self.store.get_edge_versioned(edge_id, ep, tx)
+            } else if let Some(ep) = self.viewing_epoch {
+                self.store.get_edge_at_epoch(edge_id, ep)
+            } else {
+                self.store.get_edge(edge_id)
+            };
+
+            if let Some(edge) = resolved {
                 if edge.edge_type.as_str() != self.config.edge_type {
                     continue;
                 }
