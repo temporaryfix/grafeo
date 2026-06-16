@@ -16,7 +16,7 @@ use crate::index::vector::{
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 impl GraphStore for LpgStore {
@@ -98,6 +98,15 @@ impl GraphStore for LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> FxHashMap<PropertyKey, Value> {
         LpgStore::read_edge_properties_visible(self, id, epoch, transaction_id)
+    }
+
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashSet<u32> {
+        LpgStore::read_node_labels_visible(self, id, epoch, transaction_id)
     }
 
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>> {
@@ -649,6 +658,14 @@ impl GraphStoreMut for LpgStore {
         transaction_id: TransactionId,
     ) -> bool {
         LpgStore::remove_label_versioned(self, node_id, label, transaction_id)
+    }
+
+    fn add_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        LpgStore::add_label_buffered(self, node_id, label, transaction_id);
+    }
+
+    fn remove_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        LpgStore::remove_label_buffered(self, node_id, label, transaction_id);
     }
 
     fn create_node_with_props(

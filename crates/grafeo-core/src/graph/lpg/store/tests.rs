@@ -1,6 +1,6 @@
 use super::*;
-use crate::graph::Direction;
 use crate::graph::lpg::property::CompareOp;
+use crate::graph::Direction;
 use grafeo_common::types::TransactionId;
 
 #[test]
@@ -401,8 +401,8 @@ fn test_delete_node_edges_atomic_batch() {
     // A barrier ensures both threads start at the same time, and an
     // AtomicBool keeps the reader spinning until deletion finishes,
     // so the two threads are guaranteed to overlap.
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
 
     let barrier = Arc::new(Barrier::new(2));
     let done = Arc::new(AtomicBool::new(false));
@@ -1500,8 +1500,8 @@ fn test_delete_nonexistent_node() {
 /// produce identical results to the concrete methods.
 mod graph_store_traits {
     use super::*;
-    use crate::graph::Direction;
     use crate::graph::traits::{GraphStore, GraphStoreMut};
+    use crate::graph::Direction;
 
     #[test]
     fn trait_object_safety() {
@@ -1953,5 +1953,57 @@ fn label_delta_rollback_and_savepoint() {
     assert!(
         after_restore.contains(&person_id),
         "committed :Person must be visible to writer after restore"
+    );
+}
+
+/// Mirror of `label_delta_isolates_buffered_label_ops` but exercised through
+/// `&dyn GraphStoreMut` so the trait surface is tested at the trait level.
+#[test]
+fn trait_label_accessor_isolates() {
+    use crate::graph::traits::GraphStoreMut;
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+    // Exercise through a trait-object pointer.
+    let dyn_store: &dyn GraphStoreMut = &store;
+
+    let n = dyn_store.create_node(&["Person"]);
+    let tx = TransactionId::new(99);
+    let person_id = store.label_id("Person").unwrap();
+
+    // Buffer add :Secret and remove :Person for tx — via the trait object.
+    dyn_store.add_label_buffered(n, "Secret", tx);
+    dyn_store.remove_label_buffered(n, "Person", tx);
+
+    let secret_id = store.label_id("Secret").unwrap();
+
+    // Writer view (Some(tx)) through the trait object.
+    let writer_view = dyn_store.read_node_labels_visible(n, EpochId::new(0), Some(tx));
+    assert!(
+        writer_view.contains(&secret_id),
+        "writer sees buffered add via trait"
+    );
+    assert!(
+        !writer_view.contains(&person_id),
+        "writer sees buffered remove via trait"
+    );
+
+    // Other reader (None) sees only committed labels.
+    let committed_view = dyn_store.read_node_labels_visible(n, EpochId::new(0), None);
+    assert!(
+        committed_view.contains(&person_id),
+        "others see committed :Person via trait"
+    );
+    assert!(
+        !committed_view.contains(&secret_id),
+        "others do NOT see uncommitted :Secret via trait"
+    );
+
+    // Apply promotes delta: committed view now reflects the writes.
+    dyn_store.apply_tx_overlay(tx);
+    let after = dyn_store.read_node_labels_visible(n, EpochId::new(0), None);
+    assert!(
+        after.contains(&secret_id) && !after.contains(&person_id),
+        "commit promoted label ops via trait"
     );
 }

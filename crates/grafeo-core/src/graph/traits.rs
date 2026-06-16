@@ -19,17 +19,17 @@
 //!
 //! [`LpgStore`]: crate::graph::lpg::LpgStore
 
-use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 #[cfg(feature = "lpg")]
 use crate::graph::lpg::TxDelta;
 use crate::graph::lpg::{Edge, Node};
+use crate::graph::Direction;
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 /// Read-only graph operations used by the query engine.
@@ -148,6 +148,27 @@ pub trait GraphStore: Send + Sync {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Snapshot-consistent node label set (unified-MVCC label accessor).
+    ///
+    /// Returns the set of committed label IDs merged with the writing
+    /// transaction's buffered label ops. With `transaction_id = Some(tx)` the
+    /// writer's buffered `Add` ops are inserted and buffered `Remove` ops are
+    /// deleted before returning.  With `transaction_id = None` only the
+    /// committed set is returned.
+    ///
+    /// Default: ignores isolation and returns an empty set — safe for stores
+    /// without a per-transaction label delta or a label registry. `LpgStore`
+    /// overrides this to merge its delta for the writing transaction.
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashSet<u32> {
+        let _ = (id, epoch, transaction_id);
+        FxHashSet::default()
     }
 
     /// Gets a property for multiple nodes in a single batch operation.
@@ -795,6 +816,24 @@ pub trait GraphStoreMut: GraphStoreSearch {
         self.remove_label(node_id, label)
     }
 
+    /// Buffers an uncommitted label add into the transaction's delta.
+    ///
+    /// Default: falls back to write-through (`add_label_versioned`). `LpgStore`
+    /// overrides this to buffer the change so other sessions cannot see it until
+    /// the transaction commits.
+    fn add_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        self.add_label_versioned(node_id, label, transaction_id);
+    }
+
+    /// Buffers an uncommitted label remove into the transaction's delta.
+    ///
+    /// Default: falls back to write-through (`remove_label_versioned`). `LpgStore`
+    /// overrides this to buffer the change so other sessions still see the label
+    /// until the transaction commits.
+    fn remove_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        self.remove_label_versioned(node_id, label, transaction_id);
+    }
+
     // --- Convenience (with default implementations) ---
 
     /// Creates a new node with labels and properties in one call.
@@ -1049,16 +1088,12 @@ mod tests {
         let val = Value::Int64(30);
 
         assert!(store.find_nodes_by_property("age", &val).is_empty());
-        assert!(
-            store
-                .find_nodes_by_properties(&[("age", val.clone())])
-                .is_empty()
-        );
-        assert!(
-            store
-                .find_nodes_in_range("age", Some(&val), None, true, false)
-                .is_empty()
-        );
+        assert!(store
+            .find_nodes_by_properties(&[("age", val.clone())])
+            .is_empty());
+        assert!(store
+            .find_nodes_in_range("age", Some(&val), None, true, false)
+            .is_empty());
         assert!(!store.node_property_might_match(&key, CompareOp::Eq, &val));
         assert!(!store.edge_property_might_match(&key, CompareOp::Eq, &val));
     }
@@ -1086,16 +1121,12 @@ mod tests {
         assert!(!store.is_edge_visible_at_epoch(eid, epoch));
         assert!(!store.is_edge_visible_versioned(eid, epoch, txn));
 
-        assert!(
-            store
-                .filter_visible_node_ids(&[nid, NodeId(2)], epoch)
-                .is_empty()
-        );
-        assert!(
-            store
-                .filter_visible_node_ids_versioned(&[nid], epoch, txn)
-                .is_empty()
-        );
+        assert!(store
+            .filter_visible_node_ids(&[nid, NodeId(2)], epoch)
+            .is_empty());
+        assert!(store
+            .filter_visible_node_ids_versioned(&[nid], epoch, txn)
+            .is_empty());
     }
 
     #[test]
@@ -1434,11 +1465,9 @@ mod tests {
         store.set_node_property(node_id, "city", Value::from("Amsterdam"));
         let removed = store.remove_node_property_versioned(node_id, "city", txn);
         assert_eq!(removed, Some(Value::from("Amsterdam")));
-        assert!(
-            store
-                .get_node_property(node_id, &PropertyKey::from("city"))
-                .is_none()
-        );
+        assert!(store
+            .get_node_property(node_id, &PropertyKey::from("city"))
+            .is_none());
 
         let missing = store.remove_node_property_versioned(node_id, "absent", txn);
         assert!(missing.is_none());
