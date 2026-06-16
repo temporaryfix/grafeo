@@ -201,6 +201,11 @@ pub struct Planner {
     profile_entries: std::cell::RefCell<Vec<crate::query::profile::ProfileEntry>>,
     /// Optional write tracker for recording writes during mutations.
     write_tracker: Option<grafeo_core::execution::operators::SharedWriteTracker>,
+    /// Optional read tracker for SSI read-set recording (Serializable only).
+    /// `None` for SnapshotIsolation and ReadCommitted — zero allocation on the fast path.
+    /// Threaded into read operators by later tasks (currently scaffolded).
+    #[allow(dead_code)]
+    read_tracker: Option<grafeo_core::execution::operators::SharedReadTracker>,
     /// Session context for introspection functions (info, schema, current_schema, etc.).
     pub(super) session_context: grafeo_core::execution::operators::SessionContext,
     /// When true, expand operators use epoch-only visibility (no MVCC version
@@ -247,6 +252,7 @@ impl Planner {
             profiling: std::cell::Cell::new(false),
             profile_entries: std::cell::RefCell::new(Vec::new()),
             write_tracker: None,
+            read_tracker: None,
             session_context: grafeo_core::execution::operators::SessionContext::default(),
             read_only: false,
             limit_hint: std::cell::Cell::new(None),
@@ -262,7 +268,7 @@ impl Planner {
         transaction_id: Option<TransactionId>,
         viewing_epoch: EpochId,
     ) -> Self {
-        use crate::transaction::TransactionWriteTracker;
+        use crate::transaction::{IsolationLevel, TransactionReadTracker, TransactionWriteTracker};
 
         // Create write tracker when there's an active transaction
         let write_tracker: Option<grafeo_core::execution::operators::SharedWriteTracker> =
@@ -272,6 +278,21 @@ impl Planner {
                 ))))
             } else {
                 None
+            };
+
+        // Create read tracker only for Serializable transactions (SSI read-set recording).
+        // SnapshotIsolation and ReadCommitted pay zero allocation cost.
+        let read_tracker: Option<grafeo_core::execution::operators::SharedReadTracker> =
+            match transaction_id {
+                Some(tid)
+                    if transaction_manager.isolation_level(tid)
+                        == Some(IsolationLevel::Serializable) =>
+                {
+                    Some(Arc::new(TransactionReadTracker::new(Arc::clone(
+                        &transaction_manager,
+                    ))))
+                }
+                _ => None,
             };
 
         Self {
@@ -293,6 +314,7 @@ impl Planner {
             profiling: std::cell::Cell::new(false),
             profile_entries: std::cell::RefCell::new(Vec::new()),
             write_tracker,
+            read_tracker,
             session_context: grafeo_core::execution::operators::SessionContext::default(),
             read_only: false,
             limit_hint: std::cell::Cell::new(None),
@@ -3827,5 +3849,44 @@ mod tests {
                 .unwrap_or_else(|e| panic!("plan_vector_scan failed for {label:?}: {e:?}"));
             assert_eq!(cols[0], "n", "variable column must be first for {label:?}");
         }
+    }
+
+    // ==================== Read Tracker Tests ====================
+
+    #[test]
+    fn test_planner_read_tracker_serializable_some_si_none() {
+        use crate::transaction::{IsolationLevel, TransactionManager};
+
+        let store = create_test_store();
+        let mgr = Arc::new(TransactionManager::new());
+
+        // Serializable transaction → read_tracker must be Some
+        let s_tid = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let epoch = mgr.current_epoch();
+        let planner_s = Planner::with_context(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
+            Arc::clone(&mgr),
+            Some(s_tid),
+            epoch,
+        );
+        assert!(
+            planner_s.read_tracker.is_some(),
+            "Serializable tx must have a read_tracker"
+        );
+
+        // SnapshotIsolation transaction (default) → read_tracker must be None
+        let si_tid = mgr.begin();
+        let planner_si = Planner::with_context(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
+            Arc::clone(&mgr),
+            Some(si_tid),
+            epoch,
+        );
+        assert!(
+            planner_si.read_tracker.is_none(),
+            "SnapshotIsolation tx must not have a read_tracker"
+        );
     }
 }
