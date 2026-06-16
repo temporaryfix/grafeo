@@ -1,6 +1,6 @@
 //! Variable-length expand operator for multi-hop path traversal.
 
-use super::{Operator, OperatorError, OperatorResult};
+use super::{Operator, OperatorError, OperatorResult, SharedReadTracker};
 use crate::execution::DataChunk;
 use crate::graph::Direction;
 use crate::graph::GraphStoreSearch;
@@ -66,6 +66,8 @@ pub struct VariableLengthExpandOperator {
     output_path_detail: bool,
     /// Path traversal mode (WALK, TRAIL, SIMPLE, ACYCLIC).
     path_mode: PathMode,
+    /// Optional read tracker for SSI read-set recording (Serializable only).
+    read_tracker: Option<SharedReadTracker>,
 }
 
 /// A materialized input row.
@@ -199,6 +201,7 @@ impl VariableLengthExpandOperator {
             output_path_length: false,
             output_path_detail: false,
             path_mode: PathMode::Walk,
+            read_tracker: None,
         }
     }
 
@@ -240,6 +243,16 @@ impl VariableLengthExpandOperator {
     /// Marks this expand as read-only, enabling fast-path lookups.
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Attaches a read tracker for SSI read-set recording (Serializable only).
+    ///
+    /// When set alongside a `transaction_id`, every visible edge id and neighbor
+    /// node id emitted by the operator is reported to the tracker once per
+    /// output row.
+    pub fn with_read_tracker(mut self, t: SharedReadTracker) -> Self {
+        self.read_tracker = Some(t);
         self
     }
 
@@ -553,6 +566,15 @@ impl Operator for VariableLengthExpandOperator {
 
         for out_row in &to_output {
             let input_row = &input_rows[out_row.input_idx];
+
+            // Record reads for SSI (Serializable isolation only).
+            // Only post-visibility-filter results reach this point.
+            if let (Some(tracker), Some(tid)) = (&self.read_tracker, self.transaction_id) {
+                if let Some(eid) = out_row.edge_id {
+                    tracker.record_edge_read(tid, eid);
+                }
+                tracker.record_node_read(tid, out_row.target_id);
+            }
 
             // Copy input columns
             for (col_idx, col_val) in input_row.columns.iter().enumerate() {

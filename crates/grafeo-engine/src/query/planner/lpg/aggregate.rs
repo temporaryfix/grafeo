@@ -400,12 +400,16 @@ impl super::Planner {
             Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             base_op,
             steps,
-        );
+        )
+        .with_read_only(self.read_only);
 
         if let Some(transaction_id) = self.transaction_id {
             lazy_op = lazy_op.with_transaction_context(self.viewing_epoch, Some(transaction_id));
         } else {
             lazy_op = lazy_op.with_transaction_context(self.viewing_epoch, None);
+        }
+        if let Some(t) = &self.read_tracker {
+            lazy_op = lazy_op.with_read_tracker(Arc::clone(t));
         }
 
         // Convert logical aggregates to factorized aggregates
