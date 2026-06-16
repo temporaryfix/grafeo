@@ -636,3 +636,110 @@ fn merge_edge_matches_same_tx_set_property() {
     );
     w.commit().unwrap();
 }
+
+/// MVCC 2d probe 1: property_exists must reflect the writer's own buffered SET
+/// (read-your-writes via the property-existence predicate path).
+///
+/// `property_exists(n, 'b')` in the filter evaluator reads committed properties
+/// only — it does not consult the per-tx delta — so a SET issued earlier in the
+/// same tx is invisible to it.  RED until the filter evaluator threads the tx
+/// snapshot through `property_exists`.
+#[test]
+fn property_exists_reflects_same_tx_set() {
+    let db = GrafeoDB::new_in_memory();
+    let mut w = db.session();
+    w.execute("CREATE (n:Thing {a: 1})").unwrap();
+    w.begin_transaction().unwrap();
+    w.execute("MATCH (n:Thing) SET n.b = 2").unwrap();
+    // Writer must see its own buffered SET via property_exists (read-your-writes).
+    let r = w
+        .execute("MATCH (n:Thing) WHERE property_exists(n, 'b') RETURN n")
+        .unwrap();
+    assert_eq!(
+        r.row_count(),
+        1,
+        "writer sees its own buffered SET via property_exists"
+    );
+    w.commit().unwrap();
+}
+
+/// MVCC 2d probe 2: a SET whose source is another property must read the tx's
+/// own buffered value of that source property (read-your-writes for mutation
+/// source reads).
+///
+/// `SET n.b = n.a` evaluates `n.a` through the property-read path in the
+/// mutation executor.  If that path reads the committed snapshot rather than
+/// the per-tx delta, a preceding `SET n.a = 5` in the same tx is invisible and
+/// `n.b` gets committed `a` (1) instead of the tx-visible value (5).  RED until
+/// the mutation source read threads the tx snapshot.
+#[test]
+fn mutation_source_property_reflects_same_tx_set() {
+    let db = GrafeoDB::new_in_memory();
+    let mut w = db.session();
+    w.execute("CREATE (n:Thing {a: 1})").unwrap();
+    w.begin_transaction().unwrap();
+    w.execute("MATCH (n:Thing) SET n.a = 5").unwrap();
+    // A later SET sourced from n.a must read the tx's own buffered value (5), not committed (1).
+    w.execute("MATCH (n:Thing) SET n.b = n.a").unwrap();
+    let r = w.execute("MATCH (n:Thing) WHERE n.b = 5 RETURN n").unwrap();
+    assert_eq!(
+        r.row_count(),
+        1,
+        "mutation source read sees the tx's own buffered SET"
+    );
+    w.commit().unwrap();
+}
+
+/// MVCC 2d probe 3: HorizontalAggregateOperator must reflect the writer's own
+/// buffered SET when aggregating over variable-length-path group-list variables.
+///
+/// `HorizontalAggregateOperator` holds a raw `Arc<dyn GraphStoreSearch>` and
+/// reads properties via `current_epoch()` with no tx snapshot (see the
+/// `TODO(unified-mvcc)` comment in `horizontal_aggregate.rs`).
+///
+/// TODO(2d-task4): finalize the query shape that actually compiles to
+/// `HorizontalAggregateOp` in a transactional session.  Investigation showed
+/// that `group_list_variables` in the GQL translator is never populated, so
+/// `MATCH p = ... RETURN sum(r.v)` over a `*1..1` range resolves via the
+/// normal (already-fixed) property-read path and already returns the
+/// tx-buffered value (10).  Task 4 must identify the correct query surface
+/// (possibly GQL ISO syntax or a path-mode variant) that actually routes
+/// through `HorizontalAggregateOperator` and replace the no-regression
+/// baseline below with the true RED assertion.
+///
+/// For now this probe is a NO-REGRESSION guard: the `sum(r.v)` query on a
+/// var-length path must compile and execute inside a tx without panic, and the
+/// result must equal the tx-buffered value (10) via the already-fixed path.
+#[test]
+fn horizontal_aggregate_reflects_same_tx_set() {
+    // TODO(2d-task4): finalize shape — this query resolves via the normal
+    // property-read path (already tx-aware), NOT HorizontalAggregateOperator.
+    // Identify the correct query surface that routes through that operator.
+    let db = GrafeoDB::new_in_memory();
+    let mut w = db.session();
+    w.execute("CREATE (a:N {id: 1})-[:R {v: 1}]->(b:N {id: 2})")
+        .unwrap();
+    w.begin_transaction().unwrap();
+    w.execute("MATCH ()-[r:R]->() SET r.v = 10").unwrap();
+    // Query a variable-length-path aggregate inside the tx.
+    // This query shape does NOT route through HorizontalAggregateOperator
+    // today — it uses the normal tx-aware property-read path and correctly
+    // returns the tx-buffered value (10).  No-regression: must not panic.
+    let r = w
+        .execute("MATCH p = (a:N {id: 1})-[r:R*1..1]->(b:N) RETURN sum(r.v)")
+        .unwrap();
+    assert_eq!(
+        r.row_count(),
+        1,
+        "horizontal aggregate over var-length path must return one row inside a tx"
+    );
+    // No-regression baseline: already returns tx-buffered value via normal path.
+    // TODO(2d-task4): replace with an assertion on the HorizontalAggregateOperator
+    // path once the correct query shape is identified.
+    assert_eq!(
+        r.rows()[0][0].clone(),
+        grafeo_common::types::Value::Int64(10),
+        "no-regression: var-length sum returns tx-buffered r.v=10 via normal path"
+    );
+    w.commit().unwrap();
+}
