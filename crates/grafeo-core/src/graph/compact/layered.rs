@@ -1031,6 +1031,13 @@ impl GraphStore for LayeredStore {
     // via ensure_in_overlay / ensure_edge_in_overlay before calling
     // *_buffered). No event/log side effects exist here.
 
+    fn pending_node_creates(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        self.overlay.load().pending_node_creates(transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

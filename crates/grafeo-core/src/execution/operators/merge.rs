@@ -256,14 +256,13 @@ impl MergeOperator {
             .iter()
             .any(|(k, v)| !v.is_null() && self.store.has_property_index(k));
 
-        // Candidate set comes from the committed property index only. The per-node
-        // check below routes through read_node_property_visible and IS delta-aware, so
-        // MERGE matching on a *pre-existing committed* node whose property was SET in
-        // this transaction is handled correctly. Known gap (deferred): a node CREATEd
-        // within this same transaction (properties only in the buffered overlay) is
-        // absent from this index and will not appear as a candidate, so MERGE on such a
-        // node may create a duplicate. Fix requires a delta-aware find_nodes_by_properties.
-        let candidates: Vec<NodeId> = if use_index {
+        // Candidate set comes from the committed property index (fast path) or a
+        // label/full scan. The per-node check below routes through
+        // read_node_property_visible and IS delta-aware, so MERGE matching on a
+        // *pre-existing committed* node whose property was SET in this transaction
+        // is handled correctly. Same-tx-created nodes (PENDING, absent from the
+        // committed index) are unioned in below via pending_node_creates.
+        let mut candidates: Vec<NodeId> = if use_index {
             let conditions: Vec<(&str, Value)> = resolved_match_props
                 .iter()
                 .filter(|(_, v)| !v.is_null())
@@ -275,6 +274,20 @@ impl MergeOperator {
         } else {
             self.store.node_ids()
         };
+
+        // Read-your-writes: a node CREATEd in this same transaction is PENDING and absent
+        // from the committed property-index candidate source above, so union it in. The
+        // per-node filter below (read_node_labels_visible + read_node_property_visible)
+        // then matches it correctly. (Perf: O(tx-created) per MERGE — acceptable; Part G.)
+        if let Some(tid) = self.transaction_id {
+            let existing: std::collections::HashSet<NodeId> =
+                candidates.iter().copied().collect();
+            for nid in self.store.pending_node_creates(tid) {
+                if !existing.contains(&nid) {
+                    candidates.push(nid);
+                }
+            }
+        }
 
         for node_id in candidates {
             // Transactional creates write their version at `EpochId::PENDING`,

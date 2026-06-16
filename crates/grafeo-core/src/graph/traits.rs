@@ -86,6 +86,12 @@ pub trait GraphStore: Send + Sync {
     /// Gets a single property from an edge without loading all properties.
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value>;
 
+    /// Node ids created (PENDING) by `transaction_id` in this tx, for MERGE
+    /// read-your-writes candidate discovery. Default: none.
+    fn pending_node_creates(&self, _transaction_id: TransactionId) -> Vec<NodeId> {
+        Vec::new()
+    }
+
     /// Snapshot-consistent node property read (unified-MVCC accessor).
     ///
     /// Default: ignores isolation and returns the committed value — safe for

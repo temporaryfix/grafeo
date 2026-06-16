@@ -399,6 +399,13 @@ impl GraphStore for CdcGraphStore {
     // property delta lives in the inner LpgStore (or another LpgStore beneath
     // the CDC wrapper), so these delegates route through the real delta.
 
+    fn pending_node_creates(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        self.inner.pending_node_creates(transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

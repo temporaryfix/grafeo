@@ -330,6 +330,13 @@ impl GraphStore for WalGraphStore {
     // inner LpgStore's snapshot-aware accessors. The per-transaction property
     // delta lives in the inner LpgStore.
 
+    fn pending_node_creates(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        self.inner.pending_node_creates(transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

@@ -62,6 +62,10 @@ impl GraphStore for LpgStore {
         LpgStore::get_edge_property(self, id, key)
     }
 
+    fn pending_node_creates(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        LpgStore::pending_node_creates(self, transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

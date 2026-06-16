@@ -1002,4 +1002,16 @@ impl LpgStore {
             .remove(&transaction_id)
             .unwrap_or_default()
     }
+
+    /// Non-draining snapshot of the node ids this transaction has created with a
+    /// PENDING version (from `pending_tx_creates`). Used by MERGE to treat
+    /// same-tx-created nodes as match candidates (read-your-writes). Returns empty
+    /// for the system transaction (its creates are immediately visible / committed).
+    pub fn pending_node_creates(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.pending_tx_creates
+            .read()
+            .get(&transaction_id)
+            .map(|(nodes, _edges)| nodes.clone())
+            .unwrap_or_default()
+    }
 }
