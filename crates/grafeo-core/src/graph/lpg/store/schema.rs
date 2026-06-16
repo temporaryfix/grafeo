@@ -691,13 +691,31 @@ impl LpgStore {
             .get(&id)
             .cloned()
             .unwrap_or_default();
+        //
+        // Writer-vs-other distinction (mirrors the property accessor):
+        // a node inline-created within this transaction (`MERGE (:Item)` /
+        // `CREATE (:Item)`) registers its labels directly into `node_labels`
+        // at `EpochId::PENDING` rather than into the buffered overlay below.
+        // The writing transaction must see that PENDING tail entry (so a later
+        // UNWIND row's MERGE can dedupe against it), while other readers must
+        // not. So for the writer (`Some(tx)`) read the latest entry — which is
+        // the PENDING tail when uncommitted, exactly as `build_node` does —
+        // and for others (`None`) read `at(epoch)`, which skips the PENDING
+        // tail and yields only committed state. Without this, `at(real_epoch)`
+        // dropped the writer's own inline-create label (empty set), breaking
+        // MERGE-in-UNWIND dedup.
         #[cfg(feature = "temporal")]
-        let mut label_ids: FxHashSet<u32> = self
-            .node_labels
-            .read()
-            .get(&id)
-            .and_then(|log| log.at(epoch).cloned())
-            .unwrap_or_default();
+        let mut label_ids: FxHashSet<u32> = {
+            let node_labels = self.node_labels.read();
+            let log = node_labels.get(&id);
+            if transaction_id.is_some() {
+                log.and_then(|log| log.latest().cloned())
+                    .unwrap_or_default()
+            } else {
+                log.and_then(|log| log.at(epoch).cloned())
+                    .unwrap_or_default()
+            }
+        };
         // Suppress the unused-variable warning for `epoch` under non-temporal.
         #[cfg(not(feature = "temporal"))]
         let _ = epoch;

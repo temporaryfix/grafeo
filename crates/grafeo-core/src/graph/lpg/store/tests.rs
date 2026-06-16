@@ -2000,3 +2000,29 @@ fn trait_label_accessor_isolates() {
         "commit promoted label ops via trait"
     );
 }
+
+/// Regression: a node inline-created **within a transaction** (e.g.
+/// `MERGE (:Item)` / `CREATE (:Item)`) registers its labels directly into
+/// `node_labels` at `EpochId::PENDING`. The writing transaction must see that
+/// label through `read_node_labels_visible` so a later UNWIND row's MERGE can
+/// dedupe against it. Under the `temporal` feature the committed-base read used
+/// `VersionLog::at(real_epoch)`, which skips the PENDING entry and returned an
+/// empty set — dropping the inline-create label and breaking MERGE-in-UNWIND
+/// dedup (regression_external::unwind_merge_*).
+#[test]
+fn writer_sees_inline_create_label_for_own_pending_node() {
+    let store = LpgStore::new().unwrap();
+    let tx = TransactionId::new(42);
+    let epoch = store.current_epoch();
+
+    // Transactional inline create: labels land in `node_labels` at PENDING
+    // (version_epoch = PENDING for a non-SYSTEM transaction).
+    let n = store.create_node_versioned(&["Item"], epoch, tx);
+
+    // The writing transaction must see its own just-created label.
+    let writer_view = store.read_node_labels_visible(n, epoch, Some(tx));
+    assert!(
+        writer_view.contains(&arcstr::ArcStr::from("Item")),
+        "writer must see its own inline-created :Item (got {writer_view:?})"
+    );
+}
