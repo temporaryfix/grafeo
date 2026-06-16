@@ -186,3 +186,15 @@ let has_all_props = resolved_match_props.iter().all(|(key, expected)| {
 - **Perf of the node union.** Each `find_matching_node` now scans the tx's created-node list (O(tx-created)); a big `UNWIND … MERGE` is O(n²). Accepted for correctness; Part G (property-keyed/registry path) is where this is optimized. Do not add speculative indexing here (YAGNI).
 - **`transaction_id` always paired with `viewing_epoch`.** The per-node/-edge filters assume both are `Some` together in production planner paths (existing comment at `merge.rs:321-322`); the union (Task 1) keys only off `transaction_id`, which is consistent. Don't introduce a path that has a tx id but no epoch.
 - **Wrapper parity.** As in 2b Task 4, the session transactional path resolves to the concrete `Arc<LpgStore>`, so wrapper delegation is for trait completeness; mirror the existing `read_node_property_visible` delegation exactly and don't rework the wrappers.
+
+---
+
+## STATUS: COMPLETE
+
+All tasks landed on `feat/mvcc-increment-2c`. Final verification: `--all-features -p grafeo-core -p grafeo-engine` = **7408 passed / 0 failed**; `mvcc_isolation` **18/0** (3 new MERGE probes); clippy `--all-features` clean; default/lpg/temporal/tiered-storage + `grafeo-wasm` (wasm32) compile; OPSEC-clean; tree clean. Final holistic review: READY TO MERGE (no Critical/Important; both MERGE match paths traced, ON CREATE/ON MATCH correct, node-union/edge-no-union asymmetry confirmed correct).
+
+This completes **Part C** → **Plan 1 (A labels + B edge-deletes + C MERGE) is done — the unified-MVCC isolation model is complete** across existence, properties, labels, node-deletes, edge-deletes, and MERGE read-your-writes. Next: **Plan 2 (Parts D+E)** — complete read routing + `record_read` + sharded read-registry + store-derived write-set (the SSI tracking foundation; routing behavior-preserving, registry/read-set inert for non-Serializable). Then Plan 3 (F1 OCC rung → F2 SSI + G performance).
+
+### Non-blocking follow-ups noted by the final review
+- Doc-comment wording in `merge.rs` fallback arms slightly overstates ("both Some" — really `viewing_epoch` is always Some, `transaction_id` is the gating Option). Cosmetic.
+- Pre-existing node/edge asymmetry: `find_matching_edge` lacks the null-equivalence match handling `find_matching_node` has (a null match-prop matching absent-or-null). Not introduced by 2c; candidate for a future MERGE-semantics cleanup.
