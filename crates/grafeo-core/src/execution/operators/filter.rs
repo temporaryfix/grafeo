@@ -8,6 +8,7 @@ use crate::graph::lpg::{Edge, Node};
 use grafeo_common::types::{
     EdgeId, EpochId, HashableValue, NodeId, PropertyKey, TransactionId, Value,
 };
+use grafeo_common::utils::hash::FxHashMap;
 #[cfg(feature = "regex")]
 use regex::Regex;
 #[cfg(all(feature = "regex-lite", not(feature = "regex")))]
@@ -620,6 +621,26 @@ impl ExpressionPredicate {
         } else {
             self.store.get_edge(edge_id)
         }
+    }
+
+    /// Snapshot-consistent whole property set for a node: the writing tx's buffered
+    /// SET/REMOVE merged over the committed set (read-your-writes), else committed.
+    fn visible_node_properties(&self, id: NodeId) -> FxHashMap<PropertyKey, Value> {
+        let epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+        self.store
+            .read_node_properties_visible(id, epoch, self.transaction_id)
+    }
+
+    /// Snapshot-consistent whole property set for an edge: the writing tx's buffered
+    /// SET/REMOVE merged over the committed set (read-your-writes), else committed.
+    fn visible_edge_properties(&self, id: EdgeId) -> FxHashMap<PropertyKey, Value> {
+        let epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+        self.store
+            .read_edge_properties_visible(id, epoch, self.transaction_id)
     }
 
     /// Evaluates the expression for a specific row in a chunk, returning the result value.
@@ -1854,23 +1875,22 @@ impl ExpressionPredicate {
                 if let FilterExpression::Variable(var) = &args[0] {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
-                    // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
                     if let Some(nid) = col.get_node_id(row)
-                        && let Some(node) = self.resolve_node(nid)
+                        && self.resolve_node(nid).is_some()
                     {
-                        let exists = node
-                            .properties
-                            .iter()
-                            .any(|(k, _)| k.as_str() == key.as_str());
+                        let exists = self
+                            .visible_node_properties(nid)
+                            .keys()
+                            .any(|k| k.as_str() == key.as_str());
                         return Some(Value::Bool(exists));
                     }
                     if let Some(eid) = col.get_edge_id(row)
-                        && let Some(edge) = self.resolve_edge(eid)
+                        && self.resolve_edge(eid).is_some()
                     {
-                        let exists = edge
-                            .properties
-                            .iter()
-                            .any(|(k, _)| k.as_str() == key.as_str());
+                        let exists = self
+                            .visible_edge_properties(eid)
+                            .keys()
+                            .any(|k| k.as_str() == key.as_str());
                         return Some(Value::Bool(exists));
                     }
                 }
@@ -2160,16 +2180,15 @@ impl ExpressionPredicate {
                     return None;
                 }
                 // keys(n) on a node variable: get property keys from the store
-                // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
                 if let FilterExpression::Variable(var) = &args[0] {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     if let Some(node_id) = col.get_node_id(row) {
-                        let node = self.resolve_node(node_id)?;
-                        let keys: Vec<Value> = node
-                            .properties
-                            .iter()
-                            .map(|(k, _)| Value::String(k.as_str().into()))
+                        self.resolve_node(node_id)?;
+                        let keys: Vec<Value> = self
+                            .visible_node_properties(node_id)
+                            .keys()
+                            .map(|k| Value::String(k.as_str().into()))
                             .collect();
                         return Some(Value::List(keys.into()));
                     }
@@ -2195,21 +2214,14 @@ impl ExpressionPredicate {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     if let Some(node_id) = col.get_node_id(row) {
-                        // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
-                        let node = self.resolve_node(node_id)?;
-                        let map: std::collections::BTreeMap<PropertyKey, Value> = node
-                            .properties
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
+                        self.resolve_node(node_id)?;
+                        let map: std::collections::BTreeMap<PropertyKey, Value> =
+                            self.visible_node_properties(node_id).into_iter().collect();
                         return Some(Value::Map(Arc::new(map)));
                     } else if let Some(edge_id) = col.get_edge_id(row) {
-                        let edge = self.resolve_edge(edge_id)?;
-                        let map: std::collections::BTreeMap<PropertyKey, Value> = edge
-                            .properties
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
+                        self.resolve_edge(edge_id)?;
+                        let map: std::collections::BTreeMap<PropertyKey, Value> =
+                            self.visible_edge_properties(edge_id).into_iter().collect();
                         return Some(Value::Map(Arc::new(map)));
                     }
                 }
@@ -2225,15 +2237,18 @@ impl ExpressionPredicate {
                     let col_idx = *self.variable_columns.get(var)?;
                     let col = chunk.column(col_idx)?;
                     if let Some(node_id) = col.get_node_id(row) {
-                        // TODO(unified-mvcc): reads the committed whole-property set; the writing tx's own buffered SET/REMOVE is not reflected here (read-your-writes gap, deferred; not a cross-session dirty read).
-                        let node = self.resolve_node(node_id)?;
-                        let vals: Vec<Value> =
-                            node.properties.iter().map(|(_, v)| v.clone()).collect();
+                        self.resolve_node(node_id)?;
+                        let vals: Vec<Value> = self
+                            .visible_node_properties(node_id)
+                            .into_values()
+                            .collect();
                         return Some(Value::List(vals.into()));
                     } else if let Some(edge_id) = col.get_edge_id(row) {
-                        let edge = self.resolve_edge(edge_id)?;
-                        let vals: Vec<Value> =
-                            edge.properties.iter().map(|(_, v)| v.clone()).collect();
+                        self.resolve_edge(edge_id)?;
+                        let vals: Vec<Value> = self
+                            .visible_edge_properties(edge_id)
+                            .into_values()
+                            .collect();
                         return Some(Value::List(vals.into()));
                     }
                 }
