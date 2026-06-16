@@ -36,7 +36,7 @@ use crate::config::{AdaptiveConfig, GraphModel};
 use crate::database::QueryResult;
 use crate::query::Executor;
 use crate::query::cache::QueryCache;
-use crate::transaction::TransactionManager;
+use crate::transaction::{EntityId, TransactionManager};
 
 /// Storage key suffix for the implicit default graph within a schema.
 /// Auto-created by `CREATE SCHEMA` and auto-dropped by `DROP SCHEMA`.
@@ -4026,6 +4026,25 @@ impl Session {
         // track_graph_touch() for this transaction (it checks current_transaction
         // first), so this is safe.
         let touched = std::mem::take(&mut *self.touched_graphs.lock());
+
+        // Increment 2e (Part E): complete the write-set from the store chokepoints
+        // (complete by construction) before validation. Non-draining peeks; the
+        // existing take_*/finalize_* below still consume them.
+        {
+            let mut ws: Vec<EntityId> = Vec::new();
+            for graph_name in &touched {
+                let store = self.resolve_store(graph_name);
+                ws.extend(store.pending_node_creates(transaction_id).into_iter().map(EntityId::Node));
+                ws.extend(store.pending_edge_creates(transaction_id).into_iter().map(EntityId::Edge));
+                ws.extend(store.pending_node_deletes_peek(transaction_id).into_iter().map(EntityId::Node));
+                ws.extend(store.pending_edge_deletes_peek(transaction_id).into_iter().map(EntityId::Edge));
+                let (on, oe) = store.overlay_touched_entities(transaction_id);
+                ws.extend(on.into_iter().map(EntityId::Node));
+                ws.extend(oe.into_iter().map(EntityId::Edge));
+            }
+            self.transaction_manager.extend_write_set(transaction_id, ws);
+        }
+
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
             Ok(epoch) => epoch,
             Err(e) => {
@@ -4513,6 +4532,27 @@ impl Session {
     #[must_use]
     pub(crate) fn current_transaction_id(&self) -> Option<TransactionId> {
         *self.current_transaction.lock()
+    }
+
+    /// Returns the current transaction ID (public accessor for tests).
+    ///
+    /// Returns `None` if no transaction is active. Useful for integration
+    /// tests that need to inspect the write-set via the transaction manager
+    /// after committing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn active_transaction_id(&self) -> Option<TransactionId> {
+        *self.current_transaction.lock()
+    }
+
+    /// Returns a reference to the transaction manager (public accessor for tests).
+    ///
+    /// Provides access to the manager so integration tests can inspect the
+    /// write-set, state, and epoch of any transaction ID.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn transaction_manager_ref(&self) -> &TransactionManager {
+        &self.transaction_manager
     }
 
     /// Returns a reference to the transaction manager.

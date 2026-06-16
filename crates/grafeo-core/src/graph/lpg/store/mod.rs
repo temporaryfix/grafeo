@@ -1014,4 +1014,71 @@ impl LpgStore {
             .map(|(nodes, _edges)| nodes.clone())
             .unwrap_or_default()
     }
+
+    /// Non-draining snapshot of the edge ids this transaction has created with a
+    /// PENDING version (from `pending_tx_creates`). Mirrors [`pending_node_creates`](Self::pending_node_creates)
+    /// for edges. Returns empty for the system transaction.
+    pub fn pending_edge_creates(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        self.pending_tx_creates
+            .read()
+            .get(&transaction_id)
+            .map(|(_nodes, edges)| edges.clone())
+            .unwrap_or_default()
+    }
+
+    /// Non-draining snapshot of node ids this transaction has queued for deletion
+    /// (from `pending_tx_deletes`). Does NOT consume the list — the existing
+    /// [`take_pending_deletes`](Self::take_pending_deletes) still needs it.
+    /// Returns empty if the transaction has no pending node deletes.
+    pub fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.pending_tx_deletes
+            .read()
+            .get(&transaction_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Non-draining snapshot of edge ids this transaction has queued for deletion
+    /// (from `pending_tx_edge_deletes`). Does NOT consume the list — the existing
+    /// [`take_pending_edge_deletes`](Self::take_pending_edge_deletes) still needs it.
+    /// Returns only the `EdgeId` component of each `(src, edge, dst)` triple.
+    /// Returns empty if the transaction has no pending edge deletes.
+    pub fn pending_edge_deletes_peek(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        self.pending_tx_edge_deletes
+            .read()
+            .get(&transaction_id)
+            .map(|v| v.iter().map(|(_src, eid, _dst)| *eid).collect())
+            .unwrap_or_default()
+    }
+
+    /// Non-draining snapshot of all entities this transaction has touched via
+    /// the property/label overlay (`tx_property_overlay`). Returns the unique
+    /// node ids from `node_props` keys ∪ `node_labels` keys, and the unique
+    /// edge ids from `edge_props` keys. Both lists are deduplicated.
+    /// Returns `(vec![], vec![])` if the transaction has no overlay delta.
+    pub fn overlay_touched_entities(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        let overlay = self.tx_property_overlay.read();
+        match overlay.get(&transaction_id) {
+            None => (Vec::new(), Vec::new()),
+            Some(delta) => {
+                // Collect unique node ids from node_props and node_labels keys.
+                let mut node_set: FxHashSet<NodeId> = FxHashSet::default();
+                for (node_id, _key) in delta.node_props.keys() {
+                    node_set.insert(*node_id);
+                }
+                for (node_id, _label_id) in delta.node_labels.keys() {
+                    node_set.insert(*node_id);
+                }
+                // Collect unique edge ids from edge_props keys.
+                let mut edge_set: FxHashSet<EdgeId> = FxHashSet::default();
+                for (edge_id, _key) in delta.edge_props.keys() {
+                    edge_set.insert(*edge_id);
+                }
+                (node_set.into_iter().collect(), edge_set.into_iter().collect())
+            }
+        }
+    }
 }

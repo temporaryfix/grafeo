@@ -92,6 +92,35 @@ pub trait GraphStore: Send + Sync {
         Vec::new()
     }
 
+    /// Edge ids created (PENDING) by `transaction_id` in this tx.
+    /// Mirrors [`pending_node_creates`](Self::pending_node_creates) for edges.
+    /// Default: none (stores without a PENDING edge create list return empty).
+    fn pending_edge_creates(&self, _transaction_id: TransactionId) -> Vec<EdgeId> {
+        Vec::new()
+    }
+
+    /// Non-draining snapshot of node ids this transaction has queued for deletion.
+    /// Default: none (stores without deferred node-delete tracking return empty).
+    fn pending_node_deletes_peek(&self, _transaction_id: TransactionId) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    /// Non-draining snapshot of edge ids this transaction has queued for deletion.
+    /// Default: none (stores without deferred edge-delete tracking return empty).
+    fn pending_edge_deletes_peek(&self, _transaction_id: TransactionId) -> Vec<EdgeId> {
+        Vec::new()
+    }
+
+    /// Non-draining snapshot of entities touched via the property/label overlay.
+    /// Returns `(node_ids, edge_ids)` of all entities in the transaction's delta.
+    /// Default: empty (stores without a per-transaction overlay return nothing).
+    fn overlay_touched_entities(
+        &self,
+        _transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        (Vec::new(), Vec::new())
+    }
+
     /// Snapshot-consistent node property read (unified-MVCC accessor).
     ///
     /// Default: ignores isolation and returns the committed value — safe for

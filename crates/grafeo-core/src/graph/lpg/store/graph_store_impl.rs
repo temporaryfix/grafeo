@@ -66,6 +66,25 @@ impl GraphStore for LpgStore {
         LpgStore::pending_node_creates(self, transaction_id)
     }
 
+    fn pending_edge_creates(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        LpgStore::pending_edge_creates(self, transaction_id)
+    }
+
+    fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        LpgStore::pending_node_deletes_peek(self, transaction_id)
+    }
+
+    fn pending_edge_deletes_peek(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        LpgStore::pending_edge_deletes_peek(self, transaction_id)
+    }
+
+    fn overlay_touched_entities(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        LpgStore::overlay_touched_entities(self, transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

@@ -337,6 +337,25 @@ impl GraphStore for WalGraphStore {
         self.inner.pending_node_creates(transaction_id)
     }
 
+    fn pending_edge_creates(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        self.inner.pending_edge_creates(transaction_id)
+    }
+
+    fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.inner.pending_node_deletes_peek(transaction_id)
+    }
+
+    fn pending_edge_deletes_peek(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        self.inner.pending_edge_deletes_peek(transaction_id)
+    }
+
+    fn overlay_touched_entities(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        self.inner.overlay_touched_entities(transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

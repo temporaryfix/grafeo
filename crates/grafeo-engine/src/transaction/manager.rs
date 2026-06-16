@@ -253,6 +253,26 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Adds entities to the transaction's write-set without conflict detection
+    /// (used to complete the set from store chokepoints before validation).
+    ///
+    /// Unlike [`record_write`](Self::record_write), this performs no
+    /// first-writer-wins check — it simply bulk-inserts entities so the
+    /// write-set is a complete record of what the transaction touched.
+    /// Silently no-ops if the transaction is not active (to keep commit
+    /// on the hot path allocation-free on failure).
+    pub fn extend_write_set(
+        &self,
+        transaction_id: TransactionId,
+        entities: impl IntoIterator<Item = EntityId>,
+    ) {
+        if let Some(info) = self.transactions.write().get_mut(&transaction_id)
+            && info.state == TransactionState::Active
+        {
+            info.write_set.extend(entities);
+        }
+    }
+
     /// Records a read operation for the transaction (for serializable isolation).
     ///
     /// # Errors
