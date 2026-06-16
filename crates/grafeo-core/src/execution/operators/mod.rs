@@ -156,6 +156,22 @@ pub trait WriteTracker: Send + Sync {
 /// Type alias for a shared write tracker.
 pub type SharedWriteTracker = Arc<dyn WriteTracker>;
 
+/// Trait for recording read operations during query execution (Serializable only).
+///
+/// Bridges `grafeo-core` read operators with `grafeo-engine`'s `TransactionManager`
+/// (which tracks read-sets for serializable conflict detection). Lives in `grafeo-core`
+/// to avoid a circular dependency, mirroring [`WriteTracker`]. Only attached for
+/// Serializable transactions, so SnapshotIsolation / ReadCommitted pay nothing.
+pub trait ReadTracker: Send + Sync {
+    /// Records that `transaction_id` read node `node_id` (at its snapshot).
+    fn record_node_read(&self, transaction_id: TransactionId, node_id: NodeId);
+    /// Records that `transaction_id` read edge `edge_id` (at its snapshot).
+    fn record_edge_read(&self, transaction_id: TransactionId, edge_id: EdgeId);
+}
+
+/// Type alias for a shared read tracker.
+pub type SharedReadTracker = Arc<dyn ReadTracker>;
+
 /// Result of executing an operator.
 pub type OperatorResult = Result<Option<DataChunk>, OperatorError>;
 
@@ -318,6 +334,68 @@ mod tests {
     use super::*;
     use crate::execution::vector::ValueVector;
     use grafeo_common::types::LogicalType;
+    use std::sync::Mutex;
+
+    // ── ReadTracker: object-safety + call recording ──────────────────────────
+
+    /// Spy implementation backed by `Arc<Mutex<Vec>>` so the test can inspect
+    /// recorded calls after the tracker has been type-erased to `dyn ReadTracker`.
+    struct SpyReadTracker {
+        node_reads: Arc<Mutex<Vec<(TransactionId, NodeId)>>>,
+        edge_reads: Arc<Mutex<Vec<(TransactionId, EdgeId)>>>,
+    }
+
+    impl ReadTracker for SpyReadTracker {
+        fn record_node_read(&self, transaction_id: TransactionId, node_id: NodeId) {
+            self.node_reads
+                .lock()
+                .unwrap()
+                .push((transaction_id, node_id));
+        }
+
+        fn record_edge_read(&self, transaction_id: TransactionId, edge_id: EdgeId) {
+            self.edge_reads
+                .lock()
+                .unwrap()
+                .push((transaction_id, edge_id));
+        }
+    }
+
+    #[test]
+    fn test_read_tracker_object_safe_and_records_calls() {
+        // Shared state: the test keeps Arc clones; the spy also holds one each.
+        let node_reads: Arc<Mutex<Vec<(TransactionId, NodeId)>>> = Arc::new(Mutex::new(Vec::new()));
+        let edge_reads: Arc<Mutex<Vec<(TransactionId, EdgeId)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let spy = SpyReadTracker {
+            node_reads: Arc::clone(&node_reads),
+            edge_reads: Arc::clone(&edge_reads),
+        };
+
+        // Verify object-safety: must be usable as `SharedReadTracker`.
+        let t: SharedReadTracker = Arc::new(spy);
+
+        let tx1 = TransactionId::new(1);
+        let tx2 = TransactionId::new(2);
+        let n42 = NodeId::new(42);
+        let n99 = NodeId::new(99);
+        let e7 = EdgeId::new(7);
+
+        t.record_node_read(tx1, n42);
+        t.record_node_read(tx2, n99);
+        t.record_edge_read(tx1, e7);
+
+        // Inspect via the test's own Arc clones — no downcast needed.
+        let nr = node_reads.lock().unwrap();
+        assert_eq!(nr.len(), 2);
+        assert_eq!(nr[0], (tx1, n42));
+        assert_eq!(nr[1], (tx2, n99));
+        drop(nr);
+
+        let er = edge_reads.lock().unwrap();
+        assert_eq!(er.len(), 1);
+        assert_eq!(er[0], (tx1, e7));
+    }
 
     fn create_test_chunk() -> DataChunk {
         let mut col = ValueVector::with_type(LogicalType::Int64);
