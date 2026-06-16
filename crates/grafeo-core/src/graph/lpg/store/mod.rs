@@ -120,9 +120,9 @@ pub enum PropertyUndoEntry {
 
 /// A single buffered (uncommitted) property mutation in a transaction's overlay.
 ///
-/// Part of the unified-MVCC first increment: uncommitted property writes are
-/// recorded here (the "hot delta") instead of write-through to the committed
-/// column, and merged over it by [`LpgStore::read_node_property_visible`].
+/// Part of the unified-MVCC delta: uncommitted property writes are recorded
+/// here (the "hot delta") instead of write-through to the committed column,
+/// and merged over it by [`LpgStore::read_node_property_visible`].
 #[derive(Debug, Clone)]
 pub(super) enum PropOp {
     /// Set the property to a value.
@@ -140,10 +140,11 @@ pub(super) enum LabelOp {
     Remove,
 }
 
-/// A transaction's uncommitted property writes — the per-transaction MVCC delta
-/// (first increment: properties only; labels and deletes follow). Read-merged
-/// over the committed column for the writing transaction's own reads; applied to
-/// the committed column on commit; dropped on rollback.
+/// A transaction's uncommitted writes — the per-transaction MVCC delta.
+/// Carries node property ops, edge property ops, and node label ops.
+/// Read-merged over the committed store for the writing transaction's own reads;
+/// applied to the committed store on commit; dropped on rollback.
+/// Edge-delete tracking is a later increment.
 ///
 /// Also used as the savepoint snapshot type returned by
 /// [`LpgStore::tx_overlay_snapshot`] and consumed by

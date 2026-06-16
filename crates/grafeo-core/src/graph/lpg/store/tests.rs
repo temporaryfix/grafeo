@@ -1886,3 +1886,72 @@ fn label_delta_isolates_buffered_label_ops() {
         "commit applied label ops"
     );
 }
+
+#[test]
+fn label_delta_rollback_and_savepoint() {
+    let store = LpgStore::new().unwrap();
+    let n = store.create_node(&["Person"]);
+    let epoch = grafeo_common::types::EpochId::new(0);
+    let person_id = store.label_id("Person").unwrap();
+
+    // --- Rollback path ---
+    // tx A buffers :Secret but is then dropped (rolled back).
+    let tx_a = TransactionId::new(10);
+    store.add_label_buffered(n, "Secret", tx_a);
+    store.drop_tx_overlay(tx_a);
+
+    // After rollback the committed base must be unchanged — no :Secret visible.
+    let after_rollback = store.read_node_labels_visible(n, epoch, None);
+    assert!(
+        after_rollback.contains(&person_id),
+        "committed :Person must survive rollback of tx A"
+    );
+    // :Secret must not have leaked into committed view.
+    let secret_id = store.label_id("Secret");
+    if let Some(sid) = secret_id {
+        assert!(
+            !after_rollback.contains(&sid),
+            "rolled-back :Secret must NOT be visible in committed view"
+        );
+    }
+
+    // --- Savepoint path ---
+    let tx_b = TransactionId::new(11);
+
+    // Buffer :Vip, take a savepoint, then buffer :Temp.
+    store.add_label_buffered(n, "Vip", tx_b);
+    let snap = store.tx_overlay_snapshot(tx_b);
+    store.add_label_buffered(n, "Temp", tx_b);
+
+    let vip_id = store.label_id("Vip").unwrap();
+    let temp_id = store.label_id("Temp").unwrap();
+
+    // Before restore: writer sees both Vip and Temp.
+    let before_restore = store.read_node_labels_visible(n, epoch, Some(tx_b));
+    assert!(
+        before_restore.contains(&vip_id),
+        "writer must see buffered :Vip before restore"
+    );
+    assert!(
+        before_restore.contains(&temp_id),
+        "writer must see buffered :Temp before restore"
+    );
+
+    // Restore to snapshot (Vip only, no Temp).
+    store.tx_overlay_restore(tx_b, snap);
+
+    let after_restore = store.read_node_labels_visible(n, epoch, Some(tx_b));
+    assert!(
+        after_restore.contains(&vip_id),
+        "writer must still see :Vip after savepoint restore"
+    );
+    assert!(
+        !after_restore.contains(&temp_id),
+        "savepoint restore must discard :Temp — if this fails it is a real bug"
+    );
+    // The committed :Person must also be visible to the writer.
+    assert!(
+        after_restore.contains(&person_id),
+        "committed :Person must be visible to writer after restore"
+    );
+}
