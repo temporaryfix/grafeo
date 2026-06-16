@@ -280,8 +280,7 @@ impl MergeOperator {
         // per-node filter below (read_node_labels_visible + read_node_property_visible)
         // then matches it correctly. (Perf: O(tx-created) per MERGE — acceptable; Part G.)
         if let Some(tid) = self.transaction_id {
-            let existing: std::collections::HashSet<NodeId> =
-                candidates.iter().copied().collect();
+            let existing: std::collections::HashSet<NodeId> = candidates.iter().copied().collect();
             for nid in self.store.pending_node_creates(tid) {
                 if !existing.contains(&nid) {
                     candidates.push(nid);
@@ -857,14 +856,22 @@ impl MergeRelationshipOperator {
                     continue;
                 }
 
-                // TODO(unified-mvcc): this reads committed edge properties via edge.get_property,
-                // NOT the per-tx delta — asymmetric with find_matching_node's read_node_property_visible
-                // routing. A MERGE relationship matching on an edge property SET earlier in the same
-                // transaction would see the committed value. Route through read_edge_property_visible
-                // (needs epoch+tid threaded here) in a follow-up; no probe exercises this yet.
-                let has_all_props = resolved_match_props
-                    .iter()
-                    .all(|(key, expected)| edge.get_property(key).is_some_and(|v| v == expected));
+                let has_all_props = resolved_match_props.iter().all(|(key, expected)| {
+                    // Delta-aware: a property SET earlier in this tx is visible here (read-your-writes),
+                    // mirroring find_matching_node's read_node_property_visible routing. Absent a tx
+                    // context, fall back to the committed snapshot already resolved above.
+                    let prop_key = PropertyKey::new(key.as_str());
+                    let actual = match (self.viewing_epoch, self.transaction_id) {
+                        (Some(epoch), Some(tid)) => self.store.read_edge_property_visible(
+                            edge_id,
+                            &prop_key,
+                            epoch,
+                            Some(tid),
+                        ),
+                        _ => edge.get_property(key).cloned(),
+                    };
+                    actual.as_ref().is_some_and(|v| v == expected)
+                });
 
                 if has_all_props {
                     return Some(edge_id);
