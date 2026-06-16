@@ -466,7 +466,27 @@ impl LpgStore {
         }
     }
 
-    /// Deletes an edge within a transaction, capturing undo information for rollback.
+    /// Deletes an edge within a transaction using PENDING-epoch isolation.
+    ///
+    /// Mirrors `delete_node_transactional`: this method stamps the edge's version
+    /// `deleted_epoch = EpochId::PENDING` so the deleting transaction sees the edge
+    /// as gone (read-your-writes via `visible_to`, where `deleted_by == tx`), while
+    /// every other session still sees it (PENDING > any real epoch in `is_visible_at`).
+    ///
+    /// It defers THREE things to commit (`finalize_edge_deletes_by_id`):
+    ///  1. the adjacency tombstone (`forward_adj`/`backward_adj.mark_deleted`) — the
+    ///     candidate index is non-MVCC, and the expand operators post-filter every
+    ///     candidate through `is_edge_visible_versioned`, so it must stay populated
+    ///     until commit (other sessions still traverse it);
+    ///  2. edge-property removal — another session reading the edge's properties while
+    ///     the delete is uncommitted must still see them; on rollback the writer's edge
+    ///     keeps them (the writer never sees its own deleted edge — the chain hides it);
+    ///  3. the live-edge / edge-type count decrements — an uncommitted or rolled-back
+    ///     delete must not under-count.
+    ///
+    /// Because nothing but the version chain is touched, rollback is just
+    /// `unmark_deleted_by(tx)` per edge (see `rollback_pending_edge_deletes`) — no
+    /// heavy `PropertyUndoEntry::EdgeDeleted` undo entry is needed.
     #[cfg(not(feature = "tiered-storage"))]
     pub(crate) fn delete_edge_transactional(
         &self,
@@ -476,62 +496,29 @@ impl LpgStore {
     ) -> bool {
         let mut edges = self.edges.write();
         if let Some(chain) = edges.get_mut(&id) {
-            let (src, dst, type_id) = {
+            let (src, dst) = {
                 match chain.visible_at(epoch) {
                     Some(record) => {
                         if record.is_deleted() {
                             return false;
                         }
-                        (record.src, record.dst, record.type_id)
+                        (record.src, record.dst)
                     }
                     None => return false,
                 }
             };
 
-            // Mark deleted with transaction tracking
-            chain.mark_deleted(epoch, transaction_id);
+            // Stamp PENDING so the deleter sees it gone, others still see it.
+            chain.mark_deleted(EpochId::PENDING, transaction_id);
             drop(edges);
 
-            // Get edge type name for undo log
-            let edge_type_name = {
-                let id_to_type = self.id_to_edge_type.read();
-                id_to_type
-                    .get(type_id as usize)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            };
-
-            // Capture properties for undo log
-            let properties: Vec<(PropertyKey, Value)> =
-                self.edge_properties.get_all(id).into_iter().collect();
-
-            // Mark as deleted in adjacency (soft delete)
-            self.forward_adj.mark_deleted(src, id);
-            if let Some(ref backward) = self.backward_adj {
-                backward.mark_deleted(dst, id);
-            }
-
-            // Remove properties
-            #[cfg(not(feature = "temporal"))]
-            self.edge_properties.remove_all(id);
-            #[cfg(feature = "temporal")]
-            self.edge_properties.remove_all(id, self.current_epoch());
-
-            self.live_edge_count.fetch_sub(1, Ordering::Relaxed);
-            self.decrement_edge_type_count(type_id);
-
-            // Record undo entry for rollback
-            self.property_undo_log
+            // Record for deferred finalize/rollback — adjacency tombstone, property
+            // removal, and count decrements are deferred to `finalize_edge_deletes_by_id`.
+            self.pending_tx_edge_deletes
                 .write()
                 .entry(transaction_id)
                 .or_default()
-                .push(super::PropertyUndoEntry::EdgeDeleted {
-                    edge_id: id,
-                    src,
-                    dst,
-                    edge_type: edge_type_name,
-                    properties,
-                });
+                .push((src, id, dst));
 
             true
         } else {
@@ -539,8 +526,14 @@ impl LpgStore {
         }
     }
 
-    /// Deletes an edge within a transaction, capturing undo information for rollback.
+    /// Deletes an edge within a transaction using PENDING-epoch isolation.
     /// (Tiered storage version)
+    ///
+    /// Stamps `deleted_epoch = EpochId::PENDING` so other sessions still see the
+    /// edge while the delete is uncommitted. The adjacency tombstone, edge-property
+    /// removal, and live/edge-type count decrements are deferred to
+    /// `finalize_edge_deletes_by_id` at commit time; rollback is just
+    /// `unmark_deleted_by(tx)` (see `rollback_pending_edge_deletes`).
     #[cfg(feature = "tiered-storage")]
     pub(crate) fn delete_edge_transactional(
         &self,
@@ -550,14 +543,14 @@ impl LpgStore {
     ) -> bool {
         let mut versions = self.edge_versions.write();
         if let Some(index) = versions.get_mut(&id) {
-            let (src, dst, type_id) = {
+            let (src, dst) = {
                 match index.visible_at(epoch) {
                     Some(version_ref) => {
                         if let Some(record) = self.read_edge_record(&version_ref) {
                             if record.is_deleted() {
                                 return false;
                             }
-                            (record.src, record.dst, record.type_id)
+                            (record.src, record.dst)
                         } else {
                             return false;
                         }
@@ -566,54 +559,204 @@ impl LpgStore {
                 }
             };
 
-            // Mark deleted with transaction tracking
-            index.mark_deleted(epoch, transaction_id);
+            // Stamp PENDING so the deleter sees it gone, others still see it.
+            index.mark_deleted(EpochId::PENDING, transaction_id);
             drop(versions);
 
-            // Get edge type name for undo log
-            let edge_type_name = {
-                let id_to_type = self.id_to_edge_type.read();
-                id_to_type
-                    .get(type_id as usize)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            };
-
-            // Capture properties for undo log
-            let properties: Vec<(PropertyKey, Value)> =
-                self.edge_properties.get_all(id).into_iter().collect();
-
-            // Mark as deleted in adjacency
-            self.forward_adj.mark_deleted(src, id);
-            if let Some(ref backward) = self.backward_adj {
-                backward.mark_deleted(dst, id);
-            }
-
-            // Remove properties
-            #[cfg(not(feature = "temporal"))]
-            self.edge_properties.remove_all(id);
-            #[cfg(feature = "temporal")]
-            self.edge_properties.remove_all(id, self.current_epoch());
-
-            self.live_edge_count.fetch_sub(1, Ordering::Relaxed);
-            self.decrement_edge_type_count(type_id);
-
-            // Record undo entry for rollback
-            self.property_undo_log
+            // Record for deferred finalize/rollback — adjacency tombstone, property
+            // removal, and count decrements are deferred to `finalize_edge_deletes_by_id`.
+            self.pending_tx_edge_deletes
                 .write()
                 .entry(transaction_id)
                 .or_default()
-                .push(super::PropertyUndoEntry::EdgeDeleted {
-                    edge_id: id,
-                    src,
-                    dst,
-                    edge_type: edge_type_name,
-                    properties,
-                });
+                .push((src, id, dst));
 
             true
         } else {
             false
+        }
+    }
+
+    /// Finalizes PENDING edge deletes for a committed transaction: stamps each
+    /// deleted version's `deleted_epoch` PENDING→`commit_epoch` and applies the
+    /// deferred adjacency tombstone, edge-property removal, and live/edge-type
+    /// count decrements now that the delete is committed.
+    ///
+    /// Each tuple is `(src, edge, dst)`. The edge type for the count decrement is
+    /// re-resolved from the chain (the eager path only decremented the counter, it
+    /// never removed the type mapping), so the head version's `type_id` is still
+    /// available even though the edge is now logically deleted.
+    // Called only by the test until the commit/rollback trait wiring lands (Task 3,
+    // mirroring node's `finalize_deletes_by_id` in `graph_store_impl.rs`). `expect`
+    // (not `allow`) so this is forced to be removed once that caller exists.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "wired by transactional-edge-delete trait impl in Task 3"
+        )
+    )]
+    #[cfg(not(feature = "tiered-storage"))]
+    pub(crate) fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        if edges.is_empty() {
+            return;
+        }
+
+        // Stamp PENDING→commit_epoch and capture each edge's type for the count
+        // decrement, all under a single edges write lock.
+        let mut type_ids: Vec<Option<u32>> = Vec::with_capacity(edges.len());
+        {
+            let mut edge_map = self.edges.write();
+            for &(_, id, _) in edges {
+                if let Some(chain) = edge_map.get_mut(&id) {
+                    chain.finalize_deleted_epochs(transaction_id, commit_epoch);
+                    type_ids.push(chain.latest().map(|r| r.type_id));
+                } else {
+                    type_ids.push(None);
+                }
+            }
+        }
+
+        // Apply the deferred adjacency tombstone now that the delete is committed.
+        for &(src, id, dst) in edges {
+            self.forward_adj.mark_deleted(src, id);
+            if let Some(ref backward) = self.backward_adj {
+                backward.mark_deleted(dst, id);
+            }
+        }
+
+        // Remove edge properties and decrement counts now that the delete is committed.
+        for (&(_, id, _), type_id) in edges.iter().zip(type_ids) {
+            #[cfg(not(feature = "temporal"))]
+            self.edge_properties.remove_all(id);
+            #[cfg(feature = "temporal")]
+            self.edge_properties.remove_all(id, commit_epoch);
+
+            self.live_edge_count.fetch_sub(1, Ordering::Relaxed);
+            if let Some(type_id) = type_id {
+                self.decrement_edge_type_count(type_id);
+            }
+        }
+    }
+
+    /// Finalizes PENDING edge deletes for a committed transaction.
+    /// (Tiered storage version)
+    // See the non-tiered variant: caller lands in Task 3.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "wired by transactional-edge-delete trait impl in Task 3"
+        )
+    )]
+    #[cfg(feature = "tiered-storage")]
+    pub(crate) fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        if edges.is_empty() {
+            return;
+        }
+
+        // Stamp PENDING→commit_epoch and capture each edge's type for the count
+        // decrement, all under a single versions write lock.
+        let mut type_ids: Vec<Option<u32>> = Vec::with_capacity(edges.len());
+        {
+            let mut versions = self.edge_versions.write();
+            for &(_, id, _) in edges {
+                if let Some(index) = versions.get_mut(&id) {
+                    index.finalize_deleted_epochs(transaction_id, commit_epoch);
+                    let type_id = index
+                        .latest()
+                        .and_then(|vref| self.read_edge_record(&vref))
+                        .map(|r| r.type_id);
+                    type_ids.push(type_id);
+                } else {
+                    type_ids.push(None);
+                }
+            }
+        }
+
+        // Apply the deferred adjacency tombstone now that the delete is committed.
+        for &(src, id, dst) in edges {
+            self.forward_adj.mark_deleted(src, id);
+            if let Some(ref backward) = self.backward_adj {
+                backward.mark_deleted(dst, id);
+            }
+        }
+
+        // Remove edge properties and decrement counts now that the delete is committed.
+        for (&(_, id, _), type_id) in edges.iter().zip(type_ids) {
+            #[cfg(not(feature = "temporal"))]
+            self.edge_properties.remove_all(id);
+            #[cfg(feature = "temporal")]
+            self.edge_properties.remove_all(id, commit_epoch);
+
+            self.live_edge_count.fetch_sub(1, Ordering::Relaxed);
+            if let Some(type_id) = type_id {
+                self.decrement_edge_type_count(type_id);
+            }
+        }
+    }
+
+    /// Takes (removes and returns) the pending edge-delete list for a transaction.
+    #[doc(hidden)]
+    pub fn take_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId, NodeId)> {
+        self.pending_tx_edge_deletes
+            .write()
+            .remove(&transaction_id)
+            .unwrap_or_default()
+    }
+
+    /// Rolls back PENDING edge deletes for a transaction: clears the PENDING
+    /// `deleted_epoch` on each edge's version chain so the edge is visible again.
+    /// Adjacency, properties, and counts were never touched (deferred path), so no
+    /// restoration is needed — just unmark the version chain.
+    #[cfg(not(feature = "tiered-storage"))]
+    #[doc(hidden)]
+    pub fn rollback_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        if edges.is_empty() {
+            return;
+        }
+        let mut edge_map = self.edges.write();
+        for &(_, id, _) in edges {
+            if let Some(chain) = edge_map.get_mut(&id) {
+                chain.unmark_deleted_by(transaction_id);
+            }
+        }
+    }
+
+    /// Rolls back PENDING edge deletes for a transaction.
+    /// (Tiered storage version)
+    #[cfg(feature = "tiered-storage")]
+    #[doc(hidden)]
+    pub fn rollback_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        if edges.is_empty() {
+            return;
+        }
+        let mut versions = self.edge_versions.write();
+        for &(_, id, _) in edges {
+            if let Some(index) = versions.get_mut(&id) {
+                index.unmark_deleted_by(transaction_id);
+            }
         }
     }
 

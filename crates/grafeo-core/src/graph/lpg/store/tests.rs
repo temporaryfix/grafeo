@@ -1,6 +1,6 @@
 use super::*;
-use crate::graph::Direction;
 use crate::graph::lpg::property::CompareOp;
+use crate::graph::Direction;
 use grafeo_common::types::TransactionId;
 
 #[test]
@@ -401,8 +401,8 @@ fn test_delete_node_edges_atomic_batch() {
     // A barrier ensures both threads start at the same time, and an
     // AtomicBool keeps the reader spinning until deletion finishes,
     // so the two threads are guaranteed to overlap.
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
 
     let barrier = Arc::new(Barrier::new(2));
     let done = Arc::new(AtomicBool::new(false));
@@ -1500,8 +1500,8 @@ fn test_delete_nonexistent_node() {
 /// produce identical results to the concrete methods.
 mod graph_store_traits {
     use super::*;
-    use crate::graph::Direction;
     use crate::graph::traits::{GraphStore, GraphStoreMut};
+    use crate::graph::Direction;
 
     #[test]
     fn trait_object_safety() {
@@ -2024,5 +2024,146 @@ fn writer_sees_inline_create_label_for_own_pending_node() {
     assert!(
         writer_view.contains(&arcstr::ArcStr::from("Item")),
         "writer must see its own inline-created :Item (got {writer_view:?})"
+    );
+}
+
+/// Edge-delete isolation (MVCC increment 2b, Task 1).
+///
+/// A `delete_edge_transactional` must isolate the delete to the writing
+/// transaction until commit, mirroring the node-delete deferral model:
+///  - the writer sees the edge gone (read-your-writes via the version chain),
+///  - every other session still sees it (PENDING `deleted_epoch` > any real epoch),
+///  - the candidate adjacency index stays populated (it is NON-MVCC by design;
+///    visibility is post-filtered one layer up in the expand operators), and
+///  - edge properties and the live/edge-type counts are NOT touched at delete —
+///    they are deferred to `finalize_edge_deletes_by_id` at commit, so an
+///    uncommitted/rolled-back delete neither drops another session's property
+///    read nor under-counts.
+#[test]
+fn edge_delete_pending_isolates() {
+    use grafeo_common::types::{EpochId, PropertyKey};
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["A"]);
+    let b = store.create_node(&["B"]);
+    // Edge with a property so we can assert property removal is deferred.
+    let eid = store.create_edge_with_props(a, b, "R", [("prop", Value::from(7i64))]);
+
+    let key = PropertyKey::new("prop");
+    let epoch = store.current_epoch();
+    let tx = TransactionId::new(2);
+    let other_tx = TransactionId::new(3);
+
+    // Pre-conditions: edge live and readable by everyone.
+    assert!(store.is_edge_visible_versioned(eid, epoch, tx));
+    assert_eq!(store.edge_properties.get(eid, &key), Some(Value::Int64(7)));
+    let live_before = store.live_edge_count.load(Ordering::Relaxed);
+
+    // Transactional delete: stamps PENDING deleted_epoch by `tx`.
+    assert!(store.delete_edge_transactional(eid, epoch, tx));
+
+    // Writer sees it gone (via the chain).
+    assert!(
+        store.get_edge_versioned(eid, epoch, tx).is_none(),
+        "writer must not see its own deleted edge"
+    );
+    assert!(
+        !store.is_edge_visible_versioned(eid, epoch, tx),
+        "writer visibility check must report the edge gone"
+    );
+
+    // Other transactions still see it (via the chain) — no dirty write.
+    assert!(
+        store.get_edge_versioned(eid, epoch, other_tx).is_some(),
+        "other session must still see the not-yet-committed edge"
+    );
+    assert!(
+        store.is_edge_visible_versioned(eid, epoch, other_tx),
+        "other session visibility check must still report the edge present"
+    );
+
+    // Candidate adjacency is NOT tombstoned (non-MVCC index, by design — true for
+    // everyone; visibility is enforced by the expand operators' post-filter).
+    assert!(
+        store
+            .forward_adj
+            .edges_from(a)
+            .iter()
+            .any(|(_, e)| *e == eid),
+        "forward adjacency must still contain the candidate edge before commit"
+    );
+    assert!(
+        store
+            .backward_adj
+            .as_ref()
+            .expect("default config enables backward adjacency")
+            .edges_from(b)
+            .iter()
+            .any(|(_, e)| *e == eid),
+        "backward adjacency must still contain the candidate edge before commit"
+    );
+
+    // Property removal is deferred: the stored property is still readable, and an
+    // other-session read of the edge still carries it.
+    assert_eq!(
+        store.edge_properties.get(eid, &key),
+        Some(Value::Int64(7)),
+        "edge property must not be removed at delete time"
+    );
+    let other_view = store
+        .get_edge_versioned(eid, epoch, other_tx)
+        .expect("edge still visible to other session");
+    assert_eq!(
+        other_view.get_property("prop").and_then(|v| v.as_int64()),
+        Some(7),
+        "other session must still read the edge's property"
+    );
+
+    // Count decrement is deferred too.
+    assert_eq!(
+        store.live_edge_count.load(Ordering::Relaxed),
+        live_before,
+        "live-edge count must not change at delete time"
+    );
+
+    // Commit: finalize the deferred delete at a real commit epoch.
+    let commit_epoch = EpochId::new(5);
+    store.finalize_edge_deletes_by_id(tx, commit_epoch, &[(a, eid, b)]);
+
+    // Gone for everyone at the commit epoch.
+    assert!(
+        !store.is_edge_visible_versioned(eid, commit_epoch, other_tx),
+        "after finalize the edge must be invisible to all sessions"
+    );
+    // Adjacency tombstone is now applied.
+    assert!(
+        !store
+            .forward_adj
+            .edges_from(a)
+            .iter()
+            .any(|(_, e)| *e == eid),
+        "forward adjacency tombstone must be applied at finalize"
+    );
+    assert!(
+        !store
+            .backward_adj
+            .as_ref()
+            .expect("default config enables backward adjacency")
+            .edges_from(b)
+            .iter()
+            .any(|(_, e)| *e == eid),
+        "backward adjacency tombstone must be applied at finalize"
+    );
+    // Property removal moved to finalize too.
+    assert_eq!(
+        store.edge_properties.get(eid, &key),
+        None,
+        "edge property must be removed at finalize"
+    );
+    // The live-edge count decrement moved to finalize.
+    assert_eq!(
+        store.live_edge_count.load(Ordering::Relaxed),
+        live_before - 1,
+        "live-edge count must decrease by one at finalize"
     );
 }

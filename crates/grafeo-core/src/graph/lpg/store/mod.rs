@@ -532,6 +532,15 @@ pub struct LpgStore {
     /// `finalize_deletes_by_id`, dropped on rollback.
     /// Lock order: after `tx_property_overlay`.
     pub(crate) pending_tx_deletes: RwLock<FxHashMap<TransactionId, Vec<NodeId>>>,
+
+    /// Per-transaction lists of edges deleted with a PENDING `deleted_epoch`,
+    /// recorded at `delete_edge_transactional` — the chokepoint that defers the
+    /// adjacency tombstone, edge-property removal, and live/edge-type count
+    /// decrements until commit. Each tuple is `(src, edge, dst)`. Finalized by
+    /// `finalize_edge_deletes_by_id`, dropped (via `unmark_deleted_by`) on rollback.
+    /// Lock order: after `pending_tx_deletes`.
+    pub(crate) pending_tx_edge_deletes:
+        RwLock<FxHashMap<TransactionId, Vec<(NodeId, EdgeId, NodeId)>>>,
 }
 
 impl LpgStore {
@@ -598,6 +607,7 @@ impl LpgStore {
             pending_tx_creates: RwLock::new(FxHashMap::default()),
             tx_property_overlay: RwLock::new(FxHashMap::default()),
             pending_tx_deletes: RwLock::new(FxHashMap::default()),
+            pending_tx_edge_deletes: RwLock::new(FxHashMap::default()),
         })
     }
 
