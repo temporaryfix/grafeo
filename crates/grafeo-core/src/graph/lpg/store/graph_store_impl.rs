@@ -5,6 +5,7 @@
 //! the `impl Iterator` return into `Vec` for trait object safety.
 
 use super::LpgStore;
+use crate::execution::operators::SharedReadTracker;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 use crate::graph::lpg::{Edge, Node};
@@ -68,6 +69,14 @@ impl GraphStore for LpgStore {
 
     fn pending_edge_creates(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
         LpgStore::pending_edge_creates(self, transaction_id)
+    }
+
+    fn register_read_tracker(&self, tx: TransactionId, tracker: SharedReadTracker) {
+        LpgStore::register_read_tracker(self, tx, tracker);
+    }
+
+    fn unregister_read_tracker(&self, tx: TransactionId) {
+        LpgStore::unregister_read_tracker(self, tx);
     }
 
     fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {

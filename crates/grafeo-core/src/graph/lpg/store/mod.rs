@@ -27,6 +27,7 @@ mod tests;
 use super::PropertyStorage;
 #[cfg(not(feature = "tiered-storage"))]
 use super::{EdgeRecord, NodeRecord};
+use crate::execution::operators::SharedReadTracker;
 use crate::graph::lpg::{Edge, Node};
 use crate::index::adjacency::ChunkedAdjacency;
 use crate::statistics::Statistics;
@@ -541,6 +542,12 @@ pub struct LpgStore {
     /// Lock order: after `pending_tx_deletes`.
     pub(crate) pending_tx_edge_deletes:
         RwLock<FxHashMap<TransactionId, Vec<(NodeId, EdgeId, NodeId)>>>,
+
+    /// Per-transaction read trackers (Serializable only). Set by the engine at
+    /// Serializable tx begin, dropped at commit/rollback. When present for a tx, the
+    /// visible-read accessors record observed entities into it (the SSI read-set,
+    /// complete by construction). Empty for SI/ReadCommitted (zero cost).
+    read_trackers: RwLock<FxHashMap<TransactionId, SharedReadTracker>>,
 }
 
 impl LpgStore {
@@ -608,6 +615,7 @@ impl LpgStore {
             tx_property_overlay: RwLock::new(FxHashMap::default()),
             pending_tx_deletes: RwLock::new(FxHashMap::default()),
             pending_tx_edge_deletes: RwLock::new(FxHashMap::default()),
+            read_trackers: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -723,6 +731,7 @@ impl LpgStore {
         self.property_undo_log.write().clear();
         self.pending_tx_creates.write().clear();
         self.tx_property_overlay.write().clear();
+        self.read_trackers.write().clear();
     }
 
     /// Returns whether backward adjacency (incoming edge index) is available.
@@ -1077,8 +1086,48 @@ impl LpgStore {
                 for (edge_id, _key) in delta.edge_props.keys() {
                     edge_set.insert(*edge_id);
                 }
-                (node_set.into_iter().collect(), edge_set.into_iter().collect())
+                (
+                    node_set.into_iter().collect(),
+                    edge_set.into_iter().collect(),
+                )
             }
+        }
+    }
+
+    /// Attaches `tracker` to `tx` so that subsequent visible-read accessors
+    /// record every observed node/edge into it (the SSI read-set). Call at
+    /// Serializable tx begin; the tracker is held until
+    /// [`unregister_read_tracker`](Self::unregister_read_tracker) is called at
+    /// commit/rollback. No-op for non-Serializable transactions (just don't call it).
+    pub fn register_read_tracker(&self, tx: TransactionId, tracker: SharedReadTracker) {
+        self.read_trackers.write().insert(tx, tracker);
+    }
+
+    /// Removes the read tracker for `tx`, dropping the Arc. Call at
+    /// commit/rollback for Serializable transactions. Silent no-op if none was
+    /// registered.
+    pub fn unregister_read_tracker(&self, tx: TransactionId) {
+        self.read_trackers.write().remove(&tx);
+    }
+
+    /// Records that `tx` observed `id` as a node read. Called by the store's
+    /// visible-read accessors (next task). Silent no-op when no tracker is
+    /// registered for `tx` (SI/ReadCommitted, or no Serializable tx active).
+    #[inline]
+    #[allow(dead_code)] // called by the read accessor instrumentation task (Task 2)
+    pub(crate) fn record_read_node(&self, tx: TransactionId, id: NodeId) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_node_read(tx, id);
+        }
+    }
+
+    /// Records that `tx` observed `id` as an edge read. Mirrors
+    /// [`record_read_node`](Self::record_read_node) for edges.
+    #[inline]
+    #[allow(dead_code)] // called by the read accessor instrumentation task (Task 2)
+    pub(crate) fn record_read_edge(&self, tx: TransactionId, id: EdgeId) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_edge_read(tx, id);
         }
     }
 }

@@ -7,8 +7,8 @@
 //!
 //! Requires both `compact-store` and `lpg` features.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use arcstr::ArcStr;
@@ -17,9 +17,10 @@ use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::CompactStore;
+use crate::execution::operators::SharedReadTracker;
+use crate::graph::Direction;
 use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
-use crate::graph::Direction;
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
@@ -1031,10 +1032,7 @@ impl GraphStore for LayeredStore {
     // via ensure_in_overlay / ensure_edge_in_overlay before calling
     // *_buffered). No event/log side effects exist here.
 
-    fn pending_node_creates(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Vec<NodeId> {
+    fn pending_node_creates(&self, transaction_id: TransactionId) -> Vec<NodeId> {
         self.overlay.load().pending_node_creates(transaction_id)
     }
 
@@ -1042,12 +1040,24 @@ impl GraphStore for LayeredStore {
         self.overlay.load().pending_edge_creates(transaction_id)
     }
 
+    fn register_read_tracker(&self, tx: TransactionId, tracker: SharedReadTracker) {
+        self.overlay.load().register_read_tracker(tx, tracker);
+    }
+
+    fn unregister_read_tracker(&self, tx: TransactionId) {
+        self.overlay.load().unregister_read_tracker(tx);
+    }
+
     fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {
-        self.overlay.load().pending_node_deletes_peek(transaction_id)
+        self.overlay
+            .load()
+            .pending_node_deletes_peek(transaction_id)
     }
 
     fn pending_edge_deletes_peek(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
-        self.overlay.load().pending_edge_deletes_peek(transaction_id)
+        self.overlay
+            .load()
+            .pending_edge_deletes_peek(transaction_id)
     }
 
     fn overlay_touched_entities(
@@ -2110,18 +2120,22 @@ mod tests {
         let first = persons[0];
 
         // Node has "age" property in the base.
-        assert!(layered
-            .get_node_property(first, &PropertyKey::new("age"))
-            .is_some());
+        assert!(
+            layered
+                .get_node_property(first, &PropertyKey::new("age"))
+                .is_some()
+        );
 
         // Remove it (promotes to overlay first).
         let removed = layered.remove_node_property(first, "age");
         assert!(removed.is_some());
 
         // Should be gone now.
-        assert!(layered
-            .get_node_property(first, &PropertyKey::new("age"))
-            .is_none());
+        assert!(
+            layered
+                .get_node_property(first, &PropertyKey::new("age"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2136,9 +2150,11 @@ mod tests {
         assert!(removed.is_some());
 
         // Should be gone now.
-        assert!(layered
-            .get_edge_property(eid, &PropertyKey::new("since"))
-            .is_none());
+        assert!(
+            layered
+                .get_edge_property(eid, &PropertyKey::new("since"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2327,9 +2343,11 @@ mod tests {
         assert!(layered.get_node(target).is_none());
 
         // get_node_property should also return None.
-        assert!(layered
-            .get_node_property(target, &PropertyKey::new("name"))
-            .is_none());
+        assert!(
+            layered
+                .get_node_property(target, &PropertyKey::new("name"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3083,12 +3101,16 @@ mod tests {
         );
 
         // Endpoints' existing properties are intact through the layered view.
-        assert!(layered
-            .get_node_property(persons[0], &PropertyKey::new("name"))
-            .is_some());
-        assert!(layered
-            .get_node_property(target_dst, &PropertyKey::new("name"))
-            .is_some());
+        assert!(
+            layered
+                .get_node_property(persons[0], &PropertyKey::new("name"))
+                .is_some()
+        );
+        assert!(
+            layered
+                .get_node_property(target_dst, &PropertyKey::new("name"))
+                .is_some()
+        );
     }
 
     /// Setting a property on a base-only node marks the node dirty. Directly
@@ -3696,9 +3718,11 @@ mod tests {
             removed,
             Some(Value::String(ArcStr::from("mia@example.com")))
         );
-        assert!(layered
-            .get_node_property(mia, &PropertyKey::new("email"))
-            .is_none());
+        assert!(
+            layered
+                .get_node_property(mia, &PropertyKey::new("email"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3714,9 +3738,11 @@ mod tests {
 
         let removed = layered.remove_edge_property_versioned(eid, "year", txn_id);
         assert_eq!(removed, Some(Value::Int64(2024)));
-        assert!(layered
-            .get_edge_property(eid, &PropertyKey::new("year"))
-            .is_none());
+        assert!(
+            layered
+                .get_edge_property(eid, &PropertyKey::new("year"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3839,9 +3865,11 @@ mod tests {
             "deleted promoted edge still resolves"
         );
         assert!(layered.edges_from(person, Direction::Outgoing).is_empty());
-        assert!(!layered
-            .neighbors(person, Direction::Outgoing)
-            .contains(&target));
+        assert!(
+            !layered
+                .neighbors(person, Direction::Outgoing)
+                .contains(&target)
+        );
         // Idempotent: nothing left to delete.
         assert!(!layered.delete_edge(eid));
     }
@@ -4095,8 +4123,8 @@ mod tests {
     /// the test stays bounded.
     #[test]
     fn jules_concurrent_readers_survive_repeated_base_swaps() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
         let layered = Arc::new(build_test_layered());
@@ -4147,8 +4175,8 @@ mod tests {
     /// remain visible after the test.
     #[test]
     fn shosanna_concurrent_writes_survive_periodic_merge() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::thread;
 
         let layered = Arc::new(build_test_layered());

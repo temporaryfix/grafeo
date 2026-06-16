@@ -9,6 +9,7 @@ use std::sync::Arc;
 use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
+use grafeo_core::execution::operators::SharedReadTracker;
 use grafeo_core::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
@@ -330,15 +331,20 @@ impl GraphStore for WalGraphStore {
     // inner LpgStore's snapshot-aware accessors. The per-transaction property
     // delta lives in the inner LpgStore.
 
-    fn pending_node_creates(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Vec<NodeId> {
+    fn pending_node_creates(&self, transaction_id: TransactionId) -> Vec<NodeId> {
         self.inner.pending_node_creates(transaction_id)
     }
 
     fn pending_edge_creates(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
         self.inner.pending_edge_creates(transaction_id)
+    }
+
+    fn register_read_tracker(&self, tx: TransactionId, tracker: SharedReadTracker) {
+        self.inner.register_read_tracker(tx, tracker);
+    }
+
+    fn unregister_read_tracker(&self, tx: TransactionId) {
+        self.inner.unregister_read_tracker(tx);
     }
 
     fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {

@@ -2310,3 +2310,130 @@ fn edge_delete_transactional_is_idempotent_per_tx() {
         "live-edge count must decrease by exactly one despite the duplicate delete attempt"
     );
 }
+
+// ── Read-tracker registry ────────────────────────────────────────────────────
+
+#[test]
+fn test_read_tracker_registered_records_node() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use grafeo_common::types::{EdgeId, NodeId};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    struct SpyTracker {
+        nodes: Mutex<Vec<NodeId>>,
+        edges: Mutex<Vec<EdgeId>>,
+    }
+    impl ReadTracker for SpyTracker {
+        fn record_node_read(&self, _tx: TransactionId, id: NodeId) {
+            self.nodes.lock().push(id);
+        }
+        fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+            self.edges.lock().push(id);
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let tx = TransactionId::new(42);
+    let spy = Arc::new(SpyTracker {
+        nodes: Mutex::new(Vec::new()),
+        edges: Mutex::new(Vec::new()),
+    });
+    let tracker: SharedReadTracker = spy.clone();
+
+    // Before registration: no-op.
+    store.record_read_node(tx, NodeId::new(1));
+    store.record_read_edge(tx, EdgeId::new(1));
+    assert!(
+        spy.nodes.lock().is_empty(),
+        "no recording before registration"
+    );
+    assert!(
+        spy.edges.lock().is_empty(),
+        "no recording before registration"
+    );
+
+    // After registration: reads are recorded.
+    store.register_read_tracker(tx, tracker);
+    store.record_read_node(tx, NodeId::new(5));
+    store.record_read_edge(tx, EdgeId::new(7));
+    assert_eq!(
+        *spy.nodes.lock(),
+        vec![NodeId::new(5)],
+        "node read recorded"
+    );
+    assert_eq!(
+        *spy.edges.lock(),
+        vec![EdgeId::new(7)],
+        "edge read recorded"
+    );
+
+    // After unregistration: no further recording.
+    store.unregister_read_tracker(tx);
+    store.record_read_node(tx, NodeId::new(99));
+    store.record_read_edge(tx, EdgeId::new(99));
+    assert_eq!(
+        spy.nodes.lock().len(),
+        1,
+        "no extra node read after unregistration"
+    );
+    assert_eq!(
+        spy.edges.lock().len(),
+        1,
+        "no extra edge read after unregistration"
+    );
+}
+
+#[test]
+fn test_read_tracker_unregistered_tx_is_noop() {
+    // record_read_* for a tx that was never registered must be a silent no-op
+    // (no panic, nothing collected anywhere).
+    let store = LpgStore::new().unwrap();
+    let tx = TransactionId::new(999);
+    // These must not panic.
+    store.record_read_node(tx, NodeId::new(1));
+    store.record_read_edge(tx, EdgeId::new(1));
+}
+
+#[test]
+fn test_read_tracker_cleared_by_store_clear() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use grafeo_common::types::{EdgeId, NodeId};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    struct SpyTracker {
+        nodes: Mutex<Vec<NodeId>>,
+        edges: Mutex<Vec<EdgeId>>,
+    }
+    impl ReadTracker for SpyTracker {
+        fn record_node_read(&self, _tx: TransactionId, id: NodeId) {
+            self.nodes.lock().push(id);
+        }
+        fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+            self.edges.lock().push(id);
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let tx = TransactionId::new(1);
+    let spy = Arc::new(SpyTracker {
+        nodes: Mutex::new(Vec::new()),
+        edges: Mutex::new(Vec::new()),
+    });
+    let tracker: SharedReadTracker = spy.clone();
+
+    store.register_read_tracker(tx, tracker);
+    // Sanity: records before clear.
+    store.record_read_node(tx, NodeId::new(3));
+    assert_eq!(spy.nodes.lock().len(), 1);
+
+    // clear() must drop the tracker entry.
+    store.clear();
+    store.record_read_node(tx, NodeId::new(9));
+    assert_eq!(
+        spy.nodes.lock().len(),
+        1,
+        "read tracker must be cleared by store.clear()"
+    );
+}
