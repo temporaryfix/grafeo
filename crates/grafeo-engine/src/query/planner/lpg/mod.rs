@@ -335,6 +335,21 @@ impl Planner {
         self.transaction_manager.as_ref()
     }
 
+    /// Returns `true` when the active transaction uses Serializable isolation.
+    ///
+    /// Used by `plan_operator` arms that bypass the visible-read API (shortest
+    /// path, vector scan, text scan, graph algorithms) to reject queries that
+    /// would silently miss SSI conflicts.  A planner with no transaction, or
+    /// whose transaction runs under a weaker isolation level, returns `false`.
+    fn is_serializable(&self) -> bool {
+        self.transaction_id.is_some_and(|tid| {
+            self.transaction_manager
+                .as_ref()
+                .and_then(|m| m.isolation_level(tid))
+                == Some(crate::transaction::IsolationLevel::Serializable)
+        })
+    }
+
     /// Enables or disables factorized execution for multi-hop queries.
     #[must_use]
     pub fn with_factorized_execution(mut self, enabled: bool) -> Self {
@@ -704,6 +719,66 @@ impl Planner {
     }
 
     /// Plans a single logical operator.
+    ///
+    /// # Soundness sweep — store-access classification (Task 4)
+    ///
+    /// Every arm is classified for how it accesses the graph store:
+    ///
+    /// **records-via-store** — reads the store exclusively through the
+    /// visible-read API (`node_visible`, `edge_visible`, `neighbors_visible`,
+    /// `properties_visible`, etc.) which auto-records reads for SSI. Safe
+    /// under Serializable once the read-tracking chokepoints land.
+    ///
+    /// | Arm                | Classification        |
+    /// |--------------------|-----------------------|
+    /// | `NodeScan`         | records-via-store     |
+    /// | `Expand`           | records-via-store     |
+    /// | `Return`           | no-store-read         |
+    /// | `Filter`           | records-via-store     |
+    /// | `Project`          | no-store-read         |
+    /// | `Limit`            | no-store-read         |
+    /// | `Skip`             | no-store-read         |
+    /// | `Sort`             | no-store-read         |
+    /// | `Aggregate`        | no-store-read         |
+    /// | `Join`             | no-store-read (join over already-read rows) |
+    /// | `LeftJoin`         | no-store-read         |
+    /// | `AntiJoin`         | no-store-read         |
+    /// | `Union`            | no-store-read         |
+    /// | `Except`           | no-store-read         |
+    /// | `Intersect`        | no-store-read         |
+    /// | `Otherwise`        | no-store-read         |
+    /// | `Apply`            | no-store-read (drives inner plan_operator) |
+    /// | `Distinct`         | no-store-read         |
+    /// | `CreateNode`       | no-store-read (write, already-resolved entities) |
+    /// | `CreateEdge`       | no-store-read (write) |
+    /// | `DeleteNode`       | no-store-read (write) |
+    /// | `DeleteEdge`       | no-store-read (write) |
+    /// | `Unwind`           | no-store-read         |
+    /// | `Merge`            | records-via-store (reads through MVCC-aware search) |
+    /// | `MergeRelationship`| records-via-store     |
+    /// | `AddLabel`         | no-store-read (write) |
+    /// | `RemoveLabel`      | no-store-read (write) |
+    /// | `SetProperty`      | no-store-read (write) |
+    /// | `MapCollect`       | no-store-read         |
+    /// | `ParameterScan`    | no-store-read         |
+    /// | `MultiWayJoin`     | no-store-read         |
+    /// | `HorizontalAggregate` | records-via-store (property reads via store) |
+    /// | `LoadData`         | no-store-read (reads CSV file, not the graph store) |
+    /// | `Empty`            | unreachable-Err       |
+    /// | `VectorJoin`       | unreachable-Err (always rejected; VectorJoin not supported) |
+    ///
+    /// **guarded** — bypasses the visible-read API; rejected under Serializable
+    /// until proper MVCC integration is implemented:
+    ///
+    /// | Arm                | Reason bypassed              |
+    /// |--------------------|------------------------------|
+    /// | `ShortestPath`     | raw `edges_from` adjacency   |
+    /// | `VectorScan`       | raw HNSW index               |
+    /// | `TextScan`         | raw BM25 inverted index      |
+    /// | `CallProcedure`    | raw graph traversal in algos |
+    ///
+    /// The catch-all `_ =>` arm is also an `unreachable-Err` (any newly-added
+    /// variant that isn't wired up will error immediately at planning time).
     fn plan_operator(&self, op: &LogicalOperator) -> Result<(Box<dyn Operator>, Vec<String>)> {
         let result = match op {
             LogicalOperator::NodeScan(scan) => self.plan_node_scan(scan),
@@ -898,6 +973,16 @@ impl Planner {
     fn plan_text_scan(&self, scan: &TextScanOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use grafeo_core::execution::operators::TextScanOperator;
 
+        // TextScan reads raw BM25 indexes without MVCC visibility, so it cannot
+        // track reads for SSI conflict detection.  Reject under Serializable
+        // rather than silently return non-serializable results.
+        if self.is_serializable() {
+            return Err(Error::Internal(
+                "Serializable isolation is not yet supported with text search; use SnapshotIsolation"
+                    .to_string(),
+            ));
+        }
+
         let query_string = match &scan.query {
             LogicalExpression::Literal(Value::String(s)) => s.to_string(),
             LogicalExpression::Parameter(name) => {
@@ -955,6 +1040,16 @@ impl Planner {
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use grafeo_core::execution::operators::VectorScanOperator;
         use grafeo_core::index::vector::DistanceMetric;
+
+        // VectorScan reads raw HNSW indexes without MVCC visibility, so it cannot
+        // track reads for SSI conflict detection.  Reject under Serializable
+        // rather than silently return non-serializable results.
+        if self.is_serializable() {
+            return Err(Error::Internal(
+                "Serializable isolation is not yet supported with vector search; use SnapshotIsolation"
+                    .to_string(),
+            ));
+        }
 
         // Hybrid shape `VectorScan(input=graph_pattern)` is not supported by
         // the physical VectorScanOperator: it has no input slot and would
@@ -3827,5 +3922,258 @@ mod tests {
                 .unwrap_or_else(|e| panic!("plan_vector_scan failed for {label:?}: {e:?}"));
             assert_eq!(cols[0], "n", "variable column must be first for {label:?}");
         }
+    }
+
+    // ==================== is_serializable + guard tests (Task 4) ====================
+
+    /// Helper: build a Planner with the given isolation level.
+    fn make_planner_with_isolation(
+        isolation: crate::transaction::IsolationLevel,
+    ) -> (Planner, Arc<crate::transaction::TransactionManager>) {
+        use crate::transaction::{IsolationLevel, TransactionManager};
+
+        let store = create_test_store();
+        let tm = Arc::new(TransactionManager::new());
+        let tid = tm.begin_with_isolation(isolation);
+        let epoch = tm.current_epoch();
+        let planner = Planner::with_context(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
+            Arc::clone(&tm),
+            Some(tid),
+            epoch,
+        );
+        (planner, tm)
+    }
+
+    /// A planner with no transaction context must not be Serializable.
+    #[test]
+    fn test_is_serializable_no_context() {
+        let store = create_test_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        assert!(
+            !planner.is_serializable(),
+            "no-context planner is not Serializable"
+        );
+    }
+
+    /// A planner with a SnapshotIsolation transaction must not be Serializable.
+    #[test]
+    fn test_is_serializable_snapshot_isolation() {
+        use crate::transaction::IsolationLevel;
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+        assert!(
+            !planner.is_serializable(),
+            "SnapshotIsolation planner must not report Serializable"
+        );
+    }
+
+    /// A planner with a Serializable transaction must be Serializable.
+    #[test]
+    fn test_is_serializable_serializable_level() {
+        use crate::transaction::IsolationLevel;
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        assert!(
+            planner.is_serializable(),
+            "Serializable planner must report is_serializable() == true"
+        );
+    }
+
+    /// plan_shortest_path must be rejected under Serializable isolation.
+    #[test]
+    fn test_plan_shortest_path_rejected_under_serializable() {
+        use crate::query::plan::ShortestPathOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = ShortestPathOp {
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "a".to_string(),
+                label: None,
+                input: None,
+            })),
+            source_var: "a".to_string(),
+            target_var: "b".to_string(),
+            edge_types: vec![],
+            direction: ExpandDirection::Both,
+            path_alias: "p".to_string(),
+            all_paths: false,
+        };
+        let err = planner
+            .plan_shortest_path(&op)
+            .err()
+            .expect("plan_shortest_path must return Err under Serializable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shortestPath"),
+            "error must mention shortestPath, got: {msg}"
+        );
+        assert!(
+            msg.contains("Serializable"),
+            "error must mention Serializable, got: {msg}"
+        );
+    }
+
+    /// plan_shortest_path must NOT be rejected with the Serializable guard under
+    /// SnapshotIsolation.  The input only provides variable "a", so planning
+    /// will still fail (missing target "b") — but the failure must be about the
+    /// missing column, not the Serializable guard.
+    #[test]
+    fn test_plan_shortest_path_no_serializable_guard_under_snapshot_isolation() {
+        use crate::query::plan::ShortestPathOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+
+        let op = ShortestPathOp {
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "a".to_string(),
+                label: None,
+                input: None,
+            })),
+            source_var: "a".to_string(),
+            target_var: "b".to_string(),
+            edge_types: vec![],
+            direction: ExpandDirection::Both,
+            path_alias: "p".to_string(),
+            all_paths: false,
+        };
+        // The Serializable guard must NOT fire; any failure is a different error.
+        let result = planner.plan_shortest_path(&op);
+        match result {
+            Ok(_) => { /* guard didn't fire and planning succeeded — ideal */ }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("Serializable isolation is not yet supported with shortestPath"),
+                    "SnapshotIsolation must NOT trigger the Serializable guard, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// plan_vector_scan must be rejected under Serializable isolation.
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn test_plan_vector_scan_rejected_under_serializable() {
+        use crate::query::plan::VectorScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = VectorScanOp {
+            variable: "n".to_string(),
+            index_name: None,
+            property: "emb".to_string(),
+            label: None,
+            query_vector: LogicalExpression::Literal(Value::List(
+                vec![Value::Float64(1.0), Value::Float64(0.0)].into(),
+            )),
+            k: Some(5),
+            metric: None,
+            min_similarity: None,
+            max_distance: None,
+            input: None,
+        };
+        let err = planner
+            .plan_vector_scan(&op)
+            .err()
+            .expect("plan_vector_scan must return Err under Serializable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vector search"),
+            "error must mention vector search, got: {msg}"
+        );
+        assert!(
+            msg.contains("Serializable"),
+            "error must mention Serializable, got: {msg}"
+        );
+    }
+
+    /// plan_vector_scan must NOT be rejected under SnapshotIsolation.
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn test_plan_vector_scan_allowed_under_snapshot_isolation() {
+        use crate::query::plan::VectorScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+        let op = VectorScanOp {
+            variable: "n".to_string(),
+            index_name: None,
+            property: "emb".to_string(),
+            label: None,
+            query_vector: LogicalExpression::Literal(Value::List(
+                vec![Value::Float64(1.0), Value::Float64(0.0)].into(),
+            )),
+            k: Some(5),
+            metric: None,
+            min_similarity: None,
+            max_distance: None,
+            input: None,
+        };
+        // Guard must not fire for SnapshotIsolation.
+        let result = planner.plan_vector_scan(&op);
+        assert!(
+            result.is_ok(),
+            "plan_vector_scan must succeed under SnapshotIsolation, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// plan_text_scan must be rejected under Serializable isolation.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn test_plan_text_scan_rejected_under_serializable() {
+        use crate::query::plan::TextScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = TextScanOp {
+            variable: "n".to_string(),
+            label: "Doc".to_string(),
+            property: "body".to_string(),
+            query: LogicalExpression::Literal(Value::String("hello".into())),
+            k: Some(10),
+            threshold: None,
+            score_column: None,
+        };
+        let err = planner
+            .plan_text_scan(&op)
+            .err()
+            .expect("plan_text_scan must return Err under Serializable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("text search"),
+            "error must mention text search, got: {msg}"
+        );
+        assert!(
+            msg.contains("Serializable"),
+            "error must mention Serializable, got: {msg}"
+        );
+    }
+
+    /// plan_text_scan must NOT be rejected under SnapshotIsolation.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn test_plan_text_scan_allowed_under_snapshot_isolation() {
+        use crate::query::plan::TextScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+        let op = TextScanOp {
+            variable: "n".to_string(),
+            label: "Doc".to_string(),
+            property: "body".to_string(),
+            query: LogicalExpression::Literal(Value::String("hello".into())),
+            k: Some(10),
+            threshold: None,
+            score_column: None,
+        };
+        let result = planner.plan_text_scan(&op);
+        assert!(
+            result.is_ok(),
+            "plan_text_scan must succeed under SnapshotIsolation, got: {:?}",
+            result.err()
+        );
     }
 }

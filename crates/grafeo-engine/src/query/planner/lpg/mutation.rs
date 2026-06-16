@@ -658,6 +658,17 @@ impl super::Planner {
         &self,
         sp: &ShortestPathOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        // ShortestPathOperator reads raw edges_from adjacency with no MVCC
+        // visibility and cannot record reads for SSI conflict detection.
+        // Reject under Serializable rather than silently return non-serializable
+        // results.
+        if self.is_serializable() {
+            return Err(Error::Internal(
+                "Serializable isolation is not yet supported with shortestPath/allShortestPaths; use SnapshotIsolation"
+                    .to_string(),
+            ));
+        }
+
         // Plan the input operator
         let (input_op, mut columns) = self.plan_operator(&sp.input)?;
 
@@ -720,6 +731,17 @@ impl super::Planner {
         call: &CallProcedureOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use crate::procedures::{self, BuiltinProcedures};
+
+        // Graph algorithm procedures (PageRank, BFS, community detection, etc.)
+        // read raw graph adjacency without MVCC visibility and cannot record
+        // reads for SSI conflict detection.  Reject under Serializable rather
+        // than silently return non-serializable results.
+        if self.is_serializable() {
+            return Err(Error::Internal(
+                "Serializable isolation is not yet supported with graph algorithms; use SnapshotIsolation"
+                    .to_string(),
+            ));
+        }
 
         static PROCEDURES: std::sync::OnceLock<BuiltinProcedures> = std::sync::OnceLock::new();
         let registry = PROCEDURES.get_or_init(BuiltinProcedures::new);
