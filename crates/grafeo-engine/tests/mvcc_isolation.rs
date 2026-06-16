@@ -551,3 +551,88 @@ fn self_loop_detach_delete_counts_once() {
         "self-loop DETACH DELETE must leave exactly zero edges (no double-count)"
     );
 }
+
+/// MVCC 2c probe 1: two MERGEs of the same node key in one tx must create exactly one node
+/// when a property index exists (triggering the index-based candidate path).
+///
+/// `find_matching_node` uses the committed property index when `has_property_index` is true.
+/// The node created by the first MERGE is written via `set_node_property_buffered` (delta
+/// only), so the committed property index is NOT updated → the second MERGE's index lookup
+/// finds no candidate → duplicate is created. RED until `find_matching_node` also scans
+/// the per-tx delta when the index path is taken.
+#[test]
+fn merge_twice_in_tx_creates_one_node() {
+    let db = GrafeoDB::new_in_memory();
+    // Create the property index before any writes so find_matching_node uses the
+    // index-based candidate path (has_property_index("k") == true).
+    db.create_property_index("k");
+    let mut w = db.session();
+    w.begin_transaction().unwrap();
+    w.execute("MERGE (n:Thing {k: 1})").unwrap();
+    w.execute("MERGE (n:Thing {k: 1})").unwrap();
+    let own = w.execute("MATCH (n:Thing {k: 1}) RETURN n").unwrap();
+    assert_eq!(
+        own.row_count(),
+        1,
+        "two MERGEs of the same key in one tx must create exactly one node"
+    );
+    w.commit().unwrap();
+    let reader = db.session();
+    let after = reader.execute("MATCH (n:Thing {k: 1}) RETURN n").unwrap();
+    assert_eq!(after.row_count(), 1, "exactly one node after commit");
+}
+
+/// MVCC 2c probe 2: MERGE must match a node CREATEd earlier in the same tx when a
+/// property index exists (triggering the index-based candidate path).
+///
+/// `find_matching_node` uses `find_nodes_by_properties` via the committed index when
+/// `has_property_index` returns true. A node CREATEd in the same tx writes properties
+/// via `set_node_property_buffered` (delta only) — NOT into the committed index — so the
+/// index lookup misses it → MERGE duplicates the node. RED until the index path also
+/// consults the per-tx delta.
+#[test]
+fn merge_matches_same_tx_created_node() {
+    let db = GrafeoDB::new_in_memory();
+    // Create the property index so find_matching_node takes the index path.
+    db.create_property_index("k");
+    let mut w = db.session();
+    w.begin_transaction().unwrap();
+    w.execute("CREATE (n:Thing {k: 1})").unwrap();
+    w.execute("MERGE (m:Thing {k: 1})").unwrap();
+    let own = w.execute("MATCH (n:Thing {k: 1}) RETURN n").unwrap();
+    assert_eq!(
+        own.row_count(),
+        1,
+        "MERGE must match the same-tx CREATEd node, not duplicate it"
+    );
+    w.commit().unwrap();
+}
+
+/// MVCC 2c probe 3: MERGE on an edge property must see the value SET earlier in
+/// the same tx (read-your-writes), not the committed (old) value.
+///
+/// `find_matching_edge` reads committed edge properties rather than the per-tx
+/// delta → MERGE on the tx-visible updated value finds no match → duplicate edge.
+/// RED until `find_matching_edge` reads through the tx delta.
+#[test]
+fn merge_edge_matches_same_tx_set_property() {
+    let db = GrafeoDB::new_in_memory();
+    let mut w = db.session();
+    w.execute("CREATE (:N {id: 1})-[:R {w: 1}]->(:N {id: 2})")
+        .unwrap();
+    w.begin_transaction().unwrap();
+    w.execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) SET r.w = 5")
+        .unwrap();
+    // MERGE on the tx-visible value (5) must MATCH the existing edge, not create a second.
+    w.execute("MATCH (a:N {id: 1}), (b:N {id: 2}) MERGE (a)-[r:R {w: 5}]->(b)")
+        .unwrap();
+    let own = w
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) RETURN r")
+        .unwrap();
+    assert_eq!(
+        own.row_count(),
+        1,
+        "MERGE must match the edge whose prop was SET earlier in the tx, not create a duplicate"
+    );
+    w.commit().unwrap();
+}
