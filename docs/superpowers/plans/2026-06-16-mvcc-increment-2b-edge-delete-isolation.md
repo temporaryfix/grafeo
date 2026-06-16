@@ -162,3 +162,15 @@ fn committed_edge_delete_is_visible_to_other_sessions() {
 - **live_edge_count / edge-type counts.** The eager path decremented at delete; move to finalize (or document approximation) — mirror the node-delete `live_node_count` handling.
 - **DETACH threading.** `delete_node_edges` must receive the transaction context; if the call chain doesn't currently thread it, that's the main integration work — keep it minimal.
 - **Savepoints.** Edge-delete pending set is tx-granular like node-deletes; savepoint partial rollback of edge-deletes is deferred unless a test forces it (mirror increment-1's savepoint note).
+
+---
+
+## STATUS: COMPLETE
+
+All tasks landed on `feat/mvcc-increment-2b`. Final verification (HEAD `83219b65`): `--all-features -p grafeo-core -p grafeo-engine` = **7405 passed / 0 failed**; `mvcc_isolation` 15/0 (DETACH probe un-ignored); clippy `--all-features` clean; default/lpg/temporal/tiered-storage + `grafeo-wasm` (wasm32) compile; OPSEC-clean; tree clean. Task 2 was a verified no-op (transactional DETACH already routed through the deferred path via `delete_edge_versioned` dispatch — see Task 2 note). Task 3 split into 3a (commit/rollback/conflict wiring) + 3b (`edge_matches` EXISTS/COUNT guard).
+
+### Final holistic review findings (resolved post-implementation, commit `83219b65`)
+The whole-increment review surfaced two EMERGENT bugs that per-task review couldn't see — both from the deferred-adjacency choice (stale `edges_from` candidates) hitting read/delete paths the original risk audit didn't enumerate:
+- **C1 (fixed).** `execution/operators/merge.rs` `find_matching_edge` resolved candidates via the NON-versioned `get_edge`, so `MERGE (a)-[:R]->(b)` after deleting that edge in the same tx matched the writer's own PENDING-deleted edge → created nothing → committed delete left the edge gone (read-your-writes + MERGE-contract violation). Same class as the `edge_matches` gap. Fixed: resolve via `get_edge_versioned`/`get_edge_at_epoch` (mirrors `filter.rs::resolve_edge`/`project.rs`) + e2e probe.
+- **C2 (fixed).** `delete_edge_transactional`'s re-delete guard (`visible_at(epoch)` + `is_deleted()` flag) no longer rejected a re-delete by the SAME tx under the PENDING stamp → duplicate `pending_tx_edge_deletes` entry → `finalize` double-decremented `live_edge_count`/edge-type counts (reachable via self-loop `DETACH DELETE`; bounded by `.max(0)` clamps + stat recompute, but corrupts planner cardinality until then). Fixed at the source: guard with `chain/index.visible_to(epoch, transaction_id)` (idempotent no-op return `false` when the edge is already deleted by this tx) + store-level probe `edge_delete_transactional_is_idempotent_per_tx` (the authoritative count-integrity witness; the engine self-loop probe can't observe the raw underflow).
+- **I1 (accepted limitation, documented).** `ROLLBACK TO SAVEPOINT` does not undo a DELETE issued after the savepoint (the pending set is tx-granular) — identical for nodes and edges; documented via a `NOTE` in `Session::rollback_to_savepoint`.
