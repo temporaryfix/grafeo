@@ -440,6 +440,44 @@ impl GraphStore for CdcGraphStore {
         self.inner
             .read_edge_properties_visible(id, epoch, transaction_id)
     }
+
+    // --- Task 5 (label reads, unified-MVCC) ---
+    //
+    // Label reads have no CDC event or log side effects, so delegate to the
+    // inner store's snapshot-aware label accessors. The per-transaction label
+    // delta lives in the inner LpgStore (or another LpgStore beneath the CDC
+    // wrapper), so these delegates route through the real delta.
+    //
+    // `add_label_buffered` / `remove_label_buffered`: NOT overridden here
+    // (Option B). The trait defaults call `self.add_label_versioned(...)` /
+    // `self.remove_label_versioned(...)`, which is *this* CDC wrapper's
+    // `add_label_versioned` / `remove_label_versioned` override — that already
+    // buffers the CDC event AND delegates the write to the inner store.
+    // Overriding `*_label_buffered` to bypass that would LOSE CDC events.
+    //
+    // TODO(unified-mvcc): transactional label isolation for CDC-wrapped stores
+    // is deferred — buffering would need to record CDC events for buffered
+    // label writes and flush at commit. The default write-through preserves CDC
+    // event recording at the cost of not deferring the committed label write
+    // until commit.
+
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::hash::FxHashSet<arcstr::ArcStr> {
+        self.inner
+            .read_node_labels_visible(id, epoch, transaction_id)
+    }
+
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        self.inner.nodes_by_label_visible(label, transaction_id)
+    }
 }
 
 // Pure delegation: CDC wraps the store to buffer mutation events but owns no

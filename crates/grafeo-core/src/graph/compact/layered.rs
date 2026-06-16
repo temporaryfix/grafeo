@@ -1129,6 +1129,70 @@ impl GraphStore for LayeredStore {
             })
             .unwrap_or_default()
     }
+
+    // --- Task 5 (label delegation, unified-MVCC) ---
+    //
+    // The per-transaction label delta lives in the overlay LpgStore. For nodes
+    // that are dirty (promoted into the overlay), we delegate entirely to the
+    // overlay's snapshot-aware accessor. For base-only nodes, the overlay has
+    // no label entry and no delta — any transactional label write will have
+    // promoted the node into the overlay via `ensure_in_overlay` before calling
+    // `*_label_buffered`, so base-only nodes can fall through to the committed
+    // label set from the base. No event/log side effects exist here.
+
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashSet<arcstr::ArcStr> {
+        if self.is_node_deleted_from_base(id) {
+            return FxHashSet::default();
+        }
+        if self.is_node_dirty(id) {
+            // Node is in the overlay; the label delta (if any) is there too.
+            return self
+                .overlay
+                .load()
+                .read_node_labels_visible(id, epoch, transaction_id);
+        }
+        // Base-only node: the overlay has no entry and no label delta. Return
+        // the committed label set from the base (same as get_node(id).labels).
+        self.get_node(id)
+            .map(|n| n.labels.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        let deleted = self.deleted_from_base_nodes.read();
+        let dirty = self.dirty_node_ids.read();
+
+        // Base nodes (committed, non-dirty, non-deleted).
+        let mut ids: Vec<NodeId> = self
+            .base
+            .load()
+            .nodes_by_label(label)
+            .into_iter()
+            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
+            .collect();
+
+        // Overlay nodes — includes dirty promoted base nodes and new overlay
+        // nodes; apply the tx label delta for the writing transaction.
+        ids.extend(
+            self.overlay
+                .load()
+                .nodes_by_label_visible(label, transaction_id)
+                .into_iter()
+                .filter(|id| !deleted.contains(id)),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 impl GraphStoreSearch for LayeredStore {
@@ -1501,6 +1565,31 @@ impl GraphStoreMut for LayeredStore {
         self.overlay
             .load()
             .remove_label_versioned(node_id, label, transaction_id)
+    }
+
+    // --- Task 5 label buffered writers (unified-MVCC) ---
+    //
+    // Mirror the property `*_buffered` overrides: `ensure_in_overlay` first so
+    // the per-transaction label delta (held by the overlay LpgStore) can
+    // associate the op with the promoted node, then delegate to the overlay's
+    // buffered method. This guarantees read-your-writes on the overlay while
+    // keeping the committed `label_index` clean (no dirty labels visible to
+    // other sessions).
+
+    fn add_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        let _guard = self.merge_guard.read();
+        self.ensure_in_overlay(node_id);
+        self.overlay
+            .load()
+            .add_label_buffered(node_id, label, transaction_id);
+    }
+
+    fn remove_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        let _guard = self.merge_guard.read();
+        self.ensure_in_overlay(node_id);
+        self.overlay
+            .load()
+            .remove_label_buffered(node_id, label, transaction_id);
     }
 
     // --- Task 6: full delta delegation (unified-MVCC) ---
@@ -4241,6 +4330,81 @@ mod tests {
         assert!(
             committed_view.contains_key(&PropertyKey::new("name")),
             "committed whole-entity view must still have the name"
+        );
+    }
+
+    // --- Task 5 (label delegation) tests ---
+
+    #[test]
+    fn layered_store_buffered_label_add_is_isolated() {
+        use crate::graph::traits::{GraphStore, GraphStoreMut};
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+
+        let epoch = EpochId::new(0);
+        let tx = TransactionId::new(42);
+
+        // Buffer an uncommitted label add: writer sees it, others do not.
+        layered.add_label_buffered(target, "Secret", tx);
+
+        let writer_labels = layered.read_node_labels_visible(target, epoch, Some(tx));
+        assert!(
+            writer_labels.iter().any(|l| l.as_str() == "Secret"),
+            "writer must see its own buffered label add"
+        );
+
+        let committed_labels = layered.read_node_labels_visible(target, epoch, None);
+        assert!(
+            !committed_labels.iter().any(|l| l.as_str() == "Secret"),
+            "uncommitted label add must not be visible as a committed read"
+        );
+
+        // Label scan: writer sees the node, committed scan does not.
+        let writer_scan = layered.nodes_by_label_visible("Secret", Some(tx));
+        assert!(
+            writer_scan.contains(&target),
+            "writer's label scan must include the buffered-add node"
+        );
+
+        let committed_scan = layered.nodes_by_label_visible("Secret", None);
+        assert!(
+            !committed_scan.contains(&target),
+            "committed label scan must not include the uncommitted node"
+        );
+
+        // Apply the overlay: committed read now sees the label.
+        layered.apply_tx_overlay(tx);
+        let after_labels = layered.read_node_labels_visible(target, epoch, None);
+        assert!(
+            after_labels.iter().any(|l| l.as_str() == "Secret"),
+            "committed read must see the label after apply_tx_overlay"
+        );
+    }
+
+    #[test]
+    fn layered_store_buffered_label_add_is_dropped_on_rollback() {
+        use crate::graph::traits::{GraphStore, GraphStoreMut};
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let target = persons[0];
+
+        let epoch = EpochId::new(0);
+        let tx = TransactionId::new(7);
+
+        layered.add_label_buffered(target, "Secret", tx);
+        // Drop the overlay (rollback).
+        layered.drop_tx_overlay(tx);
+
+        // Committed read must not see the rolled-back label.
+        let after = layered.read_node_labels_visible(target, epoch, None);
+        assert!(
+            !after.iter().any(|l| l.as_str() == "Secret"),
+            "drop_tx_overlay must discard the buffered label add"
         );
     }
 }

@@ -371,6 +371,43 @@ impl GraphStore for WalGraphStore {
         self.inner
             .read_edge_properties_visible(id, epoch, transaction_id)
     }
+
+    // --- Task 5 (label reads, unified-MVCC) ---
+    //
+    // Label reads have no WAL log side effects, so delegate to the inner
+    // LpgStore's snapshot-aware label accessors. The per-transaction label
+    // delta lives in the inner LpgStore.
+    //
+    // `add_label_buffered` / `remove_label_buffered`: NOT overridden here
+    // (Option B). The trait defaults call `self.add_label_versioned(...)` /
+    // `self.remove_label_versioned(...)`, which uses the trait defaults that
+    // call `self.add_label(...)` / `self.remove_label(...)` — those ARE this
+    // WAL wrapper's overrides, which log to WAL. The default write-through
+    // preserves WAL recording.
+    //
+    // TODO(unified-mvcc): transactional label isolation for WAL-wrapped stores
+    // is deferred — buffering would need to emit WAL entries for buffered label
+    // writes and replay them on recovery. The default write-through preserves
+    // WAL correctness at the cost of not deferring the committed label write
+    // until commit.
+
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::hash::FxHashSet<arcstr::ArcStr> {
+        self.inner
+            .read_node_labels_visible(id, epoch, transaction_id)
+    }
+
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        self.inner.nodes_by_label_visible(label, transaction_id)
+    }
 }
 
 // Pure delegation: the WAL wrapper logs mutations but owns no index state,
