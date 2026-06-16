@@ -7,13 +7,15 @@
 
 use std::sync::Arc;
 
-use grafeo_common::types::{EdgeId, LogicalType, NodeId, PropertyKey, Value};
+use grafeo_common::types::{
+    EdgeId, EpochId, LogicalType, NodeId, PropertyKey, TransactionId, Value,
+};
 
 use super::accumulator::AggregateFunction;
 use super::aggregate::AggregateState;
 use super::{Operator, OperatorResult};
-use crate::execution::DataChunk;
 use crate::execution::vector::ValueVector;
+use crate::execution::DataChunk;
 use crate::graph::traits::GraphStoreSearch;
 
 /// Whether the horizontal aggregate operates on edges or nodes.
@@ -48,6 +50,10 @@ pub struct HorizontalAggregateOperator {
     store: Arc<dyn GraphStoreSearch>,
     /// Number of input columns (to know where to append the result).
     input_column_count: usize,
+    /// Snapshot epoch for MVCC-aware property reads (None → use current_epoch).
+    viewing_epoch: Option<EpochId>,
+    /// In-flight transaction for read-your-writes visibility (None → committed only).
+    transaction_id: Option<TransactionId>,
 }
 
 impl HorizontalAggregateOperator {
@@ -69,35 +75,54 @@ impl HorizontalAggregateOperator {
             property,
             store,
             input_column_count,
+            viewing_epoch: None,
+            transaction_id: None,
         }
+    }
+
+    /// Sets the transaction context for MVCC-aware property lookups.
+    pub fn with_transaction_context(
+        mut self,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.viewing_epoch = Some(epoch);
+        self.transaction_id = transaction_id;
+        self
     }
 
     /// Looks up a property value for an entity ID.
     fn get_property_value(&self, entity_value: &Value) -> Option<Value> {
         let prop_key = PropertyKey::new(&self.property);
-        // TODO(unified-mvcc): thread snapshot — HorizontalAggregateOperator has no
-        // viewing_epoch or transaction_id field; reads committed value only.
-        let snap_epoch = self.store.current_epoch();
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
         match self.entity_kind {
             EntityKind::Edge => {
                 let id = match entity_value {
-                    // reason: ID encoding: i64 <-> u64 round-trip
                     #[allow(clippy::cast_sign_loss)]
                     Value::Int64(i) => EdgeId(*i as u64),
                     _ => return None,
                 };
-                self.store
-                    .read_edge_property_visible(id, &prop_key, snap_epoch, None)
+                self.store.read_edge_property_visible(
+                    id,
+                    &prop_key,
+                    snap_epoch,
+                    self.transaction_id,
+                )
             }
             EntityKind::Node => {
                 let id = match entity_value {
-                    // reason: ID encoding: i64 <-> u64 round-trip
                     #[allow(clippy::cast_sign_loss)]
                     Value::Int64(i) => NodeId(*i as u64),
                     _ => return None,
                 };
-                self.store
-                    .read_node_property_visible(id, &prop_key, snap_epoch, None)
+                self.store.read_node_property_visible(
+                    id,
+                    &prop_key,
+                    snap_epoch,
+                    self.transaction_id,
+                )
             }
         }
     }

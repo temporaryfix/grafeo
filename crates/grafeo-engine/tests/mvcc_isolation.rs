@@ -693,28 +693,23 @@ fn mutation_source_property_reflects_same_tx_set() {
 /// MVCC 2d probe 3: HorizontalAggregateOperator must reflect the writer's own
 /// buffered SET when aggregating over variable-length-path group-list variables.
 ///
-/// `HorizontalAggregateOperator` holds a raw `Arc<dyn GraphStoreSearch>` and
-/// reads properties via `current_epoch()` with no tx snapshot (see the
-/// `TODO(unified-mvcc)` comment in `horizontal_aggregate.rs`).
-///
-/// TODO(2d-task4): finalize the query shape that actually compiles to
-/// `HorizontalAggregateOp` in a transactional session.  Investigation showed
-/// that `group_list_variables` in the GQL translator is never populated, so
-/// `MATCH p = ... RETURN sum(r.v)` over a `*1..1` range resolves via the
-/// normal (already-fixed) property-read path and already returns the
-/// tx-buffered value (10).  Task 4 must identify the correct query surface
-/// (possibly GQL ISO syntax or a path-mode variant) that actually routes
-/// through `HorizontalAggregateOperator` and replace the no-regression
-/// baseline below with the true RED assertion.
+/// Task 4 threaded the snapshot: `HorizontalAggregateOperator` now holds
+/// `viewing_epoch`/`transaction_id` fields and `get_property_value` passes
+/// `self.transaction_id` to both `read_edge_property_visible` and
+/// `read_node_property_visible`.  The operator is constructed at planner
+/// `mod.rs:849` via `.with_transaction_context(self.viewing_epoch,
+/// self.transaction_id)`, but remains unreachable from real queries because
+/// `group_list_variables` in the GQL translator is never populated.  This
+/// test stays a no-regression baseline.
 ///
 /// For now this probe is a NO-REGRESSION guard: the `sum(r.v)` query on a
 /// var-length path must compile and execute inside a tx without panic, and the
 /// result must equal the tx-buffered value (10) via the already-fixed path.
 #[test]
 fn horizontal_aggregate_reflects_same_tx_set() {
-    // TODO(2d-task4): finalize shape — this query resolves via the normal
-    // property-read path (already tx-aware), NOT HorizontalAggregateOperator.
-    // Identify the correct query surface that routes through that operator.
+    // Task 4 complete: snapshot is threaded; operator is constructed at planner
+    // mod.rs:849 but unreachable because `group_list_variables` is never
+    // populated, so this stays a no-regression baseline.
     let db = GrafeoDB::new_in_memory();
     let mut w = db.session();
     w.execute("CREATE (a:N {id: 1})-[:R {v: 1}]->(b:N {id: 2})")
@@ -734,8 +729,8 @@ fn horizontal_aggregate_reflects_same_tx_set() {
         "horizontal aggregate over var-length path must return one row inside a tx"
     );
     // No-regression baseline: already returns tx-buffered value via normal path.
-    // TODO(2d-task4): replace with an assertion on the HorizontalAggregateOperator
-    // path once the correct query shape is identified.
+    // Task 4 complete: snapshot threaded; HorizontalAggregateOperator path remains
+    // unreachable (group_list_variables never populated), so baseline stays.
     assert_eq!(
         r.rows()[0][0].clone(),
         grafeo_common::types::Value::Int64(10),

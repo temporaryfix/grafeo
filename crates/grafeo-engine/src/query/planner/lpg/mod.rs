@@ -846,15 +846,18 @@ impl Planner {
         let function = convert_aggregate_function(ha.function);
         let input_column_count = child_columns.len();
 
-        let operator: Box<dyn Operator> = Box::new(HorizontalAggregateOperator::new(
-            child_op,
-            list_col_idx,
-            entity_kind,
-            function,
-            ha.property.clone(),
-            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
-            input_column_count,
-        ));
+        let operator: Box<dyn Operator> = Box::new(
+            HorizontalAggregateOperator::new(
+                child_op,
+                list_col_idx,
+                entity_kind,
+                function,
+                ha.property.clone(),
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+                input_column_count,
+            )
+            .with_transaction_context(self.viewing_epoch, self.transaction_id),
+        );
 
         let mut columns = child_columns;
         columns.push(ha.alias.clone());
