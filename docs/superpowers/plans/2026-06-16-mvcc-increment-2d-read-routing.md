@@ -294,6 +294,29 @@ fn get_property_value(&self, entity_value: &Value) -> Option<Value> {
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE
 
-Plan written against `integration` @ `78201cb7` (Plan 1 complete). Execute via subagent-driven-development (fresh subagent per task + two-stage review), then a final holistic review, mirroring 2a/2b/2c. On completion, mark COMPLETE here and write the **2e** plan (SSI tracking foundation: `record_read` + read-registry + store-derived write-set).
+All 6 tasks landed on `feat/mvcc-increment-2d` (commits `c4f4ac3f` → `1e82999d`, branched from `integration` @ `78201cb7`), via subagent-driven-development (fresh implementer per task + spec/quality review) and a final holistic review.
+
+**Final verification:**
+- `--all-features -p grafeo-core -p grafeo-engine` = **7411 passed / 0 failed** (121 binaries; baseline 7408 + 3 new probes).
+- `mvcc_isolation` = **21/21** (18 prior + `property_exists_reflects_same_tx_set` GREEN, `mutation_source_property_reflects_same_tx_set` GREEN; `horizontal_aggregate_reflects_same_tx_set` is a no-regression baseline).
+- Established clippy gate (`cargo clippy --all-features -p grafeo-core -p grafeo-engine -- -D warnings`) **clean**.
+- Profile compiles: **default / lpg / temporal / tiered-storage** all green; **`grafeo-wasm` (wasm32-unknown-unknown)** compiles.
+- OPSEC-clean (generic `:Thing`/`:N`); **zero `TODO(unified-mvcc)`** in the 5 operator files; **no `record_read`/registry/write-set** code (that is 2e).
+- Final holistic review (opus): **READY TO MERGE** — no Critical/Important.
+
+**What landed:**
+- **Observable read-your-writes fixes (RED→GREEN):** Task 1 — `filter.rs` property introspection (`property_exists`/`keys`/`properties`/`property_values`) reads the delta-merged whole-set *behind the `resolve_node`/`resolve_edge` visibility gate*; Task 2 — `mutation.rs` `PropertySource::resolve` source-property read (single-prop visible accessor), with the shared `resolve` signature threaded through `merge.rs`.
+- **Mechanical completeness (inert; by-inspection):** Tasks 3–5 — `factorized_filter`, `horizontal_aggregate`, `vector_join` gained `viewing_epoch`/`transaction_id` + `with_transaction_context`; reads now pass `self.transaction_id`.
+
+**Key findings:**
+- **Mid-development bug caught by the Task 1 spec review and fixed:** the first introspection reroute dropped the `resolve_node`/`resolve_edge` snapshot-visibility gate at all 4 sites — which would have let a same-tx-**deleted** entity report stale properties (`read_*_properties_visible` does no entity-visibility check). Restored the gate (delta-merged read *behind* the gate); verified sound at the store source — `get_node_versioned` returns `None` for not-visible-or-PENDING-deleted, while same-tx creates stay visible (so read-your-writes holds in both directions).
+- **`factorized_filter`, `horizontal_aggregate`, `vector_join` are unreachable from the production planner today** (the first two have no construction site; the third is built at `planner/lpg/mod.rs:849` only via a never-populated `group_list_variables` path). Their threading is correctness-by-construction (inert — fields default `None`), so 2e's `record_read` and any future wiring already carry the tx. Spec §6 lists them as routing targets → mandated completeness, not invented wiring.
+- **Pre-existing lint (not a 2d regression):** `clippy::large_stack_arrays` fires under `--all-targets --all-features` in untouched compact-store test code (`graph/compact/column.rs:3334`) — that file is byte-identical to `integration`. Out of scope here.
+
+**Non-blocking follow-ups:**
+- Delete-direction coverage: the gate's exclusion of same-tx-deleted entities in introspection is sound-by-construction and exercised via prior increments' expand/EXISTS paths, but has no dedicated probe (a session probe can't isolate it — upstream scan filtering masks the path; a core-level `FilterOperator` unit test could lock it). Optional.
+- The pre-existing `column.rs` `--all-targets` clippy lint is a separate cleanup.
+
+**Next: increment 2e** (Plan 2's second half — Part D's inert tracking + Part E): `ReadTracker`/`record_read` wiring at these now-complete read sites + a sharded read-registry + the store-derived write-set. Then Plan 3 (F1 OCC rung → F2 SSI + G performance).
