@@ -136,12 +136,14 @@ impl MergeOperator {
         chunk: Option<&DataChunk>,
         row: usize,
         store: &dyn GraphStore,
+        epoch: Option<EpochId>,
+        transaction_id: Option<TransactionId>,
     ) -> Vec<(String, Value)> {
         props
             .iter()
             .map(|(name, source)| {
                 let value = if let Some(chunk) = chunk {
-                    source.resolve(chunk, row, store)
+                    source.resolve(chunk, row, store, epoch, transaction_id)
                 } else {
                     // Standalone mode: only constants are valid
                     match source {
@@ -213,6 +215,8 @@ impl MergeOperator {
                 chunk,
                 row,
                 self.store.as_ref(),
+                self.viewing_epoch,
+                self.transaction_id,
             ));
         }
 
@@ -241,7 +245,13 @@ impl MergeOperator {
                     }
                     predicate.eval_at(&augmented, 0).unwrap_or(Value::Null)
                 }
-                _ => source.resolve(&augmented, 0, self.store.as_ref()),
+                _ => source.resolve(
+                    &augmented,
+                    0,
+                    self.store.as_ref(),
+                    self.viewing_epoch,
+                    self.transaction_id,
+                ),
             };
             out.push((name.clone(), value));
         }
@@ -498,8 +508,14 @@ impl MergeOperator {
         let store_ref: &dyn GraphStore = self.store.as_ref();
         // Match properties cannot reference the MERGE variable (ISO §15.5),
         // so they resolve against the input chunk directly.
-        let resolved_match =
-            Self::resolve_properties(&self.config.match_properties, chunk, row, store_ref);
+        let resolved_match = Self::resolve_properties(
+            &self.config.match_properties,
+            chunk,
+            row,
+            store_ref,
+            self.viewing_epoch,
+            self.transaction_id,
+        );
 
         if let Some(existing_id) = self.find_matching_node(&resolved_match) {
             // Resolve ON MATCH SET against an augmented row containing the
@@ -534,8 +550,14 @@ impl MergeOperator {
             Ok(new_id)
         } else {
             // Fast path: no runtime expressions; create with all properties at once.
-            let resolved_on_create =
-                Self::resolve_properties(&self.config.on_create_properties, chunk, row, store_ref);
+            let resolved_on_create = Self::resolve_properties(
+                &self.config.on_create_properties,
+                chunk,
+                row,
+                store_ref,
+                self.viewing_epoch,
+                self.transaction_id,
+            );
             self.create_node(&resolved_match, &resolved_on_create)
         }
     }
@@ -788,6 +810,8 @@ impl MergeRelationshipOperator {
                 Some(chunk),
                 row,
                 self.store.as_ref(),
+                self.viewing_epoch,
+                self.transaction_id,
             ));
         }
 
@@ -816,7 +840,13 @@ impl MergeRelationshipOperator {
                     }
                     predicate.eval_at(&augmented, 0).unwrap_or(Value::Null)
                 }
-                _ => source.resolve(&augmented, 0, self.store.as_ref()),
+                _ => source.resolve(
+                    &augmented,
+                    0,
+                    self.store.as_ref(),
+                    self.viewing_epoch,
+                    self.transaction_id,
+                ),
             };
             out.push((name.clone(), value));
         }
@@ -1051,6 +1081,8 @@ impl Operator for MergeRelationshipOperator {
                     Some(&chunk),
                     row,
                     store_ref,
+                    self.viewing_epoch,
+                    self.transaction_id,
                 );
 
                 let edge_id = if let Some(existing) =
@@ -1086,6 +1118,8 @@ impl Operator for MergeRelationshipOperator {
                         Some(&chunk),
                         row,
                         store_ref,
+                        self.viewing_epoch,
+                        self.transaction_id,
                     );
                     self.create_edge(src_val, dst_val, &resolved_match, &resolved_on_create)?
                 };

@@ -199,6 +199,8 @@ impl PropertySource {
         chunk: &crate::execution::chunk::DataChunk,
         row: usize,
         store: &dyn GraphStore,
+        epoch: Option<EpochId>,
+        transaction_id: Option<TransactionId>,
     ) -> Value {
         match self {
             PropertySource::Column(col_idx) => chunk
@@ -210,18 +212,27 @@ impl PropertySource {
                 let Some(col) = chunk.column(*column) else {
                     return Value::Null;
                 };
-                // Try node ID first, then edge ID, then map value
-                // TODO(unified-mvcc): source property read via committed get_node; a value buffered earlier in the same tx is not reflected (read-your-writes gap, deferred).
+                let prop_key = PropertyKey::new(property);
                 if let Some(node_id) = col.get_node_id(row) {
-                    store
-                        .get_node(node_id)
-                        .and_then(|node| node.get_property(property).cloned())
-                        .unwrap_or(Value::Null)
+                    match (epoch, transaction_id) {
+                        (Some(ep), Some(tx)) => store
+                            .read_node_property_visible(node_id, &prop_key, ep, Some(tx))
+                            .unwrap_or(Value::Null),
+                        _ => store
+                            .get_node(node_id)
+                            .and_then(|node| node.get_property(property).cloned())
+                            .unwrap_or(Value::Null),
+                    }
                 } else if let Some(edge_id) = col.get_edge_id(row) {
-                    store
-                        .get_edge(edge_id)
-                        .and_then(|edge| edge.get_property(property).cloned())
-                        .unwrap_or(Value::Null)
+                    match (epoch, transaction_id) {
+                        (Some(ep), Some(tx)) => store
+                            .read_edge_property_visible(edge_id, &prop_key, ep, Some(tx))
+                            .unwrap_or(Value::Null),
+                        _ => store
+                            .get_edge(edge_id)
+                            .and_then(|edge| edge.get_property(property).cloned())
+                            .unwrap_or(Value::Null),
+                    }
                 } else if let Some(Value::Map(map)) = col.get_value(row) {
                     let key = PropertyKey::new(property);
                     map.get(&key).cloned().unwrap_or(Value::Null)
@@ -355,8 +366,13 @@ impl Operator for CreateNodeOperator {
                         .properties
                         .iter()
                         .map(|(name, source)| {
-                            let value =
-                                source.resolve(&chunk, row, self.store.as_ref() as &dyn GraphStore);
+                            let value = source.resolve(
+                                &chunk,
+                                row,
+                                self.store.as_ref() as &dyn GraphStore,
+                                self.viewing_epoch,
+                                self.transaction_id,
+                            );
                             (name.clone(), value)
                         })
                         .collect();
@@ -638,8 +654,13 @@ impl Operator for CreateEdgeOperator {
                     .properties
                     .iter()
                     .map(|(name, source)| {
-                        let value =
-                            source.resolve(&chunk, row, self.store.as_ref() as &dyn GraphStore);
+                        let value = source.resolve(
+                            &chunk,
+                            row,
+                            self.store.as_ref() as &dyn GraphStore,
+                            self.viewing_epoch,
+                            self.transaction_id,
+                        );
                         (name.clone(), value)
                     })
                     .collect();
@@ -1478,8 +1499,13 @@ impl Operator for SetPropertyOperator {
                     .properties
                     .iter()
                     .map(|(name, source)| {
-                        let value =
-                            source.resolve(&chunk, row, self.store.as_ref() as &dyn GraphStore);
+                        let value = source.resolve(
+                            &chunk,
+                            row,
+                            self.store.as_ref() as &dyn GraphStore,
+                            self.viewing_epoch,
+                            self.transaction_id,
+                        );
                         (name.clone(), value)
                     })
                     .collect();
@@ -2783,7 +2809,7 @@ mod tests {
         let chunk = builder.finish();
 
         let src = PropertySource::Column(0);
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Int64(42));
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Int64(42));
     }
 
     #[test]
@@ -2793,7 +2819,7 @@ mod tests {
 
         let src = PropertySource::Constant(Value::String("hello".into()));
         assert_eq!(
-            src.resolve(&chunk, 0, &store),
+            src.resolve(&chunk, 0, &store, None, None),
             Value::String("hello".into()),
         );
     }
@@ -2804,7 +2830,7 @@ mod tests {
         let chunk = DataChunk::empty();
 
         let src = PropertySource::Column(99);
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Null);
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Null);
     }
 
     #[test]
@@ -2825,7 +2851,7 @@ mod tests {
             column: 0,
             property: "age".to_string(),
         };
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Int64(30));
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Int64(30));
     }
 
     #[test]
@@ -2837,6 +2863,6 @@ mod tests {
             column: 99,
             property: "name".to_string(),
         };
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Null);
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Null);
     }
 }
