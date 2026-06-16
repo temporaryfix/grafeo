@@ -245,7 +245,9 @@ impl LpgStore {
         }
         let record = *record;
         drop(edges);
-        self.build_edge(id, &record)
+        let edge = self.build_edge(id, &record)?;
+        self.record_read_edge(transaction_id, id);
+        Some(edge)
     }
 
     /// Gets an edge visible to a specific transaction.
@@ -267,7 +269,9 @@ impl LpgStore {
             return None;
         }
         drop(versions);
-        self.build_edge(id, &record)
+        let edge = self.build_edge(id, &record)?;
+        self.record_read_edge(transaction_id, id);
+        Some(edge)
     }
 
     /// Reads an EdgeRecord from arena using a VersionRef.
@@ -966,6 +970,9 @@ impl LpgStore {
         let edges = self.edges.read();
         let chain = edges.get(&id)?;
         let record = chain.visible_to(epoch, transaction_id)?;
+        // Store-level read recording: a tx-visible edge read (resolved as visible).
+        // Record into the SSI read-set (no-op unless a tracker is registered).
+        self.record_read_edge(transaction_id, id);
         let id_to_type = self.id_to_edge_type.read();
         id_to_type.get(record.type_id as usize).cloned()
     }
@@ -983,6 +990,9 @@ impl LpgStore {
         let versions = self.edge_versions.read();
         let index = versions.get(&id)?;
         let vref = index.visible_to(epoch, transaction_id)?;
+        // Store-level read recording: a tx-visible edge read (resolved as visible).
+        // Record into the SSI read-set (no-op unless a tracker is registered).
+        self.record_read_edge(transaction_id, id);
         let record = self.read_edge_record(&vref)?;
         let id_to_type = self.id_to_edge_type.read();
         id_to_type.get(record.type_id as usize).cloned()
@@ -1025,12 +1035,15 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        let edges = self.edges.read();
-        edges.get(&id).is_some_and(|chain| {
+        let visible = self.edges.read().get(&id).is_some_and(|chain| {
             chain
                 .visible_to(epoch, transaction_id)
                 .is_some_and(|r| !r.is_deleted())
-        })
+        });
+        if visible {
+            self.record_read_edge(transaction_id, id);
+        }
+        visible
     }
 
     /// Checks if an edge is visible to a specific transaction.
@@ -1043,12 +1056,15 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        let versions = self.edge_versions.read();
-        versions.get(&id).is_some_and(|index| {
+        let visible = self.edge_versions.read().get(&id).is_some_and(|index| {
             index.visible_to(epoch, transaction_id).is_some_and(|vref| {
                 self.read_edge_record(&vref)
                     .is_some_and(|r| !r.is_deleted())
             })
-        })
+        });
+        if visible {
+            self.record_read_edge(transaction_id, id);
+        }
+        visible
     }
 }

@@ -1111,10 +1111,10 @@ impl LpgStore {
     }
 
     /// Records that `tx` observed `id` as a node read. Called by the store's
-    /// visible-read accessors (next task). Silent no-op when no tracker is
-    /// registered for `tx` (SI/ReadCommitted, or no Serializable tx active).
+    /// visible-read accessors at the point visibility is confirmed.
+    /// Silent no-op when no tracker is registered for `tx`
+    /// (SI/ReadCommitted, or no Serializable tx active).
     #[inline]
-    #[allow(dead_code)] // called by the read accessor instrumentation task (Task 2)
     pub(crate) fn record_read_node(&self, tx: TransactionId, id: NodeId) {
         if let Some(t) = self.read_trackers.read().get(&tx) {
             t.record_node_read(tx, id);
@@ -1124,7 +1124,6 @@ impl LpgStore {
     /// Records that `tx` observed `id` as an edge read. Mirrors
     /// [`record_read_node`](Self::record_read_node) for edges.
     #[inline]
-    #[allow(dead_code)] // called by the read accessor instrumentation task (Task 2)
     pub(crate) fn record_read_edge(&self, tx: TransactionId, id: EdgeId) {
         if let Some(t) = self.read_trackers.read().get(&tx) {
             t.record_edge_read(tx, id);

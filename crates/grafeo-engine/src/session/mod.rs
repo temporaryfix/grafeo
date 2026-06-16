@@ -3949,6 +3949,25 @@ impl Session {
         *current = Some(transaction_id);
         *self.read_only_tx.lock() = read_only || self.db_read_only;
 
+        // Serializable read-tracker registration (wiring for when the enable re-lands).
+        //
+        // The session currently rejects Serializable before reaching this point (the
+        // guard above returns an error), so this block is inert in production today.
+        // It is placed here so that when the Serializable enable is re-landed (the
+        // rejection guard is lifted), the registration goes live automatically.
+        //
+        // We only build+register the bridge when the level is actually Serializable.
+        // For SI/ReadCommitted the check is a no-op (tracker is not registered,
+        // record_read_* costs nothing).
+        if self.transaction_manager.isolation_level(transaction_id)
+            == Some(crate::transaction::IsolationLevel::Serializable)
+        {
+            let bridge = std::sync::Arc::new(crate::transaction::TransactionReadTracker::new(
+                Arc::clone(&self.transaction_manager),
+            ));
+            active.register_read_tracker(transaction_id, bridge);
+        }
+
         // Record the initial graph as "touched" for cross-graph atomicity.
         // Uses the full storage key (schema/graph) for schema-scoped resolution.
         let key = self.active_graph_storage_key();
@@ -4034,15 +4053,36 @@ impl Session {
             let mut ws: Vec<EntityId> = Vec::new();
             for graph_name in &touched {
                 let store = self.resolve_store(graph_name);
-                ws.extend(store.pending_node_creates(transaction_id).into_iter().map(EntityId::Node));
-                ws.extend(store.pending_edge_creates(transaction_id).into_iter().map(EntityId::Edge));
-                ws.extend(store.pending_node_deletes_peek(transaction_id).into_iter().map(EntityId::Node));
-                ws.extend(store.pending_edge_deletes_peek(transaction_id).into_iter().map(EntityId::Edge));
+                ws.extend(
+                    store
+                        .pending_node_creates(transaction_id)
+                        .into_iter()
+                        .map(EntityId::Node),
+                );
+                ws.extend(
+                    store
+                        .pending_edge_creates(transaction_id)
+                        .into_iter()
+                        .map(EntityId::Edge),
+                );
+                ws.extend(
+                    store
+                        .pending_node_deletes_peek(transaction_id)
+                        .into_iter()
+                        .map(EntityId::Node),
+                );
+                ws.extend(
+                    store
+                        .pending_edge_deletes_peek(transaction_id)
+                        .into_iter()
+                        .map(EntityId::Edge),
+                );
                 let (on, oe) = store.overlay_touched_entities(transaction_id);
                 ws.extend(on.into_iter().map(EntityId::Node));
                 ws.extend(oe.into_iter().map(EntityId::Edge));
             }
-            self.transaction_manager.extend_write_set(transaction_id, ws);
+            self.transaction_manager
+                .extend_write_set(transaction_id, ws);
         }
 
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
@@ -4067,6 +4107,8 @@ impl Session {
                     // unmark so the edges remain visible after conflict rollback.
                     let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
                     store.rollback_pending_edge_deletes(transaction_id, &pending_edge_deletes);
+                    // Unregister the Serializable read tracker (no-op for SI/RC).
+                    store.unregister_read_tracker(transaction_id);
                 }
                 let _ = self.transaction_manager.abort(transaction_id);
                 #[cfg(feature = "triple-store")]
@@ -4121,6 +4163,9 @@ impl Session {
             // label-index/property removal (unified-MVCC increment 1).
             let pending_deletes = store.take_pending_deletes(transaction_id);
             store.finalize_deletes_by_id(transaction_id, commit_epoch, &pending_deletes);
+            // Unregister the Serializable read tracker now that the tx is committing.
+            // No-op for SI/RC (tracker was never registered for those levels).
+            store.unregister_read_tracker(transaction_id);
         }
 
         // Commit succeeded: discard undo logs (make changes permanent)
@@ -4292,6 +4337,9 @@ impl Session {
             // their version chains so the edges remain visible after rollback.
             let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
             store.rollback_pending_edge_deletes(transaction_id, &pending_edge_deletes);
+            // Unregister the Serializable read tracker on rollback.
+            // No-op for SI/RC (tracker was never registered for those levels).
+            store.unregister_read_tracker(transaction_id);
         }
 
         // Discard pending operations in the RDF store

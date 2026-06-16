@@ -2437,3 +2437,305 @@ fn test_read_tracker_cleared_by_store_clear() {
         "read tracker must be cleared by store.clear()"
     );
 }
+
+// ── Store-level visible-read chokepoints record into the tracker ─────────────
+
+/// Builds a reusable spy tracker + helper to avoid duplication across tests.
+#[cfg(test)]
+mod visible_read_recording {
+    use super::*;
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use grafeo_common::types::{EdgeId, NodeId};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    pub struct SpyTracker {
+        pub nodes: Mutex<Vec<NodeId>>,
+        pub edges: Mutex<Vec<EdgeId>>,
+    }
+
+    impl SpyTracker {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                nodes: Mutex::new(Vec::new()),
+                edges: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ReadTracker for SpyTracker {
+        fn record_node_read(&self, _tx: TransactionId, id: NodeId) {
+            self.nodes.lock().push(id);
+        }
+        fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+            self.edges.lock().push(id);
+        }
+    }
+
+    /// Creates a store with:
+    ///   - two committed nodes (n_visible, n_deleted) with properties
+    ///   - one committed edge between them (e_visible)
+    ///   - n_deleted is then deleted
+    ///   - a Serializable-tx read tracker registered for `tx`
+    pub fn fixture() -> (
+        LpgStore,
+        TransactionId,
+        NodeId,
+        NodeId,
+        EdgeId,
+        Arc<SpyTracker>,
+    ) {
+        let store = LpgStore::new().unwrap();
+        let epoch = store.current_epoch();
+
+        let n_visible = store.create_node_versioned(&["Person"], epoch, TransactionId::SYSTEM);
+        let n_deleted = store.create_node_versioned(&["Person"], epoch, TransactionId::SYSTEM);
+        let e_visible = store.create_edge_versioned(
+            n_visible,
+            n_deleted,
+            "KNOWS",
+            epoch,
+            TransactionId::SYSTEM,
+        );
+        store.set_node_property(n_visible, "name", Value::from("Alix"));
+        store.set_node_property(n_deleted, "name", Value::from("ghost"));
+        store.set_edge_property(e_visible, "since", Value::from(2020i64));
+        // Now delete n_deleted so visibility checks return false for it
+        store.delete_node(n_deleted);
+        // n_deleted is gone — but e_visible still exists (endpoints: n_visible→n_deleted)
+        // (edge endpoints survive node deletes unless DETACH DELETE is used)
+
+        let tx = TransactionId::new(77);
+        let spy = SpyTracker::new();
+        let tracker: SharedReadTracker = Arc::clone(&spy) as SharedReadTracker;
+        store.register_read_tracker(tx, tracker);
+
+        (store, tx, n_visible, n_deleted, e_visible, spy)
+    }
+}
+
+#[test]
+fn test_get_node_versioned_records_visible_node() {
+    use visible_read_recording::fixture;
+    let (store, tx, n_visible, n_deleted, _e, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    // Visible node → recorded
+    let node = store.get_node_versioned(n_visible, epoch, tx);
+    assert!(node.is_some(), "expected node to be visible");
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "visible node must be recorded"
+    );
+
+    // Deleted node → not recorded
+    let deleted = store.get_node_versioned(n_deleted, epoch, tx);
+    assert!(deleted.is_none(), "deleted node should not be visible");
+    assert!(
+        !spy.nodes.lock().contains(&n_deleted),
+        "non-visible (deleted) node must NOT be recorded"
+    );
+
+    // tx=None → no recording
+    spy.nodes.lock().clear();
+    let _ = store.get_node_versioned(n_visible, epoch, TransactionId::new(999));
+    assert!(
+        spy.nodes.lock().is_empty(),
+        "unregistered tx must not record anything"
+    );
+}
+
+#[test]
+fn test_get_edge_versioned_records_visible_edge() {
+    use visible_read_recording::fixture;
+    let (store, tx, _n, _nd, e_visible, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    // Visible edge → recorded
+    let edge = store.get_edge_versioned(e_visible, epoch, tx);
+    assert!(edge.is_some(), "expected edge to be visible");
+    assert!(
+        spy.edges.lock().contains(&e_visible),
+        "visible edge must be recorded"
+    );
+}
+
+#[test]
+fn test_is_node_visible_versioned_records_on_true() {
+    use visible_read_recording::fixture;
+    let (store, tx, n_visible, n_deleted, _e, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    // True → recorded
+    assert!(store.is_node_visible_versioned(n_visible, epoch, tx));
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "visible node must be recorded on true return"
+    );
+
+    // False (deleted) → not recorded
+    spy.nodes.lock().clear();
+    assert!(!store.is_node_visible_versioned(n_deleted, epoch, tx));
+    assert!(
+        spy.nodes.lock().is_empty(),
+        "non-visible (deleted) node must NOT be recorded"
+    );
+}
+
+#[test]
+fn test_is_edge_visible_versioned_records_on_true() {
+    use visible_read_recording::fixture;
+    let (store, tx, _n, _nd, e_visible, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    assert!(store.is_edge_visible_versioned(e_visible, epoch, tx));
+    assert!(
+        spy.edges.lock().contains(&e_visible),
+        "visible edge must be recorded"
+    );
+}
+
+#[test]
+fn test_filter_visible_node_ids_versioned_records_each_visible_node() {
+    use visible_read_recording::fixture;
+    let (store, tx, n_visible, n_deleted, _e, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    let visible = store.filter_visible_node_ids_versioned(&[n_visible, n_deleted], epoch, tx);
+    assert_eq!(
+        visible,
+        vec![n_visible],
+        "only n_visible should pass filter"
+    );
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "visible node must be in recorded set"
+    );
+    assert!(
+        !spy.nodes.lock().contains(&n_deleted),
+        "non-visible node must NOT be recorded"
+    );
+}
+
+#[test]
+fn test_read_node_property_visible_records_node() {
+    use grafeo_common::types::PropertyKey;
+    use visible_read_recording::fixture;
+    let (store, tx, n_visible, _nd, _e, spy) = fixture();
+    let epoch = store.current_epoch();
+    let key = PropertyKey::new("name");
+
+    // With Some(tx) → records the node
+    let val = store.read_node_property_visible(n_visible, &key, epoch, Some(tx));
+    assert!(val.is_some(), "property should exist");
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "node must be recorded on property read"
+    );
+
+    // With None (no tx) → no recording
+    spy.nodes.lock().clear();
+    let _ = store.read_node_property_visible(n_visible, &key, epoch, None);
+    assert!(spy.nodes.lock().is_empty(), "tx=None must not record");
+}
+
+#[test]
+fn test_read_edge_property_visible_records_edge() {
+    use grafeo_common::types::PropertyKey;
+    use visible_read_recording::fixture;
+    let (store, tx, _n, _nd, e_visible, spy) = fixture();
+    let epoch = store.current_epoch();
+    let key = PropertyKey::new("since");
+
+    let val = store.read_edge_property_visible(e_visible, &key, epoch, Some(tx));
+    assert!(val.is_some(), "property should exist");
+    assert!(
+        spy.edges.lock().contains(&e_visible),
+        "edge must be recorded on property read"
+    );
+
+    // With None → no recording
+    spy.edges.lock().clear();
+    let _ = store.read_edge_property_visible(e_visible, &key, epoch, None);
+    assert!(spy.edges.lock().is_empty(), "tx=None must not record");
+}
+
+#[test]
+fn test_read_node_properties_visible_records_node() {
+    use visible_read_recording::fixture;
+    let (store, tx, n_visible, _nd, _e, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    let props = store.read_node_properties_visible(n_visible, epoch, Some(tx));
+    assert!(!props.is_empty(), "properties should exist");
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "node must be recorded on whole-entity property read"
+    );
+
+    spy.nodes.lock().clear();
+    let _ = store.read_node_properties_visible(n_visible, epoch, None);
+    assert!(spy.nodes.lock().is_empty(), "tx=None must not record");
+}
+
+#[test]
+fn test_read_edge_properties_visible_records_edge() {
+    use visible_read_recording::fixture;
+    let (store, tx, _n, _nd, e_visible, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    let props = store.read_edge_properties_visible(e_visible, epoch, Some(tx));
+    assert!(!props.is_empty(), "properties should exist");
+    assert!(
+        spy.edges.lock().contains(&e_visible),
+        "edge must be recorded on whole-entity property read"
+    );
+
+    spy.edges.lock().clear();
+    let _ = store.read_edge_properties_visible(e_visible, epoch, None);
+    assert!(spy.edges.lock().is_empty(), "tx=None must not record");
+}
+
+#[test]
+fn test_read_node_labels_visible_records_node() {
+    use visible_read_recording::fixture;
+    let (store, tx, n_visible, _nd, _e, spy) = fixture();
+    let epoch = store.current_epoch();
+
+    let labels = store.read_node_labels_visible(n_visible, epoch, Some(tx));
+    assert!(!labels.is_empty(), "labels should exist");
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "node must be recorded on label read"
+    );
+
+    spy.nodes.lock().clear();
+    let _ = store.read_node_labels_visible(n_visible, epoch, None);
+    assert!(spy.nodes.lock().is_empty(), "tx=None must not record");
+}
+
+#[test]
+fn test_nodes_by_label_visible_records_each_returned_node() {
+    use visible_read_recording::fixture;
+    let (store, tx, _n_visible, n_deleted, _e, spy) = fixture();
+
+    // n_deleted was deleted so nodes_by_label returns only n_visible
+    let ids = store.nodes_by_label_visible("Person", Some(tx));
+    // The label index doesn't filter by tx-visibility; it returns n_visible
+    // (n_deleted was removed from the label_index by delete_node)
+    for &id in &ids {
+        assert!(
+            spy.nodes.lock().contains(&id),
+            "each returned node must be recorded"
+        );
+    }
+    assert!(
+        !spy.nodes.lock().contains(&n_deleted),
+        "deleted node removed from label_index must not be recorded"
+    );
+
+    // tx=None → no recording
+    spy.nodes.lock().clear();
+    let _ = store.nodes_by_label_visible("Person", None);
+    assert!(spy.nodes.lock().is_empty(), "tx=None must not record");
+}

@@ -376,6 +376,9 @@ impl LpgStore {
                             })
                             .collect();
                         ids.sort_unstable();
+                        for &id in &ids {
+                            self.record_read_node(tx, id);
+                        }
                         return ids;
                     }
                 }
@@ -420,6 +423,10 @@ impl LpgStore {
 
         let mut ids: Vec<NodeId> = visible.into_iter().collect();
         ids.sort_unstable();
+        // Record each returned node for the Serializable read-set.
+        for &id in &ids {
+            self.record_read_node(tx, id);
+        }
         ids
     }
 
@@ -722,6 +729,8 @@ impl LpgStore {
 
         // Merge the writing transaction's buffered label delta.
         if let Some(tx) = transaction_id {
+            // Record the node read: accessing a node's labels IS the read.
+            self.record_read_node(tx, id);
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx) {
                 for ((nid, label_id), op) in &delta.node_labels {

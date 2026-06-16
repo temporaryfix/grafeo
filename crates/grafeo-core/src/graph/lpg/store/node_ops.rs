@@ -379,7 +379,9 @@ impl LpgStore {
             return None;
         }
         drop(nodes);
-        Some(self.build_node(id))
+        let node = self.build_node(id);
+        self.record_read_node(transaction_id, id);
+        Some(node)
     }
 
     /// Gets a node visible to a specific transaction.
@@ -401,7 +403,9 @@ impl LpgStore {
             return None;
         }
         drop(versions);
-        Some(self.build_node(id))
+        let node = self.build_node(id);
+        self.record_read_node(transaction_id, id);
+        Some(node)
     }
 
     /// Returns all versions of a node with their creation/deletion epochs, newest first.
@@ -916,12 +920,15 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        let nodes = self.nodes.read();
-        nodes.get(&id).is_some_and(|chain| {
+        let visible = self.nodes.read().get(&id).is_some_and(|chain| {
             chain
                 .visible_to(epoch, transaction_id)
                 .is_some_and(|r| !r.is_deleted())
-        })
+        });
+        if visible {
+            self.record_read_node(transaction_id, id);
+        }
+        visible
     }
 
     /// Checks if a node is visible to a specific transaction.
@@ -934,13 +941,16 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        let versions = self.node_versions.read();
-        versions.get(&id).is_some_and(|index| {
+        let visible = self.node_versions.read().get(&id).is_some_and(|index| {
             index.visible_to(epoch, transaction_id).is_some_and(|vref| {
                 self.read_node_record(&vref)
                     .is_some_and(|r| !r.is_deleted())
             })
-        })
+        });
+        if visible {
+            self.record_read_node(transaction_id, id);
+        }
+        visible
     }
 
     /// Filters node IDs to only those visible at the given epoch.
@@ -991,7 +1001,8 @@ impl LpgStore {
         transaction_id: TransactionId,
     ) -> Vec<NodeId> {
         let nodes = self.nodes.read();
-        ids.iter()
+        let visible: Vec<NodeId> = ids
+            .iter()
             .copied()
             .filter(|id| {
                 nodes.get(id).is_some_and(|chain| {
@@ -1000,7 +1011,12 @@ impl LpgStore {
                         .is_some_and(|r| !r.is_deleted())
                 })
             })
-            .collect()
+            .collect();
+        drop(nodes);
+        for &id in &visible {
+            self.record_read_node(transaction_id, id);
+        }
+        visible
     }
 
     /// Filters node IDs to only those visible to a specific transaction.
@@ -1014,7 +1030,8 @@ impl LpgStore {
         transaction_id: TransactionId,
     ) -> Vec<NodeId> {
         let versions = self.node_versions.read();
-        ids.iter()
+        let visible: Vec<NodeId> = ids
+            .iter()
             .copied()
             .filter(|id| {
                 versions.get(id).is_some_and(|index| {
@@ -1024,7 +1041,12 @@ impl LpgStore {
                     })
                 })
             })
-            .collect()
+            .collect();
+        drop(versions);
+        for &id in &visible {
+            self.record_read_node(transaction_id, id);
+        }
+        visible
     }
 
     /// Returns the number of nodes (non-deleted at current epoch).
