@@ -1667,6 +1667,26 @@ impl GraphStoreMut for LayeredStore {
         self.overlay.load().take_pending_deletes(transaction_id)
     }
 
+    fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        self.overlay
+            .load()
+            .finalize_edge_deletes_by_id(transaction_id, commit_epoch, edges);
+    }
+
+    fn take_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId, NodeId)> {
+        self.overlay
+            .load()
+            .take_pending_edge_deletes(transaction_id)
+    }
+
     fn tx_overlay_snapshot(&self, transaction_id: TransactionId) -> crate::graph::lpg::TxDelta {
         self.overlay.load().tx_overlay_snapshot(transaction_id)
     }
