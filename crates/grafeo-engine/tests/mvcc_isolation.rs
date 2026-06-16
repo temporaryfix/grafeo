@@ -166,22 +166,36 @@ fn uncommitted_label_add_is_invisible_to_other_sessions() {
     writer.execute("CREATE (:Person {name: 'Ann'})").unwrap();
 
     writer.begin_transaction().unwrap();
-    writer.execute("MATCH (p:Person {name: 'Ann'}) SET p:Secret").unwrap();
+    writer
+        .execute("MATCH (p:Person {name: 'Ann'}) SET p:Secret")
+        .unwrap();
 
     // Writer sees its own label (read-your-writes), via has-label and via scan.
     let own = writer.execute("MATCH (p:Secret) RETURN p.name").unwrap();
-    assert_eq!(own.row_count(), 1, "writer must see its own uncommitted label");
+    assert_eq!(
+        own.row_count(),
+        1,
+        "writer must see its own uncommitted label"
+    );
 
     // Other session must NOT see the :Secret label.
     let reader = db.session();
     let scan = reader.execute("MATCH (p:Secret) RETURN p.name").unwrap();
-    let lbls = reader.execute("MATCH (p:Person {name: 'Ann'}) RETURN labels(p) AS l").unwrap();
+    let lbls = reader
+        .execute("MATCH (p:Person {name: 'Ann'}) RETURN labels(p) AS l")
+        .unwrap();
     let seen_scan = scan.row_count();
     let seen_labels = format!("{:?}", lbls.rows()[0][0]);
 
     writer.rollback().unwrap();
-    assert_eq!(seen_scan, 0, "uncommitted label must not be visible via scan to other sessions");
-    assert!(!seen_labels.contains("Secret"), "uncommitted label must not appear in labels(p) for other sessions: {seen_labels}");
+    assert_eq!(
+        seen_scan, 0,
+        "uncommitted label must not be visible via scan to other sessions"
+    );
+    assert!(
+        !seen_labels.contains("Secret"),
+        "uncommitted label must not appear in labels(p) for other sessions: {seen_labels}"
+    );
 
     // After rollback the writer's tx label is gone everywhere.
     let after = reader.execute("MATCH (p:Secret) RETURN p.name").unwrap();
@@ -194,22 +208,32 @@ fn committed_label_add_is_visible_to_other_sessions() {
     let mut writer = db.session();
     writer.execute("CREATE (:Person {name: 'Ann'})").unwrap();
     writer.begin_transaction().unwrap();
-    writer.execute("MATCH (p:Person {name: 'Ann'}) SET p:Secret").unwrap();
+    writer
+        .execute("MATCH (p:Person {name: 'Ann'}) SET p:Secret")
+        .unwrap();
     writer.commit().unwrap();
 
     let reader = db.session();
     let r = reader.execute("MATCH (p:Secret) RETURN p.name").unwrap();
-    assert_eq!(r.row_count(), 1, "committed label must be visible to other sessions");
+    assert_eq!(
+        r.row_count(),
+        1,
+        "committed label must be visible to other sessions"
+    );
 }
 
 #[test]
 fn uncommitted_label_remove_is_invisible_to_other_sessions() {
     let db = GrafeoDB::new_in_memory();
     let mut writer = db.session();
-    writer.execute("CREATE (:Person:Vip {name: 'Ann'})").unwrap();
+    writer
+        .execute("CREATE (:Person:Vip {name: 'Ann'})")
+        .unwrap();
 
     writer.begin_transaction().unwrap();
-    writer.execute("MATCH (p:Person {name: 'Ann'}) REMOVE p:Vip").unwrap();
+    writer
+        .execute("MATCH (p:Person {name: 'Ann'}) REMOVE p:Vip")
+        .unwrap();
 
     // Other session must still see :Vip (remove not committed).
     let reader = db.session();
@@ -219,7 +243,10 @@ fn uncommitted_label_remove_is_invisible_to_other_sessions() {
     writer.rollback().unwrap();
     let after = reader.execute("MATCH (p:Vip) RETURN p.name").unwrap();
 
-    assert_eq!(seen_during, 1, "uncommitted label-remove must not be visible to other sessions");
+    assert_eq!(
+        seen_during, 1,
+        "uncommitted label-remove must not be visible to other sessions"
+    );
     assert_eq!(after.row_count(), 1, ":Vip must be restored after rollback");
 }
 
@@ -234,7 +261,6 @@ fn uncommitted_label_remove_is_invisible_to_other_sessions() {
 ///
 /// TODO(unified-mvcc): defer adjacency tombstones for transactional DETACH.
 #[test]
-#[ignore = "known bug: delete_node_edges uses eager adjacency tombstones (TransactionId::SYSTEM); adjacency isolation deferred to unified-mvcc increment 2"]
 fn uncommitted_detach_delete_edges_invisible_to_other_sessions() {
     let db = GrafeoDB::new_in_memory();
     let mut writer = db.session();
@@ -260,4 +286,70 @@ fn uncommitted_detach_delete_edges_invisible_to_other_sessions() {
         1,
         "uncommitted DETACH DELETE must not tombstone edges for other sessions"
     );
+}
+
+#[test]
+fn uncommitted_edge_delete_is_invisible_to_other_sessions() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    writer
+        .execute("CREATE (:N {id: 1})-[:R {w: 5}]->(:N {id: 2})")
+        .unwrap();
+
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) DELETE r")
+        .unwrap();
+
+    // Writer no longer traverses the edge (read-your-writes).
+    let own = writer
+        .execute("MATCH (:N {id: 1})-[r:R]->(b) RETURN b.id")
+        .unwrap();
+    assert_eq!(
+        own.row_count(),
+        0,
+        "writer must not see its own deleted edge"
+    );
+
+    // Other session must still traverse a->b.
+    let reader = db.session();
+    let during = reader
+        .execute("MATCH (:N {id: 1})-[r:R]->(b) RETURN b.id")
+        .unwrap();
+    let visible_during = during.row_count();
+
+    writer.rollback().unwrap();
+    let after = reader
+        .execute("MATCH (:N {id: 1})-[r:R]->(b) RETURN b.id")
+        .unwrap();
+
+    assert_eq!(
+        visible_during, 1,
+        "uncommitted edge delete must not be visible to other sessions"
+    );
+    assert_eq!(
+        after.row_count(),
+        1,
+        "edge must exist after rollback of delete"
+    );
+}
+
+#[test]
+fn committed_edge_delete_is_visible_to_other_sessions() {
+    let db = GrafeoDB::new_in_memory();
+    let mut writer = db.session();
+    writer
+        .execute("CREATE (:N {id: 1})-[:R]->(:N {id: 2})")
+        .unwrap();
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("MATCH (:N {id: 1})-[r:R]->(:N {id: 2}) DELETE r")
+        .unwrap();
+    writer.commit().unwrap();
+
+    let reader = db.session();
+    let r = reader
+        .execute("MATCH (:N {id: 1})-[r:R]->(b) RETURN b.id")
+        .unwrap();
+    assert_eq!(r.row_count(), 0, "committed edge delete must be visible");
 }
