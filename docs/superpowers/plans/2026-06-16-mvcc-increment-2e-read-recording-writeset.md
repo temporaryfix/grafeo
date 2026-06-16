@@ -231,6 +231,29 @@ Then in session commit: build `Vec<EntityId>` from `pending_node_creates ∪ pen
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE
 
-Plan written against `integration` @ `13a09d93` (2d complete). Scope per the 2e decomposition decision: **record_read wiring + store-derived write-set; sharded read-registry deferred to 2f.** Execute via subagent-driven-development (fresh implementer per task + spec/quality review), then a final holistic review, mirroring 2a–2d. On completion, mark COMPLETE here and write the **2f** plan (sharded read-registry + GC), then Plan 3 (F1 → F2 + G).
+All 7 tasks landed on `feat/mvcc-increment-2e` (commits `83cf9ec3` → `835100d9`, branched from `integration` @ `13a09d93`), via subagent-driven-development (fresh implementer per task + spec review) and a final holistic review.
+
+**Final verification:**
+- `--all-features -p grafeo-core -p grafeo-engine` = **7422 passed / 0 failed** (122 binaries; 7411 after 2d + 11 new 2e tests).
+- Established clippy gate (`--all-features -p grafeo-core -p grafeo-engine -- -D warnings`) **clean**.
+- Profiles: **default / lpg / temporal / tiered-storage** all compile; **`grafeo-wasm` (wasm32-unknown-unknown)** compiles.
+- OPSEC-clean (generic `:ExtraLabel` etc.); **no new `TODO(unified-mvcc)`**; no registry/F1/F2/GC code (scope-disciplined).
+- Final holistic review (opus): **READY TO MERGE** — no Critical/Important.
+
+**What landed:**
+- **Read recording (inert for non-Serializable):** `ReadTracker` trait (grafeo-core) + `TransactionReadTracker` bridge (Serializable-gated) + planner creates the tracker only for Serializable txns + `record_read` at the scan family (`ScanOperator`/`RangeScanOperator`; `ParameterScanOperator` correctly excluded) and the expand family (`ExpandOperator`/`VariableLengthExpandOperator`/`FactorizedExpand*`), recording visible ids once per scan, post-visibility-filter.
+- **Write-set completion (active for all txns):** non-draining chokepoint peeks (`pending_edge_creates`/`pending_node_deletes_peek`/`pending_edge_deletes_peek`/`overlay_touched_entities`) across store/trait/wrappers + `manager.extend_write_set`; unioned into the write-set in `session::commit` **before** validation.
+
+**Key findings:**
+- **Task 5 spec review caught a missed planner site** — the factorized-aggregate fast-path (`planner/lpg/aggregate.rs:399`) also constructs a `LazyFactorizedChainOperator` and was missing `with_read_tracker`; fixed (all 6 producer-attach sites now covered). A missed site = a silent read-set gap when Serializable lands.
+- **Part E fixes a latent SI lost-update bug (verified sound by an opus review).** Session-direct CRUD (`create_node`/`delete_node`/`set_node_property`) **never called `record_write`**, so those entities were absent from the write-set — meaning two concurrent SI transactions modifying the same pre-existing entity via session-CRUD both committed (lost update). Completing the write-set from chokepoints feeds the commit-time write-write check (`manager.rs:334-347`, all isolation levels), so they now correctly conflict (first-updater-wins). No false conflicts (creates get unique monotonic ids), no over-abort (gated on concurrent committers), consistent with the already-conflicting operator/GQL path; 8 concurrency/isolation test files re-run, no outcome flips.
+- **Inert vs active:** read recording is fully inert (Serializable still session-rejected at `session/mod.rs:3939`; SI/RC allocate no tracker). The write-set completion is **active** for all txns (the bug-fix above) — so 2e is not *entirely* inert, but the active part is a sound correctness improvement.
+
+**Non-blocking follow-ups (a read-site sweep before Plan 3 enables Serializable):**
+- Vector/text scans (`scan_vector.rs`/`scan_text.rs`) are uninstrumented producers (and not yet MVCC-snapshot-aware) — absent from the read-set when Serializable lands.
+- `VariableLengthExpandOperator` records only the final hop of each emitted path; interior hops below `min_depth` are under-recorded for `min_depth > 1`.
+- Pre-existing `clippy::large_stack_arrays` under `--all-targets` in untouched `graph/compact/column.rs:3334` (noted since 2d).
+
+**Next: increment 2f** — the sharded read-registry + GC (Part D's remaining piece; its consumer is F2 in Plan 3). Then **Plan 3**: F1 (remove the session Serializable rejection so the existing `manager.rs:358-377` validation goes live → *sound serializable*), F2 (incremental SSI over the registry), G (performance). The read-site sweep above should land before F1.
