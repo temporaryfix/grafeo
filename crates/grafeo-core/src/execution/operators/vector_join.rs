@@ -20,7 +20,7 @@ use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
 use crate::index::vector::{DistanceMetric, brute_force_knn};
-use grafeo_common::types::{LogicalType, NodeId, PropertyKey, Value};
+use grafeo_common::types::{EpochId, LogicalType, NodeId, PropertyKey, TransactionId, Value};
 use std::sync::Arc;
 
 #[cfg(feature = "vector-index")]
@@ -85,6 +85,10 @@ pub struct VectorJoinOperator {
     left_exhausted: bool,
     /// Uses index flag for name().
     uses_index: bool,
+    /// Snapshot epoch for MVCC-aware property reads.
+    viewing_epoch: Option<EpochId>,
+    /// Transaction ID for read-your-writes within an open transaction.
+    transaction_id: Option<TransactionId>,
 }
 
 impl VectorJoinOperator {
@@ -131,6 +135,8 @@ impl VectorJoinOperator {
             chunk_capacity: 1024,
             left_exhausted: false,
             uses_index: false,
+            viewing_epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -180,6 +186,8 @@ impl VectorJoinOperator {
             chunk_capacity: 1024,
             left_exhausted: false,
             uses_index: false,
+            viewing_epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -227,6 +235,18 @@ impl VectorJoinOperator {
         self
     }
 
+    /// Sets the transaction context for MVCC-aware property lookups.
+    #[must_use]
+    pub fn with_transaction_context(
+        mut self,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.viewing_epoch = Some(epoch);
+        self.transaction_id = transaction_id;
+        self
+    }
+
     /// Gets the query vector for the current left row.
     fn get_query_vector(&self) -> Option<Vec<f32>> {
         // Static query vector (same for all left rows)
@@ -235,8 +255,9 @@ impl VectorJoinOperator {
         }
 
         // Entity-to-entity: fetch from left entity's property
-        // TODO(unified-mvcc): thread snapshot — VectorJoinOperator has no viewing_epoch or
-        // transaction_id field; reads committed value only.
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
         if let (Some(chunk), Some(col_idx), Some(prop)) = (
             &self.current_left_chunk,
             self.left_node_column,
@@ -246,8 +267,8 @@ impl VectorJoinOperator {
             && let Some(Value::Vector(vec)) = self.store.read_node_property_visible(
                 node_id,
                 &PropertyKey::new(prop),
-                self.store.current_epoch(),
-                None,
+                snap_epoch,
+                self.transaction_id,
             )
         {
             return Some(vec.to_vec());
@@ -281,9 +302,9 @@ impl VectorJoinOperator {
             None => self.store.node_ids(),
         };
 
-        // TODO(unified-mvcc): thread snapshot — VectorJoinOperator has no viewing_epoch or
-        // transaction_id field; reads committed value only.
-        let snap_epoch = self.store.current_epoch();
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
 
         // Collect vectors from node properties
         let vectors: Vec<(NodeId, Vec<f32>)> = node_ids
@@ -294,7 +315,7 @@ impl VectorJoinOperator {
                         id,
                         &PropertyKey::new(&self.right_property),
                         snap_epoch,
-                        None,
+                        self.transaction_id,
                     )
                     .and_then(|v| {
                         if let Value::Vector(vec) = v {
