@@ -658,10 +658,10 @@ impl super::Planner {
         &self,
         sp: &ShortestPathOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        // ShortestPathOperator reads raw edges_from adjacency with no MVCC
-        // visibility and cannot record reads for SSI conflict detection.
-        // Reject under Serializable rather than silently return non-serializable
-        // results.
+        // NOTE: the Serializable guard below will be removed in Task 3 once the
+        // full operator + planner integration is validated end-to-end.  The
+        // operator itself is now snapshot-ready: it carries epoch + transaction_id
+        // and routes through edges_from_versioned when a transaction is active.
         if self.is_serializable() {
             return Err(Error::Internal(
                 "Serializable isolation is not yet supported with shortestPath/allShortestPaths; use SnapshotIsolation"
@@ -700,7 +700,8 @@ impl super::Planner {
             ExpandDirection::Both => Direction::Both,
         };
 
-        // Create the shortest path operator
+        // Thread the snapshot into the operator so it traverses the transaction's
+        // view of the graph and records edge/node reads for SSI conflict detection.
         let operator: Box<dyn Operator> = Box::new(
             ShortestPathOperator::new(
                 Arc::clone(&self.store),
@@ -709,6 +710,8 @@ impl super::Planner {
                 target_column,
                 sp.edge_types.clone(),
                 direction,
+                self.viewing_epoch,
+                self.transaction_id,
             )
             .with_all_paths(sp.all_paths),
         );

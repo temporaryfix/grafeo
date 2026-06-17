@@ -7,7 +7,7 @@ use super::{Operator, OperatorResult};
 use crate::execution::chunk::DataChunkBuilder;
 use crate::graph::Direction;
 use crate::graph::GraphStoreSearch;
-use grafeo_common::types::{LogicalType, NodeId, Value};
+use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -33,10 +33,20 @@ pub struct ShortestPathOperator {
     all_paths: bool,
     /// Whether the operator has been exhausted.
     exhausted: bool,
+    /// Epoch at which to read the graph snapshot.
+    epoch: EpochId,
+    /// Transaction ID for snapshot-consistent traversal and SSI read recording.
+    /// `None` means no active transaction — the operator falls back to the
+    /// non-versioned path (current behaviour, safe for SnapshotIsolation and
+    /// auto-commit).  `Some(tx)` engages `edges_from_versioned` (snapshot
+    /// visibility filter + SSI read recording) and `is_node_visible_versioned`
+    /// (node read recording).
+    transaction_id: Option<TransactionId>,
 }
 
 impl ShortestPathOperator {
     /// Creates a new shortest path operator.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn GraphStoreSearch>,
         input: Box<dyn Operator>,
@@ -44,6 +54,8 @@ impl ShortestPathOperator {
         target_column: usize,
         edge_types: Vec<String>,
         direction: Direction,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
     ) -> Self {
         Self {
             store,
@@ -54,6 +66,8 @@ impl ShortestPathOperator {
             direction,
             all_paths: false,
             exhausted: false,
+            epoch,
+            transaction_id,
         }
     }
 
@@ -174,9 +188,29 @@ impl ShortestPathOperator {
     ///
     /// This is the direction-parameterized variant used by bidirectional BFS
     /// to traverse the forward and backward frontiers independently.
+    ///
+    /// When `self.transaction_id` is `Some(tx)`, uses `edges_from_versioned` so
+    /// that only edges visible at `(self.epoch, tx)` are returned and each
+    /// visible edge is recorded into the SSI read-set.  Falls back to the
+    /// non-versioned `edges_from` path when there is no active transaction.
+    ///
+    /// Node reads are also recorded here: before traversing `node`'s adjacency
+    /// we call `is_node_visible_versioned` which both confirms visibility and
+    /// records the node read.  Nodes that are not visible at the snapshot are
+    /// skipped entirely (no neighbours returned).
     fn get_neighbors_directed(&self, node: NodeId, direction: Direction) -> Vec<NodeId> {
-        self.store
-            .edges_from(node, direction)
+        let edge_pairs: Vec<(NodeId, _)> = if let Some(tx) = self.transaction_id {
+            // Record the node read (confirms visibility + SSI tracking).
+            if !self.store.is_node_visible_versioned(node, self.epoch, tx) {
+                return Vec::new();
+            }
+            self.store
+                .edges_from_versioned(node, direction, self.epoch, tx)
+        } else {
+            self.store.edges_from(node, direction)
+        };
+
+        edge_pairs
             .into_iter()
             .filter(|(_target, edge_id)| {
                 if self.edge_types.is_empty() {
@@ -425,6 +459,11 @@ mod tests {
     use super::*;
     use crate::graph::lpg::LpgStore;
 
+    // Convenience: pass epoch=EpochId(0), transaction_id=None for existing tests.
+    fn no_tx_epoch() -> EpochId {
+        EpochId::new(0)
+    }
+
     /// A mock operator that returns a single chunk with source/target node pairs.
     struct MockPairOperator {
         pairs: Vec<(NodeId, NodeId)>,
@@ -489,6 +528,8 @@ mod tests {
             1, // target column
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -513,6 +554,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -543,6 +586,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -569,6 +614,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -606,6 +653,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -634,6 +683,8 @@ mod tests {
             1,
             vec!["KNOWS".to_string()],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -659,6 +710,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         )
         .with_all_paths(true);
 
@@ -689,6 +742,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         )
         .with_all_paths(true);
 
@@ -724,6 +779,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -750,6 +807,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         // First iteration
@@ -775,6 +834,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         assert_eq!(op.name(), "ShortestPath");
@@ -791,6 +852,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         // Empty input should return None
@@ -814,6 +877,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         )
         .with_all_paths(true);
 
@@ -837,6 +902,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         )
         .with_all_paths(true);
 
@@ -867,6 +934,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -897,6 +966,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -920,6 +991,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -940,6 +1013,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -971,6 +1046,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -998,6 +1075,8 @@ mod tests {
             1,
             vec!["KNOWS".to_string()],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -1026,6 +1105,8 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
 
         let chunk = op.next().unwrap().unwrap();
@@ -1044,8 +1125,133 @@ mod tests {
             1,
             vec![],
             Direction::Outgoing,
+            no_tx_epoch(),
+            None,
         );
         let any = Box::new(op).into_any();
         assert!(any.downcast::<ShortestPathOperator>().is_ok());
+    }
+
+    // === MVCC snapshot + SSI read-recording tests ===
+
+    /// Verifies that the operator, when given a transaction snapshot, uses
+    /// `edges_from_versioned` so that:
+    ///
+    /// 1. Edges committed *before* the snapshot epoch are visible and the
+    ///    correct path length is returned.
+    /// 2. An edge created *after* the snapshot epoch is NOT used — snapshot
+    ///    consistency is preserved.
+    /// 3. All traversed edges and visited nodes are captured in the SSI
+    ///    read-set (via a `SharedReadTracker` registered on the store).
+    #[test]
+    fn test_snapshot_traversal_and_ssi_read_recording() {
+        use crate::execution::operators::{ReadTracker, SharedReadTracker};
+        use grafeo_common::types::EdgeId;
+        use parking_lot::Mutex;
+        use std::collections::HashSet;
+
+        // ── Build a committed 2-hop chain ──────────────────────────────────
+        let store = Arc::new(LpgStore::new().unwrap());
+
+        // Epoch 0: create nodes
+        let e0 = store.new_epoch();
+        let a = store.create_node_versioned(&["Node"], e0, TransactionId::SYSTEM);
+        let b = store.create_node_versioned(&["Node"], e0, TransactionId::SYSTEM);
+        let c = store.create_node_versioned(&["Node"], e0, TransactionId::SYSTEM);
+        // Commit the node creates.
+        store.finalize_entities_by_id(TransactionId::SYSTEM, e0, &[a, b, c], &[]);
+
+        // Epoch 1: create edges a->b and b->c, then commit them.
+        let e1 = store.new_epoch();
+        let edge_ab = store.create_edge_versioned(a, b, "KNOWS", e1, TransactionId::SYSTEM);
+        let edge_bc = store.create_edge_versioned(b, c, "KNOWS", e1, TransactionId::SYSTEM);
+        let e2 = store.new_epoch();
+        store.finalize_entities_by_id(TransactionId::SYSTEM, e2, &[], &[edge_ab, edge_bc]);
+
+        // Snapshot for our transaction: e2 (sees both edges).
+        let snapshot_epoch = e2;
+
+        // Epoch 3 (post-snapshot): add a spurious shortcut a->c that must NOT
+        // be visible to a query at snapshot_epoch.
+        let e3 = store.new_epoch();
+        let edge_ac_late = store.create_edge_versioned(a, c, "KNOWS", e3, TransactionId::SYSTEM);
+        let e4 = store.new_epoch();
+        store.finalize_entities_by_id(TransactionId::SYSTEM, e4, &[], &[edge_ac_late]);
+
+        // ── Set up SSI read-tracker ────────────────────────────────────────
+        struct Spy {
+            nodes: Mutex<HashSet<NodeId>>,
+            edges: Mutex<HashSet<EdgeId>>,
+        }
+        impl ReadTracker for Spy {
+            fn record_node_read(&self, _tx: TransactionId, id: NodeId) {
+                self.nodes.lock().insert(id);
+            }
+            fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+                self.edges.lock().insert(id);
+            }
+        }
+
+        let spy = Arc::new(Spy {
+            nodes: Mutex::new(HashSet::new()),
+            edges: Mutex::new(HashSet::new()),
+        });
+        let tx = TransactionId::new(77);
+        store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+        // ── Run the operator ───────────────────────────────────────────────
+        let input = Box::new(MockPairOperator::new(vec![(a, c)]));
+        let mut op = ShortestPathOperator::new(
+            store.clone() as Arc<dyn GraphStoreSearch>,
+            input,
+            0,
+            1,
+            vec![],
+            Direction::Outgoing,
+            snapshot_epoch,
+            Some(tx),
+        );
+
+        let chunk = op.next().unwrap().unwrap();
+
+        // ── Assertion 1: correct path length via the snapshot ──────────────
+        // a->b->c is 2 hops; the a->c shortcut (added after snapshot) must NOT
+        // be visible, so the answer remains 2.
+        let path_col = chunk.column(2).unwrap();
+        assert_eq!(
+            path_col.get_value(0).unwrap(),
+            Value::Int64(2),
+            "snapshot must see only the 2-hop path (a->c shortcut was added post-snapshot)"
+        );
+
+        // ── Assertion 2: post-snapshot edge is NOT used ────────────────────
+        let recorded_edges = spy.edges.lock().clone();
+        assert!(
+            !recorded_edges.contains(&edge_ac_late),
+            "post-snapshot shortcut edge must not appear in the SSI read-set"
+        );
+
+        // ── Assertion 3: traversed edges are in the read-set ──────────────
+        assert!(
+            recorded_edges.contains(&edge_ab),
+            "edge a->b must be recorded in the SSI read-set"
+        );
+        assert!(
+            recorded_edges.contains(&edge_bc),
+            "edge b->c must be recorded in the SSI read-set"
+        );
+
+        // ── Assertion 4: visited nodes are in the read-set ─────────────────
+        let recorded_nodes = spy.nodes.lock().clone();
+        assert!(
+            recorded_nodes.contains(&a),
+            "source node a must be recorded in the SSI read-set"
+        );
+        assert!(
+            recorded_nodes.contains(&b),
+            "intermediate node b must be recorded in the SSI read-set"
+        );
+
+        store.unregister_read_tracker(tx);
     }
 }
