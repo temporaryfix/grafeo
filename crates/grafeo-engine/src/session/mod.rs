@@ -3933,15 +3933,6 @@ impl Session {
         self.transaction_start_edge_count
             .store(active.edge_count(), Ordering::Relaxed);
         let transaction_id = if let Some(level) = isolation_level {
-            if level == crate::transaction::IsolationLevel::Serializable {
-                return Err(grafeo_common::utils::error::Error::Transaction(
-                    grafeo_common::utils::error::TransactionError::InvalidState(
-                        "Serializable isolation is not yet supported; use SnapshotIsolation \
-                         (real SSI is tracked for the Wave 2 isolation rework)"
-                            .to_string(),
-                    ),
-                ));
-            }
             self.transaction_manager.begin_with_isolation(level)
         } else {
             self.transaction_manager.begin()
@@ -3949,16 +3940,12 @@ impl Session {
         *current = Some(transaction_id);
         *self.read_only_tx.lock() = read_only || self.db_read_only;
 
-        // Serializable read-tracker registration (wiring for when the enable re-lands).
+        // Serializable read-tracker registration.
         //
-        // The session currently rejects Serializable before reaching this point (the
-        // guard above returns an error), so this block is inert in production today.
-        // It is placed here so that when the Serializable enable is re-landed (the
-        // rejection guard is lifted), the registration goes live automatically.
-        //
-        // We only build+register the bridge when the level is actually Serializable.
-        // For SI/ReadCommitted the check is a no-op (tracker is not registered,
-        // record_read_* costs nothing).
+        // For Serializable transactions, register a TransactionReadTracker bridge so that
+        // the store-level record_read_* chokepoints populate the SSI read-set used by
+        // commit-time validation.  For SI/ReadCommitted the check is a no-op (tracker is
+        // not registered, record_read_* costs nothing).
         if self.transaction_manager.isolation_level(transaction_id)
             == Some(crate::transaction::IsolationLevel::Serializable)
         {
@@ -6945,16 +6932,15 @@ mod tests {
             let db = GrafeoDB::new_in_memory();
             let session = db.session();
 
-            // SERIALIZABLE is rejected until real SSI lands (Wave 2); it must not
-            // silently downgrade to Snapshot Isolation.
-            assert!(
-                session
-                    .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-                    .is_err()
-            );
-            assert!(!session.in_transaction());
+            // Increment 2f: SERIALIZABLE is now a fully supported OCC-validated
+            // isolation level; START TRANSACTION must succeed.
+            session
+                .execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .expect("START TRANSACTION ISOLATION LEVEL SERIALIZABLE must succeed");
+            assert!(session.in_transaction());
+            session.execute("ROLLBACK").unwrap();
 
-            // A supported isolation level still starts a transaction.
+            // Other supported isolation levels continue to work.
             session
                 .execute("START TRANSACTION ISOLATION LEVEL READ COMMITTED")
                 .unwrap();

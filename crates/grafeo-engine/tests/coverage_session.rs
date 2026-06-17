@@ -447,18 +447,19 @@ fn test_begin_transaction_with_read_committed() {
 }
 
 #[test]
-fn test_begin_transaction_with_serializable_is_rejected() {
-    // Serializable currently behaves as Snapshot Isolation (record_read is never
-    // called, so SSI validation never fires). Until real SSI lands (Wave 2),
-    // begin must reject it rather than silently downgrade.
+fn test_begin_transaction_with_serializable_now_supported() {
+    // Increment 2f: Serializable is now a real OCC-validated isolation level.
+    // begin_transaction_with_isolation must succeed; a plain MATCH query must
+    // commit cleanly (SSI validation fires but no conflict exists).
     let db = setup();
     let mut session = db.session();
-    let result = session
-        .begin_transaction_with_isolation(grafeo_engine::transaction::IsolationLevel::Serializable);
-    assert!(
-        result.is_err(),
-        "Serializable must be rejected until real SSI is implemented"
-    );
+    session
+        .begin_transaction_with_isolation(grafeo_engine::transaction::IsolationLevel::Serializable)
+        .expect("Serializable begin must succeed");
+    session
+        .execute("MATCH (n) RETURN n")
+        .expect("MATCH under Serializable must succeed");
+    session.commit().expect("Serializable commit must succeed");
 
     // SnapshotIsolation is unaffected.
     let mut s2 = db.session();
