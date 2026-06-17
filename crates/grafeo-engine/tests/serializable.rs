@@ -257,45 +257,23 @@ fn benign_concurrent_writers_do_not_abort() {
 // 4. read_only_serializable_does_not_abort
 // ============================================================================
 
-/// A read-only Serializable transaction that reads entities subsequently
-/// written by a concurrent committer is conservatively aborted by the current
-/// SSI implementation.
+/// A read-only Serializable transaction concurrent with a writer on the same
+/// data MUST commit under F2 incremental SSI.
 ///
-/// ## What this test probes
+/// ## Why F2 guarantees this
 ///
-/// The SSI check in `manager.rs` (`commit()`, line ~378) fires when:
-///   - the committing tx has `IsolationLevel::Serializable`, AND
-///   - `our_read_set` is non-empty, AND
-///   - some tx committed *after* our start_epoch wrote an entity in our read-set.
+/// The F2 pivot-abort condition requires BOTH `in_conflict` AND `out_conflict`
+/// to be set. `in_conflict` is set on a transaction only when it is the
+/// *writer* end of some `reader →rw self` edge — i.e. another Serializable
+/// transaction read a version that *this* transaction overwrote. A read-only
+/// transaction never writes anything, so no reader can form an inbound edge
+/// against it: `in_conflict` stays false forever. Without `in_conflict` the
+/// pivot condition cannot fire, so a read-only Serializable tx always commits
+/// `Ok(())` regardless of what concurrent writers do.
 ///
-/// The check does NOT additionally gate on "our write-set must also be
-/// non-empty" (i.e., it does not distinguish read-only Serializable txns from
-/// read-write ones). Therefore a read-only Serializable tx whose scan visited
-/// a node that a concurrent writer later wrote WILL be aborted —
-/// `Err(SerializationFailure)` — even though a read-only tx cannot contribute
-/// to the invariant violation that SSI is designed to prevent.
-///
-/// ## Why this is conservative but correct
-///
-/// A theoretical Serializable implementation (e.g., SSI with anti-dep cycle
-/// detection) would only abort the tx that forms a *complete* rw-antidependency
-/// cycle. A read-only tx never writes, so it cannot close the cycle and should
-/// not need to abort. The current implementation is simpler and conservative:
-/// it aborts any Serializable committer whose read-set was "dirtied" by a
-/// concurrent committed writer, regardless of whether the committer itself wrote
-/// anything.
-///
-/// This is safe (no anomaly is introduced) but causes unnecessary aborts for
-/// read-only Serializable transactions. This test locks that documented behavior:
-/// if the implementation is later refined to skip the check for read-only txns,
-/// this test should be updated to assert `Ok(())` instead.
-///
-/// ## Confirmed live behavior: Interpretation A (conservative abort)
-///
-/// The reader's scan populates the read-set (ScanOperator records every visible
-/// node it iterates), the writer's write-set is populated via
-/// `overlay_touched_entities` at commit, and the SSI check triggers.
-/// Result: `Err(SerializationFailure)`.
+/// This is the key F2 correctness improvement over a naive F1 implementation
+/// that aborts any Serializable committer whose read-set was "dirtied" by a
+/// concurrent committed writer.
 #[test]
 fn read_only_serializable_does_not_abort() {
     let db = GrafeoDB::new_in_memory();
@@ -326,35 +304,15 @@ fn read_only_serializable_does_not_abort() {
         .expect("writer: SET");
     writer.commit().expect("writer: commit must succeed");
 
-    // reader.commit() triggers the SSI check:
-    //   - reader is Serializable and read-set is non-empty (scanned node 1)
-    //   - writer committed after reader's start_epoch
-    //   - writer's write-set contains node 1 (via overlay_touched_entities)
-    //   -> Err(SerializationFailure) — the conservative interpretation A.
-    //
-    // NOTE: A more precise SSI would skip this check for read-only txns (they
-    // cannot close a rw-antidependency cycle). If the implementation is later
-    // refined, update this assertion to `assert!(reader_commit.is_ok())`.
+    // F2: read-only Serializable tx — in_conflict is always false (never wrote
+    // anything, so no reader can form an inbound rw-edge against it). The pivot
+    // condition (in_conflict && out_conflict) cannot fire. Must commit Ok.
     let reader_commit = reader.commit();
-
-    // Confirmed live behavior: Interpretation A — conservative abort.
-    // The current code does not gate on write-set emptiness, so even a
-    // read-only Serializable tx is aborted when a concurrent writer modified
-    // something it read.
-    match &reader_commit {
-        Ok(()) => {
-            // Future-proof: if the implementation adds a write-set guard,
-            // read-only txns will commit Ok here. Accept that as correct.
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("Serialization failure"),
-                "read-only Serializable tx failed with unexpected error (not SSI): {msg}"
-            );
-            // Conservative abort confirmed. This is safe and documented.
-        }
-    }
+    assert!(
+        reader_commit.is_ok(),
+        "F2: read-only Serializable tx must commit Ok (never a pivot); got: {:?}",
+        reader_commit
+    );
 }
 
 // ============================================================================
@@ -454,4 +412,186 @@ fn serialization_abort_rolls_back_cleanly() {
             "s3's reset must be visible for every account"
         );
     }
+}
+
+// ============================================================================
+// 6. three_transaction_cycle_aborts_under_serializable
+// ============================================================================
+
+/// A genuine 3-transaction rw-antidependency cycle is detected and aborts
+/// exactly the pivot transaction (T2, the final committer).
+///
+/// ## Scan-granularity note
+///
+/// SSI read-sets are recorded at **scan granularity**: a `MATCH (n:Label …)`
+/// records every node the ScanOperator visits in the read-set, not just the
+/// nodes that survive the predicate filter. To ensure each transaction's
+/// read-set covers exactly one node (so rw-edges form the targeted 3-cycle
+/// rather than a complete graph), we assign each node a **distinct label**:
+/// `:P`, `:Q`, `:R`. A scan over `:P` visits only the P node, so T1's read
+/// set = {P} rather than {P, Q, R}.
+///
+/// ## Setup
+///
+/// Three nodes with distinct labels and a shared `val` property:
+/// - node P (label `:P`, val=0)
+/// - node Q (label `:Q`, val=0)
+/// - node R (label `:R`, val=0)
+///
+/// All three Serializable sessions begin before any commit, so all share
+/// snapshot epoch 0 — none sees another's writes.
+///
+/// ## Interleave
+///
+/// - **T1**: reads P (via `MATCH (n:P)`); writes Q (`MATCH (n:Q) SET n.val=1`);
+///   COMMIT (first).
+/// - **T3**: reads R (via `MATCH (n:R)`); writes P (`MATCH (n:P) SET n.val=1`);
+///   COMMIT (second).
+/// - **T2**: reads Q (via `MATCH (n:Q)`); reads R (via `MATCH (n:R)`);
+///   writes R (`MATCH (n:R) SET n.val=2`); COMMIT (third).
+///
+/// ## rw-antidependency graph
+///
+/// An rw-antidependency `X →rw Y` means X read a version that Y overwrote:
+///
+/// ```text
+/// T1 →rw T3   (T1 read P's old val=0; T3 wrote P)
+/// T3 →rw T2   (T3 read R's old val=0; T2 wrote R)
+/// T2 →rw T1   (T2 read Q's old val=0; T1 wrote Q)
+/// ```
+///
+/// This forms the cycle T1→T3→T2→T1 — a genuinely non-serializable schedule.
+///
+/// ## F2 pivot detection
+///
+/// At T2's commit:
+/// - `out_conflict = true`: T2 read Q (written by T1, who committed).
+/// - `in_conflict = true`: T3 (a Serializable tx) read R, which T2 wrote.
+/// - The out-neighbor T1 has already committed → cycle is closed.
+///   → T2 is the pivot and is aborted.
+///
+/// T1 is not a pivot (at T1's commit time, in_conflict is false — nobody has
+/// yet formed an inbound edge against T1's write of Q because T2 hasn't read
+/// Q yet). T3 is not a pivot at its commit time (T3's out-neighbor T2 has not
+/// yet committed, so the cycle is not confirmed closed). Exactly one failure.
+#[test]
+fn three_transaction_cycle_aborts_under_serializable() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed three nodes with DISTINCT labels so each transaction's label-scan
+    // visits exactly one node, giving predicate-precise read-sets (see note above).
+    let setup = db.session();
+    setup
+        .execute("CREATE (:P {val: 0})")
+        .expect("CREATE node P");
+    setup
+        .execute("CREATE (:Q {val: 0})")
+        .expect("CREATE node Q");
+    setup
+        .execute("CREATE (:R {val: 0})")
+        .expect("CREATE node R");
+    drop(setup);
+
+    // --- Begin ALL three sessions before any commit (snapshot epoch 0) ---
+    let mut t1 = db.session();
+    t1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("T1: begin Serializable");
+
+    let mut t2 = db.session();
+    t2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("T2: begin Serializable");
+
+    let mut t3 = db.session();
+    t3.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("T3: begin Serializable");
+
+    // --- T1: reads P (scan of :P — records only the P node in T1's read-set) ---
+    let t1_p = t1
+        .execute("MATCH (n:P) RETURN n.val")
+        .expect("T1: MATCH :P");
+    assert_eq!(t1_p.row_count(), 1, "T1 must see the :P node");
+
+    // --- T1: writes Q (scan of :Q before SET — records Q in read-set and write-set) ---
+    t1.execute("MATCH (n:Q) SET n.val = 1")
+        .expect("T1: SET :Q val");
+
+    // --- T3: reads R (scan of :R — records only the R node in T3's read-set) ---
+    let t3_r = t3
+        .execute("MATCH (n:R) RETURN n.val")
+        .expect("T3: MATCH :R");
+    assert_eq!(t3_r.row_count(), 1, "T3 must see the :R node");
+
+    // --- T3: writes P (scan of :P — records P in T3's read-set and write-set;
+    //     write-time detection: T1 already read P and is still active →
+    //     set_rw_edge(T1, T3): T1.out_conflict=true, T3.in_conflict=true) ---
+    t3.execute("MATCH (n:P) SET n.val = 1")
+        .expect("T3: SET :P val");
+
+    // --- T2: reads Q (scan of :Q — records Q in T2's read-set;
+    //     read-time detection: T1 has Q in its write-set (active) →
+    //     set_rw_edge(T2, T1): T2.out_conflict=true, T1.in_conflict=true) ---
+    let t2_q = t2
+        .execute("MATCH (n:Q) RETURN n.val")
+        .expect("T2: MATCH :Q");
+    assert_eq!(t2_q.row_count(), 1, "T2 must see the :Q node");
+
+    // --- T2: reads R (scan of :R — records R in T2's read-set) ---
+    let t2_r = t2
+        .execute("MATCH (n:R) RETURN n.val")
+        .expect("T2: MATCH :R");
+    assert_eq!(t2_r.row_count(), 1, "T2 must see the :R node");
+
+    // --- T2: writes R (scan of :R before SET — T3 already read R and is still active;
+    //     write-time detection: set_rw_edge(T3, T2): T3.out_conflict=true,
+    //     T2.in_conflict=true) ---
+    t2.execute("MATCH (n:R) SET n.val = 2")
+        .expect("T2: SET :R val");
+
+    // --- Commit order: T1, T3, T2 ---
+
+    // T1 commits first: read_set={P,Q(from SET scan)}, write_set={Q}.
+    // At T1's commit: out_conflict=true (T2 read Q — but wait, T2 hasn't read Q
+    // yet at this point in the interleave; out_conflict is set at read-time when
+    // T2 reads Q, which happens BEFORE T1 commits in our interleave above).
+    // Actually: T2 reads Q before T1 commits → read-time edge T2→rw→T1 fires
+    // (T1 wrote Q and is active) → T1.in_conflict=true, T2.out_conflict=true.
+    // T1.out_conflict was set when T3 wrote P (T1 read P) → T1.out_conflict=true.
+    // So T1 has both flags. But T1's out-neighbor T3 has NOT committed yet →
+    // cycle not closed → T1 commits Ok.
+    let c1 = t1.commit();
+    assert!(
+        c1.is_ok(),
+        "T1 (first committer, reads :P / writes :Q) must commit Ok: {:?}",
+        c1
+    );
+
+    // T3 commits second: read_set={R, P(from SET scan)}, write_set={P}.
+    // T3.in_conflict=true (T1 read P, T3 wrote P — already set above).
+    // T3.out_conflict=true (T3 read R, T2 wrote R — set when T2 did SET :R).
+    // T3 has both flags. T3's out-neighbor T2 has NOT committed yet → cycle
+    // not closed → T3 commits Ok.
+    let c3 = t3.commit();
+    assert!(
+        c3.is_ok(),
+        "T3 (second committer, reads :R / writes :P) must commit Ok: {:?}",
+        c3
+    );
+
+    // T2 commits last: read_set={Q, R(x2 from READ+SET scans)}, write_set={R}.
+    // T2.out_conflict=true: T2 read Q; T1 wrote Q (active at read time, now committed).
+    // T2.in_conflict=true: T3 (Serializable) read R; T2 overwrote R.
+    // T1 (T2's out-neighbor via T2→rw→T1) has already committed.
+    // At commit-time cycle check: T1 committed after T2.start_epoch=0 and wrote Q
+    // which is in T2's read_set → cycle_closed=true → T2 is the pivot → ABORT.
+    let c2 = t2.commit();
+    assert_serialization_failure(&c2, "T2 (final committer, pivot of 3-tx cycle)");
+
+    // Confirm exactly one serialization failure across all three commits.
+    let failure_count = [&c1, &c3, &c2].iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        failure_count, 1,
+        "exactly one of the three commits must be a serialization failure; \
+         got c1={:?}, c3={:?}, c2={:?}",
+        c1, c3, c2
+    );
 }
