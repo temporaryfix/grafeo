@@ -140,6 +140,12 @@ pub struct TransactionManager {
     /// Sharded registry of active Serializable readers (SIREAD locks).
     /// Used for read-time rw-antidependency detection (F2 incremental SSI).
     read_registry: ReadRegistry,
+    /// Committed Serializable readers whose SIREAD locks (their `read_registry`
+    /// entries) are retained past their own commit until every concurrent
+    /// transaction has finished (the standard Cahill/PostgreSQL SSI rule). Maps
+    /// the committed reader's `TransactionId` -> its commit epoch. A later
+    /// concurrent writer can then still form the in-edge `reader →rw writer`.
+    retired_readers: RwLock<FxHashMap<TransactionId, EpochId>>,
 }
 
 impl TransactionManager {
@@ -155,6 +161,7 @@ impl TransactionManager {
             transactions: RwLock::new(FxHashMap::default()),
             committed_epochs: RwLock::new(FxHashMap::default()),
             read_registry: ReadRegistry::new(),
+            retired_readers: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -215,7 +222,9 @@ impl TransactionManager {
 
         // Perform the W-W check and write_set insert under the transactions lock,
         // then release the lock before any read_registry or set_rw_edge calls.
-        let is_serializable: bool = {
+        // Also capture the writer's start epoch (for the concurrency check
+        // against retired committed readers lingering in the registry).
+        let (is_serializable, our_start): (bool, EpochId) = {
             let mut txns = self.transactions.write();
 
             // First-writer-wins conflict detection. Skip the scan when only one
@@ -247,9 +256,12 @@ impl TransactionManager {
             }
 
             info.write_set.insert(entity);
-            // Capture isolation level while we hold the lock; drop the lock at
-            // the end of this block.
-            info.isolation_level == IsolationLevel::Serializable
+            // Capture isolation level and start epoch while we hold the lock;
+            // drop the lock at the end of this block.
+            (
+                info.isolation_level == IsolationLevel::Serializable,
+                info.start_epoch,
+            )
             // transactions write lock drops here
         };
 
@@ -261,9 +273,14 @@ impl TransactionManager {
         // acting side (reader at read-time, writer at write-time) is Serializable.
         if is_serializable {
             // readers_of uses its own sharded locks, independent of transactions.
+            // Committed readers now linger in the registry (SIREAD retention), so
+            // gate each on the concurrency check: a committed reader is only a
+            // real in-edge source if this writer started before the reader's
+            // commit epoch (so the writer's snapshot couldn't see that reader).
             let readers = self.read_registry.readers_of(entity);
             for reader in readers {
-                if reader != transaction_id {
+                if reader != transaction_id && self.reader_concurrent_with(reader, Some(our_start))
+                {
                     // reader read a version this writer is now overwriting.
                     self.set_rw_edge(reader, transaction_id);
                 }
@@ -439,13 +456,102 @@ impl TransactionManager {
             .get(&tx)
             .map(|i| (i.isolation_level, i.write_set.clone()));
         if let Some((IsolationLevel::Serializable, ws)) = write_set {
+            // Capture the writer's start epoch for the concurrency check against
+            // retired (committed) readers lingering in the registry.
+            let writer_start = self.start_epoch(tx);
             for entity in ws {
                 for reader in self.read_registry.readers_of(entity) {
-                    if reader != tx {
+                    if reader != tx && self.reader_concurrent_with(reader, writer_start) {
                         self.set_rw_edge(reader, tx);
                     }
                 }
             }
+        }
+    }
+
+    /// Decides whether a reader found via `read_registry.readers_of` is
+    /// concurrent with a writer that started at `writer_start`.
+    ///
+    /// Committed readers now linger in the registry (their SIREAD locks are
+    /// retained until all concurrent txns finish), so `readers_of` can return a
+    /// reader that already committed at epoch `C_r`. Such a reader is concurrent
+    /// with the writer only if the writer started before `C_r` (i.e. the writer
+    /// could not see the reader's commit). A reader that is still active (not in
+    /// `retired_readers`) is always concurrent (both started at or before now and
+    /// neither has finished).
+    ///
+    /// `writer_start` is `None` only if the writer is already gone from
+    /// `transactions`; in that case there is no live edge to form, so return
+    /// `false`.
+    fn reader_concurrent_with(&self, reader: TransactionId, writer_start: Option<EpochId>) -> bool {
+        let retired = self.retired_readers.read();
+        match retired.get(&reader) {
+            // Committed reader: concurrent iff the writer started before the
+            // reader's commit epoch.
+            Some(commit_epoch) => {
+                writer_start.is_some_and(|ws| ws.as_u64() < commit_epoch.as_u64())
+            }
+            // Still active → concurrent.
+            None => true,
+        }
+    }
+
+    /// Garbage-collect retained SIREAD locks (the `retired_readers` set).
+    ///
+    /// A committed reader's SIREAD lock must persist until every transaction
+    /// concurrent with it has finished. A retired reader (commit epoch `C_r`) is
+    /// releasable once no currently-Active Serializable transaction could be
+    /// concurrent with it — i.e. once `C_r <= min_active_start`, where
+    /// `min_active_start` is the minimum start epoch over all Active Serializable
+    /// transactions. If there are no Active Serializable transactions, every
+    /// retired reader is releasable.
+    ///
+    /// # Lock discipline
+    ///
+    /// Collects the releasable ids first (a short read over `transactions` to
+    /// compute `min_active_start`, then a read over `retired_readers`), releasing
+    /// both before calling `read_registry.remove_reader` (independent sharded
+    /// locks) and before taking the `retired_readers` write lock to prune. Never
+    /// holds `transactions` while calling into the registry.
+    fn gc_retired_readers(&self) {
+        // min_active_start over Active + Serializable transactions; None ⇒ none
+        // active ⇒ release everything.
+        let min_active_start: Option<u64> = {
+            let txns = self.transactions.read();
+            txns.values()
+                .filter(|info| {
+                    info.state == TransactionState::Active
+                        && info.isolation_level == IsolationLevel::Serializable
+                })
+                .map(|info| info.start_epoch.as_u64())
+                .min()
+            // transactions read lock drops here
+        };
+
+        // Collect releasable ids under the retired_readers read lock.
+        let releasable: Vec<TransactionId> = {
+            let retired = self.retired_readers.read();
+            retired
+                .iter()
+                .filter(|(_, commit_epoch)| match min_active_start {
+                    Some(min_start) => commit_epoch.as_u64() <= min_start,
+                    None => true,
+                })
+                .map(|(tx, _)| *tx)
+                .collect()
+            // retired_readers read lock drops here
+        };
+
+        if releasable.is_empty() {
+            return;
+        }
+
+        // Release SIREAD locks (registry uses independent sharded locks) and
+        // prune retired_readers.
+        let mut retired = self.retired_readers.write();
+        for tx in releasable {
+            self.read_registry.remove_reader(tx);
+            retired.remove(&tx);
         }
     }
 
@@ -577,13 +683,29 @@ impl TransactionManager {
         self.active_count.fetch_sub(1, Ordering::Relaxed);
         committed.insert(transaction_id, commit_epoch);
 
+        // Retire this tx's SIREAD locks instead of releasing them immediately.
+        //
+        // The standard Cahill/PostgreSQL SSI rule: a committed reader's SIREAD
+        // locks (its read_registry entries) must persist until every transaction
+        // concurrent with it has finished, so a later concurrent writer can still
+        // form the in-edge `reader →rw writer`. We therefore keep the reader's
+        // entries in the registry and record its commit epoch; the GC sweep below
+        // (and at every commit/abort) releases them once no concurrent
+        // transaction remains. Only Serializable txns have registry entries, but
+        // recording any committed tx here is harmless (remove_reader is a no-op
+        // for a tx with no entries).
+        self.retired_readers
+            .write()
+            .insert(transaction_id, commit_epoch);
+
         // Release locks before GC (remove_reader uses its own sharded locks).
         drop(txns);
         drop(committed);
 
-        // GC: release this tx's SIREAD locks so future writers do not falsely
-        // see it as a concurrent reader.
-        self.read_registry.remove_reader(transaction_id);
+        // Sweep: release any retired readers whose concurrent txns have all
+        // finished (this commit may have been the last one concurrent with some
+        // earlier retired reader).
+        self.gc_retired_readers();
 
         Ok(commit_epoch)
     }
@@ -614,9 +736,16 @@ impl TransactionManager {
         // Release lock before GC (remove_reader uses its own sharded locks).
         drop(txns);
 
-        // GC: release this tx's SIREAD locks so future writers do not falsely
-        // see it as a concurrent reader.
+        // An aborted tx's reads never participated in any committed schedule, so
+        // its SIREAD locks release at once (no retention). Also defensively drop
+        // it from retired_readers (it should not be there — abort only fires on
+        // an Active tx).
         self.read_registry.remove_reader(transaction_id);
+        self.retired_readers.write().remove(&transaction_id);
+
+        // Sweep: aborting shrinks the active set, which may now let earlier
+        // retired readers be released.
+        self.gc_retired_readers();
 
         Ok(())
     }
@@ -2075,5 +2204,194 @@ mod tests {
                 .contains(&reader),
             "reader must be removed from registry after abort"
         );
+    }
+
+    // --- F2 SIREAD lock lifecycle: retain reader entries until concurrent
+    //     transactions finish (sound 3-tx SSI cycles) ---
+
+    /// THE regression test. A genuinely non-serializable 3-transaction
+    /// rw-antidependency cycle (all Serializable, all snapshot epoch 0 — none
+    /// sees another's writes) must abort EXACTLY ONE transaction.
+    ///
+    /// Interleave:
+    ///   T1: read(p), write(q), commit
+    ///   T3: read(r), write(p), commit
+    ///   T2: read(q), read(r), write(r), commit
+    ///
+    /// Edges: T2 →rw T1 (T2 read q, T1 wrote q), T3 →rw T2 (T3 read r, T2 wrote r),
+    /// T1 →rw T3 (T1 read p, T3 wrote p) → cycle T1 → T3 → T2 → T1.
+    ///
+    /// The hole this guards: when T2 writes r, its in-neighbor T3 has already
+    /// committed. If T3's SIREAD lock on r were discarded at its own commit, the
+    /// in-edge `T3 →rw T2` would never form and all three would commit. With
+    /// SIREAD retention (T3 is still concurrent with T2 at epoch 0), the edge
+    /// forms, T2 becomes a pivot (in+out), and aborts.
+    #[test]
+    fn three_tx_rw_cycle_aborts_one() {
+        let mgr = TransactionManager::new();
+
+        let p = NodeId::new(1);
+        let q = NodeId::new(2);
+        let r = NodeId::new(3);
+
+        // All three begin at snapshot epoch 0 (none sees another's writes).
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // T1: read p, write q, commit.
+        mgr.record_read(t1, p).unwrap();
+        mgr.record_write(t1, q).unwrap();
+        let r1 = mgr.commit(t1);
+
+        // T3: read r, write p, commit.
+        mgr.record_read(t3, r).unwrap();
+        mgr.record_write(t3, p).unwrap();
+        let r3 = mgr.commit(t3);
+
+        // T2: read q, read r, write r, commit.
+        mgr.record_read(t2, q).unwrap();
+        mgr.record_read(t2, r).unwrap();
+        mgr.record_write(t2, r).unwrap();
+        let r2 = mgr.commit(t2);
+
+        // Exactly one of the three must fail with SerializationFailure.
+        let results = [&r1, &r2, &r3];
+        let failures = results.iter().filter(|res| res.is_err()).count();
+        assert_eq!(
+            failures, 1,
+            "exactly one of the 3-tx cycle must abort; got r1={r1:?} r2={r2:?} r3={r3:?}"
+        );
+
+        // The single failure must be a SerializationFailure (not a W-W conflict).
+        let failing = results.into_iter().find(|res| res.is_err()).unwrap();
+        assert!(
+            failing
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "the abort must be a SerializationFailure; got {failing:?}"
+        );
+    }
+
+    /// A committed Serializable reader's SIREAD lock must persist while a
+    /// concurrent transaction is still active, so that a later write by that
+    /// concurrent tx still forms the in-edge.
+    #[test]
+    fn committed_reader_siread_retained_until_concurrent_finishes() {
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(90);
+
+        // reader and writer both begin at epoch 0 (concurrent).
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // reader reads E, then commits — but writer is still active, so the
+        // SIREAD lock must be retained.
+        mgr.record_read(reader, entity).unwrap();
+        mgr.commit(reader).unwrap();
+
+        // The reader's SIREAD entry must still be present (concurrent writer alive).
+        assert!(
+            mgr.read_registry
+                .readers_of(EntityId::Node(entity))
+                .contains(&reader),
+            "committed reader's SIREAD lock must persist while concurrent writer is active"
+        );
+
+        // writer now writes E → must discover the retained reader as a concurrent
+        // reader and form the in-edge → writer.in_conflict = true.
+        mgr.record_write(writer, entity).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(writer),
+            (true, false),
+            "writer must get in_conflict from the retained committed reader"
+        );
+    }
+
+    /// After all transactions concurrent with a committed reader finish, the
+    /// reader's SIREAD lock is garbage-collected (no leak).
+    #[test]
+    fn siread_released_after_no_concurrent() {
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(100);
+
+        // reader and writer both begin at epoch 0 (concurrent).
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(reader, entity).unwrap();
+        mgr.commit(reader).unwrap();
+
+        // Still retained while writer is active.
+        assert!(
+            mgr.read_registry
+                .readers_of(EntityId::Node(entity))
+                .contains(&reader),
+            "reader retained while concurrent writer active"
+        );
+
+        // writer commits → no transaction concurrent with reader remains → GC.
+        mgr.commit(writer).unwrap();
+
+        assert!(
+            !mgr.read_registry
+                .readers_of(EntityId::Node(entity))
+                .contains(&reader),
+            "reader's SIREAD lock must be released once no concurrent txn remains"
+        );
+    }
+
+    /// A writer that STARTED AFTER a committed reader's commit epoch is NOT
+    /// concurrent with it and must not receive a false in-edge from its lingering
+    /// SIREAD lock.
+    #[test]
+    fn non_concurrent_committed_reader_no_false_edge() {
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(110);
+
+        // keep_alive holds the active set non-empty so the reader's SIREAD lock
+        // is not GC'd before the (non-concurrent) writer can observe it.
+        let keep_alive = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // reader reads E and commits at some epoch C_r.
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(reader, entity).unwrap();
+        mgr.commit(reader).unwrap();
+
+        // writer begins AFTER reader committed → writer.start_epoch >= C_r →
+        // NOT concurrent with reader. The lingering SIREAD lock must not form an
+        // edge.
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let c_r = mgr.committed_epoch(reader).unwrap();
+        assert!(
+            mgr.start_epoch(writer).unwrap().as_u64() >= c_r.as_u64(),
+            "writer must start at/after reader's commit epoch for this test"
+        );
+
+        // The reader's SIREAD lock should still be present (keep_alive is active
+        // and concurrent with reader, so GC has not released it).
+        assert!(
+            mgr.read_registry
+                .readers_of(EntityId::Node(entity))
+                .contains(&reader),
+            "reader's SIREAD lock retained by keep_alive being concurrent"
+        );
+
+        mgr.record_write(writer, entity).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(writer),
+            (false, false),
+            "non-concurrent committed reader must not form a false in-edge"
+        );
+
+        // And the writer must commit Ok (no spurious abort).
+        assert!(
+            mgr.commit(writer).is_ok(),
+            "writer must not be spuriously aborted by a non-concurrent committed reader"
+        );
+
+        let _ = mgr.commit(keep_alive);
     }
 }
