@@ -437,11 +437,16 @@ impl GraphStore for LayeredStore {
         // the base doesn't know them, so defer to the overlay's versioned
         // fetch. CompactStore itself has no MVCC versions, so `get_node`
         // is the right base call.
-        self.base.load().get_node(id).or_else(|| {
-            self.overlay
-                .load()
-                .get_node_versioned(id, epoch, transaction_id)
-        })
+        if let Some(node) = self.base.load().get_node(id) {
+            // Base-resident read: record it so Serializable read-sets include
+            // base nodes (the overlay's own accessor already records overlay
+            // reads; no double-record risk here since the base path is exclusive).
+            self.overlay.load().record_read_node(transaction_id, id);
+            return Some(node);
+        }
+        self.overlay
+            .load()
+            .get_node_versioned(id, epoch, transaction_id)
     }
 
     fn get_edge_versioned(
@@ -459,11 +464,14 @@ impl GraphStore for LayeredStore {
                 .load()
                 .get_edge_versioned(id, epoch, transaction_id);
         }
-        self.base.load().get_edge(id).or_else(|| {
-            self.overlay
-                .load()
-                .get_edge_versioned(id, epoch, transaction_id)
-        })
+        if let Some(edge) = self.base.load().get_edge(id) {
+            // Base-resident read: record for Serializable isolation.
+            self.overlay.load().record_read_edge(transaction_id, id);
+            return Some(edge);
+        }
+        self.overlay
+            .load()
+            .get_edge_versioned(id, epoch, transaction_id)
     }
 
     fn get_node_at_epoch(&self, id: NodeId, epoch: EpochId) -> Option<Node> {
@@ -940,12 +948,16 @@ impl GraphStore for LayeredStore {
         }
         let base = self.base.load();
         if base.get_node(id).is_some() {
-            base.is_node_visible_versioned(id, epoch, transaction_id)
-        } else {
-            self.overlay
-                .load()
-                .is_node_visible_versioned(id, epoch, transaction_id)
+            let visible = base.is_node_visible_versioned(id, epoch, transaction_id);
+            if visible {
+                // Base-resident visibility confirmed: record for Serializable read-set.
+                self.overlay.load().record_read_node(transaction_id, id);
+            }
+            return visible;
         }
+        self.overlay
+            .load()
+            .is_node_visible_versioned(id, epoch, transaction_id)
     }
 
     fn is_edge_visible_at_epoch(&self, id: EdgeId, epoch: EpochId) -> bool {
@@ -980,12 +992,16 @@ impl GraphStore for LayeredStore {
         }
         let base = self.base.load();
         if base.get_edge(id).is_some() {
-            base.is_edge_visible_versioned(id, epoch, transaction_id)
-        } else {
-            self.overlay
-                .load()
-                .is_edge_visible_versioned(id, epoch, transaction_id)
+            let visible = base.is_edge_visible_versioned(id, epoch, transaction_id);
+            if visible {
+                // Base-resident visibility confirmed: record for Serializable read-set.
+                self.overlay.load().record_read_edge(transaction_id, id);
+            }
+            return visible;
         }
+        self.overlay
+            .load()
+            .is_edge_visible_versioned(id, epoch, transaction_id)
     }
 
     fn filter_visible_node_ids(&self, ids: &[NodeId], epoch: EpochId) -> Vec<NodeId> {
@@ -1086,10 +1102,19 @@ impl GraphStore for LayeredStore {
         }
         // Base-only node: the overlay has no entry and no delta. Fall through
         // to the base's committed value (same as get_node_property for base).
-        self.base
+        let overlay = self.overlay.load();
+        let result = self
+            .base
             .load()
             .get_node_property(id, key)
-            .or_else(|| self.overlay.load().get_node_property(id, key))
+            .or_else(|| overlay.get_node_property(id, key));
+        if result.is_some()
+            && let Some(tx) = transaction_id
+        {
+            // Record base-resident read into the Serializable read-set.
+            overlay.record_read_node(tx, id);
+        }
+        result
     }
 
     fn read_edge_property_visible(
@@ -1108,10 +1133,19 @@ impl GraphStore for LayeredStore {
                 .load()
                 .read_edge_property_visible(id, key, epoch, transaction_id);
         }
-        self.base
+        let overlay = self.overlay.load();
+        let result = self
+            .base
             .load()
             .get_edge_property(id, key)
-            .or_else(|| self.overlay.load().get_edge_property(id, key))
+            .or_else(|| overlay.get_edge_property(id, key));
+        if result.is_some()
+            && let Some(tx) = transaction_id
+        {
+            // Record base-resident read into the Serializable read-set.
+            overlay.record_read_edge(tx, id);
+        }
+        result
     }
 
     fn read_node_properties_visible(
@@ -1130,14 +1164,22 @@ impl GraphStore for LayeredStore {
                 .read_node_properties_visible(id, epoch, transaction_id);
         }
         // Base-only: return the committed property map from the base (no delta).
-        self.get_node(id)
+        let result: FxHashMap<PropertyKey, Value> = self
+            .get_node(id)
             .map(|n| {
                 n.properties
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !result.is_empty()
+            && let Some(tx) = transaction_id
+        {
+            // Record base-resident read into the Serializable read-set.
+            self.overlay.load().record_read_node(tx, id);
+        }
+        result
     }
 
     fn read_edge_properties_visible(
@@ -1156,14 +1198,22 @@ impl GraphStore for LayeredStore {
                 .read_edge_properties_visible(id, epoch, transaction_id);
         }
         // Base-only: return the committed property map from the base (no delta).
-        self.get_edge(id)
+        let result = self
+            .get_edge(id)
             .map(|e| {
                 e.properties
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
+                    .collect::<FxHashMap<_, _>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !result.is_empty()
+            && let Some(tx) = transaction_id
+        {
+            // Record base-resident read into the Serializable read-set.
+            self.overlay.load().record_read_edge(tx, id);
+        }
+        result
     }
 
     // --- Task 5 (label delegation, unified-MVCC) ---
@@ -1194,9 +1244,17 @@ impl GraphStore for LayeredStore {
         }
         // Base-only node: the overlay has no entry and no label delta. Return
         // the committed label set from the base (same as get_node(id).labels).
-        self.get_node(id)
+        let result: FxHashSet<arcstr::ArcStr> = self
+            .get_node(id)
             .map(|n| n.labels.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !result.is_empty()
+            && let Some(tx) = transaction_id
+        {
+            // Record base-resident read into the Serializable read-set.
+            self.overlay.load().record_read_node(tx, id);
+        }
+        result
     }
 
     fn nodes_by_label_visible(
@@ -1208,19 +1266,26 @@ impl GraphStore for LayeredStore {
         let dirty = self.dirty_node_ids.read();
 
         // Base nodes (committed, non-dirty, non-deleted).
-        let mut ids: Vec<NodeId> = self
+        let overlay = self.overlay.load();
+        let base_ids: Vec<NodeId> = self
             .base
             .load()
             .nodes_by_label(label)
             .into_iter()
             .filter(|id| !deleted.contains(id) && !dirty.contains(id))
             .collect();
+        // Record each base-resident node read for Serializable isolation.
+        if let Some(tx) = transaction_id {
+            for &id in &base_ids {
+                overlay.record_read_node(tx, id);
+            }
+        }
+        let mut ids = base_ids;
 
         // Overlay nodes — includes dirty promoted base nodes and new overlay
         // nodes; apply the tx label delta for the writing transaction.
         ids.extend(
-            self.overlay
-                .load()
+            overlay
                 .nodes_by_label_visible(label, transaction_id)
                 .into_iter()
                 .filter(|id| !deleted.contains(id)),
@@ -4479,6 +4544,317 @@ mod tests {
         assert!(
             !after.iter().any(|l| l.as_str() == "Secret"),
             "drop_tx_overlay must discard the buffered label add"
+        );
+    }
+
+    // ── N. SSI read-set: base-resident reads are recorded ────────────────────
+    //
+    // Regression tests for the C1 completeness gap: a Serializable tx reading a
+    // base-resident entity (the steady state after `compact()`) must see its
+    // read recorded into the tracker registered on the overlay.  Before the fix
+    // the base path silently skipped `record_read_node` / `record_read_edge`.
+
+    /// SpyTracker shared across SSI read-set tests.
+    mod ssi_spy {
+        use crate::execution::operators::{ReadTracker, SharedReadTracker};
+        use grafeo_common::types::{EdgeId, NodeId, TransactionId};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        pub struct SpyTracker {
+            pub nodes: Mutex<Vec<NodeId>>,
+            pub edges: Mutex<Vec<EdgeId>>,
+        }
+
+        impl SpyTracker {
+            pub fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    nodes: Mutex::new(Vec::new()),
+                    edges: Mutex::new(Vec::new()),
+                })
+            }
+            pub fn saw_node(&self, id: NodeId) -> bool {
+                self.nodes.lock().contains(&id)
+            }
+            pub fn saw_edge(&self, id: EdgeId) -> bool {
+                self.edges.lock().contains(&id)
+            }
+        }
+
+        impl ReadTracker for SpyTracker {
+            fn record_node_read(&self, _tx: TransactionId, id: NodeId) {
+                self.nodes.lock().push(id);
+            }
+            fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+                self.edges.lock().push(id);
+            }
+        }
+
+        /// Register a SpyTracker for `tx` on `layered` and return the Arc.
+        pub fn register(layered: &super::LayeredStore, tx: TransactionId) -> Arc<SpyTracker> {
+            use crate::graph::traits::GraphStore;
+            let spy = SpyTracker::new();
+            let tracker: SharedReadTracker = Arc::clone(&spy) as SharedReadTracker;
+            layered.register_read_tracker(tx, tracker);
+            spy
+        }
+    }
+
+    #[test]
+    fn ssi_get_node_versioned_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        // After build_test_layered(), all nodes are in the compact base.
+        let persons = layered.nodes_by_label("Person");
+        let base_node = persons[0];
+
+        let tx = TransactionId::new(101);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        // Read a base-resident node via the versioned accessor.
+        let result = layered.get_node_versioned(base_node, epoch, tx);
+        assert!(result.is_some(), "base-resident node must be visible");
+        assert!(
+            spy.saw_node(base_node),
+            "get_node_versioned must record base-resident node into the SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_get_edge_versioned_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, base_eid) = edges[0];
+
+        let tx = TransactionId::new(102);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let result = layered.get_edge_versioned(base_eid, epoch, tx);
+        assert!(result.is_some(), "base-resident edge must be visible");
+        assert!(
+            spy.saw_edge(base_eid),
+            "get_edge_versioned must record base-resident edge into the SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_is_node_visible_versioned_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let base_node = persons[0];
+
+        let tx = TransactionId::new(103);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let visible = layered.is_node_visible_versioned(base_node, epoch, tx);
+        assert!(visible, "base-resident node must be visible");
+        assert!(
+            spy.saw_node(base_node),
+            "is_node_visible_versioned must record base-resident node when visible"
+        );
+    }
+
+    #[test]
+    fn ssi_is_edge_visible_versioned_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, base_eid) = edges[0];
+
+        let tx = TransactionId::new(104);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let visible = layered.is_edge_visible_versioned(base_eid, epoch, tx);
+        assert!(visible, "base-resident edge must be visible");
+        assert!(
+            spy.saw_edge(base_eid),
+            "is_edge_visible_versioned must record base-resident edge when visible"
+        );
+    }
+
+    #[test]
+    fn ssi_read_node_property_visible_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let base_node = persons[0];
+
+        let tx = TransactionId::new(105);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let result = layered.read_node_property_visible(
+            base_node,
+            &PropertyKey::new("name"),
+            epoch,
+            Some(tx),
+        );
+        assert!(result.is_some(), "base-resident property must be readable");
+        assert!(
+            spy.saw_node(base_node),
+            "read_node_property_visible must record base-resident node into SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_read_edge_property_visible_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, base_eid) = edges[0];
+
+        let tx = TransactionId::new(106);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let result = layered.read_edge_property_visible(
+            base_eid,
+            &PropertyKey::new("since"),
+            epoch,
+            Some(tx),
+        );
+        assert!(
+            result.is_some(),
+            "base-resident edge property must be readable"
+        );
+        assert!(
+            spy.saw_edge(base_eid),
+            "read_edge_property_visible must record base-resident edge into SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_read_node_properties_visible_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let base_node = persons[0];
+
+        let tx = TransactionId::new(107);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let props = layered.read_node_properties_visible(base_node, epoch, Some(tx));
+        assert!(!props.is_empty(), "base-resident node must have properties");
+        assert!(
+            spy.saw_node(base_node),
+            "read_node_properties_visible must record base-resident node into SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_read_edge_properties_visible_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let edges = layered.edges_from(persons[0], Direction::Outgoing);
+        let (_, base_eid) = edges[0];
+
+        let tx = TransactionId::new(108);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let props = layered.read_edge_properties_visible(base_eid, epoch, Some(tx));
+        assert!(!props.is_empty(), "base-resident edge must have properties");
+        assert!(
+            spy.saw_edge(base_eid),
+            "read_edge_properties_visible must record base-resident edge into SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_read_node_labels_visible_records_base_resident_read() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let base_node = persons[0];
+
+        let tx = TransactionId::new(109);
+        let spy = ssi_spy::register(&layered, tx);
+        let epoch = EpochId::from(u64::MAX);
+
+        let labels = layered.read_node_labels_visible(base_node, epoch, Some(tx));
+        assert!(!labels.is_empty(), "base-resident node must have labels");
+        assert!(
+            spy.saw_node(base_node),
+            "read_node_labels_visible must record base-resident node into SSI read-set"
+        );
+    }
+
+    #[test]
+    fn ssi_nodes_by_label_visible_records_base_resident_reads() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::TransactionId;
+
+        let layered = build_test_layered();
+        // Snapshot which Person IDs are in the base.
+        let base_persons: Vec<NodeId> = layered.nodes_by_label("Person");
+        assert_eq!(base_persons.len(), 2, "fixture must have 2 base Persons");
+
+        let tx = TransactionId::new(110);
+        let spy = ssi_spy::register(&layered, tx);
+
+        let visible = layered.nodes_by_label_visible("Person", Some(tx));
+        assert_eq!(visible.len(), 2);
+        for &id in &base_persons {
+            assert!(
+                spy.saw_node(id),
+                "nodes_by_label_visible must record each base-resident Person ({:?})",
+                id
+            );
+        }
+    }
+
+    /// Ensure that an unregistered tx does NOT cause a spurious recording
+    /// (no-op path, mirrors the LpgStore behaviour).
+    #[test]
+    fn ssi_unregistered_tx_does_not_record() {
+        use crate::graph::traits::GraphStore;
+        use grafeo_common::types::{EpochId, TransactionId};
+
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let base_node = persons[0];
+
+        // Register a *different* tx so the tracker map is non-empty, then read
+        // with an unregistered one; nothing must be recorded for the latter.
+        let registered_tx = TransactionId::new(200);
+        let spy = ssi_spy::register(&layered, registered_tx);
+
+        let unregistered_tx = TransactionId::new(201);
+        let epoch = EpochId::from(u64::MAX);
+
+        let _ = layered.get_node_versioned(base_node, epoch, unregistered_tx);
+        assert!(
+            !spy.saw_node(base_node),
+            "unregistered tx must not produce a recording on the registered tracker"
         );
     }
 }
