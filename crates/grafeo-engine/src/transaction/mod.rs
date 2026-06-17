@@ -205,7 +205,6 @@ pub use manager::{
 pub use mvcc::{VersionChain, VersionInfo};
 #[cfg(feature = "lpg")]
 pub use prepared::{CommitInfo, PreparedCommit};
-#[allow(unused_imports)] // used by future F2 tasks (record_read / record_write)
 pub(crate) use read_registry::ReadRegistry;
 pub use read_tracker::TransactionReadTracker;
 pub use write_tracker::TransactionWriteTracker;

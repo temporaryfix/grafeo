@@ -982,8 +982,7 @@ impl TransactionManager {
         self.transactions
             .read()
             .get(&tx)
-            .map(|i| (i.in_conflict, i.out_conflict))
-            .unwrap_or((false, false))
+            .map_or((false, false), |i| (i.in_conflict, i.out_conflict))
     }
 }
 

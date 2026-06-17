@@ -11,17 +11,14 @@ use parking_lot::RwLock;
 
 use super::EntityId;
 
-#[allow(dead_code)] // used by future F2 tasks (record_read / record_write)
 const SHARDS: usize = 64; // power of two
 
 /// Sharded registry of active Serializable readers (SIREAD locks).
-#[allow(dead_code)] // used by future F2 tasks (record_read / record_write)
 pub struct ReadRegistry {
     shards: Vec<RwLock<FxHashMap<EntityId, FxHashSet<TransactionId>>>>,
     by_tx: RwLock<FxHashMap<TransactionId, Vec<EntityId>>>,
 }
 
-#[allow(dead_code)] // used by future F2 tasks (record_read / record_write)
 impl ReadRegistry {
     /// Creates a new, empty `ReadRegistry`.
     pub fn new() -> Self {

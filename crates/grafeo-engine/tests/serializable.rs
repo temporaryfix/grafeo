@@ -1,4 +1,4 @@
-//! Serializable Snapshot Isolation acceptance suite — increment 2f.
+//! Serializable Snapshot Isolation acceptance suite — F2 (incremental SSI).
 //!
 //! These are session-level end-to-end tests that prove the SSI guarantees:
 //!
@@ -12,6 +12,9 @@
 //!    concurrent with a writer on the same data commits cleanly.
 //! 5. `serialization_abort_rolls_back_cleanly` — after a write-skew abort the
 //!    aborted tx's write is not visible; the store is in the expected state.
+//! 6. `three_transaction_cycle_aborts_under_serializable` — a 3-transaction
+//!    rw-cycle (T1→T3→T2→T1) aborts exactly one committer end-to-end, proving
+//!    incremental SSI catches multi-transaction dangerous structures.
 //!
 //! ```bash
 //! CARGO_INCREMENTAL=0 cargo test --features full -p grafeo-engine --test serializable
