@@ -1129,4 +1129,27 @@ impl LpgStore {
             t.record_edge_read(tx, id);
         }
     }
+
+    /// Records that `tx` read property `key` of node `id`.
+    ///
+    /// Delegates to [`ReadTracker::record_node_property_read`]; the default
+    /// implementation drops the key and falls back to entity-level recording,
+    /// so behaviour is identical to [`record_read_node`](Self::record_read_node)
+    /// until an override is registered.
+    #[inline]
+    pub(crate) fn record_read_node_property(&self, tx: TransactionId, id: NodeId, key: &str) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_node_property_read(tx, id, key);
+        }
+    }
+
+    /// Records that `tx` read property `key` of edge `id`.
+    ///
+    /// Mirrors [`record_read_node_property`](Self::record_read_node_property) for edges.
+    #[inline]
+    pub(crate) fn record_read_edge_property(&self, tx: TransactionId, id: EdgeId, key: &str) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_edge_property_read(tx, id, key);
+        }
+    }
 }

@@ -1111,8 +1111,8 @@ impl GraphStore for LayeredStore {
         if result.is_some()
             && let Some(tx) = transaction_id
         {
-            // Record base-resident read into the Serializable read-set.
-            overlay.record_read_node(tx, id);
+            // Record base-resident property read into the Serializable read-set.
+            overlay.record_read_node_property(tx, id, key.as_str());
         }
         result
     }
@@ -1142,8 +1142,8 @@ impl GraphStore for LayeredStore {
         if result.is_some()
             && let Some(tx) = transaction_id
         {
-            // Record base-resident read into the Serializable read-set.
-            overlay.record_read_edge(tx, id);
+            // Record base-resident property read into the Serializable read-set.
+            overlay.record_read_edge_property(tx, id, key.as_str());
         }
         result
     }

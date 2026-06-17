@@ -167,6 +167,32 @@ pub trait ReadTracker: Send + Sync {
     fn record_node_read(&self, transaction_id: TransactionId, node_id: NodeId);
     /// Records that `transaction_id` read edge `edge_id` (at its snapshot).
     fn record_edge_read(&self, transaction_id: TransactionId, edge_id: EdgeId);
+
+    /// Records that `transaction_id` read property `_key` of node `node_id`.
+    ///
+    /// Default impl ignores the property and records an entity-level read — overridden
+    /// by the engine bridge to record a property tag under property-level granularity.
+    fn record_node_property_read(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        _key: &str,
+    ) {
+        self.record_node_read(transaction_id, node_id);
+    }
+
+    /// Records that `transaction_id` read property `_key` of edge `edge_id`.
+    ///
+    /// Default impl ignores the property and records an entity-level read — overridden
+    /// by the engine bridge to record a property tag under property-level granularity.
+    fn record_edge_property_read(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        _key: &str,
+    ) {
+        self.record_edge_read(transaction_id, edge_id);
+    }
 }
 
 /// Type alias for a shared read tracker.

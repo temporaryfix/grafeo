@@ -1078,8 +1078,9 @@ impl LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
         if let Some(tx) = transaction_id {
-            // Record the node read: the property access IS the read of the entity.
-            self.record_read_node(tx, id);
+            // Record the property-level read (defaults to entity-level until Task 4
+            // overrides record_node_property_read in the engine bridge).
+            self.record_read_node_property(tx, id, key.as_str());
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx)
                 && let Some(op) = delta.node_props.get(&(id, key.clone()))
@@ -1113,8 +1114,9 @@ impl LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
         if let Some(tx) = transaction_id {
-            // Record the edge read: the property access IS the read of the entity.
-            self.record_read_edge(tx, id);
+            // Record the property-level read (defaults to entity-level until Task 4
+            // overrides record_edge_property_read in the engine bridge).
+            self.record_read_edge_property(tx, id, key.as_str());
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx)
                 && let Some(op) = delta.edge_props.get(&(id, key.clone()))
