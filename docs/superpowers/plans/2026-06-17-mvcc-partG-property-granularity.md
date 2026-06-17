@@ -151,6 +151,14 @@ pub fn prop_tag(key: &str) -> u64 {
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE — merged to `integration`
 
-Plan written against `integration` @ `eecf0359` (F2 merged). Scope: **opt-in property-level conflict-granularity knob** (the spec's Part-G performance knob), behavior-preserving entity-level default, demonstrated deterministically. **Invasive** (a `grafeo-core` `ReadTracker` trait change + store recording + manager key generalization + a session/db policy) and it touches the sound read-recording foundation — recommend executing with fresh context, reviewing the trait change + the all-`None` behavior-preservation (Tasks 1-3) carefully, and gating each task on the unchanged default-path suite. On completion: throughput benchmarks + the integrate-or-guard follow-ups.
+All tasks landed (1: `PropTag` module · 2: read/write-set + registry carry `PropTag`, behavior-preserving · 3a/3b: symmetric property-aware read+write recording, inert · 4: `ConflictGranularity` policy + activation + demos · + a structural-read **soundness fix** · + final-review polish). The opt-in `ConflictGranularity::Property` policy tracks SSI rw-antidependencies per `(entity, property)`; the entity-level default is **provably unchanged**.
+
+**Model that landed:** `PropTag = Option<u64>` rides alongside `EntityId` — `None` = structural/whole-entity wildcard, `Some(prop_tag(key))` = a property, `Some(STRUCT_TAG)` = a structural read under Property. `prop_compatible(a,b) = a.is_none() || b.is_none() || a == b`. Read-set/write-set/registry carry `PropTag`; rw-detection is `prop_compatible`-gated; **W-W lost-update stays entity-only**. Recording: `ReadTracker`/`WriteTracker` gained property methods (default-delegating to entity-level → inert under Entity); store property accessors + `SetPropertyOperator` pass the key; store-derived completion via `overlay_touched_properties`. Policy threaded per-session to both bridges + the commit completion.
+
+**The soundness fix (found in holistic review):** the first activation made `record_node_read`/`record_edge_read` (structural reads) no-ops under Property → a structural-read-vs-DELETE rw-cycle committed unsoundly (reproduced by probe). Fixed by recording structural reads with a reserved `STRUCT_TAG` — conflicts with deletes (`None` writes, via the wildcard) and label changes, but not with disjoint property writes (so the knob is preserved). Regression test added.
+
+**Verification:** `--all-features` **7494/0**; serializable suite **9/9** (disjoint-property commits under Property / aborts under Entity · same-property aborts · structural-read-vs-delete aborts under Property · the 6 F2 tests unchanged); clippy clean; profiles (`default`/`lpg`/`lpg,temporal` engine, `grafeo-core` tiered) + wasm.
+
+**Residuals (sound, documented):** multi-property / map-merge `SET` stays entity-level (`None`, conservative — the knob applies to single-property SETs); **scan/predicate granularity unchanged** (a filtered scan still visits + records every matched node — property granularity narrows *which property* of each, not *which nodes*); property identity via hash (collisions over-approximate, never miss). **Next:** throughput benchmarks; integrate-or-guard follow-ups (MVCC-integrate shortestPath/vector/text/algos to drop their Serializable guards); optional interned-property-id keys + multi-property-SET tagging.

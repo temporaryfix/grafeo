@@ -1078,8 +1078,8 @@ impl LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
         if let Some(tx) = transaction_id {
-            // Record the property-level read (defaults to entity-level until Task 4
-            // overrides record_node_property_read in the engine bridge).
+            // Record the property-level read: the engine bridge records a property
+            // tag under Property granularity, else an entity-level read.
             self.record_read_node_property(tx, id, key.as_str());
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx)
@@ -1114,8 +1114,8 @@ impl LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
         if let Some(tx) = transaction_id {
-            // Record the property-level read (defaults to entity-level until Task 4
-            // overrides record_edge_property_read in the engine bridge).
+            // Record the property-level read: the engine bridge records a property
+            // tag under Property granularity, else an entity-level read.
             self.record_read_edge_property(tx, id, key.as_str());
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx)

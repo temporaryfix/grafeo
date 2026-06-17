@@ -619,14 +619,13 @@ fn three_transaction_cycle_aborts_under_serializable() {
 /// then writes to disjoint entities. The cross-read creates an rw-antidependency
 /// at entity level, triggering SSI to abort the second committer.
 ///
-/// Under **Property** granularity the same workload commits both sessions:
-/// - s1 reads `id` + `balance` of account-1 only (different entity from s2's write).
-/// - s2 reads `id` + `balance` of account-2 only (different entity from s1's write).
-/// Each session uses `MATCH (a:Account {id:K})` which filters to ONE node at
-/// the store level, so only that node appears in the read-set. The write is on
-/// the same node the session read, so there is NO cross-session rw-antidependency
-/// even at entity granularity. But under Property granularity the `balance`
-/// writes are tagged, making disjoint-property reads on the SAME entity also safe.
+/// Under **Property** granularity the same workload commits both sessions: the
+/// scan's cross-account reads are tagged `id` (and `STRUCT` for the structural
+/// visit) while the writes are tagged `balance` — disjoint properties, so the
+/// cross-read no longer forms an rw-antidependency with the other session's write.
+/// (Contrast the Entity case above, where that same cross-read aborts the second
+/// committer.) This test is therefore itself a knob demonstration, not merely the
+/// contrast with the Entity test below.
 ///
 /// ## Interleave
 ///
@@ -676,10 +675,11 @@ fn disjoint_property_writes_commit_under_property_granularity() {
     s2.execute("MATCH (a:Account {id: 2}) SET a.balance = 75")
         .expect("s2: SET account-2.balance");
 
-    // Under Property granularity: reads touch (account-1, prop_tag("id")) and
-    // (account-1, prop_tag("balance")) for s1, and the symmetric account-2 entries
-    // for s2. Writes are to different entities entirely. No cross-session
-    // rw-antidependency → BOTH must commit.
+    // Under Property granularity: the label scan tags each visited account's reads
+    // with `id`/`STRUCT` and the writes with `balance` — disjoint properties, so the
+    // cross-account read (the scan visits both accounts) does NOT form an
+    // rw-antidependency with the other session's `balance` write → BOTH commit.
+    // (At entity granularity that same cross-account read collides → second aborts.)
     let c1 = s1.commit();
     assert!(
         c1.is_ok(),

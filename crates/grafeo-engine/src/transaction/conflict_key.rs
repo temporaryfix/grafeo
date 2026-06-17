@@ -55,10 +55,6 @@ pub fn prop_compatible(a: PropTag, b: PropTag) -> bool {
 ///
 /// Collisions only *merge* keys (a safe over-approximation — a false conflict at
 /// worst, never a missed conflict), so this never makes SSI unsound.
-///
-/// Consumed by Part G Task 3+ (property-tag producers); the allow is narrowed to
-/// this one function now that `PropTag` and `prop_compatible` are used.
-#[allow(dead_code)]
 #[inline]
 #[must_use]
 pub fn prop_tag(key: &str) -> u64 {
