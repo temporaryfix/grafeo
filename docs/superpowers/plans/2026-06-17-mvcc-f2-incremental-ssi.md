@@ -191,6 +191,20 @@ impl ReadRegistry {
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE — merged to `integration` @ `6aa295c8`
 
-Plan written against `integration` (F1 merged — Serializable enabled + sound). Scope: **incremental SSI** (read-registry + rw-edge flags + dangerous-structure pivot abort) replacing F1's commit-time OCC backward scan; entity-granularity (property-granularity is Part G). Execute via subagent-driven-development + final holistic review. The Cahill SSI algorithm is subtle — recommend executing with fresh context and reviewing the flag-direction/detection design first. On completion: **Part G** (property granularity + benchmarks) and the integrate-or-guard follow-ups.
+All 7 tasks landed + merged (Tasks 1-6 + the **5b SIREAD-retention fix** + final-review cleanups). Serializable is now **incremental SSI** (Cahill), replacing F1's OCC backward scan.
+
+**What landed:** rw-conflict flags (`in_conflict`/`out_conflict`) + `set_rw_edge` (independent per-side gating) · sharded read-registry (SIREAD locks) + `by_tx` GC reverse-index · read-time detection (`record_read`: concurrent active + committed-after-start writers) · write-time detection (`record_write` + `detect_writeset_conflicts` safety net for store-derived writes) · dangerous-structure pivot abort at commit (`in && out && out-neighbor-committed`) — **read-only + benign single-edge now COMMIT (the F2 win over F1)** · **SIREAD retention** (committed readers retained until no concurrent active tx; GC when `min_active_start >= commit_epoch`; concurrency-checked write-time detection).
+
+**The key finding (why this took a fix-cycle):** the first pivot-abort released SIREAD locks at the reader's *own* commit → a holistic opus review **found + empirically reproduced a real soundness hole** — a 3-tx rw-cycle (`T1→T3→T2→T1`) committed in full (a regression vs F1, which caught it via its ungated scan). Fixed by SIREAD retention (Cahill/PostgreSQL: a committed tx's SIREAD locks persist until all concurrent txns finish). A deep re-review (17 probes vs the real manager) then validated soundness across **3/4/5-tx cycles (all commit orders)**, the read-time-committed-writer mirror, and store-derived writes — **no missed aborts**.
+
+**Verification:** `--all-features` **7483/0**; serializable suite **6/6** (write-skew aborts · read-only commits · benign commits · 3-tx cycle aborts · SI allows the same · clean rollback); clippy clean; profiles (`default`/`lpg`/`lpg,temporal` engine, `lpg,tiered-storage` core) + `grafeo-wasm` compile.
+
+**Residuals (documented, sound — over-abort is safe, never a missed abort):**
+- **Entity/scan granularity:** a label scan over-records all matched nodes → same-label concurrent scans can false-abort. Tightening = **Part G** (property-level granularity). Acceptance tests use distinct labels to target true cycles.
+- **Benign over-abort** on some k-cycle commit orders (sound; acceptable).
+- **Commit cost is NOT O(1)** as the plan body aspired: the pivot `cycle_closed` scan is `O(committed × read_set)` but **gated behind `in_conflict && out_conflict`** — non-pivots and the entire SI/RC path skip it. Tightening this to true O(1) (track the out-neighbor-committed bit incrementally) is a perf follow-up.
+- `edge_type_versioned`-on-LayeredStore residual (inherited from store-level recording; latent).
+
+**Next:** **Part G** (property-level conflict granularity + benchmarks: abort-rate under contention, disjoint-write throughput) · the integrate-or-guard follow-ups (MVCC-integrate shortestPath/vector/text/algos to remove their Serializable guards) · optional: incremental out-neighbor-committed tracking for true O(1) commit.
