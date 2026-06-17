@@ -192,6 +192,26 @@ These operators bypass the visible-read API (raw adjacency/index reads), so they
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE
 
-Plan written against `integration` @ `c8a20726` (2e complete; 2f parked). Scope: **store-level read-recording** (supersedes 2e Decision A) + guard the non-MVCC operators. Inert (Serializable stays session-rejected). Execute via subagent-driven-development + final holistic review. On completion: **re-land the F1 enable** (the parked 2f enable + `serializable.rs` acceptance suite) on this sound-by-construction foundation; then integrate-or-guard follow-ups; then F2 + G.
+Landed on `feat/mvcc-store-level-read-recording` (commits `014eb1cf` → `acd4d838`, from `integration` @ `c8a20726`), via subagent-driven-development + spec/holistic review.
+
+**Final verification:** `--all-features -p grafeo-core -p grafeo-engine` = **7450 passed / 0 failed**; clippy `--all-features` clean; `default`/`temporal`/`tiered-storage` + `grafeo-wasm` compile (these don't build `layered.rs` without `compact-store`; `--all-features` does, and is green); inert (Serializable still session-rejected at `session/mod.rs:3936`).
+
+**What landed:**
+- **Store read-tracker registry** (`LpgStore.read_trackers` + register/unregister + `record_read_node/edge`; trait + cdc/wal/layered delegation).
+- **Chokepoint instrumentation** — all 12 visible-read accessors on `LpgStore` record the visible entity (the surface table above + `edge_type_versioned`); engine registers the bridge at Serializable begin, unregisters at all 3 tx-exits.
+- **Operator-level recording removed** (2e's per-operator `record_read` superseded; trait/bridge/manager kept).
+- **Non-MVCC operators guarded** (`shortestPath`/vector/text/algos) via `is_serializable()`; full `plan_operator` arm classification (records-via-store / guarded / unreachable / no-store-read) as a doc-comment; catch-all `_ => Err` fails new raw-access ops closed.
+- **LayeredStore base-resident reads recorded** (C1 fix) — the 10 overridden layered accessors record into the overlay's tracker; `filter_visible_node_ids_versioned` covered transitively.
+
+**Key findings (review caught, fixed):**
+- The opus Task-2 review enumerated the store read API and found **`edge_type_versioned` (LpgStore)** was the one un-instrumented tx-visible read → fixed. This is the payoff of "complete by construction": the surface is *enumerable*, so the gap was *findable* (vs. the unbounded per-operator audit).
+- The opus holistic review found **C1: `LayeredStore` served base-resident reads from a tracker-less base layer** → fixed with 10 regression tests.
+- `MERGE`/`MergeRelationship` are **auto-covered** (their matching uses the visible accessors) — the per-operator "MERGE gap" closed for free.
+
+**Residual (documented, latent, non-blocking):**
+- `edge_type_versioned` is a trait method `LayeredStore` does NOT override (uses the trait default → not recorded by construction on layered). Latent/caller-dependent: the edge reaches `type(r)`/expand-predicate via EXPAND, which records it through layered's now-instrumented `is_edge_visible_versioned`. Address by an explicit `LayeredStore::edge_type_versioned` override (or MVCC-integration) when the F1 enable hardens.
+- Over-recording (`nodes_by_label_visible`/Merge candidate examination) and absence/phantom reads not recorded — sound, deferred to Part G granularity.
+
+**Next: re-land the F1 enable** — the parked `feat/mvcc-increment-2f` (remove session rejection + `serializable.rs` acceptance suite), now **sound by construction**. Then integrate-or-guard follow-ups (MVCC-integrate shortestPath/vector/text/algos to remove their guards), then F2 (incremental SSI + read-registry) + G (granularity/perf).
