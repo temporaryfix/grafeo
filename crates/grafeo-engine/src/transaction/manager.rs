@@ -97,6 +97,14 @@ pub struct TransactionInfo {
     pub write_set: HashSet<EntityId>,
     /// Set of entities read by this transaction (for serializable isolation).
     pub read_set: HashSet<EntityId>,
+    /// An rw-antidependency edge points INTO this transaction (this tx is the
+    /// writer end of some `reader →rw self`). Used for F2 incremental SSI pivot
+    /// detection.
+    pub in_conflict: bool,
+    /// An rw-antidependency edge points OUT of this transaction (this tx is
+    /// the reader end of some `self →rw writer`). Used for F2 incremental SSI
+    /// pivot detection.
+    pub out_conflict: bool,
 }
 
 impl TransactionInfo {
@@ -108,6 +116,8 @@ impl TransactionInfo {
             start_epoch,
             write_set: HashSet::new(),
             read_set: HashSet::new(),
+            in_conflict: false,
+            out_conflict: false,
         }
     }
 }
@@ -630,6 +640,43 @@ impl TransactionManager {
     #[cfg(test)]
     pub fn committed_epoch(&self, transaction_id: TransactionId) -> Option<EpochId> {
         self.committed_epochs.read().get(&transaction_id).copied()
+    }
+
+    /// Record a read-write antidependency edge `reader →rw writer` (the reader read a
+    /// version the writer overwrites). Sets the reader's out-flag and the writer's
+    /// in-flag — but only while both are Active Serializable transactions.
+    // Called by the read-registry (later F2 tasks); dead_code until wired up.
+    #[allow(dead_code)]
+    pub(crate) fn set_rw_edge(&self, reader: TransactionId, writer: TransactionId) {
+        if reader == writer {
+            return;
+        }
+        let mut txns = self.transactions.write();
+        let reader_ok = txns.get(&reader).is_some_and(|i| {
+            i.state == TransactionState::Active && i.isolation_level == IsolationLevel::Serializable
+        });
+        let writer_ok = txns.get(&writer).is_some_and(|i| {
+            i.state == TransactionState::Active && i.isolation_level == IsolationLevel::Serializable
+        });
+        if reader_ok && writer_ok {
+            if let Some(i) = txns.get_mut(&reader) {
+                i.out_conflict = true;
+            }
+            if let Some(i) = txns.get_mut(&writer) {
+                i.in_conflict = true;
+            }
+        }
+    }
+
+    /// Returns the `(in_conflict, out_conflict)` flags for a transaction.
+    /// Returns `(false, false)` if the transaction is not found.
+    #[cfg(test)]
+    pub(crate) fn conflict_flags(&self, tx: TransactionId) -> (bool, bool) {
+        self.transactions
+            .read()
+            .get(&tx)
+            .map(|i| (i.in_conflict, i.out_conflict))
+            .unwrap_or((false, false))
     }
 }
 
@@ -1317,5 +1364,99 @@ mod tests {
             Some(epoch),
             "committed_epochs must contain tx immediately after commit()"
         );
+    }
+
+    // --- F2 incremental SSI: rw-conflict flags ---
+
+    #[test]
+    fn test_rw_conflict_flags_initial_false() {
+        // Both flags start as false for any new Serializable transaction.
+        let mgr = TransactionManager::new();
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        assert_eq!(mgr.conflict_flags(t1), (false, false));
+        assert_eq!(mgr.conflict_flags(t2), (false, false));
+    }
+
+    #[test]
+    fn test_set_rw_edge_sets_reader_out_and_writer_in() {
+        // set_rw_edge(t1, t2): t1 is the reader, t2 is the writer.
+        // t1.out_conflict must become true; t2.in_conflict must become true.
+        let mgr = TransactionManager::new();
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.set_rw_edge(t1, t2);
+
+        // t1 is the reader end: out_conflict = true, in_conflict unchanged (false)
+        assert_eq!(
+            mgr.conflict_flags(t1),
+            (false, true),
+            "reader t1 must have out_conflict=true"
+        );
+        // t2 is the writer end: in_conflict = true, out_conflict unchanged (false)
+        assert_eq!(
+            mgr.conflict_flags(t2),
+            (true, false),
+            "writer t2 must have in_conflict=true"
+        );
+    }
+
+    #[test]
+    fn test_set_rw_edge_noop_for_non_serializable() {
+        // If either transaction is not Serializable, set_rw_edge is a no-op.
+        let mgr = TransactionManager::new();
+        let t_ser = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
+
+        // t_ser reads, t_si writes — t_si is not Serializable: no flags set
+        mgr.set_rw_edge(t_ser, t_si);
+        assert_eq!(
+            mgr.conflict_flags(t_ser),
+            (false, false),
+            "no flags on Serializable reader when writer is SI"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "no flags on SI writer"
+        );
+
+        // t_si reads, t_ser writes — t_si is not Serializable: no flags set
+        mgr.set_rw_edge(t_si, t_ser);
+        assert_eq!(
+            mgr.conflict_flags(t_ser),
+            (false, false),
+            "no flags on Serializable writer when reader is SI"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "no flags on SI reader"
+        );
+    }
+
+    #[test]
+    fn test_set_rw_edge_self_loop_is_noop() {
+        // set_rw_edge(t, t) must be silently ignored.
+        let mgr = TransactionManager::new();
+        let t = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.set_rw_edge(t, t);
+        assert_eq!(mgr.conflict_flags(t), (false, false));
+    }
+
+    #[test]
+    fn test_set_rw_edge_noop_for_committed_tx() {
+        // Edges involving a committed transaction are ignored.
+        let mgr = TransactionManager::new();
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Commit t1 before recording the edge
+        mgr.commit(t1).unwrap();
+
+        // t1 is committed — edge must be a no-op for t2
+        mgr.set_rw_edge(t1, t2);
+        assert_eq!(mgr.conflict_flags(t2), (false, false));
     }
 }
