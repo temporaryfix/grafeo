@@ -18,6 +18,29 @@
 /// (and the only value produced under `ConflictGranularity::Entity`).
 pub type PropTag = Option<u64>;
 
+/// Reserved [`PropTag`] payload for a **structural / whole-entity read** recorded
+/// under `ConflictGranularity::Property`.
+///
+/// Purely structural reads (label-scan visits, existence/label checks, `count`)
+/// touch the entity without naming a property. Under `Property` granularity they
+/// are tagged `Some(STRUCT_TAG)` rather than dropped (which would miss a
+/// concurrent structural write — unsound) or recorded as `None` (which would
+/// conflict with *every* property write, defeating the per-property knob).
+///
+/// Soundness/precision of `Some(STRUCT_TAG)`:
+/// - vs a structural write (`DELETE`/label change, tagged `None`):
+///   `prop_compatible(Some(STRUCT_TAG), None) == true` → the rw-antidependency is
+///   **detected** (sound — a delete invalidates every read of the entity).
+/// - vs a disjoint property write (e.g. `balance`, tagged `Some(prop_tag("balance"))`):
+///   `STRUCT_TAG != prop_tag("balance")` → **no false conflict** (the knob holds —
+///   a structural visit does not clash with a disjoint-property write).
+///
+/// The value is a fixed reserved sentinel. [`prop_tag`] is a full 64-bit hash, so
+/// the probability any real property key hashes to exactly this value is ~2^-64
+/// (negligible); a collision would only ever *merge* keys — a false conflict at
+/// worst, never a missed one — so soundness is preserved regardless.
+pub const STRUCT_TAG: u64 = 0xFFFF_FFFF_FFFF_FFFE;
+
 /// Whether two rw-conflict participants on the **same entity** actually conflict.
 ///
 /// A structural (`None`) read/write touches the whole entity, so it is compatible
