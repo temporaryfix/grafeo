@@ -39,6 +39,21 @@ struct BaseEdgeDelete {
     /// Transaction that requested the delete, if it was transactional.
     deleter: Option<TransactionId>,
 }
+
+/// Epoch+transaction stamp for a base-node tombstone.
+///
+/// The node-side mirror of [`BaseEdgeDelete`]: gives each base-node delete the
+/// same `(epoch, deleter)` stamp so versioned node readers apply the overlay's
+/// `deleted_epoch <= viewing_epoch` boundary instead of the old epoch-blind
+/// "any tombstone hides" rule. Same semantics for the two fields as
+/// [`BaseEdgeDelete`].
+#[derive(Clone, Copy)]
+struct BaseNodeDelete {
+    /// Commit epoch of the delete, or [`EpochId::PENDING`] while uncommitted.
+    epoch: EpochId,
+    /// Transaction that requested the delete, if it was transactional.
+    deleter: Option<TransactionId>,
+}
 use crate::graph::Direction;
 use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
@@ -74,8 +89,15 @@ pub struct LayeredStore {
     dirty_node_ids: RwLock<FxHashSet<NodeId>>,
     /// Edge IDs modified or created in the overlay.
     dirty_edge_ids: RwLock<FxHashSet<EdgeId>>,
-    /// Base node IDs that have been deleted.
-    deleted_from_base_nodes: RwLock<FxHashSet<NodeId>>,
+    /// Base node IDs that have been deleted, each stamped with the epoch and
+    /// transaction of the delete so versioned readers stay snapshot-isolated.
+    /// Node-side mirror of [`Self::deleted_from_base_edges`] — see that field
+    /// for the `PENDING`/`deleter` semantics.
+    deleted_from_base_nodes: RwLock<FxHashMap<NodeId, BaseNodeDelete>>,
+    /// Per-transaction list of base node ids this transaction has PENDING-
+    /// tombstoned, so commit can finalize their epochs and rollback can remove
+    /// them. Node-side mirror of [`Self::pending_base_edge_deletes`].
+    pending_base_node_deletes: RwLock<FxHashMap<TransactionId, Vec<NodeId>>>,
     /// Base edge IDs that have been deleted, each stamped with the epoch and
     /// transaction of the delete so versioned readers stay snapshot-isolated.
     ///
@@ -189,7 +211,8 @@ impl LayeredStore {
             overlay: ArcSwap::new(overlay),
             dirty_node_ids: RwLock::new(dirty_nodes),
             dirty_edge_ids: RwLock::new(dirty_edges),
-            deleted_from_base_nodes: RwLock::new(FxHashSet::default()),
+            deleted_from_base_nodes: RwLock::new(FxHashMap::default()),
+            pending_base_node_deletes: RwLock::new(FxHashMap::default()),
             deleted_from_base_edges: RwLock::new(FxHashMap::default()),
             pending_base_edge_deletes: RwLock::new(FxHashMap::default()),
             deletions_dirty: AtomicBool::new(false),
@@ -203,7 +226,8 @@ impl LayeredStore {
             overlay: ArcSwap::new(overlay),
             dirty_node_ids: RwLock::new(FxHashSet::default()),
             dirty_edge_ids: RwLock::new(FxHashSet::default()),
-            deleted_from_base_nodes: RwLock::new(FxHashSet::default()),
+            deleted_from_base_nodes: RwLock::new(FxHashMap::default()),
+            pending_base_node_deletes: RwLock::new(FxHashMap::default()),
             deleted_from_base_edges: RwLock::new(FxHashMap::default()),
             pending_base_edge_deletes: RwLock::new(FxHashMap::default()),
             deletions_dirty: AtomicBool::new(false),
@@ -303,6 +327,7 @@ impl LayeredStore {
         self.dirty_node_ids.write().clear();
         self.dirty_edge_ids.write().clear();
         self.deleted_from_base_nodes.write().clear();
+        self.pending_base_node_deletes.write().clear();
         self.deleted_from_base_edges.write().clear();
         self.pending_base_edge_deletes.write().clear();
         self.deletions_dirty.store(false, Ordering::Release);
@@ -314,9 +339,12 @@ impl LayeredStore {
     /// section so the deletions survive close/reopen cycles.
     #[must_use]
     pub fn snapshot_deleted_node_ids(&self) -> Vec<NodeId> {
+        // Keys only: same keys-only on-disk format and re-seed-as-committed
+        // semantics as `snapshot_deleted_edge_ids` (the (epoch, deleter) stamp
+        // is in-memory MVCC bookkeeping, not persisted).
         self.deleted_from_base_nodes
             .read()
-            .iter()
+            .keys()
             .copied()
             .collect()
     }
@@ -349,15 +377,23 @@ impl LayeredStore {
         nodes: impl IntoIterator<Item = NodeId>,
         edges: impl IntoIterator<Item = EdgeId>,
     ) {
-        let mut node_set = self.deleted_from_base_nodes.write();
-        node_set.clear();
-        node_set.extend(nodes);
-        let mut edge_set = self.deleted_from_base_edges.write();
-        edge_set.clear();
         // A prior-session delete is, by definition, committed before any
         // snapshot of this session: stamp epoch 0 (≤ every future snapshot) and
         // `deleter: None` so it is hidden from every current snapshot and the
-        // latest view alike.
+        // latest view alike. Applies identically to nodes and edges.
+        let mut node_set = self.deleted_from_base_nodes.write();
+        node_set.clear();
+        node_set.extend(nodes.into_iter().map(|id| {
+            (
+                id,
+                BaseNodeDelete {
+                    epoch: EpochId::INITIAL,
+                    deleter: None,
+                },
+            )
+        }));
+        let mut edge_set = self.deleted_from_base_edges.write();
+        edge_set.clear();
         edge_set.extend(edges.into_iter().map(|id| {
             (
                 id,
@@ -371,6 +407,7 @@ impl LayeredStore {
         drop(edge_set);
         // A reseed replaces any in-flight transactional base tombstones; their
         // pending bookkeeping is now stale (open happens before new mutations).
+        self.pending_base_node_deletes.write().clear();
         self.pending_base_edge_deletes.write().clear();
         self.deletions_dirty.store(false, Ordering::Release);
     }
@@ -423,10 +460,36 @@ impl LayeredStore {
         self.dirty_node_ids.read().contains(&id)
     }
 
-    /// Checks whether a node was deleted from the base.
+    /// Checks whether a node was deleted from the base (latest view).
+    ///
+    /// Epoch-blind on purpose (mirror of [`Self::is_edge_deleted_from_base`]):
+    /// the non-versioned accessors want the newest truth, so ANY tombstone —
+    /// even an uncommitted one — hides the base node, preserving the audit-fixed
+    /// base-tier-resurrection behavior. Versioned accessors use
+    /// [`Self::is_node_deleted_from_base_at`] instead.
     #[inline]
     fn is_node_deleted_from_base(&self, id: NodeId) -> bool {
-        self.deleted_from_base_nodes.read().contains(&id)
+        self.deleted_from_base_nodes.read().contains_key(&id)
+    }
+
+    /// Snapshot-aware variant: whether a base node is hidden from a reader at
+    /// `(epoch, tx)`. Node-side mirror of [`Self::is_edge_deleted_from_base_at`]
+    /// — identical visibility boundary
+    /// ([`VersionInfo::is_visible_at`](grafeo_common::mvcc::VersionInfo)):
+    ///
+    /// * not deleted → visible (`false`);
+    /// * deleted by `tx` itself (even PENDING) → hidden (read-your-writes);
+    /// * another tx's still-PENDING delete → visible (no dirty read);
+    /// * committed delete → hidden iff the snapshot is at/after the delete's
+    ///   commit epoch (`deleted_epoch <= viewing_epoch`).
+    #[inline]
+    fn is_node_deleted_from_base_at(&self, id: NodeId, epoch: EpochId, tx: TransactionId) -> bool {
+        match self.deleted_from_base_nodes.read().get(&id) {
+            None => false,
+            Some(d) if d.deleter == Some(tx) => true,
+            Some(d) if d.epoch == EpochId::PENDING => false,
+            Some(d) => d.epoch.as_u64() <= epoch.as_u64(),
+        }
     }
 
     /// Checks whether an edge ID is in the overlay (dirty or deleted).
@@ -504,7 +567,7 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> Option<Node> {
-        if self.is_node_deleted_from_base(id) {
+        if self.is_node_deleted_from_base_at(id, epoch, transaction_id) {
             return None;
         }
         if self.is_node_dirty(id) {
@@ -556,7 +619,10 @@ impl GraphStore for LayeredStore {
     }
 
     fn get_node_at_epoch(&self, id: NodeId, epoch: EpochId) -> Option<Node> {
-        if self.is_node_deleted_from_base(id) {
+        // Epoch-only view: no transaction context, so pass INVALID (see
+        // `get_edge_at_epoch`) — the read-your-writes branch is inert and an
+        // uncommitted (PENDING) base delete stays visible.
+        if self.is_node_deleted_from_base_at(id, epoch, TransactionId::INVALID) {
             return None;
         }
         if self.is_node_dirty(id) {
@@ -701,9 +767,9 @@ impl GraphStore for LayeredStore {
         // tiers because their properties were modified) live at the same
         // `EdgeId` in base and overlay and are folded together by the
         // dedup-by-eid pass below.
-        if !deleted_nodes.contains(&node) {
+        if !deleted_nodes.contains_key(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target) && !deleted_edges.contains_key(&eid) {
+                if !deleted_nodes.contains_key(&target) && !deleted_edges.contains_key(&eid) {
                     results.push((target, eid));
                 }
             }
@@ -717,7 +783,7 @@ impl GraphStore for LayeredStore {
         // edges, so the unconditional call is cheap when there's nothing
         // to report.
         for (target, eid) in self.overlay.load().edges_from(node, direction) {
-            if !deleted_nodes.contains(&target) && !deleted_edges.contains_key(&eid) {
+            if !deleted_nodes.contains_key(&target) && !deleted_edges.contains_key(&eid) {
                 results.push((target, eid));
             }
         }
@@ -747,9 +813,9 @@ impl GraphStore for LayeredStore {
         // and also records the read for SSI.  A source node explicitly deleted
         // from the base is entirely gone even for old snapshots (it left a
         // tombstone in the overlay), so we still guard on that.
-        if !deleted_nodes.contains(&node) {
+        if !deleted_nodes.contains_key(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target)
+                if !deleted_nodes.contains_key(&target)
                     && self.is_edge_visible_versioned(eid, epoch, transaction_id)
                 {
                     results.push((target, eid));
@@ -764,7 +830,7 @@ impl GraphStore for LayeredStore {
                 .load()
                 .edges_from_versioned(node, direction, epoch, transaction_id)
         {
-            if !deleted_nodes.contains(&target) {
+            if !deleted_nodes.contains_key(&target) {
                 results.push((target, eid));
             }
         }
@@ -813,7 +879,7 @@ impl GraphStore for LayeredStore {
             .load()
             .node_ids()
             .into_iter()
-            .filter(|id| !deleted.contains(id))
+            .filter(|id| !deleted.contains_key(id))
             .collect();
         ids.extend(self.overlay.load().node_ids());
         ids.sort_unstable();
@@ -830,14 +896,14 @@ impl GraphStore for LayeredStore {
             .load()
             .nodes_by_label(label)
             .into_iter()
-            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
+            .filter(|id| !deleted.contains_key(id) && !dirty.contains(id))
             .collect();
         ids.extend(
             self.overlay
                 .load()
                 .nodes_by_label(label)
                 .into_iter()
-                .filter(|id| !deleted.contains(id)),
+                .filter(|id| !deleted.contains_key(id)),
         );
         ids.sort_unstable();
         ids.dedup();
@@ -902,7 +968,7 @@ impl GraphStore for LayeredStore {
             .load()
             .find_nodes_by_property(property, value)
             .into_iter()
-            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
+            .filter(|id| !deleted.contains_key(id) && !dirty.contains(id))
             .collect();
 
         results.extend(self.overlay.load().find_nodes_by_property(property, value));
@@ -921,7 +987,7 @@ impl GraphStore for LayeredStore {
             .load()
             .find_nodes_by_properties(conditions)
             .into_iter()
-            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
+            .filter(|id| !deleted.contains_key(id) && !dirty.contains(id))
             .collect();
 
         results.extend(self.overlay.load().find_nodes_by_properties(conditions));
@@ -944,7 +1010,7 @@ impl GraphStore for LayeredStore {
             .load()
             .find_nodes_in_range(property, min, max, min_inclusive, max_inclusive)
             .into_iter()
-            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
+            .filter(|id| !deleted.contains_key(id) && !dirty.contains(id))
             .collect();
 
         results.extend(self.overlay.load().find_nodes_in_range(
@@ -1059,7 +1125,8 @@ impl GraphStore for LayeredStore {
     }
 
     fn is_node_visible_at_epoch(&self, id: NodeId, epoch: EpochId) -> bool {
-        if self.is_node_deleted_from_base(id) {
+        // Epoch-only view: INVALID tx (see `get_node_at_epoch`).
+        if self.is_node_deleted_from_base_at(id, epoch, TransactionId::INVALID) {
             return false;
         }
         if self.is_node_dirty(id) {
@@ -1087,7 +1154,7 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        if self.is_node_deleted_from_base(id) {
+        if self.is_node_deleted_from_base_at(id, epoch, transaction_id) {
             return false;
         }
         if self.is_node_dirty(id) {
@@ -1250,7 +1317,16 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
-        if self.is_node_deleted_from_base(id) {
+        // Snapshot-aware gate (mirrors `read_node_properties_visible` and the
+        // edge accessors): an old snapshot that can still see a base node
+        // deleted-after-its-start must read its property too. Epoch-only callers
+        // (`None`) pass INVALID so the read-your-writes branch is inert and a
+        // PENDING delete stays visible.
+        if self.is_node_deleted_from_base_at(
+            id,
+            epoch,
+            transaction_id.unwrap_or(TransactionId::INVALID),
+        ) {
             return None;
         }
         if self.is_node_dirty(id) {
@@ -1284,7 +1360,15 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
-        if self.is_edge_deleted_from_base(id) {
+        // Snapshot-aware gate (mirrors `read_edge_properties_visible`): an old
+        // snapshot that can still traverse a base edge deleted-after-its-start
+        // must read its property too. Epoch-only callers (`None`) pass INVALID so
+        // the read-your-writes branch is inert and a PENDING delete stays visible.
+        if self.is_edge_deleted_from_base_at(
+            id,
+            epoch,
+            transaction_id.unwrap_or(TransactionId::INVALID),
+        ) {
             return None;
         }
         if self.is_edge_dirty(id) {
@@ -1314,7 +1398,8 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> FxHashMap<PropertyKey, Value> {
-        if self.is_node_deleted_from_base(id) {
+        let tx = transaction_id.unwrap_or(TransactionId::INVALID);
+        if self.is_node_deleted_from_base_at(id, epoch, tx) {
             return FxHashMap::default();
         }
         if self.is_node_dirty(id) {
@@ -1323,9 +1408,12 @@ impl GraphStore for LayeredStore {
                 .load()
                 .read_node_properties_visible(id, epoch, transaction_id);
         }
-        // Base-only: return the committed property map from the base (no delta).
+        // Base-only: return the committed property map. Use the versioned fetch
+        // (not the epoch-blind `get_node`) so the property read agrees with the
+        // snapshot-aware gate above — otherwise an old snapshot that may still
+        // see a base node deleted-after-its-start would get an empty map.
         let result: FxHashMap<PropertyKey, Value> = self
-            .get_node(id)
+            .get_node_versioned(id, epoch, tx)
             .map(|n| {
                 n.properties
                     .iter()
@@ -1348,11 +1436,8 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> FxHashMap<PropertyKey, Value> {
-        if self.is_edge_deleted_from_base_at(
-            id,
-            epoch,
-            transaction_id.unwrap_or(TransactionId::INVALID),
-        ) {
+        let tx = transaction_id.unwrap_or(TransactionId::INVALID);
+        if self.is_edge_deleted_from_base_at(id, epoch, tx) {
             return FxHashMap::default();
         }
         if self.is_edge_dirty(id) {
@@ -1361,9 +1446,12 @@ impl GraphStore for LayeredStore {
                 .load()
                 .read_edge_properties_visible(id, epoch, transaction_id);
         }
-        // Base-only: return the committed property map from the base (no delta).
+        // Base-only: return the committed property map. Use the versioned fetch
+        // (not the epoch-blind `get_edge`) so the property read agrees with the
+        // snapshot-aware gate above — otherwise an old snapshot that may still
+        // see a base edge deleted-after-its-start would get an empty map.
         let result = self
-            .get_edge(id)
+            .get_edge_versioned(id, epoch, tx)
             .map(|e| {
                 e.properties
                     .iter()
@@ -1396,7 +1484,8 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> FxHashSet<arcstr::ArcStr> {
-        if self.is_node_deleted_from_base(id) {
+        let tx = transaction_id.unwrap_or(TransactionId::INVALID);
+        if self.is_node_deleted_from_base_at(id, epoch, tx) {
             return FxHashSet::default();
         }
         if self.is_node_dirty(id) {
@@ -1407,9 +1496,12 @@ impl GraphStore for LayeredStore {
                 .read_node_labels_visible(id, epoch, transaction_id);
         }
         // Base-only node: the overlay has no entry and no label delta. Return
-        // the committed label set from the base (same as get_node(id).labels).
+        // the committed label set. Use the versioned fetch (not the epoch-blind
+        // `get_node`) so the labels agree with the snapshot-aware gate above —
+        // otherwise an old snapshot that may still see a base node
+        // deleted-after-its-start would get an empty label set.
         let result: FxHashSet<arcstr::ArcStr> = self
-            .get_node(id)
+            .get_node_versioned(id, epoch, tx)
             .map(|n| n.labels.iter().cloned().collect())
             .unwrap_or_default();
         if !result.is_empty()
@@ -1436,7 +1528,7 @@ impl GraphStore for LayeredStore {
             .load()
             .nodes_by_label(label)
             .into_iter()
-            .filter(|id| !deleted.contains(id) && !dirty.contains(id))
+            .filter(|id| !deleted.contains_key(id) && !dirty.contains(id))
             .collect();
         // Record each base-resident node read for Serializable isolation.
         if let Some(tx) = transaction_id {
@@ -1452,7 +1544,7 @@ impl GraphStore for LayeredStore {
             overlay
                 .nodes_by_label_visible(label, transaction_id)
                 .into_iter()
-                .filter(|id| !deleted.contains(id)),
+                .filter(|id| !deleted.contains_key(id)),
         );
         ids.sort_unstable();
         ids.dedup();
@@ -1489,7 +1581,7 @@ impl GraphStoreSearch for LayeredStore {
             self.overlay
                 .load()
                 .text_search(label, property, query, k + deleted.len());
-        results.retain(|(id, _)| !deleted.contains(id));
+        results.retain(|(id, _)| !deleted.contains_key(id));
         results.truncate(k);
         results
     }
@@ -1507,7 +1599,7 @@ impl GraphStoreSearch for LayeredStore {
             .overlay
             .load()
             .text_search_with_threshold(label, property, query, threshold);
-        results.retain(|(id, _)| !deleted.contains(id));
+        results.retain(|(id, _)| !deleted.contains_key(id));
         results
     }
 
@@ -1537,7 +1629,7 @@ impl GraphStoreSearch for LayeredStore {
             self.overlay
                 .load()
                 .vector_search(label, property, query, k + deleted.len(), metric);
-        results.retain(|(id, _)| !deleted.contains(id));
+        results.retain(|(id, _)| !deleted.contains_key(id));
         results.truncate(k);
         results
     }
@@ -1556,7 +1648,7 @@ impl GraphStoreSearch for LayeredStore {
             .overlay
             .load()
             .vector_search_with_threshold(label, property, query, threshold, metric);
-        results.retain(|(id, _)| !deleted.contains(id));
+        results.retain(|(id, _)| !deleted.contains_key(id));
         results
     }
 }
@@ -1635,9 +1727,26 @@ impl GraphStoreMut for LayeredStore {
         // base copy if present. A promoted node lives in both tiers (its base
         // adjacency stays in the base), so both must happen; a fresh
         // overlay-only node has no base copy.
+        //
+        // SYSTEM/auto-commit: stamp the base tombstone with the current
+        // committed epoch and `deleter: None` (mirrors the edge `delete_edge`
+        // and `LpgStore::delete_node`, which delete at `current_epoch()`). The
+        // latest view hides it immediately; a versioned snapshot strictly
+        // before this epoch still sees it.
         let overlay_removed = self.overlay.load().delete_node(id);
+        let now = self.overlay.load().current_epoch();
         let base_tombstoned = self.base.load().get_node(id).is_some()
-            && self.deleted_from_base_nodes.write().insert(id);
+            && self
+                .deleted_from_base_nodes
+                .write()
+                .insert(
+                    id,
+                    BaseNodeDelete {
+                        epoch: now,
+                        deleter: None,
+                    },
+                )
+                .is_none();
         if base_tombstoned {
             self.deletions_dirty.store(true, Ordering::Release);
         }
@@ -1655,8 +1764,34 @@ impl GraphStoreMut for LayeredStore {
             .overlay
             .load()
             .delete_node_versioned(id, epoch, transaction_id);
-        let base_tombstoned = self.base.load().get_node(id).is_some()
-            && self.deleted_from_base_nodes.write().insert(id);
+        // Transactional base tombstone: stamp PENDING + deleter so the deleter
+        // sees it gone immediately (read-your-writes) while every other snapshot
+        // still sees the node until the delete commits. The real commit epoch is
+        // stamped in `finalize_deletes_by_id`; rollback removes it via
+        // `drop_tx_overlay`. Record the id in this tx's pending list so
+        // commit/rollback can find it (a base-only node never reaches the
+        // overlay's pending node-delete list). Mirror of `delete_edge_versioned`.
+        let base_tombstoned = self.base.load().get_node(id).is_some() && {
+            let newly_inserted = self
+                .deleted_from_base_nodes
+                .write()
+                .insert(
+                    id,
+                    BaseNodeDelete {
+                        epoch: EpochId::PENDING,
+                        deleter: Some(transaction_id),
+                    },
+                )
+                .is_none();
+            if newly_inserted {
+                self.pending_base_node_deletes
+                    .write()
+                    .entry(transaction_id)
+                    .or_default()
+                    .push(id);
+            }
+            newly_inserted
+        };
         if base_tombstoned {
             self.deletions_dirty.store(true, Ordering::Release);
         }
@@ -1970,10 +2105,30 @@ impl GraphStoreMut for LayeredStore {
 
     fn drop_tx_overlay(&self, transaction_id: TransactionId) {
         self.overlay.load().drop_tx_overlay(transaction_id);
-        // Rollback path: undo this tx's uncommitted base-edge tombstones.
-        // `drop_tx_overlay` is only invoked on the abort/conflict paths (commit
-        // uses `apply_tx_overlay` + `finalize_edge_deletes_by_id`), so removing
-        // the PENDING base tombstones here restores the edges for everyone.
+        // Rollback path: undo this tx's uncommitted base tombstones (nodes AND
+        // edges). `drop_tx_overlay` is only invoked on the abort/conflict paths
+        // (commit uses `apply_tx_overlay` + finalize), so removing the PENDING
+        // base tombstones here restores the entities for everyone.
+        let pending_nodes = self
+            .pending_base_node_deletes
+            .write()
+            .remove(&transaction_id);
+        if let Some(ids) = pending_nodes {
+            let mut tombstones = self.deleted_from_base_nodes.write();
+            for id in ids {
+                // Only remove if it is still this tx's PENDING tombstone — a
+                // re-delete by a later SYSTEM/auto-commit path would have
+                // overwritten the stamp, and that committed delete must stand.
+                if let Some(d) = tombstones.get(&id)
+                    && d.deleter == Some(transaction_id)
+                    && d.epoch == EpochId::PENDING
+                {
+                    tombstones.remove(&id);
+                }
+            }
+            drop(tombstones);
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
         let pending = self
             .pending_base_edge_deletes
             .write()
@@ -2005,6 +2160,29 @@ impl GraphStoreMut for LayeredStore {
         self.overlay
             .load()
             .finalize_deletes_by_id(transaction_id, commit_epoch, node_ids);
+        // Commit path: stamp this tx's PENDING base-node tombstones with the
+        // real commit epoch. Driven from the LayeredStore's own per-tx list, NOT
+        // the `node_ids` slice: a base-only node delete never reaches the
+        // overlay's pending node-delete list, so it would be absent from
+        // `node_ids` (which comes from `take_pending_deletes`). Mirror of
+        // `finalize_edge_deletes_by_id`.
+        let pending = self
+            .pending_base_node_deletes
+            .write()
+            .remove(&transaction_id);
+        if let Some(ids) = pending {
+            let mut tombstones = self.deleted_from_base_nodes.write();
+            for id in ids {
+                if let Some(d) = tombstones.get_mut(&id)
+                    && d.deleter == Some(transaction_id)
+                    && d.epoch == EpochId::PENDING
+                {
+                    d.epoch = commit_epoch;
+                }
+            }
+            drop(tombstones);
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
     }
 
     fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
@@ -5353,5 +5531,310 @@ mod tests {
         let tx = TransactionId::from(9);
         let now = layered.current_epoch();
         assert!(!layered.is_edge_visible_versioned(g, now, tx));
+    }
+
+    // ── Fix A: base-EDGE *property* accessors must honor the snapshot-aware
+    //          delete predicate (not the epoch-blind latest one) ──
+    //
+    // An old snapshot can still traverse a base edge a concurrent tx deleted
+    // AFTER the snapshot started; its property reads must agree with that
+    // topology and STILL return the value, not NULL/empty.
+
+    /// `read_edge_property_visible` (singular): A (E0) reads a base edge's
+    /// property after B committed a delete at E1 > E0. A must still get the
+    /// value. Previously returned NULL (the accessor used the epoch-blind
+    /// `is_edge_deleted_from_base`).
+    #[test]
+    fn read_edge_property_visible_old_snapshot_sees_concurrently_deleted_edge() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (_, g) = edges[0];
+        let since = PropertyKey::new("since");
+
+        let tx_a = TransactionId::from(1); // reader, snapshot E0
+        let tx_b = TransactionId::from(2); // concurrent deleter
+        let e0 = EpochId::new(0);
+        let e1 = EpochId::new(1);
+
+        // Precondition: A sees the value at E0.
+        let before = layered.read_edge_property_visible(g, &since, e0, Some(tx_a));
+        assert!(
+            before.is_some(),
+            "base edge property must be visible to A before any delete"
+        );
+
+        // B deletes G and commits at E1 > E0.
+        assert!(layered.delete_edge_versioned(g, e1, tx_b));
+        let pending = layered.take_pending_edge_deletes(tx_b);
+        layered.finalize_edge_deletes_by_id(tx_b, e1, &pending);
+
+        // A's snapshot (E0) precedes the commit; A must STILL read the value.
+        let after = layered.read_edge_property_visible(g, &since, e0, Some(tx_a));
+        assert_eq!(
+            after, before,
+            "read_edge_property_visible must agree with the snapshot-aware gate: \
+             A (E0) keeps the value of a base edge deleted at E1>E0"
+        );
+
+        // And a LATER snapshot (E1) must NOT see it (boundary check).
+        let tx_c = TransactionId::from(3);
+        assert!(
+            layered
+                .read_edge_property_visible(g, &since, e1, Some(tx_c))
+                .is_none(),
+            "a snapshot AT the delete's commit epoch must not read the deleted edge's property"
+        );
+    }
+
+    /// `read_edge_properties_visible` (plural): same scenario; the map must be
+    /// non-empty for A (E0). Previously the snapshot-aware gate passed but the
+    /// fall-through `self.get_edge(id)` re-applied the epoch-blind latest
+    /// predicate and returned an empty map.
+    #[test]
+    fn read_edge_properties_visible_old_snapshot_sees_concurrently_deleted_edge() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (_, g) = edges[0];
+
+        let tx_a = TransactionId::from(1);
+        let tx_b = TransactionId::from(2);
+        let e0 = EpochId::new(0);
+        let e1 = EpochId::new(1);
+
+        let before = layered.read_edge_properties_visible(g, e0, Some(tx_a));
+        assert!(
+            !before.is_empty(),
+            "base edge property map must be visible to A before any delete"
+        );
+
+        assert!(layered.delete_edge_versioned(g, e1, tx_b));
+        let pending = layered.take_pending_edge_deletes(tx_b);
+        layered.finalize_edge_deletes_by_id(tx_b, e1, &pending);
+
+        let after = layered.read_edge_properties_visible(g, e0, Some(tx_a));
+        assert_eq!(
+            after, before,
+            "read_edge_properties_visible must agree with the snapshot-aware gate: \
+             A (E0) keeps the full property map of a base edge deleted at E1>E0"
+        );
+
+        let tx_c = TransactionId::from(3);
+        assert!(
+            layered
+                .read_edge_properties_visible(g, e1, Some(tx_c))
+                .is_empty(),
+            "a snapshot AT the delete's commit epoch must read an empty property map"
+        );
+    }
+
+    // ── Fix B: snapshot-isolated base-NODE deletes (epoch-versioned tombstone) ──
+    //
+    // Mirror of the base-edge tombstone fix. A base node deleted by a concurrent
+    // transaction AFTER a reader's snapshot start must stay visible to that
+    // reader (topology AND properties/labels), while the latest (non-versioned)
+    // view keeps hiding any tombstone (audit base-tier-resurrection guard).
+
+    /// HEADLINE: a base node N live at tx A's snapshot E0; tx B deletes N and
+    /// commits at E1 > E0. A (E0) must STILL see N via `is_node_visible_versioned`
+    /// AND read its properties/labels; a LATER snapshot (E1) must not.
+    #[test]
+    fn base_node_delete_committed_after_snapshot_is_invisible_only_to_later_snapshots() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let n = persons[0];
+        let name = PropertyKey::new("name");
+
+        let tx_a = TransactionId::from(1); // reader (snapshot E0)
+        let tx_b = TransactionId::from(2); // concurrent deleter
+        let e0 = EpochId::new(0);
+        let e1 = EpochId::new(1);
+
+        // Precondition: N visible + readable to A at E0.
+        assert!(
+            layered.is_node_visible_versioned(n, e0, tx_a),
+            "base node must be visible to A's snapshot before any delete"
+        );
+        let name_before = layered.read_node_property_visible(n, &name, e0, Some(tx_a));
+        let props_before = layered.read_node_properties_visible(n, e0, Some(tx_a));
+        let labels_before = layered.read_node_labels_visible(n, e0, Some(tx_a));
+        assert!(name_before.is_some());
+        assert!(!props_before.is_empty());
+        assert!(!labels_before.is_empty());
+
+        // B deletes N (PENDING) and commits at E1 (drive the node finalize path).
+        assert!(layered.delete_node_versioned(n, e1, tx_b));
+        let pending = layered.take_pending_deletes(tx_b);
+        layered.finalize_deletes_by_id(tx_b, e1, &pending);
+
+        // A's snapshot started at E0 (< E1), so A must STILL see + read N.
+        assert!(
+            layered.is_node_visible_versioned(n, e0, tx_a),
+            "snapshot-isolation violated: A (E0) lost a base node a concurrent tx deleted at E1>E0"
+        );
+        assert_eq!(
+            layered.read_node_property_visible(n, &name, e0, Some(tx_a)),
+            name_before,
+            "A (E0) must keep the property of a base node deleted at E1>E0"
+        );
+        assert_eq!(
+            layered.read_node_properties_visible(n, e0, Some(tx_a)),
+            props_before,
+            "A (E0) must keep the property map of a base node deleted at E1>E0"
+        );
+        assert_eq!(
+            layered.read_node_labels_visible(n, e0, Some(tx_a)),
+            labels_before,
+            "A (E0) must keep the labels of a base node deleted at E1>E0"
+        );
+
+        // A LATER snapshot (E1) must NOT see N — boundary `deleted_epoch <= viewing_epoch`.
+        let tx_c = TransactionId::from(3);
+        assert!(
+            !layered.is_node_visible_versioned(n, e1, tx_c),
+            "a snapshot AT the delete's commit epoch must not see the node"
+        );
+        assert!(
+            layered
+                .read_node_property_visible(n, &name, e1, Some(tx_c))
+                .is_none(),
+            "a snapshot AT the commit epoch must read no property"
+        );
+        assert!(
+            layered
+                .read_node_properties_visible(n, e1, Some(tx_c))
+                .is_empty(),
+            "a snapshot AT the commit epoch must read an empty property map"
+        );
+        assert!(
+            layered
+                .read_node_labels_visible(n, e1, Some(tx_c))
+                .is_empty(),
+            "a snapshot AT the commit epoch must read no labels"
+        );
+    }
+
+    /// An UNCOMMITTED base-node delete by B is NOT visible to B's own reads
+    /// (read-your-writes) but IS still visible to a concurrent A.
+    #[test]
+    fn uncommitted_base_node_delete_hidden_from_deleter_visible_to_others() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let n = persons[0];
+
+        let tx_a = TransactionId::from(1);
+        let tx_b = TransactionId::from(2);
+        let e0 = EpochId::new(0);
+
+        // B deletes N but does NOT commit (still PENDING).
+        assert!(layered.delete_node_versioned(n, e0, tx_b));
+
+        // B's own read must not see N.
+        assert!(
+            !layered.is_node_visible_versioned(n, e0, tx_b),
+            "deleter must not see its own uncommitted base-node delete"
+        );
+        // Concurrent A must STILL see N (the delete is uncommitted).
+        assert!(
+            layered.is_node_visible_versioned(n, e0, tx_a),
+            "an uncommitted base-node delete must remain invisible to other snapshots"
+        );
+        assert!(
+            layered
+                .read_node_property_visible(n, &PropertyKey::new("name"), e0, Some(tx_a))
+                .is_some(),
+            "A must still read the property of a node B has only PENDING-deleted"
+        );
+    }
+
+    /// Rolling back B's uncommitted base-node delete (via `drop_tx_overlay`)
+    /// restores visibility for everyone, including the latest view.
+    #[test]
+    fn rolled_back_base_node_delete_is_restored() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let n = persons[0];
+
+        let tx_b = TransactionId::from(2);
+        let e0 = EpochId::new(0);
+
+        assert!(layered.delete_node_versioned(n, e0, tx_b));
+        assert!(!layered.is_node_visible_versioned(n, e0, tx_b));
+
+        // Roll back B (abort path: drop_tx_overlay, then rollback pending node deletes).
+        layered.drop_tx_overlay(tx_b);
+        let pending = layered.take_pending_deletes(tx_b);
+        layered
+            .overlay_store()
+            .rollback_pending_deletes(tx_b, &pending);
+
+        assert!(
+            layered.is_node_visible_versioned(n, e0, tx_b),
+            "rolled-back base-node delete must restore visibility to the deleter"
+        );
+        assert!(
+            layered.get_node(n).is_some(),
+            "rolled-back base-node delete must restore the latest-view node"
+        );
+    }
+
+    /// A persisted/seeded base-node delete (a prior session's committed delete)
+    /// is hidden from ALL current snapshots and the latest view.
+    #[test]
+    fn seeded_base_node_delete_hidden_from_all_snapshots() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let n = persons[0];
+
+        // Seed as a prior-session committed delete (keys-only on-disk format).
+        layered.seed_deleted_from_base(std::iter::once(n), std::iter::empty());
+
+        let tx = TransactionId::from(7);
+        let e0 = EpochId::new(0);
+        assert!(
+            !layered.is_node_visible_versioned(n, e0, tx),
+            "a seeded (prior-session committed) base-node delete must be hidden from every snapshot"
+        );
+        assert!(
+            layered.get_node(n).is_none(),
+            "seeded base-node delete must also be hidden from the latest view"
+        );
+        let snap = layered.snapshot_deleted_node_ids();
+        assert!(
+            snap.contains(&n),
+            "snapshot_deleted_node_ids must still return the seeded node id (keys-only format)"
+        );
+    }
+
+    /// LATEST-view regression guard: a SYSTEM (auto-commit, non-versioned)
+    /// base-node delete must NOT be resurrected by the latest view, and must be
+    /// hidden from versioned reads at the current epoch too.
+    #[test]
+    fn system_base_node_delete_not_resurrected_in_latest_view() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let n = persons[0];
+
+        // SYSTEM delete (auto-commit, no tx snapshot).
+        assert!(layered.delete_node(n));
+
+        // Latest view must not resurrect it.
+        assert!(layered.get_node(n).is_none());
+        assert!(
+            layered
+                .get_node_property(n, &PropertyKey::new("name"))
+                .is_none()
+        );
+        assert!(
+            !layered.nodes_by_label("Person").contains(&n),
+            "latest-view nodes_by_label must not resurrect a SYSTEM-deleted base node"
+        );
+        // Versioned read at the current epoch must also be hidden.
+        let tx = TransactionId::from(9);
+        let now = layered.current_epoch();
+        assert!(!layered.is_node_visible_versioned(n, now, tx));
     }
 }
