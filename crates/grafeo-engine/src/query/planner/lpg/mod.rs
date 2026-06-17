@@ -307,6 +307,28 @@ impl Planner {
         self
     }
 
+    /// Replaces the write tracker with one that uses the given conflict granularity.
+    ///
+    /// Must be called after [`with_context`](Self::with_context) and only takes
+    /// effect when a transaction is active (i.e. when `write_tracker` is `Some`).
+    /// No-op when no transaction is active.
+    #[must_use]
+    pub fn with_conflict_granularity(
+        mut self,
+        granularity: crate::transaction::ConflictGranularity,
+    ) -> Self {
+        use crate::transaction::{ConflictGranularity, TransactionWriteTracker};
+        if granularity == ConflictGranularity::Property
+            && let Some(ref mgr) = self.transaction_manager
+        {
+            self.write_tracker = Some(Arc::new(TransactionWriteTracker::with_granularity(
+                Arc::clone(mgr),
+                granularity,
+            )));
+        }
+        self
+    }
+
     /// Returns the writable store, or `TransactionError::ReadOnly` if unavailable.
     fn write_store(&self) -> Result<Arc<dyn GraphStoreMut>> {
         self.write_store

@@ -94,6 +94,13 @@ impl GraphStore for LpgStore {
         LpgStore::overlay_touched_entities(self, transaction_id)
     }
 
+    fn overlay_touched_properties(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        LpgStore::overlay_touched_properties(self, transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

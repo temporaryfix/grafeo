@@ -199,12 +199,11 @@ pub mod parallel;
 mod prepared;
 mod read_registry;
 
-pub(crate) use conflict_key::{PropTag, prop_compatible};
-// prop_tag re-exported when property-tag producers land (Part G Tasks 3+).
-#[allow(unused_imports)]
 pub(crate) use conflict_key::prop_tag;
+pub(crate) use conflict_key::{PropTag, prop_compatible};
 pub use manager::{
-    EntityId, IsolationLevel, TransactionInfo, TransactionManager, TransactionState,
+    ConflictGranularity, EntityId, IsolationLevel, TransactionInfo, TransactionManager,
+    TransactionState,
 };
 #[doc(hidden)]
 pub use mvcc::{VersionChain, VersionInfo};

@@ -1094,6 +1094,48 @@ impl LpgStore {
         }
     }
 
+    /// Non-draining snapshot of property-level writes from the overlay, for use
+    /// under property-granularity conflict detection.
+    ///
+    /// Returns:
+    /// - `Vec<(NodeId, Option<String>)>`: node-property writes as `(node, Some(key))`;
+    ///   label changes (structural) as `(node, None)`.
+    /// - `Vec<(EdgeId, Option<String>)>`: edge-property writes as `(edge, Some(key))`.
+    ///
+    /// Unlike [`overlay_touched_entities`](Self::overlay_touched_entities) (which
+    /// deduplicates to unique entity ids), this method returns one entry *per
+    /// `(entity, property)`* write so the caller can build tagged write-set entries.
+    /// Duplicates within the same `(entity, key)` are naturally collapsed by the
+    /// `HashSet<(EntityId, PropTag)>` write-set.
+    pub fn overlay_touched_properties(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        let overlay = self.tx_property_overlay.read();
+        match overlay.get(&transaction_id) {
+            None => (Vec::new(), Vec::new()),
+            Some(delta) => {
+                // Each (node, property_key) write → (node, Some(key)).
+                let mut node_props: Vec<(NodeId, Option<String>)> = delta
+                    .node_props
+                    .keys()
+                    .map(|(node_id, key)| (*node_id, Some(key.to_string())))
+                    .collect();
+                // Label changes are structural: record as (node, None).
+                for (node_id, _label_id) in delta.node_labels.keys() {
+                    node_props.push((*node_id, None));
+                }
+                // Edge-property writes → (edge, Some(key)).
+                let edge_props: Vec<(EdgeId, Option<String>)> = delta
+                    .edge_props
+                    .keys()
+                    .map(|(edge_id, key)| (*edge_id, Some(key.to_string())))
+                    .collect();
+                (node_props, edge_props)
+            }
+        }
+    }
+
     /// Attaches `tracker` to `tx` so that subsequent visible-read accessors
     /// record every observed node/edge into it (the SSI read-set). Call at
     /// Serializable tx begin; the tracker is held until

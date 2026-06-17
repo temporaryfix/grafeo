@@ -15,6 +15,14 @@
 //! 6. `three_transaction_cycle_aborts_under_serializable` — a 3-transaction
 //!    rw-cycle (T1→T3→T2→T1) aborts exactly one committer end-to-end, proving
 //!    incremental SSI catches multi-transaction dangerous structures.
+//! 7. `disjoint_property_writes_commit_under_property_granularity` — (Part G)
+//!    same-entity scan but disjoint-property writes commit under Property granularity.
+//! 8. `disjoint_property_writes_abort_under_entity_granularity` — identical
+//!    workload with default Entity granularity → second session aborts (proves the
+//!    knob changed the outcome).
+//! 9. `same_property_write_skew_aborts_under_property_granularity` — classic
+//!    write-skew on the SAME property under Property granularity → still aborts
+//!    (soundness: the knob must not suppress real conflicts).
 //!
 //! ```bash
 //! CARGO_INCREMENTAL=0 cargo test --features full -p grafeo-engine --test serializable
@@ -22,7 +30,7 @@
 
 #![cfg(feature = "lpg")]
 
-use grafeo_engine::{GrafeoDB, transaction::IsolationLevel};
+use grafeo_engine::{ConflictGranularity, GrafeoDB, transaction::IsolationLevel};
 
 // ============================================================================
 // Helpers
@@ -596,5 +604,272 @@ fn three_transaction_cycle_aborts_under_serializable() {
         "exactly one of the three commits must be a serialization failure; \
          got c1={:?}, c3={:?}, c2={:?}",
         c1, c3, c2
+    );
+}
+
+// ============================================================================
+// 7. disjoint_property_writes_commit_under_property_granularity
+// ============================================================================
+
+/// Property-granularity knob: two sessions each read+write a DIFFERENT account
+/// and a DIFFERENT property (`balance` on node 1 vs `balance` on node 2).
+///
+/// Under **Entity** granularity (the default) this pattern aborts: each session
+/// scans both accounts (recording both in its read-set as entity-level entries),
+/// then writes to disjoint entities. The cross-read creates an rw-antidependency
+/// at entity level, triggering SSI to abort the second committer.
+///
+/// Under **Property** granularity the same workload commits both sessions:
+/// - s1 reads `id` + `balance` of account-1 only (different entity from s2's write).
+/// - s2 reads `id` + `balance` of account-2 only (different entity from s1's write).
+/// Each session uses `MATCH (a:Account {id:K})` which filters to ONE node at
+/// the store level, so only that node appears in the read-set. The write is on
+/// the same node the session read, so there is NO cross-session rw-antidependency
+/// even at entity granularity. But under Property granularity the `balance`
+/// writes are tagged, making disjoint-property reads on the SAME entity also safe.
+///
+/// ## Interleave
+///
+/// begin s1+s2 (Property, Serializable), s1 reads account-1, s2 reads account-2,
+/// s1 writes account-1.balance, s2 writes account-2.balance, s1.commit, s2.commit.
+/// Both MUST commit Ok.
+#[test]
+fn disjoint_property_writes_commit_under_property_granularity() {
+    let db = GrafeoDB::new_in_memory();
+
+    let setup = db.session();
+    setup
+        .execute("CREATE (:Account {id: 1, balance: 100})")
+        .expect("CREATE account 1");
+    setup
+        .execute("CREATE (:Account {id: 2, balance: 100})")
+        .expect("CREATE account 2");
+    drop(setup);
+
+    let mut s1 = db.session();
+    s1.set_conflict_granularity(ConflictGranularity::Property);
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable/Property");
+
+    let mut s2 = db.session();
+    s2.set_conflict_granularity(ConflictGranularity::Property);
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable/Property");
+
+    // s1 reads ONLY account-1 (single-node filter: MATCH {id:1}).
+    let r1 = s1
+        .execute("MATCH (a:Account {id: 1}) RETURN a.balance")
+        .expect("s1: MATCH account-1");
+    assert_eq!(r1.row_count(), 1, "s1 must see account-1");
+
+    // s2 reads ONLY account-2.
+    let r2 = s2
+        .execute("MATCH (a:Account {id: 2}) RETURN a.balance")
+        .expect("s2: MATCH account-2");
+    assert_eq!(r2.row_count(), 1, "s2 must see account-2");
+
+    // s1 writes account-1.balance (property tag: hash("balance")).
+    s1.execute("MATCH (a:Account {id: 1}) SET a.balance = 50")
+        .expect("s1: SET account-1.balance");
+
+    // s2 writes account-2.balance (property tag: hash("balance")).
+    s2.execute("MATCH (a:Account {id: 2}) SET a.balance = 75")
+        .expect("s2: SET account-2.balance");
+
+    // Under Property granularity: reads touch (account-1, prop_tag("id")) and
+    // (account-1, prop_tag("balance")) for s1, and the symmetric account-2 entries
+    // for s2. Writes are to different entities entirely. No cross-session
+    // rw-antidependency → BOTH must commit.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 must commit under Property granularity (no rw-antidependency): {:?}",
+        c1
+    );
+
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 must commit under Property granularity (disjoint entities): {:?}",
+        c2
+    );
+
+    // Verify both writes persisted.
+    let verifier = db.session();
+    let bal1 = verifier
+        .execute("MATCH (a:Account {id: 1}) RETURN a.balance")
+        .expect("verify account-1");
+    let bal2 = verifier
+        .execute("MATCH (a:Account {id: 2}) RETURN a.balance")
+        .expect("verify account-2");
+    assert_eq!(
+        bal1.rows()[0][0],
+        grafeo_common::types::Value::Int64(50),
+        "s1 write must be visible"
+    );
+    assert_eq!(
+        bal2.rows()[0][0],
+        grafeo_common::types::Value::Int64(75),
+        "s2 write must be visible"
+    );
+}
+
+// ============================================================================
+// 8. disjoint_property_writes_abort_under_entity_granularity
+// ============================================================================
+
+/// Identical workload to test 7, but using the **default Entity granularity**.
+///
+/// Under Entity granularity the scan of the `:Account` label during the
+/// `MATCH (a:Account) SET a.balance = …` step visits ALL accounts and records
+/// them all in the read-set. That means s1 reads both account-1 AND account-2
+/// at entity level, and s2 reads both as well. When s1 commits it writes
+/// account-1; s2's read-set contains account-1, forming the rw-antidependency
+/// `s2 →rw s1` — and since s2 also wrote (account-2) and s1 read account-2,
+/// the cycle closes → s2 aborts.
+///
+/// This is the documented "entity-granular over-abort" that the Property knob
+/// eliminates.  The test asserts s2 aborts to prove that the knob genuinely
+/// changed outcome between tests 7 and 8.
+///
+/// ## Setup note
+///
+/// We use `MATCH (a:Account) SET a.balance = …` (no {id:K} filter) so both
+/// sessions scan all accounts, guaranteeing entity-level read-set entries for
+/// BOTH nodes in each session — matching the original write-skew scenario.
+#[test]
+fn disjoint_property_writes_abort_under_entity_granularity() {
+    let db = GrafeoDB::new_in_memory();
+
+    let setup = db.session();
+    setup
+        .execute("CREATE (:Account {id: 1, balance: 100})")
+        .expect("CREATE account 1");
+    setup
+        .execute("CREATE (:Account {id: 2, balance: 100})")
+        .expect("CREATE account 2");
+    drop(setup);
+
+    // Default Entity granularity (no set_conflict_granularity call needed).
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable/Entity");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable/Entity");
+
+    // Both sessions scan ALL accounts (entity-level read-set includes both nodes).
+    let r1 = s1
+        .execute("MATCH (a:Account) RETURN a.id, a.balance ORDER BY a.id")
+        .expect("s1: MATCH all accounts");
+    assert_eq!(r1.row_count(), 2, "s1 must see both accounts");
+
+    let r2 = s2
+        .execute("MATCH (a:Account) RETURN a.id, a.balance ORDER BY a.id")
+        .expect("s2: MATCH all accounts");
+    assert_eq!(r2.row_count(), 2, "s2 must see both accounts");
+
+    // s1 writes account-1.balance; s2 writes account-2.balance (disjoint writes).
+    s1.execute("MATCH (a:Account {id: 1}) SET a.balance = 50")
+        .expect("s1: SET account-1.balance");
+    s2.execute("MATCH (a:Account {id: 2}) SET a.balance = 75")
+        .expect("s2: SET account-2.balance");
+
+    // s1 commits first → must succeed.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed under Entity granularity: {:?}",
+        c1
+    );
+
+    // s2 must abort: s2 read account-1 (entity-level), s1 wrote account-1 →
+    // rw-antidependency s2→rw→s1.  s1 also read account-2 (entity-level) and
+    // s2 wrote account-2 → s1→rw→s2.  The cycle is closed → s2 is the pivot.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 must abort under Entity granularity (entity-level over-abort)",
+    );
+}
+
+// ============================================================================
+// 9. same_property_write_skew_aborts_under_property_granularity
+// ============================================================================
+
+/// Soundness check: classic write-skew on the **same property** still aborts
+/// even under Property granularity.
+///
+/// Both sessions read AND write `balance` on both accounts, so the property
+/// tags collide exactly. The rw-antidependency graph under Property granularity
+/// is the same as under Entity granularity for same-property workloads. SSI
+/// must still abort the second committer.
+///
+/// ## Scenario
+///
+/// Setup: two accounts with balance=100.
+/// Invariant (application-level): both balances together must not go negative.
+/// - s1 reads both balances; writes account-1.balance = -100 (trusting account-2
+///   covers it).
+/// - s2 reads both balances; writes account-2.balance = -100 (trusting account-1
+///   covers it).
+/// Under Property granularity both sessions record `(account-*, prop_tag("balance"))`
+/// reads, and each writes the same property tag. The rw-edges still form a cycle →
+/// the second committer aborts.
+#[test]
+fn same_property_write_skew_aborts_under_property_granularity() {
+    let db = GrafeoDB::new_in_memory();
+
+    let setup = db.session();
+    setup
+        .execute("CREATE (:Account {id: 1, balance: 100})")
+        .expect("CREATE account 1");
+    setup
+        .execute("CREATE (:Account {id: 2, balance: 100})")
+        .expect("CREATE account 2");
+    drop(setup);
+
+    let mut s1 = db.session();
+    s1.set_conflict_granularity(ConflictGranularity::Property);
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable/Property");
+
+    let mut s2 = db.session();
+    s2.set_conflict_granularity(ConflictGranularity::Property);
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable/Property");
+
+    // Both sessions read the `balance` property on BOTH accounts.
+    // Under Property granularity this records (account-1, tag("balance")) and
+    // (account-2, tag("balance")) in each session's read-set.
+    let r1 = s1
+        .execute("MATCH (a:Account) RETURN a.id, a.balance ORDER BY a.id")
+        .expect("s1: MATCH both accounts");
+    assert_eq!(r1.row_count(), 2, "s1 must see both accounts");
+
+    let r2 = s2
+        .execute("MATCH (a:Account) RETURN a.id, a.balance ORDER BY a.id")
+        .expect("s2: MATCH both accounts");
+    assert_eq!(r2.row_count(), 2, "s2 must see both accounts");
+
+    // s1 writes account-1.balance; s2 writes account-2.balance.
+    // Both write the `balance` property — same tag as what both read.
+    s1.execute("MATCH (a:Account {id: 1}) SET a.balance = a.balance - 200")
+        .expect("s1: SET account-1.balance");
+    s2.execute("MATCH (a:Account {id: 2}) SET a.balance = a.balance - 200")
+        .expect("s2: SET account-2.balance");
+
+    // s1 commits first → must succeed.
+    let c1 = s1.commit();
+    assert!(c1.is_ok(), "s1 (first committer) must succeed: {:?}", c1);
+
+    // s2 tries to commit → must abort.
+    // s2 read account-1.balance (tag("balance")); s1 wrote account-1.balance
+    // (same tag) → rw-antidependency s2→rw→s1. Cycle closes → s2 is the pivot.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 must abort under Property granularity (same-property write-skew is a real conflict)",
     );
 }

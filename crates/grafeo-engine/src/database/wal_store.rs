@@ -362,6 +362,13 @@ impl GraphStore for WalGraphStore {
         self.inner.overlay_touched_entities(transaction_id)
     }
 
+    fn overlay_touched_properties(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        self.inner.overlay_touched_properties(transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

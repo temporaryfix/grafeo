@@ -61,5 +61,6 @@ pub use metrics::{MetricsRegistry, MetricsSnapshot};
 #[cfg(all(feature = "gql", feature = "lpg"))]
 pub use query::executor::stream::{OwnedResultStream, OwnedRowIterator, ResultStream, RowIterator};
 pub use session::Session;
+pub use transaction::ConflictGranularity;
 #[cfg(feature = "lpg")]
 pub use transaction::{CommitInfo, PreparedCommit};

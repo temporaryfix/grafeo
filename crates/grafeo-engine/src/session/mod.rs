@@ -36,7 +36,9 @@ use crate::config::{AdaptiveConfig, GraphModel};
 use crate::database::QueryResult;
 use crate::query::Executor;
 use crate::query::cache::QueryCache;
-use crate::transaction::{EntityId, TransactionManager};
+#[cfg(feature = "lpg")]
+use crate::transaction::prop_tag;
+use crate::transaction::{ConflictGranularity, EntityId, TransactionManager};
 
 /// Storage key suffix for the implicit default graph within a schema.
 /// Auto-created by `CREATE SCHEMA` and auto-dropped by `DROP SCHEMA`.
@@ -204,6 +206,10 @@ pub struct Session {
     /// rollback block while any streams are outstanding so mid-iteration
     /// snapshots are not invalidated.
     active_streams: AtomicUsize,
+    /// Conflict-detection granularity used for the NEXT Serializable
+    /// transaction begun on this session.  Changing this field mid-transaction
+    /// has no effect until the next `BEGIN`.
+    conflict_granularity: parking_lot::Mutex<crate::transaction::ConflictGranularity>,
     /// Shared metrics registry (populated when the `metrics` feature is enabled).
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Option<Arc<crate::metrics::MetricsRegistry>>,
@@ -314,6 +320,9 @@ impl Session {
             transaction_nesting_depth: parking_lot::Mutex::new(0),
             touched_graphs: parking_lot::Mutex::new(Vec::new()),
             active_streams: AtomicUsize::new(0),
+            conflict_granularity: parking_lot::Mutex::new(
+                crate::transaction::ConflictGranularity::Entity,
+            ),
             #[cfg(feature = "metrics")]
             metrics: None,
             #[cfg(feature = "metrics")]
@@ -459,6 +468,9 @@ impl Session {
             transaction_nesting_depth: parking_lot::Mutex::new(0),
             touched_graphs: parking_lot::Mutex::new(Vec::new()),
             active_streams: AtomicUsize::new(0),
+            conflict_granularity: parking_lot::Mutex::new(
+                crate::transaction::ConflictGranularity::Entity,
+            ),
             #[cfg(feature = "metrics")]
             metrics: None,
             #[cfg(feature = "metrics")]
@@ -3908,6 +3920,20 @@ impl Session {
         self.begin_transaction_inner(false, Some(isolation_level))
     }
 
+    /// Sets the conflict-detection granularity for the NEXT Serializable
+    /// transaction begun on this session.
+    ///
+    /// Changing this setting mid-transaction has no effect until the next
+    /// `begin_transaction_with_isolation` call.  The granularity is ignored
+    /// for `SnapshotIsolation` and `ReadCommitted` transactions.
+    ///
+    /// See [`ConflictGranularity`](crate::transaction::ConflictGranularity) for
+    /// the tradeoffs between `Entity` (the conservative default) and `Property`
+    /// (finer-grained, fewer false aborts).
+    pub fn set_conflict_granularity(&self, granularity: crate::transaction::ConflictGranularity) {
+        *self.conflict_granularity.lock() = granularity;
+    }
+
     /// Core transaction begin logic, usable from both `&mut self` and `&self` paths.
     #[cfg(feature = "lpg")]
     fn begin_transaction_inner(
@@ -3949,9 +3975,13 @@ impl Session {
         if self.transaction_manager.isolation_level(transaction_id)
             == Some(crate::transaction::IsolationLevel::Serializable)
         {
-            let bridge = std::sync::Arc::new(crate::transaction::TransactionReadTracker::new(
-                Arc::clone(&self.transaction_manager),
-            ));
+            let granularity = *self.conflict_granularity.lock();
+            let bridge = std::sync::Arc::new(
+                crate::transaction::TransactionReadTracker::with_granularity(
+                    Arc::clone(&self.transaction_manager),
+                    granularity,
+                ),
+            );
             active.register_read_tracker(transaction_id, bridge);
         }
 
@@ -4036,40 +4066,73 @@ impl Session {
         // Increment 2e (Part E): complete the write-set from the store chokepoints
         // (complete by construction) before validation. Non-draining peeks; the
         // existing take_*/finalize_* below still consume them.
+        //
+        // Part G Task 4: under Property granularity the overlay entries are tagged
+        // with their per-property hash rather than collapsing to entity-level None,
+        // so disjoint-property concurrent writes do not form false rw-antidependencies.
         {
-            let mut ws: Vec<EntityId> = Vec::new();
+            let granularity = *self.conflict_granularity.lock();
+            // Structural writes (creates, deletes) are always entity-level (None).
+            let mut structural_ws: Vec<EntityId> = Vec::new();
             for graph_name in &touched {
                 let store = self.resolve_store(graph_name);
-                ws.extend(
+                structural_ws.extend(
                     store
                         .pending_node_creates(transaction_id)
                         .into_iter()
                         .map(EntityId::Node),
                 );
-                ws.extend(
+                structural_ws.extend(
                     store
                         .pending_edge_creates(transaction_id)
                         .into_iter()
                         .map(EntityId::Edge),
                 );
-                ws.extend(
+                structural_ws.extend(
                     store
                         .pending_node_deletes_peek(transaction_id)
                         .into_iter()
                         .map(EntityId::Node),
                 );
-                ws.extend(
+                structural_ws.extend(
                     store
                         .pending_edge_deletes_peek(transaction_id)
                         .into_iter()
                         .map(EntityId::Edge),
                 );
-                let (on, oe) = store.overlay_touched_entities(transaction_id);
-                ws.extend(on.into_iter().map(EntityId::Node));
-                ws.extend(oe.into_iter().map(EntityId::Edge));
             }
             self.transaction_manager
-                .extend_write_set(transaction_id, ws);
+                .extend_write_set(transaction_id, structural_ws);
+
+            // Overlay touches: property-tagged under Property granularity, entity-level
+            // (None) under Entity granularity.
+            if granularity == ConflictGranularity::Property {
+                let mut tagged: Vec<(EntityId, crate::transaction::PropTag)> = Vec::new();
+                for graph_name in &touched {
+                    let store = self.resolve_store(graph_name);
+                    let (node_props, edge_props) = store.overlay_touched_properties(transaction_id);
+                    for (node_id, opt_key) in node_props {
+                        let tag = opt_key.as_deref().map(prop_tag);
+                        tagged.push((EntityId::Node(node_id), tag));
+                    }
+                    for (edge_id, opt_key) in edge_props {
+                        let tag = opt_key.as_deref().map(prop_tag);
+                        tagged.push((EntityId::Edge(edge_id), tag));
+                    }
+                }
+                self.transaction_manager
+                    .extend_write_set_tagged(transaction_id, tagged);
+            } else {
+                let mut ws: Vec<EntityId> = Vec::new();
+                for graph_name in &touched {
+                    let store = self.resolve_store(graph_name);
+                    let (on, oe) = store.overlay_touched_entities(transaction_id);
+                    ws.extend(on.into_iter().map(EntityId::Node));
+                    ws.extend(oe.into_iter().map(EntityId::Edge));
+                }
+                self.transaction_manager
+                    .extend_write_set(transaction_id, ws);
+            }
         }
 
         let commit_epoch = match self.transaction_manager.commit(transaction_id) {
@@ -4923,6 +4986,7 @@ impl Session {
 
         let write_store = self.active_write_store();
 
+        let granularity = *self.conflict_granularity.lock();
         let mut planner = Planner::with_context(
             Arc::clone(&store),
             write_store,
@@ -4930,6 +4994,7 @@ impl Session {
             transaction_id,
             viewing_epoch,
         )
+        .with_conflict_granularity(granularity)
         .with_factorized_execution(self.factorized_execution)
         .with_catalog(Arc::clone(&self.catalog))
         .with_session_context(session_context)

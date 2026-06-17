@@ -1083,6 +1083,15 @@ impl GraphStore for LayeredStore {
         self.overlay.load().overlay_touched_entities(transaction_id)
     }
 
+    fn overlay_touched_properties(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        self.overlay
+            .load()
+            .overlay_touched_properties(transaction_id)
+    }
+
     fn read_node_property_visible(
         &self,
         id: NodeId,

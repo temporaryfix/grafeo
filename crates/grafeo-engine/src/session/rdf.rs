@@ -75,6 +75,9 @@ impl Session {
             savepoints: parking_lot::Mutex::new(Vec::new()),
             transaction_nesting_depth: parking_lot::Mutex::new(0),
             touched_graphs: parking_lot::Mutex::new(Vec::new()),
+            conflict_granularity: parking_lot::Mutex::new(
+                crate::transaction::ConflictGranularity::Entity,
+            ),
             #[cfg(feature = "metrics")]
             metrics: None,
             #[cfg(feature = "metrics")]

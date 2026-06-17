@@ -65,6 +65,50 @@ pub enum IsolationLevel {
     Serializable,
 }
 
+/// Conflict-detection granularity for Serializable transactions.
+///
+/// Controls whether rw-antidependency edges (the SSI read-set / write-set
+/// overlap check) are tracked at the entity level or at the individual
+/// property level.
+///
+/// - **`Entity`** (default) — every read or write records the whole entity.
+///   A read of any property on node N and a write to any other property on N
+///   form an rw-antidependency, which may abort transactions that otherwise
+///   have no true data conflict. This is the conservative default.
+///
+/// - **`Property`** — reads and writes record `(entity, property_tag)` pairs.
+///   Two operations on the same entity only conflict if they touch the *same*
+///   property (or one is structural: delete, label-change, whole-entity read).
+///   This allows disjoint-property workloads (e.g. session 1 writes `bal`,
+///   session 2 writes `name` on different nodes) to commit concurrently
+///   instead of aborting with a false serialization failure.
+///
+/// # Safety
+///
+/// Property-level granularity is still sound: hash collisions can only produce
+/// false *conflicts* (two distinct properties map to the same tag → both abort
+/// conservatively), never missed conflicts. The knob cannot introduce anomalies.
+///
+/// # Effect
+///
+/// The granularity is checked only at the next
+/// [`begin_transaction_with_isolation`](crate::Session::begin_transaction_with_isolation)
+/// call; changing it mid-transaction has no effect until the next `BEGIN`.
+///
+/// Only active under `Serializable` isolation; it is ignored for
+/// `SnapshotIsolation` and `ReadCommitted` (which never build read-sets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictGranularity {
+    /// Whole-entity granularity (default). Every property read/write records
+    /// the containing entity, not the individual property.
+    #[default]
+    Entity,
+    /// Per-property granularity. Reads and writes record
+    /// `(entity, prop_tag(key))` so that disjoint-property accesses on the
+    /// same entity do not form rw-antidependencies.
+    Property,
+}
+
 /// Entity identifier for write tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -351,6 +395,26 @@ impl TransactionManager {
         {
             info.write_set
                 .extend(entities.into_iter().map(|e| (e, None)));
+        }
+    }
+
+    /// Tagged variant of [`extend_write_set`](Self::extend_write_set) used
+    /// under `ConflictGranularity::Property`.
+    ///
+    /// Accepts `(EntityId, PropTag)` pairs directly, so the commit path can
+    /// supply per-property tags from the store overlay instead of collapsing
+    /// every write to entity-level (`None`). Entity-level structural writes
+    /// (creates, deletes, label changes) still carry `None` even under
+    /// `Property` granularity.
+    pub fn extend_write_set_tagged(
+        &self,
+        transaction_id: TransactionId,
+        tagged: impl IntoIterator<Item = (EntityId, super::PropTag)>,
+    ) {
+        if let Some(info) = self.transactions.write().get_mut(&transaction_id)
+            && info.state == TransactionState::Active
+        {
+            info.write_set.extend(tagged);
         }
     }
 
@@ -798,6 +862,19 @@ impl TransactionManager {
             .read()
             .get(&transaction_id)
             .map(|i| i.read_set.iter().map(|(e, _)| *e).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns a copy of the read-set including per-entry [`PropTag`] values.
+    ///
+    /// Used by tests (and potentially diagnostics) to verify that property-level
+    /// granularity is emitting `Some(tag)` entries rather than entity-level `None`.
+    #[cfg(test)]
+    pub fn read_set_tagged(&self, transaction_id: TransactionId) -> HashSet<(EntityId, PropTag)> {
+        self.transactions
+            .read()
+            .get(&transaction_id)
+            .map(|i| i.read_set.clone())
             .unwrap_or_default()
     }
 

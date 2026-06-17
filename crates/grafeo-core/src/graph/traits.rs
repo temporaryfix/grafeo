@@ -130,6 +130,27 @@ pub trait GraphStore: Send + Sync {
         (Vec::new(), Vec::new())
     }
 
+    /// Non-draining snapshot of property-level writes from the overlay, for use
+    /// under `ConflictGranularity::Property`.
+    ///
+    /// Returns:
+    /// - `Vec<(NodeId, Option<String>)>`: each node-property write as
+    ///   `(node, Some(key))`.  Label changes (structural) are returned as
+    ///   `(node, None)`.
+    /// - `Vec<(EdgeId, Option<String>)>`: edge-property writes as
+    ///   `(edge, Some(key))`.
+    ///
+    /// The `Option<String>` becomes `Option<u64>` (a `PropTag`) in the session
+    /// commit path after calling `prop_tag(key)`.
+    ///
+    /// Default: empty (stores without a per-transaction overlay return nothing).
+    fn overlay_touched_properties(
+        &self,
+        _transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        (Vec::new(), Vec::new())
+    }
+
     /// Snapshot-consistent node property read (unified-MVCC accessor).
     ///
     /// Default: ignores isolation and returns the committed value — safe for
