@@ -196,6 +196,7 @@ mod mvcc;
 pub mod parallel;
 #[cfg(feature = "lpg")]
 mod prepared;
+mod read_registry;
 
 pub use manager::{
     EntityId, IsolationLevel, TransactionInfo, TransactionManager, TransactionState,
@@ -204,6 +205,8 @@ pub use manager::{
 pub use mvcc::{VersionChain, VersionInfo};
 #[cfg(feature = "lpg")]
 pub use prepared::{CommitInfo, PreparedCommit};
+#[allow(unused_imports)] // used by future F2 tasks (record_read / record_write)
+pub(crate) use read_registry::ReadRegistry;
 pub use read_tracker::TransactionReadTracker;
 pub use write_tracker::TransactionWriteTracker;
 
