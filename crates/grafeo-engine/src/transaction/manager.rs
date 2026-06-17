@@ -189,6 +189,19 @@ impl TransactionManager {
     /// written to the same entity, returns a write-write conflict error
     /// immediately (before the caller mutates the store).
     ///
+    /// For Serializable transactions, also performs write-time
+    /// rw-antidependency detection (the mirror of the read-time detection in
+    /// [`record_read`](Self::record_read)): any concurrent Serializable
+    /// transaction that has read `entity` (and is still active) is found via
+    /// the `ReadRegistry` and a `reader →rw tx` edge is recorded for each.
+    ///
+    /// # Lock discipline
+    ///
+    /// The `transactions` write lock is held only for the W-W check and
+    /// `write_set.insert`. It is dropped before consulting the `ReadRegistry`
+    /// and before calling `set_rw_edge` (which also takes `transactions.write()`),
+    /// avoiding re-entrant deadlock.
+    ///
     /// # Errors
     ///
     /// Returns an error if the transaction is not active or if another
@@ -199,37 +212,64 @@ impl TransactionManager {
         entity: impl Into<EntityId>,
     ) -> Result<()> {
         let entity = entity.into();
-        let mut txns = self.transactions.write();
 
-        // First-writer-wins conflict detection. Skip the scan when only one
-        // transaction is active (common case for auto-commit).
-        if self.active_count.load(Ordering::Relaxed) > 1 {
-            for (other_tx, other_info) in txns.iter() {
-                if *other_tx != transaction_id
-                    && other_info.state == TransactionState::Active
-                    && other_info.write_set.contains(&entity)
-                {
-                    return Err(Error::Transaction(TransactionError::WriteConflict(
-                        format!("Write-write conflict on entity {entity:?}"),
-                    )));
+        // Perform the W-W check and write_set insert under the transactions lock,
+        // then release the lock before any read_registry or set_rw_edge calls.
+        let is_serializable: bool = {
+            let mut txns = self.transactions.write();
+
+            // First-writer-wins conflict detection. Skip the scan when only one
+            // transaction is active (common case for auto-commit).
+            if self.active_count.load(Ordering::Relaxed) > 1 {
+                for (other_tx, other_info) in txns.iter() {
+                    if *other_tx != transaction_id
+                        && other_info.state == TransactionState::Active
+                        && other_info.write_set.contains(&entity)
+                    {
+                        return Err(Error::Transaction(TransactionError::WriteConflict(
+                            format!("Write-write conflict on entity {entity:?}"),
+                        )));
+                    }
+                }
+            }
+
+            // Single lookup: get_mut for both state check and write_set insert
+            let info = txns.get_mut(&transaction_id).ok_or_else(|| {
+                Error::Transaction(TransactionError::InvalidState(
+                    "Transaction not found".to_string(),
+                ))
+            })?;
+
+            if info.state != TransactionState::Active {
+                return Err(Error::Transaction(TransactionError::InvalidState(
+                    "Transaction is not active".to_string(),
+                )));
+            }
+
+            info.write_set.insert(entity);
+            // Capture isolation level while we hold the lock; drop the lock at
+            // the end of this block.
+            info.isolation_level == IsolationLevel::Serializable
+            // transactions write lock drops here
+        };
+
+        // Write-time rw-antidependency detection (Serializable writers only).
+        //
+        // An SI writer's overwrite does not participate in SSI cycle detection —
+        // symmetric with the read-time choice in record_read, which only detects
+        // when the READER is Serializable. SSI edges are formed only when the
+        // acting side (reader at read-time, writer at write-time) is Serializable.
+        if is_serializable {
+            // readers_of uses its own sharded locks, independent of transactions.
+            let readers = self.read_registry.readers_of(entity);
+            for reader in readers {
+                if reader != transaction_id {
+                    // reader read a version this writer is now overwriting.
+                    self.set_rw_edge(reader, transaction_id);
                 }
             }
         }
 
-        // Single lookup: get_mut for both state check and write_set insert
-        let info = txns.get_mut(&transaction_id).ok_or_else(|| {
-            Error::Transaction(TransactionError::InvalidState(
-                "Transaction not found".to_string(),
-            ))
-        })?;
-
-        if info.state != TransactionState::Active {
-            return Err(Error::Transaction(TransactionError::InvalidState(
-                "Transaction is not active".to_string(),
-            )));
-        }
-
-        info.write_set.insert(entity);
         Ok(())
     }
 
@@ -1687,6 +1727,106 @@ mod tests {
         assert!(
             !readers.contains(&t_si),
             "SI reader must not be registered in read_registry"
+        );
+    }
+
+    // --- F2 Task 4: write-time rw-edge detection via read-registry (mirror direction) ---
+
+    #[test]
+    fn test_write_after_concurrent_read_sets_reader_out_writer_in() {
+        // t_r (Serializable, active) record_read(E) registers it in the
+        // read_registry; t_w (Serializable, active) record_write(E) must detect
+        // t_r as a concurrent reader and set the rw-edge: reader.out_conflict=true,
+        // writer.in_conflict=true.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(10);
+
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // t_r reads E first → registered in read_registry
+        mgr.record_read(t_r, entity).unwrap();
+        // t_w writes E → discovers t_r as concurrent reader → sets rw-edge
+        mgr.record_write(t_w, entity).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, true),
+            "t_r (reader) must have out_conflict after write-time detection"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (true, false),
+            "t_w (writer) must have in_conflict after write-time detection"
+        );
+    }
+
+    #[test]
+    fn test_write_with_no_concurrent_readers_no_edge() {
+        // t_w writes E that nobody has read → no flags set.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(20);
+
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_write(t_w, entity).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (false, false),
+            "no rw edge when nobody read the entity"
+        );
+    }
+
+    #[test]
+    fn test_non_serializable_write_no_edges() {
+        // An SI writer does not participate in SSI cycle detection; detection
+        // fires only for Serializable actors on the acting side.
+        //
+        // Choice: we skip write-time detection when the WRITER is not Serializable
+        // (symmetric with Task 3's choice to skip when the READER is not
+        // Serializable). An SI writer's overwrite does not form an SSI rw-edge.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(30);
+
+        // t_r is Serializable and reads E → registered in read_registry
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(t_r, entity).unwrap();
+
+        // t_si is SI and writes E → does NOT trigger write-time detection
+        let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
+        mgr.record_write(t_si, entity).unwrap();
+
+        // The SI writer gets no flag
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "SI writer must not get any conflict flags"
+        );
+        // The Serializable reader's flags are unchanged by the SI write
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, false),
+            "Serializable reader must not get out_conflict from a non-Serializable writer"
+        );
+    }
+
+    #[test]
+    fn test_write_does_not_self_edge() {
+        // A transaction that reads E then writes E is in the read_registry for E,
+        // but the `reader != tx` guard must skip itself → no self-edge.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(40);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        // Read first (registers in read_registry)
+        mgr.record_read(tx, entity).unwrap();
+        // Write same entity → readers_of returns `tx` itself, but guard skips it
+        mgr.record_write(tx, entity).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx),
+            (false, false),
+            "a tx that reads then writes the same entity must not self-edge"
         );
     }
 }
