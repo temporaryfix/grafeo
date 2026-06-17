@@ -272,6 +272,38 @@ pub trait GraphStore: Send + Sync {
     /// Returns (target_node, edge_id) pairs for edges from a node.
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)>;
 
+    /// Returns snapshot-visible `(target_node, edge_id)` pairs for edges from
+    /// a node, and records each visible edge into the SSI read-set.
+    ///
+    /// The default delegates to `edges_from` (no MVCC visibility filter, no
+    /// recording).  `LpgStore` overrides with the raw-adjacency + version-chain
+    /// path described in `LpgStore::edges_from_versioned`.
+    fn edges_from_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        let _ = (epoch, transaction_id);
+        self.edges_from(node, direction)
+    }
+
+    /// Returns neighbor node IDs reachable via snapshot-visible edges.
+    ///
+    /// The default delegates to `neighbors` (no MVCC visibility filter, no
+    /// recording).  `LpgStore` overrides via `neighbors_versioned`.
+    fn neighbors_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let _ = (epoch, transaction_id);
+        self.neighbors(node, direction)
+    }
+
     /// Returns the out-degree of a node (number of outgoing edges).
     fn out_degree(&self, node: NodeId) -> usize;
 

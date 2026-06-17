@@ -2739,3 +2739,162 @@ fn test_nodes_by_label_visible_records_each_returned_node() {
     let _ = store.nodes_by_label_visible("Person", None);
     assert!(spy.nodes.lock().is_empty(), "tx=None must not record");
 }
+
+// ── edges_from_versioned / neighbors_versioned ───────────────────────────────
+
+/// Tx A snapshots at E0. Another tx creates edge F (src→dst) and commits at
+/// E1 > E0. `edges_from_versioned(src, Outgoing, E0, tx_a)` must NOT include F
+/// because F was created after A's snapshot.
+#[test]
+fn edges_from_versioned_excludes_concurrent_committed_edge() {
+    let store = LpgStore::new().unwrap();
+    let src = store.create_node(&["N"]);
+    let dst = store.create_node(&["N"]);
+
+    // Tx A's snapshot epoch — taken before the concurrent tx runs.
+    let e0 = store.new_epoch();
+    let tx_a = TransactionId::new(10);
+
+    // Another tx creates edge F and commits at E1.
+    let tx_other = TransactionId::new(11);
+    let e1_start = store.new_epoch();
+    let edge_f = store.create_edge_versioned(src, dst, "F", e1_start, tx_other);
+    let e1 = store.new_epoch();
+    store.finalize_entities_by_id(tx_other, e1, &[], &[edge_f]);
+
+    // A's versioned traversal at E0 must not see F.
+    let edges = store.edges_from_versioned(src, Direction::Outgoing, e0, tx_a);
+    assert!(
+        !edges.iter().any(|&(_, eid)| eid == edge_f),
+        "edge F created after snapshot E0 must not appear in edges_from_versioned"
+    );
+}
+
+/// Edge G exists at E0. Tx A snapshots at E0. Another tx deletes G and commits
+/// at E1 > E0. `edges_from_versioned(src, Outgoing, E0, tx_a)` MUST still
+/// include G — it was visible at A's snapshot epoch. This test fails if the
+/// raw adjacency (including soft-deleted entries) is not used.
+#[test]
+fn edges_from_versioned_includes_edge_deleted_after_my_start() {
+    let store = LpgStore::new().unwrap();
+    let src = store.create_node(&["N"]);
+    let dst = store.create_node(&["N"]);
+
+    // Edge G exists before both snapshots.
+    let e0_pre = store.new_epoch();
+    let edge_g = store.create_edge_versioned(src, dst, "G", e0_pre, TransactionId::SYSTEM);
+    let e0 = store.new_epoch();
+    store.finalize_entities_by_id(TransactionId::SYSTEM, e0, &[], &[edge_g]);
+
+    // Tx A snapshots at E0 (edge G is committed and visible).
+    let tx_a = TransactionId::new(20);
+    let snapshot_e0 = e0;
+
+    // Another tx deletes G and commits at E1.
+    let tx_del = TransactionId::new(21);
+    let e1_start = store.new_epoch();
+    store.delete_edge_transactional(edge_g, e1_start, tx_del);
+    let e1 = store.new_epoch();
+    // finalize_edge_deletes_by_id applies the adjacency tombstone (mark_deleted).
+    let pending = store.take_pending_edge_deletes(tx_del);
+    store.finalize_edge_deletes_by_id(tx_del, e1, &pending);
+
+    // Sanity: the non-versioned path no longer sees G (tombstone applied).
+    let non_versioned = store
+        .edges_from(src, Direction::Outgoing)
+        .collect::<Vec<_>>();
+    assert!(
+        !non_versioned.iter().any(|&(_, eid)| eid == edge_g),
+        "non-versioned path should not see deleted edge G"
+    );
+
+    // Versioned path at E0 MUST still see G (deleted after snapshot).
+    let edges = store.edges_from_versioned(src, Direction::Outgoing, snapshot_e0, tx_a);
+    assert!(
+        edges.iter().any(|&(_, eid)| eid == edge_g),
+        "edge G deleted after snapshot E0 must still appear in edges_from_versioned \
+         — this fails if soft-deleted entries are pre-filtered from raw adjacency"
+    );
+}
+
+/// Tx A creates edge H (uncommitted / PENDING). `edges_from_versioned` for tx A
+/// must include H (read-your-writes).
+#[test]
+fn edges_from_versioned_includes_own_pending_edge() {
+    let store = LpgStore::new().unwrap();
+    let src = store.create_node(&["N"]);
+    let dst = store.create_node(&["N"]);
+
+    let tx_a = TransactionId::new(30);
+    let epoch = store.new_epoch();
+
+    // Tx A creates edge H — PENDING, not yet committed.
+    let edge_h = store.create_edge_versioned(src, dst, "H", epoch, tx_a);
+
+    // Tx A must see its own uncommitted edge.
+    let edges = store.edges_from_versioned(src, Direction::Outgoing, epoch, tx_a);
+    assert!(
+        edges.iter().any(|&(_, eid)| eid == edge_h),
+        "tx A must see its own pending edge H in edges_from_versioned (read-your-writes)"
+    );
+
+    // Another tx at the same epoch must NOT see H (not yet committed).
+    let tx_other = TransactionId::new(31);
+    let edges_other = store.edges_from_versioned(src, Direction::Outgoing, epoch, tx_other);
+    assert!(
+        !edges_other.iter().any(|&(_, eid)| eid == edge_h),
+        "other tx must not see tx A's pending edge H"
+    );
+}
+
+/// Under a Serializable tx with a registered read-tracker,
+/// `edges_from_versioned` populates the read-set with visible edge IDs.
+/// The recording rides on `is_edge_visible_versioned`.
+#[test]
+fn edges_from_versioned_records_reads() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    struct EdgeSpy {
+        edges: Mutex<Vec<EdgeId>>,
+    }
+    impl ReadTracker for EdgeSpy {
+        fn record_node_read(&self, _tx: TransactionId, _id: NodeId) {}
+        fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+            self.edges.lock().push(id);
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let src = store.create_node(&["N"]);
+    let dst = store.create_node(&["N"]);
+
+    // Two committed edges.
+    let e0 = store.new_epoch();
+    let edge1 = store.create_edge_versioned(src, dst, "R", e0, TransactionId::SYSTEM);
+    let edge2 = store.create_edge_versioned(src, dst, "R", e0, TransactionId::SYSTEM);
+    let e1 = store.new_epoch();
+    store.finalize_entities_by_id(TransactionId::SYSTEM, e1, &[], &[edge1, edge2]);
+
+    // Register a spy tracker for the Serializable tx.
+    let tx = TransactionId::new(40);
+    let spy = Arc::new(EdgeSpy {
+        edges: Mutex::new(Vec::new()),
+    });
+    store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+    // Traverse: both visible edges must be recorded.
+    let edges = store.edges_from_versioned(src, Direction::Outgoing, e1, tx);
+    assert_eq!(edges.len(), 2, "both edges should be visible");
+
+    let recorded = spy.edges.lock().clone();
+    assert!(
+        recorded.contains(&edge1),
+        "edge1 must be recorded in the SSI read-set"
+    );
+    assert!(
+        recorded.contains(&edge2),
+        "edge2 must be recorded in the SSI read-set"
+    );
+}

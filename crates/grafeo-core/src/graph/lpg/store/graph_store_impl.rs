@@ -180,6 +180,26 @@ impl GraphStore for LpgStore {
         LpgStore::edges_from(self, node, direction).collect()
     }
 
+    fn edges_from_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        LpgStore::edges_from_versioned(self, node, direction, epoch, transaction_id)
+    }
+
+    fn neighbors_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        LpgStore::neighbors_versioned(self, node, direction, epoch, transaction_id)
+    }
+
     fn out_degree(&self, node: NodeId) -> usize {
         LpgStore::out_degree(self, node)
     }

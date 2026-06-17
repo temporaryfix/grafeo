@@ -366,6 +366,20 @@ impl AdjacencyList {
             .filter(move |(_, edge_id)| !deleted.contains(edge_id))
     }
 
+    /// Like `iter()` but includes soft-deleted entries.
+    ///
+    /// Used by snapshot-aware traversal: an edge deleted *after* a transaction's
+    /// snapshot start must still be visible to that snapshot.  The soft-delete
+    /// tombstone in `deleted` is applied at commit time, so simply skipping the
+    /// filter lets the MVCC version chain (consulted by `is_edge_visible_versioned`)
+    /// make the correct per-snapshot decision.
+    fn iter_including_deleted(&self) -> impl Iterator<Item = (NodeId, EdgeId)> + '_ {
+        let cold_iter = self.cold_chunks.iter().flat_map(|c| c.iter());
+        let hot_iter = self.hot_chunks.iter().flat_map(|c| c.iter());
+        let delta_iter = self.delta_inserts.iter().copied();
+        cold_iter.chain(hot_iter).chain(delta_iter)
+    }
+
     /// Checks whether a specific destination node exists in this list.
     ///
     /// Uses the skip index for O(log n) lookup over cold chunks (only
@@ -651,6 +665,22 @@ impl ChunkedAdjacency {
         lists
             .get(&src)
             .map(|list| list.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns all `(neighbor, edge_id)` pairs including soft-deleted entries.
+    ///
+    /// Unlike `edges_from`, this does **not** filter out edges in the `deleted`
+    /// set.  Use this as the raw adjacency source for snapshot-aware traversal:
+    /// an edge soft-deleted after a transaction's snapshot start is still present
+    /// in the chunks and must be handed to the MVCC version-chain check
+    /// (`is_edge_visible_versioned`) rather than being silently dropped here.
+    #[must_use]
+    pub fn edges_from_including_deleted(&self, src: NodeId) -> Vec<(NodeId, EdgeId)> {
+        let lists = self.lists.read();
+        lists
+            .get(&src)
+            .map(|list| list.iter_including_deleted().collect())
             .unwrap_or_default()
     }
 

@@ -3,7 +3,7 @@
 use super::LpgStore;
 use crate::graph::Direction;
 use crate::graph::lpg::{Edge, Node};
-use grafeo_common::types::{EdgeId, NodeId};
+use grafeo_common::types::{EdgeId, EpochId, NodeId, TransactionId};
 
 impl LpgStore {
     // === Traversal ===
@@ -65,6 +65,73 @@ impl LpgStore {
         };
 
         forward.chain(backward)
+    }
+
+    /// Returns edges from a node that are visible at a transaction's snapshot,
+    /// and records each visible edge into the SSI read-set.
+    ///
+    /// Uses raw adjacency (including soft-deleted entries) so that an edge
+    /// deleted *after* the snapshot's start is still examined by the version
+    /// chain and correctly returned as visible.  The `deleted` filter in the
+    /// regular `edges_from` path would hide such edges before the version chain
+    /// gets a chance to evaluate them — which would be both unsound (wrong path)
+    /// and a missed read for SSI purposes.
+    ///
+    /// The read-recording is a side-effect of `is_edge_visible_versioned`: it is
+    /// a no-op for non-Serializable transactions (no tracker registered).
+    pub fn edges_from_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        let forward: Vec<(NodeId, EdgeId)> = match direction {
+            Direction::Outgoing | Direction::Both => self
+                .forward_adj
+                .edges_from_including_deleted(node)
+                .into_iter()
+                .filter(|&(_, eid)| self.is_edge_visible_versioned(eid, epoch, tx))
+                .collect(),
+            Direction::Incoming => Vec::new(),
+        };
+
+        let backward: Vec<(NodeId, EdgeId)> = match direction {
+            Direction::Incoming | Direction::Both => {
+                if let Some(ref adj) = self.backward_adj {
+                    adj.edges_from_including_deleted(node)
+                        .into_iter()
+                        .filter(|&(_, eid)| self.is_edge_visible_versioned(eid, epoch, tx))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            Direction::Outgoing => Vec::new(),
+        };
+
+        forward.into_iter().chain(backward).collect()
+    }
+
+    /// Returns neighbor node IDs reachable via snapshot-visible edges.
+    ///
+    /// Derives targets from `edges_from_versioned` so that a node reachable
+    /// only via an invisible edge is never yielded.
+    pub fn neighbors_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<NodeId> {
+        let mut targets: Vec<NodeId> = self
+            .edges_from_versioned(node, direction, epoch, tx)
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
     }
 
     /// Returns edges to a node (where the node is the destination).

@@ -643,6 +643,70 @@ impl GraphStore for LayeredStore {
         results
     }
 
+    fn edges_from_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        let deleted_nodes = self.deleted_from_base_nodes.read();
+
+        let mut results = Vec::new();
+
+        // Base edges: iterate without filtering by `deleted_from_base_edges` so
+        // that an edge deleted (from the base) after this snapshot's start is
+        // still examined by `is_edge_visible_versioned`.  The visibility check
+        // consults the overlay's version chain (which includes delete tombstones)
+        // and also records the read for SSI.  A source node explicitly deleted
+        // from the base is entirely gone even for old snapshots (it left a
+        // tombstone in the overlay), so we still guard on that.
+        if !deleted_nodes.contains(&node) {
+            for (target, eid) in self.base.load().edges_from(node, direction) {
+                if !deleted_nodes.contains(&target)
+                    && self.is_edge_visible_versioned(eid, epoch, transaction_id)
+                {
+                    results.push((target, eid));
+                }
+            }
+        }
+
+        // Overlay edges: use the overlay's versioned traversal which already
+        // uses raw adjacency + version-chain visibility + SSI recording.
+        for (target, eid) in
+            self.overlay
+                .load()
+                .edges_from_versioned(node, direction, epoch, transaction_id)
+        {
+            if !deleted_nodes.contains(&target) {
+                results.push((target, eid));
+            }
+        }
+
+        // Deduplicate promoted edges that appear in both tiers.
+        results.sort_unstable_by_key(|&(_, eid)| eid);
+        results.dedup_by_key(|&mut (_, eid)| eid);
+
+        results
+    }
+
+    fn neighbors_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let mut targets: Vec<NodeId> = self
+            .edges_from_versioned(node, direction, epoch, transaction_id)
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
     fn out_degree(&self, node: NodeId) -> usize {
         self.edges_from(node, Direction::Outgoing).len()
     }
