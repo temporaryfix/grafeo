@@ -18,6 +18,27 @@ use parking_lot::RwLock;
 
 use super::CompactStore;
 use crate::execution::operators::SharedReadTracker;
+
+/// Epoch+transaction stamp for a base-edge tombstone.
+///
+/// Mirrors the overlay version chain's delete model
+/// ([`VersionInfo`](grafeo_common::mvcc::VersionInfo)) so base-edge deletes are
+/// snapshot-isolated: a versioned reader applies the same
+/// `deleted_epoch <= viewing_epoch` boundary the overlay uses, instead of the
+/// old epoch-blind "any tombstone hides" rule.
+///
+/// * `epoch == EpochId::PENDING` while the deleting transaction is uncommitted;
+///   finalized to the real commit epoch on commit.
+/// * `deleter == Some(tx)` for a transactional delete (read-your-writes: hidden
+///   to `tx` even while PENDING); `None` for a SYSTEM/auto-commit delete or a
+///   persisted-seeded (prior-session committed) delete.
+#[derive(Clone, Copy)]
+struct BaseEdgeDelete {
+    /// Commit epoch of the delete, or [`EpochId::PENDING`] while uncommitted.
+    epoch: EpochId,
+    /// Transaction that requested the delete, if it was transactional.
+    deleter: Option<TransactionId>,
+}
 use crate::graph::Direction;
 use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
@@ -55,8 +76,20 @@ pub struct LayeredStore {
     dirty_edge_ids: RwLock<FxHashSet<EdgeId>>,
     /// Base node IDs that have been deleted.
     deleted_from_base_nodes: RwLock<FxHashSet<NodeId>>,
-    /// Base edge IDs that have been deleted.
-    deleted_from_base_edges: RwLock<FxHashSet<EdgeId>>,
+    /// Base edge IDs that have been deleted, each stamped with the epoch and
+    /// transaction of the delete so versioned readers stay snapshot-isolated.
+    ///
+    /// A `PENDING` entry with `deleter == Some(tx)` is an uncommitted
+    /// transactional delete: hidden to `tx` (read-your-writes) but still visible
+    /// to every other snapshot until commit finalizes its epoch. Mirrors the
+    /// overlay's `pending_tx_edge_deletes` + version-chain model.
+    deleted_from_base_edges: RwLock<FxHashMap<EdgeId, BaseEdgeDelete>>,
+    /// Per-transaction list of base edge ids this transaction has PENDING-
+    /// tombstoned, so commit can finalize their epochs and rollback can remove
+    /// them. A base-only edge delete does not reach the overlay's
+    /// `pending_tx_edge_deletes` (the overlay has no such edge), so the
+    /// LayeredStore must track its own base tombstones to drive finalize/rollback.
+    pending_base_edge_deletes: RwLock<FxHashMap<TransactionId, Vec<EdgeId>>>,
     /// Tracks whether `deleted_from_base_*` has changed since the last
     /// flush. The `OverlayDeletionsSection` checks this on each
     /// `is_dirty()` call so periodic checkpoints skip the write when no
@@ -157,7 +190,8 @@ impl LayeredStore {
             dirty_node_ids: RwLock::new(dirty_nodes),
             dirty_edge_ids: RwLock::new(dirty_edges),
             deleted_from_base_nodes: RwLock::new(FxHashSet::default()),
-            deleted_from_base_edges: RwLock::new(FxHashSet::default()),
+            deleted_from_base_edges: RwLock::new(FxHashMap::default()),
+            pending_base_edge_deletes: RwLock::new(FxHashMap::default()),
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
         }
@@ -170,7 +204,8 @@ impl LayeredStore {
             dirty_node_ids: RwLock::new(FxHashSet::default()),
             dirty_edge_ids: RwLock::new(FxHashSet::default()),
             deleted_from_base_nodes: RwLock::new(FxHashSet::default()),
-            deleted_from_base_edges: RwLock::new(FxHashSet::default()),
+            deleted_from_base_edges: RwLock::new(FxHashMap::default()),
+            pending_base_edge_deletes: RwLock::new(FxHashMap::default()),
             deletions_dirty: AtomicBool::new(false),
             merge_guard: RwLock::new(()),
         }
@@ -269,6 +304,7 @@ impl LayeredStore {
         self.dirty_edge_ids.write().clear();
         self.deleted_from_base_nodes.write().clear();
         self.deleted_from_base_edges.write().clear();
+        self.pending_base_edge_deletes.write().clear();
         self.deletions_dirty.store(false, Ordering::Release);
     }
 
@@ -289,9 +325,13 @@ impl LayeredStore {
     /// [`Self::snapshot_deleted_node_ids`].
     #[must_use]
     pub fn snapshot_deleted_edge_ids(&self) -> Vec<EdgeId> {
+        // Keys only: the on-disk `OverlayDeletions` format is unchanged (just
+        // edge ids). The per-tombstone (epoch, deleter) stamp is in-memory MVCC
+        // bookkeeping and is not persisted — a reopened delete is re-seeded as
+        // a committed delete (epoch 0, deleter None) by `seed_deleted_from_base`.
         self.deleted_from_base_edges
             .read()
-            .iter()
+            .keys()
             .copied()
             .collect()
     }
@@ -314,7 +354,24 @@ impl LayeredStore {
         node_set.extend(nodes);
         let mut edge_set = self.deleted_from_base_edges.write();
         edge_set.clear();
-        edge_set.extend(edges);
+        // A prior-session delete is, by definition, committed before any
+        // snapshot of this session: stamp epoch 0 (≤ every future snapshot) and
+        // `deleter: None` so it is hidden from every current snapshot and the
+        // latest view alike.
+        edge_set.extend(edges.into_iter().map(|id| {
+            (
+                id,
+                BaseEdgeDelete {
+                    epoch: EpochId::INITIAL,
+                    deleter: None,
+                },
+            )
+        }));
+        drop(node_set);
+        drop(edge_set);
+        // A reseed replaces any in-flight transactional base tombstones; their
+        // pending bookkeeping is now stale (open happens before new mutations).
+        self.pending_base_edge_deletes.write().clear();
         self.deletions_dirty.store(false, Ordering::Release);
     }
 
@@ -378,10 +435,34 @@ impl LayeredStore {
         self.dirty_edge_ids.read().contains(&id)
     }
 
-    /// Checks whether an edge was deleted from the base.
+    /// Checks whether an edge was deleted from the base (latest view).
+    ///
+    /// Epoch-blind on purpose: the non-versioned accessors want the newest
+    /// truth, so ANY tombstone — even an uncommitted one — hides the base edge.
+    /// This preserves the audit-fixed base-tier-resurrection behavior. Versioned
+    /// accessors use [`Self::is_edge_deleted_from_base_at`] instead.
     #[inline]
     fn is_edge_deleted_from_base(&self, id: EdgeId) -> bool {
-        self.deleted_from_base_edges.read().contains(&id)
+        self.deleted_from_base_edges.read().contains_key(&id)
+    }
+
+    /// Snapshot-aware variant: whether a base edge is hidden from a reader at
+    /// `(epoch, tx)`, applying the same delete-visibility boundary the overlay
+    /// version chain uses ([`VersionInfo::is_visible_at`](grafeo_common::mvcc::VersionInfo)).
+    ///
+    /// * not deleted → visible (`false`);
+    /// * deleted by `tx` itself (even PENDING) → hidden (read-your-writes);
+    /// * another tx's still-PENDING delete → visible (no dirty read);
+    /// * committed delete → hidden iff the snapshot is at/after the delete's
+    ///   commit epoch (`deleted_epoch <= viewing_epoch`).
+    #[inline]
+    fn is_edge_deleted_from_base_at(&self, id: EdgeId, epoch: EpochId, tx: TransactionId) -> bool {
+        match self.deleted_from_base_edges.read().get(&id) {
+            None => false,
+            Some(d) if d.deleter == Some(tx) => true,
+            Some(d) if d.epoch == EpochId::PENDING => false,
+            Some(d) => d.epoch.as_u64() <= epoch.as_u64(),
+        }
     }
 }
 
@@ -455,7 +536,7 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> Option<Edge> {
-        if self.is_edge_deleted_from_base(id) {
+        if self.is_edge_deleted_from_base_at(id, epoch, transaction_id) {
             return None;
         }
         if self.is_edge_dirty(id) {
@@ -488,7 +569,12 @@ impl GraphStore for LayeredStore {
     }
 
     fn get_edge_at_epoch(&self, id: EdgeId, epoch: EpochId) -> Option<Edge> {
-        if self.is_edge_deleted_from_base(id) {
+        // Epoch-only view: no transaction context, so pass INVALID — it can
+        // never be a real deleter, so the read-your-writes branch is inert and
+        // an uncommitted (PENDING) base delete stays visible (mirrors the
+        // overlay's `is_edge_visible_at_epoch`, which only hides committed
+        // deletes at/before `epoch`).
+        if self.is_edge_deleted_from_base_at(id, epoch, TransactionId::INVALID) {
             return None;
         }
         if self.is_edge_dirty(id) {
@@ -617,7 +703,7 @@ impl GraphStore for LayeredStore {
         // dedup-by-eid pass below.
         if !deleted_nodes.contains(&node) {
             for (target, eid) in self.base.load().edges_from(node, direction) {
-                if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+                if !deleted_nodes.contains(&target) && !deleted_edges.contains_key(&eid) {
                     results.push((target, eid));
                 }
             }
@@ -631,7 +717,7 @@ impl GraphStore for LayeredStore {
         // edges, so the unconditional call is cheap when there's nothing
         // to report.
         for (target, eid) in self.overlay.load().edges_from(node, direction) {
-            if !deleted_nodes.contains(&target) && !deleted_edges.contains(&eid) {
+            if !deleted_nodes.contains(&target) && !deleted_edges.contains_key(&eid) {
                 results.push((target, eid));
             }
         }
@@ -1025,7 +1111,8 @@ impl GraphStore for LayeredStore {
     }
 
     fn is_edge_visible_at_epoch(&self, id: EdgeId, epoch: EpochId) -> bool {
-        if self.is_edge_deleted_from_base(id) {
+        // Epoch-only view: INVALID tx (see `get_edge_at_epoch`).
+        if self.is_edge_deleted_from_base_at(id, epoch, TransactionId::INVALID) {
             return false;
         }
         if self.is_edge_dirty(id) {
@@ -1045,7 +1132,7 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        if self.is_edge_deleted_from_base(id) {
+        if self.is_edge_deleted_from_base_at(id, epoch, transaction_id) {
             return false;
         }
         if self.is_edge_dirty(id) {
@@ -1261,7 +1348,11 @@ impl GraphStore for LayeredStore {
         epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> FxHashMap<PropertyKey, Value> {
-        if self.is_edge_deleted_from_base(id) {
+        if self.is_edge_deleted_from_base_at(
+            id,
+            epoch,
+            transaction_id.unwrap_or(TransactionId::INVALID),
+        ) {
             return FxHashMap::default();
         }
         if self.is_edge_dirty(id) {
@@ -1578,11 +1669,25 @@ impl GraphStoreMut for LayeredStore {
         if self.is_node_dirty(node_id) {
             self.overlay.load().delete_node_edges(node_id);
         }
-        // Mark base edges as deleted.
+        // Mark base edges as deleted. SYSTEM/auto-commit path: stamp with the
+        // current committed epoch and `deleter: None` (mirrors the overlay's
+        // non-versioned `delete_edge`, which stamps `current_epoch()`). The
+        // latest view hides it immediately; a versioned snapshot strictly
+        // before this epoch still sees it.
+        let now = self.overlay.load().current_epoch();
         let mut deleted_any = false;
         let mut edges = self.deleted_from_base_edges.write();
         for (_, eid) in self.base.load().edges_from(node_id, Direction::Both) {
-            if edges.insert(eid) {
+            if edges
+                .insert(
+                    eid,
+                    BaseEdgeDelete {
+                        epoch: now,
+                        deleter: None,
+                    },
+                )
+                .is_none()
+            {
                 deleted_any = true;
             }
         }
@@ -1597,9 +1702,24 @@ impl GraphStoreMut for LayeredStore {
         // Delete the overlay copy if present, and independently tombstone the
         // base copy if present. A promoted edge lives in both tiers, so both
         // must happen; a fresh overlay-only edge has no base copy.
+        //
+        // SYSTEM/auto-commit: stamp the base tombstone with the current
+        // committed epoch and `deleter: None` (mirrors `LpgStore::delete_edge`,
+        // which deletes at `current_epoch()`).
         let overlay_removed = self.overlay.load().delete_edge(id);
+        let now = self.overlay.load().current_epoch();
         let base_tombstoned = self.base.load().get_edge(id).is_some()
-            && self.deleted_from_base_edges.write().insert(id);
+            && self
+                .deleted_from_base_edges
+                .write()
+                .insert(
+                    id,
+                    BaseEdgeDelete {
+                        epoch: now,
+                        deleter: None,
+                    },
+                )
+                .is_none();
         if base_tombstoned {
             self.deletions_dirty.store(true, Ordering::Release);
         }
@@ -1617,8 +1737,34 @@ impl GraphStoreMut for LayeredStore {
             .overlay
             .load()
             .delete_edge_versioned(id, epoch, transaction_id);
-        let base_tombstoned = self.base.load().get_edge(id).is_some()
-            && self.deleted_from_base_edges.write().insert(id);
+        // Transactional base tombstone: stamp PENDING + deleter so the deleter
+        // sees it gone immediately (read-your-writes) while every other
+        // snapshot still sees the edge until the delete commits. The real
+        // commit epoch is stamped in `finalize_edge_deletes_by_id`; rollback
+        // removes it via `drop_tx_overlay`. Record the id in this tx's pending
+        // list so commit/rollback can find it (a base-only edge never reaches
+        // the overlay's `pending_tx_edge_deletes`).
+        let base_tombstoned = self.base.load().get_edge(id).is_some() && {
+            let newly_inserted = self
+                .deleted_from_base_edges
+                .write()
+                .insert(
+                    id,
+                    BaseEdgeDelete {
+                        epoch: EpochId::PENDING,
+                        deleter: Some(transaction_id),
+                    },
+                )
+                .is_none();
+            if newly_inserted {
+                self.pending_base_edge_deletes
+                    .write()
+                    .entry(transaction_id)
+                    .or_default()
+                    .push(id);
+            }
+            newly_inserted
+        };
         if base_tombstoned {
             self.deletions_dirty.store(true, Ordering::Release);
         }
@@ -1824,6 +1970,30 @@ impl GraphStoreMut for LayeredStore {
 
     fn drop_tx_overlay(&self, transaction_id: TransactionId) {
         self.overlay.load().drop_tx_overlay(transaction_id);
+        // Rollback path: undo this tx's uncommitted base-edge tombstones.
+        // `drop_tx_overlay` is only invoked on the abort/conflict paths (commit
+        // uses `apply_tx_overlay` + `finalize_edge_deletes_by_id`), so removing
+        // the PENDING base tombstones here restores the edges for everyone.
+        let pending = self
+            .pending_base_edge_deletes
+            .write()
+            .remove(&transaction_id);
+        if let Some(ids) = pending {
+            let mut tombstones = self.deleted_from_base_edges.write();
+            for id in ids {
+                // Only remove if it is still this tx's PENDING tombstone — a
+                // re-delete by a later SYSTEM/auto-commit path would have
+                // overwritten the stamp, and that committed delete must stand.
+                if let Some(d) = tombstones.get(&id)
+                    && d.deleter == Some(transaction_id)
+                    && d.epoch == EpochId::PENDING
+                {
+                    tombstones.remove(&id);
+                }
+            }
+            drop(tombstones);
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
     }
 
     fn finalize_deletes_by_id(
@@ -1850,6 +2020,28 @@ impl GraphStoreMut for LayeredStore {
         self.overlay
             .load()
             .finalize_edge_deletes_by_id(transaction_id, commit_epoch, edges);
+        // Commit path: stamp this tx's PENDING base-edge tombstones with the
+        // real commit epoch. Driven from the LayeredStore's own per-tx list,
+        // NOT the `edges` slice: a base-only edge delete never reaches the
+        // overlay's `pending_tx_edge_deletes`, so it would be absent from
+        // `edges` (which comes from `take_pending_edge_deletes`).
+        let pending = self
+            .pending_base_edge_deletes
+            .write()
+            .remove(&transaction_id);
+        if let Some(ids) = pending {
+            let mut tombstones = self.deleted_from_base_edges.write();
+            for id in ids {
+                if let Some(d) = tombstones.get_mut(&id)
+                    && d.deleter == Some(transaction_id)
+                    && d.epoch == EpochId::PENDING
+                {
+                    d.epoch = commit_epoch;
+                }
+            }
+            drop(tombstones);
+            self.deletions_dirty.store(true, Ordering::Release);
+        }
     }
 
     fn take_pending_edge_deletes(
@@ -4929,5 +5121,237 @@ mod tests {
             !spy.saw_node(base_node),
             "unregistered tx must not produce a recording on the registered tracker"
         );
+    }
+
+    // ── Snapshot-isolated base-edge deletes (epoch-versioned tombstone) ──
+    //
+    // Regression coverage for the bug where a base edge deleted by a
+    // concurrent transaction AFTER a reader's snapshot start was hidden from
+    // EVERY snapshot (the base-edge tombstone was epoch-blind). The fix gives
+    // each base-edge tombstone an (epoch, deleter) stamp so versioned readers
+    // apply the same snapshot-isolation boundary as the overlay version chain,
+    // while the latest (non-versioned) view keeps hiding any tombstone.
+
+    /// HEADLINE: a base edge G live at tx A's snapshot E0; tx B (a different
+    /// tx) deletes G and the delete commits at E1 > E0. A (snapshot E0) must
+    /// STILL see G — both via `is_edge_visible_versioned` and via
+    /// `edges_from_versioned`. This is the probe that previously FAILED.
+    #[test]
+    fn base_edge_delete_committed_after_snapshot_is_invisible_only_to_later_snapshots() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (dst, g) = edges[0];
+
+        let tx_a = TransactionId::from(1); // the reader (snapshot E0)
+        let tx_b = TransactionId::from(2); // the concurrent deleter
+        let e0 = EpochId::new(0); // A's snapshot
+        let e1 = EpochId::new(1); // B's commit epoch (> E0)
+
+        // Precondition: G is visible to A at E0.
+        assert!(
+            layered.is_edge_visible_versioned(g, e0, tx_a),
+            "base edge must be visible to A's snapshot before any delete"
+        );
+
+        // B deletes G (PENDING) then commits at E1 (drive the finalize path
+        // that the session would run: take pending overlay tuples, then
+        // finalize by id + commit epoch — the LayeredStore base tombstone is
+        // finalized inside its own override).
+        assert!(layered.delete_edge_versioned(g, e1, tx_b));
+        let pending = layered.take_pending_edge_deletes(tx_b);
+        layered.finalize_edge_deletes_by_id(tx_b, e1, &pending);
+
+        // A's snapshot started at E0 (before the delete's commit at E1), so A
+        // must STILL see G.
+        assert!(
+            layered.is_edge_visible_versioned(g, e0, tx_a),
+            "snapshot-isolation violated: A (E0) lost a base edge a concurrent tx deleted at E1>E0"
+        );
+        let a_out = layered.edges_from_versioned(src, Direction::Outgoing, e0, tx_a);
+        assert!(
+            a_out.iter().any(|&(t, e)| t == dst && e == g),
+            "edges_from_versioned for A (E0) must still include the concurrently-deleted base edge"
+        );
+
+        // A LATER snapshot (E1, the commit epoch) must NOT see G — boundary is
+        // `deleted_epoch <= viewing_epoch` (mirrors VersionInfo::is_visible_at).
+        let tx_c = TransactionId::from(3);
+        assert!(
+            !layered.is_edge_visible_versioned(g, e1, tx_c),
+            "a snapshot AT the delete's commit epoch must not see the edge"
+        );
+        let c_out = layered.edges_from_versioned(src, Direction::Outgoing, e1, tx_c);
+        assert!(
+            !c_out.iter().any(|&(_, e)| e == g),
+            "edges_from_versioned at the commit epoch must exclude the deleted base edge"
+        );
+    }
+
+    /// An UNCOMMITTED base-edge delete by B is NOT visible to B's own reads
+    /// (read-your-writes), but IS still visible to a concurrent A.
+    #[test]
+    fn uncommitted_base_edge_delete_hidden_from_deleter_visible_to_others() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (_, g) = edges[0];
+
+        let tx_a = TransactionId::from(1);
+        let tx_b = TransactionId::from(2);
+        let e0 = EpochId::new(0);
+
+        // B deletes G but does NOT commit (still PENDING).
+        assert!(layered.delete_edge_versioned(g, e0, tx_b));
+
+        // B's own read must not see G (read-your-writes).
+        assert!(
+            !layered.is_edge_visible_versioned(g, e0, tx_b),
+            "deleter must not see its own uncommitted base-edge delete"
+        );
+        // Concurrent A must STILL see G (the delete is uncommitted).
+        assert!(
+            layered.is_edge_visible_versioned(g, e0, tx_a),
+            "an uncommitted base-edge delete must remain invisible to other snapshots"
+        );
+        let a_out = layered.edges_from_versioned(src, Direction::Outgoing, e0, tx_a);
+        assert!(
+            a_out.iter().any(|&(_, e)| e == g),
+            "A's traversal must still include an edge B has only PENDING-deleted"
+        );
+    }
+
+    /// A transaction's OWN base-edge delete is hidden from itself immediately
+    /// (even while PENDING), at its own snapshot epoch.
+    #[test]
+    fn own_base_edge_delete_hidden_immediately() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (_, g) = edges[0];
+
+        let tx_b = TransactionId::from(2);
+        let e0 = EpochId::new(0);
+
+        assert!(layered.is_edge_visible_versioned(g, e0, tx_b));
+        assert!(layered.delete_edge_versioned(g, e0, tx_b));
+        assert!(
+            !layered.is_edge_visible_versioned(g, e0, tx_b),
+            "a tx must not see a base edge it just deleted"
+        );
+        let out = layered.edges_from_versioned(src, Direction::Outgoing, e0, tx_b);
+        assert!(
+            !out.iter().any(|&(_, e)| e == g),
+            "deleter's own traversal must exclude its just-deleted base edge"
+        );
+    }
+
+    /// Rolling back B's uncommitted base-edge delete (via `drop_tx_overlay`)
+    /// restores visibility for everyone.
+    #[test]
+    fn rolled_back_base_edge_delete_is_restored() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (dst, g) = edges[0];
+
+        let tx_b = TransactionId::from(2);
+        let e0 = EpochId::new(0);
+
+        assert!(layered.delete_edge_versioned(g, e0, tx_b));
+        assert!(!layered.is_edge_visible_versioned(g, e0, tx_b));
+
+        // Roll back B (the session calls drop_tx_overlay on abort, then
+        // rolls back pending edge deletes).
+        layered.drop_tx_overlay(tx_b);
+        let pending = layered.take_pending_edge_deletes(tx_b);
+        layered
+            .overlay_store()
+            .rollback_pending_edge_deletes(tx_b, &pending);
+
+        assert!(
+            layered.is_edge_visible_versioned(g, e0, tx_b),
+            "rolled-back base-edge delete must restore visibility to the deleter"
+        );
+        // Latest (non-versioned) view must also see it again.
+        assert!(
+            layered.get_edge(g).is_some(),
+            "rolled-back base-edge delete must restore the latest-view edge"
+        );
+        let out = layered.edges_from_versioned(src, Direction::Outgoing, e0, tx_b);
+        assert!(out.iter().any(|&(t, e)| t == dst && e == g));
+    }
+
+    /// A persisted/seeded base-edge delete (a prior session's committed delete)
+    /// is hidden from ALL current snapshots, because every new snapshot starts
+    /// after it.
+    #[test]
+    fn seeded_base_edge_delete_hidden_from_all_snapshots() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (_, g) = edges[0];
+
+        // Seed as a prior-session committed delete (keys-only on-disk format).
+        layered.seed_deleted_from_base(std::iter::empty(), std::iter::once(g));
+
+        // Even the earliest possible snapshot (E0) must not see it.
+        let tx = TransactionId::from(7);
+        let e0 = EpochId::new(0);
+        assert!(
+            !layered.is_edge_visible_versioned(g, e0, tx),
+            "a seeded (prior-session committed) base-edge delete must be hidden from every snapshot"
+        );
+        assert!(
+            layered.get_edge(g).is_none(),
+            "seeded base-edge delete must also be hidden from the latest view"
+        );
+        // Persistence round-trips the key unchanged.
+        let snap = layered.snapshot_deleted_edge_ids();
+        assert!(
+            snap.contains(&g),
+            "snapshot_deleted_edge_ids must still return the seeded edge id (keys-only format)"
+        );
+    }
+
+    /// LATEST-view regression guard: a SYSTEM (auto-commit, non-versioned)
+    /// base-edge delete must NOT be resurrected by the latest-view
+    /// `edges_from` / `neighbors` (the audit fix must stay fixed), and must be
+    /// hidden from versioned reads at the current epoch too.
+    #[test]
+    fn system_base_edge_delete_not_resurrected_in_latest_view() {
+        let layered = build_test_layered();
+        let persons = layered.nodes_by_label("Person");
+        let src = persons[0];
+        let edges = layered.edges_from(src, Direction::Outgoing);
+        let (dst, g) = edges[0];
+
+        // SYSTEM delete (auto-commit, no tx snapshot).
+        assert!(layered.delete_edge(g));
+
+        // Latest view must not resurrect it.
+        assert!(layered.get_edge(g).is_none());
+        let out = layered.edges_from(src, Direction::Outgoing);
+        assert!(
+            !out.iter().any(|&(_, e)| e == g),
+            "latest-view edges_from must not resurrect a SYSTEM-deleted base edge"
+        );
+        assert!(
+            !layered.neighbors(src, Direction::Outgoing).contains(&dst)
+                || layered
+                    .edges_from(src, Direction::Outgoing)
+                    .iter()
+                    .any(|&(t, _)| t == dst),
+            "neighbors must agree with edges_from after a SYSTEM base-edge delete"
+        );
+        // Versioned read at the current epoch must also be hidden.
+        let tx = TransactionId::from(9);
+        let now = layered.current_epoch();
+        assert!(!layered.is_edge_visible_versioned(g, now, tx));
     }
 }
