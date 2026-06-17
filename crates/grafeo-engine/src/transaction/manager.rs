@@ -8,7 +8,7 @@ use grafeo_common::utils::error::{Error, Result, TransactionError};
 use grafeo_common::utils::hash::FxHashMap;
 use parking_lot::RwLock;
 
-use super::ReadRegistry;
+use super::{PropTag, ReadRegistry, prop_compatible};
 
 /// State of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,10 +95,13 @@ pub struct TransactionInfo {
     pub isolation_level: IsolationLevel,
     /// Start epoch (snapshot epoch for reads).
     pub start_epoch: EpochId,
-    /// Set of entities written by this transaction.
-    pub write_set: HashSet<EntityId>,
-    /// Set of entities read by this transaction (for serializable isolation).
-    pub read_set: HashSet<EntityId>,
+    /// Set of `(entity, prop_tag)` pairs written by this transaction.
+    /// W-W conflict detection uses the entity component only; the tag
+    /// is carried for future property-level rw-antidependency checks.
+    pub write_set: HashSet<(EntityId, PropTag)>,
+    /// Set of `(entity, prop_tag)` pairs read by this transaction (for
+    /// serializable isolation). All callers currently pass `None` as the tag.
+    pub read_set: HashSet<(EntityId, PropTag)>,
     /// An rw-antidependency edge points INTO this transaction (this tx is the
     /// writer end of some `reader →rw self`). Used for F2 incremental SSI pivot
     /// detection.
@@ -193,14 +196,15 @@ impl TransactionManager {
     /// Records a write operation for the transaction.
     ///
     /// Uses first-writer-wins: if another active transaction has already
-    /// written to the same entity, returns a write-write conflict error
-    /// immediately (before the caller mutates the store).
+    /// written to the same **entity** (regardless of tag), returns a write-write
+    /// conflict error immediately (before the caller mutates the store).
     ///
     /// For Serializable transactions, also performs write-time
     /// rw-antidependency detection (the mirror of the read-time detection in
     /// [`record_read`](Self::record_read)): any concurrent Serializable
-    /// transaction that has read `entity` (and is still active) is found via
-    /// the `ReadRegistry` and a `reader →rw tx` edge is recorded for each.
+    /// transaction that has read `entity` with a tag compatible with `tag`
+    /// (and is still active) is found via the `ReadRegistry` and a
+    /// `reader →rw tx` edge is recorded for each.
     ///
     /// # Lock discipline
     ///
@@ -217,6 +221,7 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         entity: impl Into<EntityId>,
+        tag: PropTag,
     ) -> Result<()> {
         let entity = entity.into();
 
@@ -227,13 +232,14 @@ impl TransactionManager {
         let (is_serializable, our_start): (bool, EpochId) = {
             let mut txns = self.transactions.write();
 
-            // First-writer-wins conflict detection. Skip the scan when only one
+            // First-writer-wins conflict detection (entity only — W-W is always
+            // entity-level regardless of tag). Skip the scan when only one
             // transaction is active (common case for auto-commit).
             if self.active_count.load(Ordering::Relaxed) > 1 {
                 for (other_tx, other_info) in txns.iter() {
                     if *other_tx != transaction_id
                         && other_info.state == TransactionState::Active
-                        && other_info.write_set.contains(&entity)
+                        && other_info.write_set.iter().any(|(e, _)| *e == entity)
                     {
                         return Err(Error::Transaction(TransactionError::WriteConflict(
                             format!("Write-write conflict on entity {entity:?}"),
@@ -255,7 +261,7 @@ impl TransactionManager {
                 )));
             }
 
-            info.write_set.insert(entity);
+            info.write_set.insert((entity, tag));
             // Capture isolation level and start epoch while we hold the lock;
             // drop the lock at the end of this block.
             (
@@ -272,12 +278,13 @@ impl TransactionManager {
         // when the READER is Serializable. SSI edges are formed only when the
         // acting side (reader at read-time, writer at write-time) is Serializable.
         if is_serializable {
-            // readers_of uses its own sharded locks, independent of transactions.
-            // Committed readers now linger in the registry (SIREAD retention), so
-            // gate each on the concurrency check: a committed reader is only a
-            // real in-edge source if this writer started before the reader's
-            // commit epoch (so the writer's snapshot couldn't see that reader).
-            let readers = self.read_registry.readers_of(entity);
+            // readers_of_compatible uses its own sharded locks, independent of
+            // transactions. Committed readers now linger in the registry (SIREAD
+            // retention), so gate each on the concurrency check: a committed
+            // reader is only a real in-edge source if this writer started before
+            // the reader's commit epoch (so the writer's snapshot couldn't see
+            // that reader).
+            let readers = self.read_registry.readers_of_compatible(entity, tag);
             for reader in readers {
                 if reader != transaction_id && self.reader_concurrent_with(reader, Some(our_start))
                 {
@@ -322,7 +329,7 @@ impl TransactionManager {
             )));
         }
 
-        info.write_set.insert(entity);
+        info.write_set.insert((entity, None));
         Ok(())
     }
 
@@ -342,7 +349,8 @@ impl TransactionManager {
         if let Some(info) = self.transactions.write().get_mut(&transaction_id)
             && info.state == TransactionState::Active
         {
-            info.write_set.extend(entities);
+            info.write_set
+                .extend(entities.into_iter().map(|e| (e, None)));
         }
     }
 
@@ -351,7 +359,8 @@ impl TransactionManager {
     /// For Serializable transactions, also registers the reader in the
     /// `ReadRegistry` and performs read-time rw-antidependency detection:
     /// any concurrent transaction (active or committed-after-our-start) that
-    /// has written `entity` is recorded as a writer end of a `tx →rw T_w` edge.
+    /// has written `entity` with a tag compatible with `tag` is recorded as
+    /// a writer end of a `tx →rw T_w` edge.
     ///
     /// # Lock discipline
     ///
@@ -367,6 +376,7 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         entity: impl Into<EntityId>,
+        tag: PropTag,
     ) -> Result<()> {
         let entity = entity.into();
 
@@ -386,7 +396,7 @@ impl TransactionManager {
                 )));
             }
 
-            info.read_set.insert(entity);
+            info.read_set.insert((entity, tag));
 
             // Only gather concurrent writers for Serializable transactions.
             if info.isolation_level != IsolationLevel::Serializable {
@@ -395,13 +405,17 @@ impl TransactionManager {
 
             let our_start = info.start_epoch;
 
-            // Collect active writers (uncommitted writes that our snapshot cannot see).
+            // Collect active writers whose write_set contains `(entity, write_tag)`
+            // with `prop_compatible(tag, write_tag)`.
             let mut writers: Vec<TransactionId> = txns
                 .iter()
                 .filter(|(other_tx, other_info)| {
                     **other_tx != transaction_id
                         && other_info.state == TransactionState::Active
-                        && other_info.write_set.contains(&entity)
+                        && other_info
+                            .write_set
+                            .iter()
+                            .any(|(e, wt)| *e == entity && prop_compatible(tag, *wt))
                 })
                 .map(|(id, _)| *id)
                 .collect();
@@ -416,9 +430,11 @@ impl TransactionManager {
             for (other_tx, commit_epoch) in committed.iter() {
                 if *other_tx != transaction_id
                     && commit_epoch.as_u64() > our_start.as_u64()
-                    && txns
-                        .get(other_tx)
-                        .is_some_and(|i| i.write_set.contains(&entity))
+                    && txns.get(other_tx).is_some_and(|i| {
+                        i.write_set
+                            .iter()
+                            .any(|(e, wt)| *e == entity && prop_compatible(tag, *wt))
+                    })
                 {
                     writers.push(*other_tx);
                 }
@@ -429,7 +445,8 @@ impl TransactionManager {
         };
 
         // Register this reader in the SIREAD registry (uses its own sharded locks).
-        self.read_registry.record_reader(entity, transaction_id);
+        self.read_registry
+            .record_reader(entity, transaction_id, tag);
 
         // Apply rw-antidependency edges now that the transactions lock is released.
         for writer in concurrent_writers {
@@ -459,8 +476,8 @@ impl TransactionManager {
             // Capture the writer's start epoch for the concurrency check against
             // retired (committed) readers lingering in the registry.
             let writer_start = self.start_epoch(tx);
-            for entity in ws {
-                for reader in self.read_registry.readers_of(entity) {
+            for (entity, write_tag) in ws {
+                for reader in self.read_registry.readers_of_compatible(entity, write_tag) {
                     if reader != tx && self.reader_concurrent_with(reader, writer_start) {
                         self.set_rw_edge(reader, tx);
                     }
@@ -469,16 +486,16 @@ impl TransactionManager {
         }
     }
 
-    /// Decides whether a reader found via `read_registry.readers_of` is
-    /// concurrent with a writer that started at `writer_start`.
+    /// Decides whether a reader found via `read_registry.readers_of_compatible`
+    /// is concurrent with a writer that started at `writer_start`.
     ///
     /// Committed readers now linger in the registry (their SIREAD locks are
-    /// retained until all concurrent txns finish), so `readers_of` can return a
-    /// reader that already committed at epoch `C_r`. Such a reader is concurrent
-    /// with the writer only if the writer started before `C_r` (i.e. the writer
-    /// could not see the reader's commit). A reader that is still active (not in
-    /// `retired_readers`) is always concurrent (both started at or before now and
-    /// neither has finished).
+    /// retained until all concurrent txns finish), so `readers_of_compatible`
+    /// can return a reader that already committed at epoch `C_r`. Such a reader
+    /// is concurrent with the writer only if the writer started before `C_r`
+    /// (i.e. the writer could not see the reader's commit). A reader that is
+    /// still active (not in `retired_readers`) is always concurrent (both
+    /// started at or before now and neither has finished).
     ///
     /// `writer_start` is `None` only if the writer is already gone from
     /// `transactions`; in that case there is no live edge to form, so return
@@ -624,12 +641,13 @@ impl TransactionManager {
         // after our snapshot (i.e., concurrent writers to the same entities).
         // Transactions committed before our start_epoch are part of our visible
         // snapshot, so overwriting their values is not a conflict.
+        // W-W comparison is entity-only (ignores PropTag).
         for (other_tx, commit_epoch) in committed.iter() {
             if *other_tx != transaction_id && commit_epoch.as_u64() > our_start_epoch.as_u64() {
                 // Check if that transaction wrote to any of our entities
                 if let Some(other_info) = txns.get(other_tx) {
-                    for entity in &our_write_set {
-                        if other_info.write_set.contains(entity) {
+                    for (entity, _) in &our_write_set {
+                        if other_info.write_set.iter().any(|(e, _)| e == entity) {
                             return Err(Error::Transaction(TransactionError::WriteConflict(
                                 format!("Write-write conflict on entity {:?}", entity),
                             )));
@@ -650,9 +668,10 @@ impl TransactionManager {
         // can form an inbound edge against them); benign single-edge txns have
         // only one flag — neither aborts.
         //
-        // The cycle-closed check (scan of committed_epochs for our read_set) is
-        // the same scan as F1's backward pass, but now gated on in_conflict —
-        // so read-only Serializable txns no longer abort from a mere out_conflict.
+        // The cycle-closed check: a committed tx wrote some (entity, write_tag)
+        // and our read_set contains some (entity, read_tag) with
+        // prop_compatible(read_tag, write_tag). Under all-None this is identical
+        // to the old "entity in read_set" check.
         if our_isolation == IsolationLevel::Serializable
             && our_in_conflict
             && our_out_conflict
@@ -661,9 +680,13 @@ impl TransactionManager {
             let cycle_closed = committed.iter().any(|(other_tx, commit_epoch)| {
                 *other_tx != transaction_id
                     && commit_epoch.as_u64() > our_start_epoch.as_u64()
-                    && txns
-                        .get(other_tx)
-                        .is_some_and(|i| our_read_set.iter().any(|e| i.write_set.contains(e)))
+                    && txns.get(other_tx).is_some_and(|i| {
+                        i.write_set.iter().any(|(wentity, wtag)| {
+                            our_read_set.iter().any(|(rentity, rtag)| {
+                                wentity == rentity && prop_compatible(*rtag, *wtag)
+                            })
+                        })
+                    })
             });
             if cycle_closed {
                 return Err(Error::Transaction(TransactionError::SerializationFailure(
@@ -750,7 +773,7 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Returns the write set of a transaction.
+    /// Returns the write set of a transaction as a set of `EntityId` values.
     ///
     /// This returns a copy of the entities written by this transaction,
     /// used for rollback to discard uncommitted versions.
@@ -765,15 +788,16 @@ impl TransactionManager {
                 "Transaction not found".to_string(),
             ))
         })?;
-        Ok(info.write_set.clone())
+        Ok(info.write_set.iter().map(|(e, _)| *e).collect())
     }
 
-    /// Returns a copy of the read-set of a transaction (serializable read tracking).
+    /// Returns a copy of the read-set of a transaction as a set of `EntityId`
+    /// values (serializable read tracking).
     pub fn read_set(&self, transaction_id: TransactionId) -> HashSet<EntityId> {
         self.transactions
             .read()
             .get(&transaction_id)
-            .map(|i| i.read_set.clone())
+            .map(|i| i.read_set.iter().map(|(e, _)| *e).collect())
             .unwrap_or_default()
     }
 
@@ -793,7 +817,7 @@ impl TransactionManager {
                 "Transaction not found".to_string(),
             ))
         })?;
-        info.write_set = write_set;
+        info.write_set = write_set.into_iter().map(|e| (e, None)).collect();
         Ok(())
     }
 
@@ -1107,9 +1131,9 @@ mod tests {
         let tx = mgr.begin();
 
         // Record writes
-        mgr.record_write(tx, NodeId::new(1)).unwrap();
-        mgr.record_write(tx, NodeId::new(2)).unwrap();
-        mgr.record_write(tx, EdgeId::new(100)).unwrap();
+        mgr.record_write(tx, NodeId::new(1), None).unwrap();
+        mgr.record_write(tx, NodeId::new(2), None).unwrap();
+        mgr.record_write(tx, EdgeId::new(100), None).unwrap();
 
         // Should commit successfully (no conflicts)
         assert!(mgr.commit(tx).is_ok());
@@ -1208,10 +1232,10 @@ mod tests {
 
         // First writer succeeds
         let entity = NodeId::new(42);
-        mgr.record_write(tx1, entity).unwrap();
+        mgr.record_write(tx1, entity, None).unwrap();
 
         // Second writer is rejected immediately (first-writer-wins)
-        let result = mgr.record_write(tx2, entity);
+        let result = mgr.record_write(tx2, entity, None);
         assert!(result.is_err());
         assert!(
             result
@@ -1349,9 +1373,9 @@ mod tests {
         let tx2 = mgr.begin(); // SI — write-time detection skipped for SI writers
 
         let entity = NodeId::new(42);
-        mgr.record_read(tx1, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
 
-        mgr.record_write(tx2, entity).unwrap();
+        mgr.record_write(tx2, entity, None).unwrap();
         mgr.commit(tx2).unwrap();
 
         // tx1 has out_conflict from a committed SI writer, but no in_conflict.
@@ -1376,10 +1400,10 @@ mod tests {
 
         // tx1 reads entity 42
         let entity = NodeId::new(42);
-        mgr.record_read(tx1, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
 
         // tx2 writes to the same entity and commits
-        mgr.record_write(tx2, entity).unwrap();
+        mgr.record_write(tx2, entity, None).unwrap();
         mgr.commit(tx2).unwrap();
 
         // tx1 should commit successfully (SI doesn't check read-write conflicts)
@@ -1397,12 +1421,12 @@ mod tests {
         // tx1 writes and commits first
         let tx1 = mgr.begin();
         let entity = NodeId::new(42);
-        mgr.record_write(tx1, entity).unwrap();
+        mgr.record_write(tx1, entity, None).unwrap();
         mgr.commit(tx1).unwrap();
 
         // tx2 starts AFTER tx1 committed and reads the entity
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(tx2, entity).unwrap();
+        mgr.record_read(tx2, entity, None).unwrap();
 
         // tx2 should commit successfully (tx1 committed before tx2 started)
         let result = mgr.commit(tx2);
@@ -1430,14 +1454,14 @@ mod tests {
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // Both read both accounts
-        mgr.record_read(tx1, account_a).unwrap();
-        mgr.record_read(tx1, account_b).unwrap();
-        mgr.record_read(tx2, account_a).unwrap();
-        mgr.record_read(tx2, account_b).unwrap();
+        mgr.record_read(tx1, account_a, None).unwrap();
+        mgr.record_read(tx1, account_b, None).unwrap();
+        mgr.record_read(tx2, account_a, None).unwrap();
+        mgr.record_read(tx2, account_b, None).unwrap();
 
         // T1 writes to A, T2 writes to B (no write-write conflict)
-        mgr.record_write(tx1, account_a).unwrap();
-        mgr.record_write(tx2, account_b).unwrap();
+        mgr.record_write(tx1, account_a, None).unwrap();
+        mgr.record_write(tx2, account_b, None).unwrap();
 
         // T1 commits first
         let result1 = mgr.commit(tx1);
@@ -1464,11 +1488,11 @@ mod tests {
         let entity = NodeId::new(42);
 
         // tx1 reads entity
-        mgr.record_read(tx1, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
 
         // tx2 writes and commits
         let tx2 = mgr.begin();
-        mgr.record_write(tx2, entity).unwrap();
+        mgr.record_write(tx2, entity, None).unwrap();
         mgr.commit(tx2).unwrap();
 
         // tx1 can still commit (ReadCommitted allows non-repeatable reads)
@@ -1511,8 +1535,8 @@ mod tests {
         let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-        mgr.record_read(tx1, entity).unwrap();
-        mgr.record_read(tx2, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
+        mgr.record_read(tx2, entity, None).unwrap();
 
         // Both should commit successfully (read-read is not a conflict)
         assert!(mgr.commit(tx1).is_ok());
@@ -1530,10 +1554,10 @@ mod tests {
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // First writer succeeds
-        mgr.record_write(tx1, entity).unwrap();
+        mgr.record_write(tx1, entity, None).unwrap();
 
         // Second writer is rejected immediately (first-writer-wins)
-        let result = mgr.record_write(tx2, entity);
+        let result = mgr.record_write(tx2, entity, None);
         assert!(
             result.is_err(),
             "Second record_write should fail with write-write conflict"
@@ -1562,13 +1586,13 @@ mod tests {
             let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
             let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-            mgr.record_read(tx1, entity_a).unwrap();
-            mgr.record_read(tx1, entity_b).unwrap();
-            mgr.record_read(tx2, entity_a).unwrap();
-            mgr.record_read(tx2, entity_b).unwrap();
+            mgr.record_read(tx1, entity_a, None).unwrap();
+            mgr.record_read(tx1, entity_b, None).unwrap();
+            mgr.record_read(tx2, entity_a, None).unwrap();
+            mgr.record_read(tx2, entity_b, None).unwrap();
 
-            mgr.record_write(tx1, entity_a).unwrap();
-            mgr.record_write(tx2, entity_b).unwrap();
+            mgr.record_write(tx1, entity_a, None).unwrap();
+            mgr.record_write(tx2, entity_b, None).unwrap();
 
             // Commit tx1 first so it's in committed_epochs
             mgr.commit(tx1).unwrap();
@@ -1604,13 +1628,13 @@ mod tests {
             let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
             let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-            mgr.record_read(tx1, entity_a).unwrap();
-            mgr.record_read(tx1, entity_b).unwrap();
-            mgr.record_read(tx2, entity_a).unwrap();
-            mgr.record_read(tx2, entity_b).unwrap();
+            mgr.record_read(tx1, entity_a, None).unwrap();
+            mgr.record_read(tx1, entity_b, None).unwrap();
+            mgr.record_read(tx2, entity_a, None).unwrap();
+            mgr.record_read(tx2, entity_b, None).unwrap();
 
-            mgr.record_write(tx1, entity_a).unwrap();
-            mgr.record_write(tx2, entity_b).unwrap();
+            mgr.record_write(tx1, entity_a, None).unwrap();
+            mgr.record_write(tx2, entity_b, None).unwrap();
 
             let mgr1 = Arc::clone(&mgr);
             let mgr2 = Arc::clone(&mgr);
@@ -1659,7 +1683,7 @@ mod tests {
         let mgr = TransactionManager::new();
 
         let tx = mgr.begin();
-        mgr.record_write(tx, NodeId::new(1)).unwrap();
+        mgr.record_write(tx, NodeId::new(1), None).unwrap();
         let epoch = mgr.commit(tx).unwrap();
 
         // committed_epoch must be available immediately after commit returns
@@ -1820,11 +1844,11 @@ mod tests {
         // t_w begins, writes E, commits (commit_epoch > t_r.start_epoch = 0)
         let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let entity = NodeId::new(1);
-        mgr.record_write(t_w, entity).unwrap();
+        mgr.record_write(t_w, entity, None).unwrap();
         mgr.commit(t_w).unwrap();
 
         // t_r now reads E; t_w committed after t_r started → concurrent writer
-        mgr.record_read(t_r, entity).unwrap();
+        mgr.record_read(t_r, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(t_r),
@@ -1849,8 +1873,8 @@ mod tests {
         let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let entity = NodeId::new(2);
 
-        mgr.record_write(t_w, entity).unwrap();
-        mgr.record_read(t_r, entity).unwrap();
+        mgr.record_write(t_w, entity, None).unwrap();
+        mgr.record_read(t_r, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(t_r),
@@ -1872,7 +1896,7 @@ mod tests {
         let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let entity = EntityId::Node(NodeId::new(42));
 
-        mgr.record_read(t_r, entity).unwrap();
+        mgr.record_read(t_r, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(t_r),
@@ -1881,7 +1905,7 @@ mod tests {
         );
 
         // The reader must be registered in the read_registry.
-        let readers = mgr.read_registry.readers_of(entity);
+        let readers = mgr.read_registry.readers_of_compatible(entity, None);
         assert!(
             readers.contains(&t_r),
             "t_r must be registered in read_registry after record_read"
@@ -1896,10 +1920,10 @@ mod tests {
 
         let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let entity = NodeId::new(7);
-        mgr.record_write(t_w, entity).unwrap();
+        mgr.record_write(t_w, entity, None).unwrap();
 
         let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
-        mgr.record_read(t_si, entity).unwrap();
+        mgr.record_read(t_si, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(t_si),
@@ -1913,7 +1937,9 @@ mod tests {
         );
 
         // SI reader must NOT be in the read_registry.
-        let readers = mgr.read_registry.readers_of(EntityId::Node(entity));
+        let readers = mgr
+            .read_registry
+            .readers_of_compatible(EntityId::Node(entity), None);
         assert!(
             !readers.contains(&t_si),
             "SI reader must not be registered in read_registry"
@@ -1935,9 +1961,9 @@ mod tests {
         let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // t_r reads E first → registered in read_registry
-        mgr.record_read(t_r, entity).unwrap();
+        mgr.record_read(t_r, entity, None).unwrap();
         // t_w writes E → discovers t_r as concurrent reader → sets rw-edge
-        mgr.record_write(t_w, entity).unwrap();
+        mgr.record_write(t_w, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(t_r),
@@ -1958,7 +1984,7 @@ mod tests {
         let entity = NodeId::new(20);
 
         let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_write(t_w, entity).unwrap();
+        mgr.record_write(t_w, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(t_w),
@@ -1980,11 +2006,11 @@ mod tests {
 
         // t_r is Serializable and reads E → registered in read_registry
         let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(t_r, entity).unwrap();
+        mgr.record_read(t_r, entity, None).unwrap();
 
         // t_si is SI and writes E → does NOT trigger write-time detection
         let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
-        mgr.record_write(t_si, entity).unwrap();
+        mgr.record_write(t_si, entity, None).unwrap();
 
         // The SI writer gets no flag
         assert_eq!(
@@ -2009,9 +2035,9 @@ mod tests {
 
         let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
         // Read first (registers in read_registry)
-        mgr.record_read(tx, entity).unwrap();
-        // Write same entity → readers_of returns `tx` itself, but guard skips it
-        mgr.record_write(tx, entity).unwrap();
+        mgr.record_read(tx, entity, None).unwrap();
+        // Write same entity → readers_of_compatible returns `tx` itself, but guard skips it
+        mgr.record_write(tx, entity, None).unwrap();
 
         assert_eq!(
             mgr.conflict_flags(tx),
@@ -2045,14 +2071,14 @@ mod tests {
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // Both read both accounts.
-        mgr.record_read(tx1, account_a).unwrap();
-        mgr.record_read(tx1, account_b).unwrap();
-        mgr.record_read(tx2, account_a).unwrap();
-        mgr.record_read(tx2, account_b).unwrap();
+        mgr.record_read(tx1, account_a, None).unwrap();
+        mgr.record_read(tx1, account_b, None).unwrap();
+        mgr.record_read(tx2, account_a, None).unwrap();
+        mgr.record_read(tx2, account_b, None).unwrap();
 
         // tx1 writes A; tx2 writes B (disjoint — no W-W conflict).
-        mgr.record_write(tx1, account_a).unwrap();
-        mgr.record_write(tx2, account_b).unwrap();
+        mgr.record_write(tx1, account_a, None).unwrap();
+        mgr.record_write(tx2, account_b, None).unwrap();
 
         // tx1 commits first → must succeed (cycle not yet closed for tx1).
         let r1 = mgr.commit(tx1);
@@ -2088,12 +2114,12 @@ mod tests {
 
         // Writer (SI, so write-time detection does not fire) writes E and commits.
         let writer = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
-        mgr.record_write(writer, entity).unwrap();
+        mgr.record_write(writer, entity, None).unwrap();
         mgr.commit(writer).unwrap();
 
         // Reader reads E: committed-after-start writer detected via read-time
         // scan in record_read (but writer is SI, so no edge is formed).
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
 
         // Reader has no in_conflict (it wrote nothing) → not a pivot → Ok.
         let result = mgr.commit(reader);
@@ -2119,11 +2145,11 @@ mod tests {
 
         // reader registers in read_registry.
         let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
 
         // writer: write E → write-time detection finds reader → writer.in_conflict=true.
         let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_write(writer, entity).unwrap();
+        mgr.record_write(writer, entity, None).unwrap();
 
         // writer has in_conflict=true, out_conflict=false → not a pivot → Ok.
         assert_eq!(
@@ -2150,12 +2176,12 @@ mod tests {
 
         // Reader registers in read_registry.
         let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
 
         // Confirm it is registered.
         assert!(
             mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader must be in registry before commit"
         );
@@ -2166,7 +2192,7 @@ mod tests {
         // After commit, the reader must be gone from the registry.
         assert!(
             !mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader must be removed from registry after commit"
         );
@@ -2183,12 +2209,12 @@ mod tests {
 
         // Reader registers in read_registry.
         let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
 
         // Confirm it is registered.
         assert!(
             mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader must be in registry before abort"
         );
@@ -2199,7 +2225,7 @@ mod tests {
         // After abort, the reader must be gone from the registry.
         assert!(
             !mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader must be removed from registry after abort"
         );
@@ -2239,19 +2265,19 @@ mod tests {
         let t3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // T1: read p, write q, commit.
-        mgr.record_read(t1, p).unwrap();
-        mgr.record_write(t1, q).unwrap();
+        mgr.record_read(t1, p, None).unwrap();
+        mgr.record_write(t1, q, None).unwrap();
         let r1 = mgr.commit(t1);
 
         // T3: read r, write p, commit.
-        mgr.record_read(t3, r).unwrap();
-        mgr.record_write(t3, p).unwrap();
+        mgr.record_read(t3, r, None).unwrap();
+        mgr.record_write(t3, p, None).unwrap();
         let r3 = mgr.commit(t3);
 
         // T2: read q, read r, write r, commit.
-        mgr.record_read(t2, q).unwrap();
-        mgr.record_read(t2, r).unwrap();
-        mgr.record_write(t2, r).unwrap();
+        mgr.record_read(t2, q, None).unwrap();
+        mgr.record_read(t2, r, None).unwrap();
+        mgr.record_write(t2, r, None).unwrap();
         let r2 = mgr.commit(t2);
 
         // Exactly one of the three must fail with SerializationFailure.
@@ -2288,20 +2314,20 @@ mod tests {
 
         // reader reads E, then commits — but writer is still active, so the
         // SIREAD lock must be retained.
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
         mgr.commit(reader).unwrap();
 
         // The reader's SIREAD entry must still be present (concurrent writer alive).
         assert!(
             mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "committed reader's SIREAD lock must persist while concurrent writer is active"
         );
 
         // writer now writes E → must discover the retained reader as a concurrent
         // reader and form the in-edge → writer.in_conflict = true.
-        mgr.record_write(writer, entity).unwrap();
+        mgr.record_write(writer, entity, None).unwrap();
         assert_eq!(
             mgr.conflict_flags(writer),
             (true, false),
@@ -2320,13 +2346,13 @@ mod tests {
         let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
         mgr.commit(reader).unwrap();
 
         // Still retained while writer is active.
         assert!(
             mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader retained while concurrent writer active"
         );
@@ -2336,7 +2362,7 @@ mod tests {
 
         assert!(
             !mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader's SIREAD lock must be released once no concurrent txn remains"
         );
@@ -2356,7 +2382,7 @@ mod tests {
 
         // reader reads E and commits at some epoch C_r.
         let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(reader, entity).unwrap();
+        mgr.record_read(reader, entity, None).unwrap();
         mgr.commit(reader).unwrap();
 
         // writer begins AFTER reader committed → writer.start_epoch >= C_r →
@@ -2373,12 +2399,12 @@ mod tests {
         // and concurrent with reader, so GC has not released it).
         assert!(
             mgr.read_registry
-                .readers_of(EntityId::Node(entity))
+                .readers_of_compatible(EntityId::Node(entity), None)
                 .contains(&reader),
             "reader's SIREAD lock retained by keep_alive being concurrent"
         );
 
-        mgr.record_write(writer, entity).unwrap();
+        mgr.record_write(writer, entity, None).unwrap();
         assert_eq!(
             mgr.conflict_flags(writer),
             (false, false),
@@ -2392,5 +2418,47 @@ mod tests {
         );
 
         let _ = mgr.commit(keep_alive);
+    }
+
+    // --- Part G Task 2: all-None tags reproduce existing write-skew abort ---
+
+    /// Regression: with all PropTag=None, the tag-threaded read/write-set must
+    /// detect write-skew exactly as F2 did. Any deviation means a stray non-None
+    /// was introduced or a compatibility check is backwards.
+    #[test]
+    fn all_none_tags_write_skew_aborts_second_committer() {
+        let mgr = TransactionManager::new();
+
+        let a = NodeId::new(1);
+        let b = NodeId::new(2);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Both read both accounts with None tag.
+        mgr.record_read(tx1, a, None).unwrap();
+        mgr.record_read(tx1, b, None).unwrap();
+        mgr.record_read(tx2, a, None).unwrap();
+        mgr.record_read(tx2, b, None).unwrap();
+
+        // Disjoint writes with None tag.
+        mgr.record_write(tx1, a, None).unwrap();
+        mgr.record_write(tx2, b, None).unwrap();
+
+        // tx1 commits first.
+        assert!(mgr.commit(tx1).is_ok(), "first committer must succeed");
+
+        // tx2 must be aborted: it read a (which tx1 wrote) → pivot.
+        let r2 = mgr.commit(tx2);
+        assert!(
+            r2.is_err(),
+            "second committer must be aborted under all-None tags"
+        );
+        assert!(
+            r2.unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "expected SerializationFailure"
+        );
     }
 }

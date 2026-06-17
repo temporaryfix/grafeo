@@ -14,10 +14,6 @@
 //! iff equal. Hash collisions only ever *merge* keys (a safe over-approximation —
 //! a false conflict at worst, never a missed one), so soundness is preserved.
 
-// These items are consumed when the read-set/registry generalization lands
-// (Part G Task 2); this module-level allow is removed there.
-#![allow(dead_code)]
-
 /// Optional property tag on a conflict key. `None` is the entity-level default
 /// (and the only value produced under `ConflictGranularity::Entity`).
 pub type PropTag = Option<u64>;
@@ -36,6 +32,10 @@ pub fn prop_compatible(a: PropTag, b: PropTag) -> bool {
 ///
 /// Collisions only *merge* keys (a safe over-approximation — a false conflict at
 /// worst, never a missed conflict), so this never makes SSI unsound.
+///
+/// Consumed by Part G Task 3+ (property-tag producers); the allow is narrowed to
+/// this one function now that `PropTag` and `prop_compatible` are used.
+#[allow(dead_code)]
 #[inline]
 #[must_use]
 pub fn prop_tag(key: &str) -> u64 {

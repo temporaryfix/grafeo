@@ -25,13 +25,13 @@ impl TransactionReadTracker {
 impl ReadTracker for TransactionReadTracker {
     fn record_node_read(&self, transaction_id: TransactionId, node_id: NodeId) {
         if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
-            let _ = self.manager.record_read(transaction_id, node_id);
+            let _ = self.manager.record_read(transaction_id, node_id, None);
         }
     }
 
     fn record_edge_read(&self, transaction_id: TransactionId, edge_id: EdgeId) {
         if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
-            let _ = self.manager.record_read(transaction_id, edge_id);
+            let _ = self.manager.record_read(transaction_id, edge_id, None);
         }
     }
 }

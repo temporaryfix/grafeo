@@ -134,11 +134,11 @@ fn test_write_write_conflict_detection() {
 
     // T1 records a write (succeeds)
     let tx1 = tx_manager.begin();
-    tx_manager.record_write(tx1, node_id).unwrap();
+    tx_manager.record_write(tx1, node_id, None).unwrap();
 
     // T2 tries to write the same entity (rejected by first-writer-wins)
     let tx2 = tx_manager.begin();
-    let result = tx_manager.record_write(tx2, node_id);
+    let result = tx_manager.record_write(tx2, node_id, None);
     assert!(
         result.is_err(),
         "Second writer should be rejected immediately"
@@ -166,11 +166,11 @@ fn test_committed_transaction_conflict_at_commit() {
     let tx2 = tx_manager.begin();
 
     // T1 writes and commits (advances epoch past T2's start)
-    tx_manager.record_write(tx1, node_id).unwrap();
+    tx_manager.record_write(tx1, node_id, None).unwrap();
     tx_manager.commit(tx1).unwrap();
 
     // T2 writes to same entity (succeeds: T1 is no longer active)
-    tx_manager.record_write(tx2, node_id).unwrap();
+    tx_manager.record_write(tx2, node_id, None).unwrap();
 
     // T2 commit fails: T1 committed a conflicting write after T2's start
     let result = tx_manager.commit(tx2);
@@ -196,12 +196,12 @@ fn test_post_commit_write_succeeds() {
 
     // T1 writes and commits
     let tx1 = tx_manager.begin();
-    tx_manager.record_write(tx1, node_id).unwrap();
+    tx_manager.record_write(tx1, node_id, None).unwrap();
     tx_manager.commit(tx1).unwrap();
 
     // T2 starts after T1 committed, writes to same entity
     let tx2 = tx_manager.begin();
-    tx_manager.record_write(tx2, node_id).unwrap();
+    tx_manager.record_write(tx2, node_id, None).unwrap();
 
     // T2 commits successfully (T1's commit is within T2's visible snapshot)
     assert!(
@@ -221,11 +221,11 @@ fn test_non_overlapping_writes_succeed() {
 
     // T1 writes to node 0
     let tx1 = tx_manager.begin();
-    tx_manager.record_write(tx1, nodes[0]).unwrap();
+    tx_manager.record_write(tx1, nodes[0], None).unwrap();
 
     // T2 writes to node 1
     let tx2 = tx_manager.begin();
-    tx_manager.record_write(tx2, nodes[1]).unwrap();
+    tx_manager.record_write(tx2, nodes[1], None).unwrap();
 
     // Both should commit successfully
     assert!(tx_manager.commit(tx1).is_ok(), "T1 should commit");
@@ -249,7 +249,7 @@ fn test_rollback_makes_writes_invisible() {
     let tx1 = tx_manager.begin();
     let epoch = tx_manager.current_epoch();
     let node_id = store.create_node_versioned(&["Rollback"], epoch, tx1);
-    tx_manager.record_write(tx1, node_id).unwrap();
+    tx_manager.record_write(tx1, node_id, None).unwrap();
 
     // Abort T1
     tx_manager.abort(tx1).unwrap();
@@ -278,7 +278,7 @@ fn test_abort_releases_write_locks() {
 
     // T1 records a write
     let tx1 = tx_manager.begin();
-    tx_manager.record_write(tx1, node_id).unwrap();
+    tx_manager.record_write(tx1, node_id, None).unwrap();
 
     // Abort T1
     tx_manager.abort(tx1).unwrap();
@@ -288,7 +288,7 @@ fn test_abort_releases_write_locks() {
 
     // T2 should be able to write to the same entity
     let tx2 = tx_manager.begin();
-    tx_manager.record_write(tx2, node_id).unwrap();
+    tx_manager.record_write(tx2, node_id, None).unwrap();
 
     // T2 should commit successfully
     assert!(
@@ -467,7 +467,7 @@ fn test_many_concurrent_transactions() {
 
         // Create a node in each transaction
         let node_id = store.create_node_versioned(&["Stress"], epoch, tx);
-        tx_manager.record_write(tx, node_id).unwrap();
+        tx_manager.record_write(tx, node_id, None).unwrap();
 
         transactions.push((tx, node_id));
     }

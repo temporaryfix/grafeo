@@ -29,7 +29,7 @@ impl WriteTracker for TransactionWriteTracker {
         node_id: NodeId,
     ) -> Result<(), OperatorError> {
         self.manager
-            .record_write(transaction_id, node_id)
+            .record_write(transaction_id, node_id, None)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 
@@ -39,7 +39,7 @@ impl WriteTracker for TransactionWriteTracker {
         edge_id: EdgeId,
     ) -> Result<(), OperatorError> {
         self.manager
-            .record_write(transaction_id, edge_id)
+            .record_write(transaction_id, edge_id, None)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 }

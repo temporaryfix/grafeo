@@ -199,9 +199,10 @@ pub mod parallel;
 mod prepared;
 mod read_registry;
 
+pub(crate) use conflict_key::{PropTag, prop_compatible};
+// prop_tag re-exported when property-tag producers land (Part G Tasks 3+).
 #[allow(unused_imports)]
-// prop_compatible/prop_tag consumed as property granularity lands (Part G Tasks 2-4)
-pub(crate) use conflict_key::{PropTag, prop_compatible, prop_tag};
+pub(crate) use conflict_key::prop_tag;
 pub use manager::{
     EntityId, IsolationLevel, TransactionInfo, TransactionManager, TransactionState,
 };
