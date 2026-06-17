@@ -151,6 +151,38 @@ pub trait WriteTracker: Send + Sync {
         transaction_id: TransactionId,
         edge_id: EdgeId,
     ) -> Result<(), OperatorError>;
+
+    /// Records a write to property `key` of `node_id`. Default impl ignores the
+    /// property and records an entity-level write — overridden by the engine bridge
+    /// to record a property tag under property-level granularity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a write-write conflict (first-writer-wins), same as `record_node_write`.
+    fn record_node_property_write(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        _key: &str,
+    ) -> Result<(), OperatorError> {
+        self.record_node_write(transaction_id, node_id)
+    }
+
+    /// Records a write to property `key` of `edge_id`. Default impl ignores the
+    /// property and records an entity-level write — overridden by the engine bridge
+    /// to record a property tag under property-level granularity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a write-write conflict (first-writer-wins), same as `record_edge_write`.
+    fn record_edge_property_write(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        _key: &str,
+    ) -> Result<(), OperatorError> {
+        self.record_edge_write(transaction_id, edge_id)
+    }
 }
 
 /// Type alias for a shared write tracker.

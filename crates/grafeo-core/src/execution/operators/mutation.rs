@@ -1485,10 +1485,30 @@ impl Operator for SetPropertyOperator {
                     }
                 };
 
-                // Record write for conflict detection
+                // Record write for conflict detection.
+                // If exactly one named property is being set (a single `SET e.prop = …`),
+                // use the property-aware method so the engine bridge can record a finer tag.
+                // Map-merge (`prop_name == "*"`), multi-property, or whole-entity mutations
+                // stay entity-level (None wildcard is the conservative-correct choice).
                 if let (Some(tracker), Some(tid)) = (&self.write_tracker, self.transaction_id) {
+                    let single_prop = if self.properties.len() == 1 {
+                        let name = &self.properties[0].0;
+                        if name != "*" {
+                            Some(name.as_str())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     if self.is_edge {
-                        tracker.record_edge_write(tid, EdgeId(entity_id))?;
+                        if let Some(key) = single_prop {
+                            tracker.record_edge_property_write(tid, EdgeId(entity_id), key)?;
+                        } else {
+                            tracker.record_edge_write(tid, EdgeId(entity_id))?;
+                        }
+                    } else if let Some(key) = single_prop {
+                        tracker.record_node_property_write(tid, NodeId(entity_id), key)?;
                     } else {
                         tracker.record_node_write(tid, NodeId(entity_id))?;
                     }
