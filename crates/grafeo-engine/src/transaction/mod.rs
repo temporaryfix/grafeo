@@ -190,6 +190,7 @@
 //! # }
 //! ```
 
+mod conflict_key;
 mod manager;
 mod mvcc;
 #[cfg(feature = "parallel")]
@@ -198,6 +199,9 @@ pub mod parallel;
 mod prepared;
 mod read_registry;
 
+#[allow(unused_imports)]
+// prop_compatible/prop_tag consumed as property granularity lands (Part G Tasks 2-4)
+pub(crate) use conflict_key::{PropTag, prop_compatible, prop_tag};
 pub use manager::{
     EntityId, IsolationLevel, TransactionInfo, TransactionManager, TransactionState,
 };
