@@ -309,8 +309,14 @@ impl LpgStore {
         if text_indexes.is_empty() {
             return;
         }
+        // Single-source: stamp the removal at the current (commit) epoch so a
+        // deleted node's text postings are `deleted_epoch = C` — visible to a
+        // snapshot before C, hidden at/after C — matching the node's property
+        // version chain. (Legacy `remove` stamped epoch 0 = hidden from every
+        // snapshot, which lied to pre-delete readers.)
+        let epoch = self.current_epoch();
         for (_, index) in text_indexes.iter() {
-            index.write().remove(id);
+            index.write().remove_versioned(id, epoch, None);
         }
     }
 
