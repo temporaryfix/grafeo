@@ -2898,3 +2898,156 @@ fn edges_from_versioned_records_reads() {
         "edge2 must be recorded in the SSI read-set"
     );
 }
+
+// ── TI3: per-tx text-index delta ─────────────────────────────────────────────
+
+/// Under a transaction, setting an indexed text property buffers the change into
+/// `text_index_overlay` and does NOT mutate the committed `InvertedIndex`.
+#[cfg(feature = "text-index")]
+#[test]
+fn tx_text_index_delta_buffers_set_without_mutating_committed_index() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+
+    // Create a committed text index on :Doc(content).
+    let committed_idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "content", Arc::clone(&committed_idx));
+
+    // Create a node with the Doc label (committed).
+    let node = store.create_node(&["Doc"]);
+
+    // Transactional buffered set.
+    let tx = TransactionId::new(1);
+    store.set_node_property_buffered(
+        node,
+        "content",
+        Value::String("transactional hello world".into()),
+        tx,
+    );
+
+    // The committed InvertedIndex must NOT see the new text.
+    let results = committed_idx.read().search("hello world", 10);
+    assert!(
+        results.is_empty(),
+        "committed index must be untouched by a transactional buffered write"
+    );
+
+    // The text_index_overlay must have the buffered change.
+    {
+        let overlay = store.text_index_overlay.read();
+        let delta = overlay
+            .get(&tx)
+            .expect("text_index_overlay must have an entry for tx");
+        let entry = delta.get("Doc:content", node);
+        assert_eq!(
+            entry,
+            Some(&Some("transactional hello world".to_owned())),
+            "text_index_overlay must hold the buffered text"
+        );
+    }
+}
+
+/// Under a transaction, removing an indexed text property buffers a tombstone
+/// into `text_index_overlay` and does NOT touch the committed `InvertedIndex`.
+#[cfg(feature = "text-index")]
+#[test]
+fn tx_text_index_delta_buffers_remove_tombstone() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let committed_idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "content", Arc::clone(&committed_idx));
+
+    // Committed node + committed text (via auto-commit path).
+    let node = store.create_node(&["Doc"]);
+    store.set_node_property(node, "content", Value::String("committed text".into()));
+
+    // Verify committed index has the entry.
+    let results_before = committed_idx.read().search("committed text", 10);
+    assert_eq!(
+        results_before.len(),
+        1,
+        "committed index should have the node before transactional remove"
+    );
+
+    // Transactional buffered remove.
+    let tx = TransactionId::new(2);
+    store.remove_node_property_buffered(node, "content", tx);
+
+    // Committed index must still have the entry (remove is only buffered).
+    let results_after = committed_idx.read().search("committed text", 10);
+    assert_eq!(
+        results_after.len(),
+        1,
+        "committed index must be untouched by a transactional buffered remove"
+    );
+
+    // The overlay must have a None tombstone.
+    {
+        let overlay = store.text_index_overlay.read();
+        let delta = overlay
+            .get(&tx)
+            .expect("text_index_overlay must have an entry for tx");
+        let entry = delta.get("Doc:content", node);
+        assert_eq!(
+            entry,
+            Some(&None),
+            "text_index_overlay must hold a removal tombstone"
+        );
+    }
+}
+
+/// Rolling back a transaction drops its `text_index_overlay` entry.
+#[cfg(feature = "text-index")]
+#[test]
+fn tx_text_index_delta_rollback_clears_overlay() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let committed_idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "content", Arc::clone(&committed_idx));
+
+    let node = store.create_node(&["Doc"]);
+    let tx = TransactionId::new(3);
+
+    store.set_node_property_buffered(
+        node,
+        "content",
+        Value::String("will be rolled back".into()),
+        tx,
+    );
+
+    // Verify it's buffered.
+    {
+        let overlay = store.text_index_overlay.read();
+        assert!(
+            overlay.get(&tx).is_some(),
+            "overlay must exist before rollback"
+        );
+    }
+
+    // Rollback: drop_tx_overlay must clear both property delta and text-index delta.
+    store.drop_tx_overlay(tx);
+
+    {
+        let overlay = store.text_index_overlay.read();
+        assert!(
+            overlay.get(&tx).is_none(),
+            "text_index_overlay entry must be gone after rollback"
+        );
+    }
+
+    // The committed index must still be clean.
+    let results = committed_idx.read().search("rolled back", 10);
+    assert!(
+        results.is_empty(),
+        "committed index must remain clean after rollback"
+    );
+}

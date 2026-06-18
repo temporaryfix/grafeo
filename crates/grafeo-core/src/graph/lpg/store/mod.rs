@@ -527,6 +527,18 @@ pub struct LpgStore {
     /// sessions never see it. Lock order: after `pending_tx_creates`.
     tx_property_overlay: RwLock<FxHashMap<TransactionId, TxDelta>>,
 
+    /// Per-transaction uncommitted text-index delta (mirrors `tx_property_overlay`).
+    ///
+    /// When a transactional write touches a property covered by a text index the
+    /// change is buffered here instead of mutating the committed `InvertedIndex`.
+    /// Applied to the committed index at commit (TI5 — not yet) and dropped on
+    /// rollback.  The committed index is never mutated on the transactional path,
+    /// keeping it as the snapshot-consistent base for all other readers.
+    /// Lock order: same level as `tx_property_overlay`, independent key space.
+    #[cfg(feature = "text-index")]
+    pub(crate) text_index_overlay:
+        RwLock<FxHashMap<TransactionId, crate::index::text::TextIndexDelta>>,
+
     /// Per-transaction lists of node IDs deleted with a PENDING `deleted_epoch`,
     /// recorded at `delete_node_transactional` — the chokepoint that defers
     /// label-index/adjacency removal until commit. Finalized by
@@ -613,6 +625,8 @@ impl LpgStore {
             property_undo_log: RwLock::new(FxHashMap::default()),
             pending_tx_creates: RwLock::new(FxHashMap::default()),
             tx_property_overlay: RwLock::new(FxHashMap::default()),
+            #[cfg(feature = "text-index")]
+            text_index_overlay: RwLock::new(FxHashMap::default()),
             pending_tx_deletes: RwLock::new(FxHashMap::default()),
             pending_tx_edge_deletes: RwLock::new(FxHashMap::default()),
             read_trackers: RwLock::new(FxHashMap::default()),
@@ -731,6 +745,8 @@ impl LpgStore {
         self.property_undo_log.write().clear();
         self.pending_tx_creates.write().clear();
         self.tx_property_overlay.write().clear();
+        #[cfg(feature = "text-index")]
+        self.text_index_overlay.write().clear();
         self.read_trackers.write().clear();
     }
 

@@ -2,6 +2,8 @@
 
 use super::LpgStore;
 use dashmap::DashMap;
+#[cfg(feature = "text-index")]
+use grafeo_common::types::TransactionId;
 use grafeo_common::types::{HashableValue, NodeId, PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashSet;
 #[cfg(feature = "text-index")]
@@ -291,6 +293,98 @@ impl LpgStore {
         }
         for (_, index) in text_indexes.iter() {
             index.write().remove(id);
+        }
+    }
+
+    // === Transactional text-index buffering ===
+    //
+    // These two helpers are called from `set_node_property_buffered` /
+    // `remove_node_property_buffered` (property_ops.rs) when the property is
+    // covered by a text index.  They buffer the change into `text_index_overlay`
+    // WITHOUT touching the committed `InvertedIndex`.
+
+    /// Buffers a text-index set for a transactional node property write.
+    ///
+    /// For every label of `id` that has a text index on `key`, records
+    /// `Some(text)` into `text_index_overlay[transaction_id]`.  Only called
+    /// when the value is a `Value::String`; non-string values record a removal
+    /// (the committed index path treats non-string as "remove").
+    #[cfg(feature = "text-index")]
+    pub(super) fn buffer_text_index_set(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: &Value,
+        transaction_id: TransactionId,
+    ) {
+        let text_indexes = self.text_indexes.read();
+        if text_indexes.is_empty() {
+            return;
+        }
+        let registry = self.label_registry.read();
+        let node_labels = self.node_labels.read();
+        #[cfg(not(feature = "temporal"))]
+        let label_set = node_labels.get(&id);
+        #[cfg(feature = "temporal")]
+        let label_set = node_labels.get(&id).and_then(|log| log.latest());
+        if let Some(label_ids) = label_set {
+            for &label_id in label_ids {
+                if let Some(label_name) = registry.get_name(label_id) {
+                    let index_key = format!("{label_name}:{key}");
+                    if text_indexes.contains_key(&index_key) {
+                        let mut overlay = self.text_index_overlay.write();
+                        let delta = overlay.entry(transaction_id).or_default();
+                        match value {
+                            Value::String(text) => {
+                                delta.buffer_set(&index_key, id, text.to_string());
+                            }
+                            _ => {
+                                // Non-string value: the index treats this as a removal
+                                // (mirrors `update_text_index_on_set` which calls
+                                // `idx.remove(id)` when the value is not a string).
+                                delta.buffer_remove(&index_key, id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Buffers a text-index removal for a transactional node property removal.
+    ///
+    /// For every label of `id` that has a text index on `key`, records
+    /// `None` (tombstone) into `text_index_overlay[transaction_id]`.
+    #[cfg(feature = "text-index")]
+    pub(super) fn buffer_text_index_remove(
+        &self,
+        id: NodeId,
+        key: &str,
+        transaction_id: TransactionId,
+    ) {
+        let text_indexes = self.text_indexes.read();
+        if text_indexes.is_empty() {
+            return;
+        }
+        let registry = self.label_registry.read();
+        let node_labels = self.node_labels.read();
+        #[cfg(not(feature = "temporal"))]
+        let label_set = node_labels.get(&id);
+        #[cfg(feature = "temporal")]
+        let label_set = node_labels.get(&id).and_then(|log| log.latest());
+        if let Some(label_ids) = label_set {
+            for &label_id in label_ids {
+                if let Some(label_name) = registry.get_name(label_id) {
+                    let index_key = format!("{label_name}:{key}");
+                    if text_indexes.contains_key(&index_key) {
+                        self.text_index_overlay
+                            .write()
+                            .entry(transaction_id)
+                            .or_default()
+                            .buffer_remove(&index_key, id);
+                    }
+                }
+            }
         }
     }
 }

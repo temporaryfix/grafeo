@@ -32,11 +32,14 @@
 mod inverted_index;
 pub mod section;
 mod tokenizer;
+pub mod tx_delta;
 mod versioned;
 
 pub use inverted_index::{BM25Config, InvertedIndex};
 pub use section::TextIndexSection;
 pub use tokenizer::{SimpleTokenizer, Tokenizer};
+#[cfg(feature = "text-index")]
+pub use tx_delta::TextIndexDelta;
 
 #[cfg(feature = "hybrid-search")]
 mod fusion;

@@ -996,6 +996,10 @@ impl LpgStore {
     // through the accessor in a later increment.
 
     /// Buffers an uncommitted node property write into the transaction's delta.
+    ///
+    /// If the property is covered by a text index for any of the node's labels,
+    /// the change is also buffered into `text_index_overlay` so the committed
+    /// [`InvertedIndex`] is NOT mutated on this path.
     #[doc(hidden)]
     pub fn set_node_property_buffered(
         &self,
@@ -1004,6 +1008,10 @@ impl LpgStore {
         value: Value,
         transaction_id: TransactionId,
     ) {
+        // Buffer the text-index change before moving `value`.
+        #[cfg(feature = "text-index")]
+        self.buffer_text_index_set(id, key, &value, transaction_id);
+
         self.tx_property_overlay
             .write()
             .entry(transaction_id)
@@ -1013,6 +1021,10 @@ impl LpgStore {
     }
 
     /// Buffers an uncommitted node property removal (tombstone) into the delta.
+    ///
+    /// If the property is covered by a text index for any of the node's labels,
+    /// a removal tombstone is buffered into `text_index_overlay` (committed index
+    /// is NOT touched).
     #[doc(hidden)]
     pub fn remove_node_property_buffered(
         &self,
@@ -1020,6 +1032,10 @@ impl LpgStore {
         key: &str,
         transaction_id: TransactionId,
     ) {
+        // Buffer the text-index removal.
+        #[cfg(feature = "text-index")]
+        self.buffer_text_index_remove(id, key, transaction_id);
+
         self.tx_property_overlay
             .write()
             .entry(transaction_id)
@@ -1207,12 +1223,26 @@ impl LpgStore {
                 }
             }
         }
+        // TI5: promote text_index_overlay here
+        // When TI5 lands: take `text_index_overlay[transaction_id]` and apply
+        // each `(index_key, node, Some(text))` as a versioned insert and each
+        // `(index_key, node, None)` as a versioned remove into the committed
+        // `InvertedIndex`.  For now just drop the delta (it was never applied).
+        #[cfg(feature = "text-index")]
+        {
+            self.text_index_overlay.write().remove(&transaction_id);
+        }
     }
 
     /// Drops a transaction's buffered property delta (rollback) without applying.
     #[doc(hidden)]
     pub fn drop_tx_overlay(&self, transaction_id: TransactionId) {
         self.tx_property_overlay.write().remove(&transaction_id);
+        // Drop the text-index delta too (rollback — nothing to promote).
+        #[cfg(feature = "text-index")]
+        {
+            self.text_index_overlay.write().remove(&transaction_id);
+        }
     }
 
     /// Clones a transaction's buffered property delta for savepoint capture.
