@@ -13,6 +13,7 @@
 
 pub mod lpg;
 pub mod projection;
+pub mod snapshot_view;
 pub mod traits;
 
 #[cfg(feature = "compact-store")]
@@ -22,6 +23,7 @@ pub mod compact;
 pub mod rdf;
 
 pub use projection::{GraphProjection, ProjectionSpec};
+pub use snapshot_view::SnapshotView;
 pub use traits::{GraphStore, GraphStoreMut, GraphStoreSearch, NullGraphStore};
 
 /// Controls which edges to follow during traversal.
