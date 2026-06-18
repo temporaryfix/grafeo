@@ -144,6 +144,26 @@ On `integration` @ `d1a4998b` (the spec commit). This increment heavily **reuses
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE — merged to `integration` @ `ac1c5420`
 
-Plan written against `integration` @ `d1a4998b` (spec committed). Scope: snapshot-versioned BM25 text index under Serializable via MVCC delta-over-base, with the single-source invariant as a first-class tested requirement and the machinery factored for HNSW reuse. Heavily reuses merged patterns (Part-G `PropTag` threading; `tx_property_overlay` commit-promote; store GC; the graph-algorithm per-procedure guard). Execute subagent-driven, one task behind its gate; the single-source invariant test (Task 5) and the phantom test (Task 8) are the load-bearing checks. On completion: term-level predicate recording (refinement) + the **vector/HNSW cycle** (same pattern + traverse-all-return-visible).
+Snapshot-versioned BM25 text search under Serializable is **done and merged** (29 files, +5224/−164). The committed-latest index became an MVCC delta-over-base structure: epoch-versioned postings + as-of-E aggregate stats (`avgdl@E`) + per-tx delta + `search_visible` merge + commit-promote (single-source) + GC; a coarse `EntityId::Index` predicate-read makes a Serializable text search abort against a concurrent indexed write (anti-phantom); guard removed; **vector still guarded** (its cycle).
+
+**Tasks (all landed):**
+- **TI1-2** versioned postings + visibility (`is_visible_to` mirror) + as-of-E aggregate log — behavior-preserving foundation.
+- **TI3-4** per-tx `text_index_overlay` (mirrors `tx_property_overlay`) + `search_visible` (committed-visible ⊕ delta, read-your-writes).
+- **TI5** commit-promote — **single-source invariant** (index posting epoch == property version epoch, stamped at the same commit; opus-reviewed, invariant test with the property version chain as oracle). Follow-up: node-delete path (`remove_from_all_text_indexes`) stamped epoch-0 → fixed to `current_epoch()` (review-found).
+- **TI6** GC postings + agg-log below `min_active_epoch`.
+- **TI7** `EntityId::Index(IndexId)` + the read/write-tracker bridges + a new store-level WriteTracker registration (opus-reviewed).
+- **TI8** integration + guard removal + acceptance (`text_search_visible`; per-procedure `serializable_safe`).
+
+**The anti-phantom find-and-fix tail (4 review-found phantom paths — the recording had to reach every entry point):**
+- **TI9** index-pushdown operator path (top-k + threshold) + the 4 wrapper-store delegations (`active_store()` is a `WalGraphStore`).
+- **TI10** per-row filter path (`text_match`/`text_score` when pushdown declined) via `score_text_visible`.
+- **TI11** moved recording to **execution-time** (FilterOperator first-poll, robust to plan caching) + **complete predicate walk** (`coalesce`/`CASE`/comprehensions/…); retired the fragile plan-time side-effect.
+- **TI12** **property-driven** recording (every text index on the predicate's property, not just the static scan label) — closes the multi-label 0-row corner. Enumerator hardened to exact `":{property}"` suffix-match (final-review finding, `ac1c5420`).
+
+**Verification:** `--all-features` 7610/0; serializable suite **27/27** (CALL / operator / per-row / nested / 0-row / multi-label phantom-aborts + disjoint-commits + read-your-writes + snapshot-consistent + single-source + node-delete); clippy; profiles (`default`/`lpg`/`lpg,temporal`/`lpg,text-index`) + wasm; SI/RC byte-unchanged; OPSEC (un-pushed). Read/write `IndexId` keys symmetric; tx-context uniform across nested/subquery/UNION filters (single `plan_filter` chokepoint).
+
+**Documented residuals (sound, not holes):** coarse predicate recording over-conflicts (term-level is the follow-on); projection-only `RETURN text_score` over 0 rows is unrecorded but benign (row set governed by MATCH, not the index); the synthetic-node (`NodeId::INVALID`) recording trigger relies on `record_read_index` running first (it does, in all impls) — a noted latent coupling; concurrent CREATE TEXT INDEX (DDL) not modelled.
+
+**Next:** term-level predicate recording (refinement) + the **vector/HNSW cycle** (same MVCC-secondary-index pattern + a versioned HNSW entry structure + traverse-all-return-visible search + per-tx delta).
