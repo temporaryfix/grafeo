@@ -35,6 +35,16 @@
 //! The read-tracker is only registered for Serializable transactions.  For
 //! SI / Read-Committed the tracker is absent, so every `record_*` call is a
 //! no-op.  Wrapping is therefore harmless under any isolation level.
+//!
+//! # Completeness invariant (maintainers)
+//!
+//! SSI soundness depends on *every* read an algorithm makes routing through a
+//! recording override here — true today because algorithms touch only the 6
+//! methods above.  **A new algorithm that calls another `GraphStore` read
+//! (e.g. `get_node_property`, `nodes_by_label`, `get_nodes_properties_batch`)
+//! MUST get a recording override** — a delegated read silently bypasses the SSI
+//! read-set + snapshot pin (unrecorded read = missed conflict = unsound). Re-grep
+//! `grafeo-adapters/src/plugins/algorithms` for `store.` when adding one.
 
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};

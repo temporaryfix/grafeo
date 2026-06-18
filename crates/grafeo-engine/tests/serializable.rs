@@ -814,6 +814,7 @@ fn disjoint_property_writes_abort_under_entity_granularity() {
 ///   covers it).
 /// - s2 reads both balances; writes account-2.balance = -100 (trusting account-1
 ///   covers it).
+///
 /// Under Property granularity both sessions record `(account-*, prop_tag("balance"))`
 /// reads, and each writes the same property tag. The rw-edges still form a cycle →
 /// the second committer aborts.
