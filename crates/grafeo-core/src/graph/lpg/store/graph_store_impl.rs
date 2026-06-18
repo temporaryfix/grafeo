@@ -396,17 +396,19 @@ impl GraphStoreSearch for LpgStore {
     /// correctly.
     #[cfg(feature = "text-index")]
     fn text_index_labels_for_property(&self, property: &str) -> Vec<String> {
+        // Match by suffix `":{property}"` rather than splitting the key on a
+        // single ':'.  The key format `"{label}:{property}"` is ambiguous under
+        // a *single* split when EITHER the label or the property contains a ':'
+        // (`split_once` mis-handles colon-properties; `rsplit_once` mis-handles
+        // colon-labels).  Stripping the exact `":{property}"` suffix recovers the
+        // label unambiguously for the precise property string queried, so a node
+        // whose `(label, property)` index write is recorded as
+        // `format!("{label}:{property}")` is always enumerated here.
+        let suffix = format!(":{property}");
         self.text_indexes
             .read()
             .keys()
-            .filter_map(|key| {
-                let (lbl, prop) = key.rsplit_once(':')?;
-                if prop == property {
-                    Some(lbl.to_string())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|key| key.strip_suffix(&suffix).map(str::to_string))
             .collect()
     }
 
