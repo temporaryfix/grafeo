@@ -873,3 +873,201 @@ fn same_property_write_skew_aborts_under_property_granularity() {
         "s2 must abort under Property granularity (same-property write-skew is a real conflict)",
     );
 }
+
+// ============================================================================
+// 10. serializable_shortest_path_conflict_aborts
+// ============================================================================
+
+/// shortestPath under Serializable isolation: a genuine write-skew cycle
+/// involving a shortestPath read is detected and the second committer aborts.
+///
+/// ## Setup
+///
+/// A single-hop path graph plus a separate sentinel node (distinct labels so
+/// each session's scans are predicate-precise):
+///   (:SpSrc {id:1}) -[:SPLINK]-> (:SpDst {id:2})
+///   (:SpSentinel {v: 100})
+///
+/// ## Interleave
+///
+/// Both sessions begin before any commit (same snapshot epoch).
+///
+/// - **s1** (Serializable):
+///   1. Runs `shortestPath` from SpSrc to SpDst — records the SPLINK edge
+///      and the SpSrc/SpDst nodes in s1's SSI read-set.
+///   2. Writes `SpSentinel.v = 99` — records SpSentinel in s1's write-set;
+///      at write-time: s2 (active) has SpSentinel in its read-set →
+///      rw-edge s2→rw→s1: `s2.out_conflict=true, s1.in_conflict=true`.
+///
+/// - **s2** (Serializable):
+///   1. Reads `SpSentinel.v` — records SpSentinel in s2's read-set.
+///   2. Deletes the SPLINK edge — records SPLINK in s2's write-set; at
+///      write-time: s1 (active) has SPLINK in its read-set →
+///      rw-edge s1→rw→s2: `s1.out_conflict=true, s2.in_conflict=true`.
+///
+/// ## rw-antidependency graph
+///
+/// ```text
+/// s1 →rw→ s2  (s1 read SPLINK; s2 deleted SPLINK)
+/// s2 →rw→ s1  (s2 read SpSentinel; s1 wrote SpSentinel)
+/// ```
+///
+/// Cycle: s1 → s2 → s1.
+///
+/// ## Expected outcome
+///
+/// s1 commits first → Ok (s1.out_conflict=true, s1.in_conflict=true, but
+/// no committed writer of SPLINK-or-SpSentinel-yet → cycle not confirmed →
+/// commits Ok).
+///
+/// s2 commits second → s2.in_conflict=true AND s2.out_conflict=true.
+/// Cycle check: s1 committed and wrote SpSentinel; s2 read SpSentinel →
+/// cycle confirmed → s2 is the pivot → SerializationFailure.
+#[test]
+fn serializable_shortest_path_conflict_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed the path graph and a disjoint sentinel node.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:SpSrc {id: 1})-[:SPLINK]->(:SpDst {id: 2})")
+        .expect("seed SpSrc-SpDst path");
+    setup
+        .execute("CREATE (:SpSentinel {v: 100})")
+        .expect("seed SpSentinel");
+    drop(setup);
+
+    // Both sessions begin before any commit (same snapshot epoch).
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: run shortestPath — records the SPLINK edge and SpSrc/SpDst nodes
+    // in s1's SSI read-set.
+    let r1 = s1
+        .execute(
+            "MATCH p = shortestPath((a:SpSrc {id: 1})-[:SPLINK*]->(b:SpDst {id: 2})) \
+             RETURN length(p) AS len",
+        )
+        .expect("s1: shortestPath under Serializable must not error");
+    assert_eq!(r1.row_count(), 1, "s1 must find the 1-hop path");
+
+    // s2: read SpSentinel — records SpSentinel in s2's read-set.
+    let r2 = s2
+        .execute("MATCH (n:SpSentinel) RETURN n.v")
+        .expect("s2: MATCH SpSentinel");
+    assert_eq!(r2.row_count(), 1, "s2 must see the sentinel node");
+
+    // s1: write SpSentinel — s2 (active) has SpSentinel in its read-set →
+    // write-time detection: rw-edge s2→rw→s1: s2.out_conflict=true, s1.in_conflict=true.
+    s1.execute("MATCH (n:SpSentinel) SET n.v = 99")
+        .expect("s1: SET SpSentinel.v");
+
+    // s2: delete the SPLINK edge — s1 (active) has SPLINK in its read-set →
+    // write-time detection: rw-edge s1→rw→s2: s1.out_conflict=true, s2.in_conflict=true.
+    s2.execute("MATCH (:SpSrc {id: 1})-[e:SPLINK]->(:SpDst {id: 2}) DELETE e")
+        .expect("s2: delete SPLINK edge");
+
+    // s1 commits first → must succeed.
+    // s1.out_conflict=true, s1.in_conflict=true, but no committed writer of
+    // SPLINK (s2 not yet committed) → cycle not confirmed at s1's commit time.
+    let c1 = s1.commit();
+    assert!(c1.is_ok(), "s1 (first committer) must succeed: {:?}", c1);
+
+    // s2 commits second → must abort.
+    // s2.in_conflict=true (from s1's rw-edge via SPLINK delete) AND
+    // s2.out_conflict=true (from s2's read of SpSentinel that s1 wrote).
+    // Cycle check: s1 committed and wrote SpSentinel; s2 read SpSentinel →
+    // cycle confirmed → s2 is the pivot → SerializationFailure.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (write-skew involving shortestPath read-set) must abort with SerializationFailure",
+    );
+}
+
+// ============================================================================
+// 11. serializable_shortest_path_disjoint_commits
+// ============================================================================
+
+/// shortestPath under Serializable isolation: a write to a DISJOINT region
+/// (no overlap with the path read-set) lets both transactions commit.
+///
+/// ## Setup
+///
+/// The path graph from above plus a completely isolated node with a distinct label:
+///   (:Src2 {id:1})-[:ROAD2]->(:Mid2 {id:2})-[:ROAD2]->(:Dst2 {id:3})
+///   (:Isolated {v: 0})    ← touched ONLY by s2
+///
+/// ## Scenario
+///
+/// - s1 (Serializable): runs `shortestPath` over the ROAD2 path — records the
+///   two ROAD2 edges and their endpoints in s1's SSI read-set.
+///
+/// - s2 (Serializable, concurrent): writes ONLY the `:Isolated` node
+///   (`SET n.v = 99`) — touches nothing s1 read.
+///
+/// ## Expected outcome
+///
+/// No rw-antidependency between s1 and s2 → BOTH must commit.
+#[test]
+fn serializable_shortest_path_disjoint_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed path graph and an isolated node.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:Src2 {id: 1})-[:ROAD2]->(:Mid2 {id: 2})-[:ROAD2]->(:Dst2 {id: 3})")
+        .expect("seed path graph");
+    setup
+        .execute("CREATE (:Isolated {v: 0})")
+        .expect("seed isolated node");
+    drop(setup);
+
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: shortestPath over the ROAD2 path.
+    let r1 = s1
+        .execute(
+            "MATCH p = shortestPath((a:Src2 {id: 1})-[:ROAD2*]->(b:Dst2 {id: 3})) \
+             RETURN length(p) AS len",
+        )
+        .expect("s1: shortestPath under Serializable must not error");
+    assert_eq!(r1.row_count(), 1, "s1 must find the 2-hop path");
+
+    // s2: write to a node that is completely disjoint from s1's read-set.
+    s2.execute("MATCH (n:Isolated) SET n.v = 99")
+        .expect("s2: SET Isolated.v");
+
+    // Both must commit: no rw-antidependency.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (shortestPath reader, disjoint from s2's write) must commit: {:?}",
+        c1
+    );
+
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 (writes disjoint :Isolated node) must commit: {:?}",
+        c2
+    );
+
+    // Verify s2's write persisted.
+    let verifier = db.session();
+    let iso = verifier
+        .execute("MATCH (n:Isolated) RETURN n.v")
+        .expect("verify Isolated node");
+    assert_eq!(iso.row_count(), 1);
+}

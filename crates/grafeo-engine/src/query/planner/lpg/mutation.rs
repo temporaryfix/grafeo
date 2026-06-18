@@ -658,17 +658,6 @@ impl super::Planner {
         &self,
         sp: &ShortestPathOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        // NOTE: the Serializable guard below will be removed in Task 3 once the
-        // full operator + planner integration is validated end-to-end.  The
-        // operator itself is now snapshot-ready: it carries epoch + transaction_id
-        // and routes through edges_from_versioned when a transaction is active.
-        if self.is_serializable() {
-            return Err(Error::Internal(
-                "Serializable isolation is not yet supported with shortestPath/allShortestPaths; use SnapshotIsolation"
-                    .to_string(),
-            ));
-        }
-
         // Plan the input operator
         let (input_op, mut columns) = self.plan_operator(&sp.input)?;
 

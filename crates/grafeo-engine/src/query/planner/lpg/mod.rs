@@ -4001,18 +4001,29 @@ mod tests {
         );
     }
 
-    /// plan_shortest_path must be rejected under Serializable isolation.
+    /// plan_shortest_path now succeeds under Serializable isolation (guard removed in Task 3).
+    ///
+    /// The operator carries `(epoch, transaction_id)` and traverses the tx snapshot
+    /// via `edges_from_versioned`, recording reads for SSI conflict detection.  The
+    /// old guard is gone; this test asserts the plan succeeds (no Err returned).
+    ///
+    /// The input scan exposes both "a" and "b" variables so planning can find them;
+    /// we chain two NodeScans to provide both source and target.
     #[test]
-    fn test_plan_shortest_path_rejected_under_serializable() {
+    fn test_plan_shortest_path_succeeds_under_serializable() {
         use crate::query::plan::ShortestPathOp;
         use crate::transaction::IsolationLevel;
 
         let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
         let op = ShortestPathOp {
             input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
-                variable: "a".to_string(),
+                variable: "b".to_string(),
                 label: None,
-                input: None,
+                input: Some(Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".to_string(),
+                    label: None,
+                    input: None,
+                }))),
             })),
             source_var: "a".to_string(),
             target_var: "b".to_string(),
@@ -4021,18 +4032,12 @@ mod tests {
             path_alias: "p".to_string(),
             all_paths: false,
         };
-        let err = planner
-            .plan_shortest_path(&op)
-            .err()
-            .expect("plan_shortest_path must return Err under Serializable");
-        let msg = err.to_string();
+        // The Serializable guard has been removed: planning MUST succeed.
+        let result = planner.plan_shortest_path(&op);
         assert!(
-            msg.contains("shortestPath"),
-            "error must mention shortestPath, got: {msg}"
-        );
-        assert!(
-            msg.contains("Serializable"),
-            "error must mention Serializable, got: {msg}"
+            result.is_ok(),
+            "plan_shortest_path must succeed under Serializable (guard removed), got: {:?}",
+            result.err()
         );
     }
 
@@ -4060,15 +4065,15 @@ mod tests {
             path_alias: "p".to_string(),
             all_paths: false,
         };
-        // The Serializable guard must NOT fire; any failure is a different error.
+        // The guard is gone for all isolation levels; any failure is a different error.
         let result = planner.plan_shortest_path(&op);
         match result {
-            Ok(_) => { /* guard didn't fire and planning succeeded — ideal */ }
+            Ok(_) => { /* planning succeeded — ideal */ }
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
                     !msg.contains("Serializable isolation is not yet supported with shortestPath"),
-                    "SnapshotIsolation must NOT trigger the Serializable guard, got: {msg}"
+                    "The Serializable guard must not exist for any isolation level, got: {msg}"
                 );
             }
         }
