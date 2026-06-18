@@ -17,7 +17,7 @@ use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::CompactStore;
-use crate::execution::operators::SharedReadTracker;
+use crate::execution::operators::{SharedReadTracker, SharedWriteTracker};
 
 /// Epoch+transaction stamp for a base-edge tombstone.
 ///
@@ -1280,6 +1280,14 @@ impl GraphStore for LayeredStore {
 
     fn unregister_read_tracker(&self, tx: TransactionId) {
         self.overlay.load().unregister_read_tracker(tx);
+    }
+
+    fn register_write_tracker(&self, tx: TransactionId, tracker: SharedWriteTracker) {
+        self.overlay.load().register_write_tracker(tx, tracker);
+    }
+
+    fn unregister_write_tracker(&self, tx: TransactionId) {
+        self.overlay.load().unregister_write_tracker(tx);
     }
 
     fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use grafeo_common::types::{EdgeId, NodeId, TransactionId};
 use grafeo_core::execution::operators::{OperatorError, WriteTracker};
 
-use super::{ConflictGranularity, TransactionManager, prop_tag};
+use super::{ConflictGranularity, IndexId, TransactionManager, prop_tag};
 
 /// Implements [`WriteTracker`] by forwarding to [`TransactionManager::record_write`].
 ///
@@ -88,5 +88,21 @@ impl WriteTracker for TransactionWriteTracker {
         self.manager
             .record_write(transaction_id, edge_id, tag)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Records that `transaction_id` wrote to the `(label, property)` text index
+    /// identified by `index_key`. Coarse index-write recording for anti-phantom SSI.
+    ///
+    /// Intentionally infallible: the index-entity write is a coarse SSI signal,
+    /// not a first-writer-wins entity lock (two concurrent indexed SETs to different
+    /// *nodes* in the same index are not a W-W conflict on the index entity itself).
+    fn record_index_write(&self, transaction_id: TransactionId, index_key: &str) {
+        let idx = if let Some((label, property)) = index_key.split_once(':') {
+            IndexId::for_text_index(label, property)
+        } else {
+            IndexId::for_text_index(index_key, "")
+        };
+        // Ignore W-W conflict result: the index is not a first-writer-wins entity.
+        let _ = self.manager.record_write(transaction_id, idx, None);
     }
 }

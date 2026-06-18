@@ -10,6 +10,31 @@ use parking_lot::RwLock;
 
 use super::{PropTag, ReadRegistry, prop_compatible};
 
+/// Stable identifier for a `(label, property)` text index.
+///
+/// Used as the entity key in the SSI read-set / write-set when a Serializable
+/// text search records a predicate read, or a SET/REMOVE on an indexed property
+/// records an index write. Two different `(label, property)` pairs produce
+/// different `IndexId` values; collisions are impossible in practice (probability
+/// ~2^-64) and, like all hash-based conflict keys, produce only false conflicts
+/// (never missed ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IndexId(u64);
+
+impl IndexId {
+    /// Returns a stable `IndexId` for the given label and property.
+    ///
+    /// The hash is computed from `"label:property"` using the same stable FNV-1a
+    /// function as [`grafeo_common::utils::hash::stable_hash`], so it survives
+    /// process restarts (though the conflict machinery is in-memory only, so
+    /// stability across restarts is a bonus, not a requirement).
+    #[must_use]
+    pub fn for_text_index(label: &str, property: &str) -> Self {
+        let key = format!("{label}:{property}");
+        Self(grafeo_common::utils::hash::hash_one(&key))
+    }
+}
+
 /// State of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -117,6 +142,9 @@ pub enum EntityId {
     Node(NodeId),
     /// An edge.
     Edge(EdgeId),
+    /// A `(label, property)` text index — used for coarse predicate-read
+    /// recording to prevent phantom reads in Serializable text searches.
+    Index(IndexId),
 }
 
 impl From<NodeId> for EntityId {
@@ -128,6 +156,12 @@ impl From<NodeId> for EntityId {
 impl From<EdgeId> for EntityId {
     fn from(id: EdgeId) -> Self {
         Self::Edge(id)
+    }
+}
+
+impl From<IndexId> for EntityId {
+    fn from(id: IndexId) -> Self {
+        Self::Index(id)
     }
 }
 
@@ -2495,6 +2529,112 @@ mod tests {
         );
 
         let _ = mgr.commit(keep_alive);
+    }
+
+    // --- Task 7: IndexId + EntityId::Index predicate-read recording ---
+
+    #[test]
+    fn index_id_stable_and_distinguishing() {
+        // IndexId::for_text_index must be stable (same input → same id) and
+        // distinguish different (label, property) pairs.
+        let id1 = IndexId::for_text_index("Doc", "body");
+        let id2 = IndexId::for_text_index("Doc", "body");
+        let id3 = IndexId::for_text_index("Doc", "title");
+        let id4 = IndexId::for_text_index("Article", "body");
+
+        assert_eq!(id1, id2, "same inputs must produce equal IndexId");
+        assert_ne!(id1, id3, "(Doc,body) must differ from (Doc,title)");
+        assert_ne!(id1, id4, "(Doc,body) must differ from (Article,body)");
+        assert_ne!(id3, id4, "(Doc,title) must differ from (Article,body)");
+    }
+
+    #[test]
+    fn entity_id_index_variant_from_index_id() {
+        let idx = IndexId::for_text_index("Doc", "body");
+        let eid: EntityId = idx.into();
+        assert!(matches!(eid, EntityId::Index(_)));
+        // Must be usable as a HashSet key.
+        let mut set = std::collections::HashSet::new();
+        set.insert(eid);
+        assert!(set.contains(&EntityId::Index(idx)));
+    }
+
+    #[test]
+    fn index_rw_edge_formed_between_read_and_write() {
+        // tx1 (Serializable) records an index read; tx2 (Serializable) records an
+        // index write on the same IndexId → rw-edge: tx1.out_conflict, tx2.in_conflict.
+        let mgr = TransactionManager::new();
+        let idx = IndexId::for_text_index("Doc", "body");
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx1, EntityId::Index(idx), None).unwrap();
+        mgr.record_write(tx2, EntityId::Index(idx), None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "tx1 (reader) must have out_conflict after index write by tx2"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "tx2 (writer) must have in_conflict after index read by tx1"
+        );
+    }
+
+    #[test]
+    fn different_index_ids_do_not_conflict() {
+        // tx1 reads (Doc, body); tx2 writes (Doc, title) — different indexes.
+        // No rw-edge must be formed.
+        let mgr = TransactionManager::new();
+        let idx_body = IndexId::for_text_index("Doc", "body");
+        let idx_title = IndexId::for_text_index("Doc", "title");
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx1, EntityId::Index(idx_body), None)
+            .unwrap();
+        mgr.record_write(tx2, EntityId::Index(idx_title), None)
+            .unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, false),
+            "different index ids must not form an rw-edge"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (false, false),
+            "different index ids must not form an rw-edge on the writer side"
+        );
+    }
+
+    #[test]
+    fn index_rw_write_before_read_sets_reader_out() {
+        // tx_w (Serializable) writes index and commits; tx_r (Serializable) began
+        // BEFORE tx_w committed, then reads the same index → tx_r.out_conflict.
+        let mgr = TransactionManager::new();
+        let idx = IndexId::for_text_index("Post", "content");
+
+        // tx_r begins first (start_epoch = 0)
+        let tx_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx_w writes index and commits (commit_epoch > tx_r.start_epoch)
+        let tx_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_write(tx_w, EntityId::Index(idx), None).unwrap();
+        mgr.commit(tx_w).unwrap();
+
+        // tx_r now reads the index; tx_w committed after tx_r started → out_conflict
+        mgr.record_read(tx_r, EntityId::Index(idx), None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx_r),
+            (false, true),
+            "tx_r must have out_conflict: index read after concurrent committed index write"
+        );
     }
 
     // --- Part G Task 2: all-None tags reproduce existing write-skew abort ---

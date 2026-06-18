@@ -27,7 +27,7 @@ mod tests;
 use super::PropertyStorage;
 #[cfg(not(feature = "tiered-storage"))]
 use super::{EdgeRecord, NodeRecord};
-use crate::execution::operators::SharedReadTracker;
+use crate::execution::operators::{SharedReadTracker, SharedWriteTracker};
 use crate::graph::lpg::{Edge, Node};
 use crate::index::adjacency::ChunkedAdjacency;
 use crate::statistics::Statistics;
@@ -560,6 +560,13 @@ pub struct LpgStore {
     /// visible-read accessors record observed entities into it (the SSI read-set,
     /// complete by construction). Empty for SI/ReadCommitted (zero cost).
     read_trackers: RwLock<FxHashMap<TransactionId, SharedReadTracker>>,
+
+    /// Per-transaction write trackers (Serializable only). Set by the engine at
+    /// Serializable tx begin, dropped at commit/rollback. When present, the
+    /// buffered indexed-write path records index writes via
+    /// [`WriteTracker::record_index_write`] for anti-phantom SSI.
+    /// Parallel to `read_trackers`; empty for SI/ReadCommitted (zero cost).
+    write_trackers: RwLock<FxHashMap<TransactionId, SharedWriteTracker>>,
 }
 
 impl LpgStore {
@@ -630,6 +637,7 @@ impl LpgStore {
             pending_tx_deletes: RwLock::new(FxHashMap::default()),
             pending_tx_edge_deletes: RwLock::new(FxHashMap::default()),
             read_trackers: RwLock::new(FxHashMap::default()),
+            write_trackers: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -748,6 +756,7 @@ impl LpgStore {
         #[cfg(feature = "text-index")]
         self.text_index_overlay.write().clear();
         self.read_trackers.write().clear();
+        self.write_trackers.write().clear();
     }
 
     /// Returns whether backward adjacency (incoming edge index) is available.
@@ -1208,6 +1217,47 @@ impl LpgStore {
     pub(crate) fn record_read_edge_property(&self, tx: TransactionId, id: EdgeId, key: &str) {
         if let Some(t) = self.read_trackers.read().get(&tx) {
             t.record_edge_property_read(tx, id, key);
+        }
+    }
+
+    // ── Write-tracker: per-transaction registration for indexed-SET anti-phantom ──
+
+    /// Attaches `tracker` to `tx` so that subsequent buffered indexed-property
+    /// writes record the index write via [`WriteTracker::record_index_write`].
+    /// Call at Serializable tx begin alongside
+    /// [`register_read_tracker`](Self::register_read_tracker).
+    /// No-op for SI/ReadCommitted (just don't call it).
+    pub fn register_write_tracker(&self, tx: TransactionId, tracker: SharedWriteTracker) {
+        self.write_trackers.write().insert(tx, tracker);
+    }
+
+    /// Removes the write tracker for `tx`. Call at commit/rollback for
+    /// Serializable transactions. Silent no-op if none was registered.
+    pub fn unregister_write_tracker(&self, tx: TransactionId) {
+        self.write_trackers.write().remove(&tx);
+    }
+
+    /// Records that `tx` executed a text search on `index_key` (`"label:property"`).
+    ///
+    /// Forwards to the registered [`ReadTracker::record_index_read`] if one is
+    /// present for `tx`. Silent no-op for SI/ReadCommitted (no tracker registered).
+    #[cfg(feature = "text-index")]
+    #[inline]
+    pub(crate) fn record_read_index(&self, tx: TransactionId, index_key: &str) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_index_read(tx, index_key);
+        }
+    }
+
+    /// Records that `tx` wrote to the text index identified by `index_key`
+    /// (`"label:property"` format). Forwards to the registered
+    /// [`WriteTracker::record_index_write`] if present.
+    /// Silent no-op for SI/ReadCommitted.
+    #[cfg(feature = "text-index")]
+    #[inline]
+    pub(crate) fn record_write_index(&self, tx: TransactionId, index_key: &str) {
+        if let Some(t) = self.write_trackers.read().get(&tx) {
+            t.record_index_write(tx, index_key);
         }
     }
 }

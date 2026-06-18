@@ -362,6 +362,13 @@ impl LpgStore {
         epoch: EpochId,
         tx: TransactionId,
     ) -> Vec<(NodeId, f64)> {
+        // Coarse predicate-read recording for anti-phantom SSI (Task 7).
+        // A Serializable text search reads every document matching `query` in
+        // this index; a concurrent indexed SET is a phantom. Record the whole
+        // index as read so the existing rw-detection can form the edge. This is
+        // a no-op for SI/ReadCommitted (no read tracker registered for `tx`).
+        self.record_read_index(tx, index_key);
+
         // Build delta_docs and delta_removed from the overlay for this tx.
         let (delta_docs, delta_removed): (Vec<(NodeId, String)>, FxHashSet<NodeId>) = {
             let overlay = self.text_index_overlay.read();
@@ -447,6 +454,13 @@ impl LpgStore {
                 if let Some(label_name) = registry.get_name(label_id) {
                     let index_key = format!("{label_name}:{key}");
                     if text_indexes.contains_key(&index_key) {
+                        // Coarse index-write recording for anti-phantom SSI (Task 7).
+                        // A transactional SET on an indexed property writes to this
+                        // index; a concurrent Serializable text search is a phantom.
+                        // Record the index write so the rw-detection can form the edge.
+                        // No-op for SI/ReadCommitted (no write tracker registered).
+                        self.record_write_index(transaction_id, &index_key);
+
                         let mut overlay = self.text_index_overlay.write();
                         let delta = overlay.entry(transaction_id).or_default();
                         match value {
@@ -492,6 +506,9 @@ impl LpgStore {
                 if let Some(label_name) = registry.get_name(label_id) {
                     let index_key = format!("{label_name}:{key}");
                     if text_indexes.contains_key(&index_key) {
+                        // Coarse index-write recording for anti-phantom SSI (Task 7).
+                        self.record_write_index(transaction_id, &index_key);
+
                         self.text_index_overlay
                             .write()
                             .entry(transaction_id)

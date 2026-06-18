@@ -202,7 +202,7 @@ mod read_registry;
 pub(crate) use conflict_key::prop_tag;
 pub(crate) use conflict_key::{PropTag, STRUCT_TAG, prop_compatible};
 pub use manager::{
-    ConflictGranularity, EntityId, IsolationLevel, TransactionInfo, TransactionManager,
+    ConflictGranularity, EntityId, IndexId, IsolationLevel, TransactionInfo, TransactionManager,
     TransactionState,
 };
 #[doc(hidden)]

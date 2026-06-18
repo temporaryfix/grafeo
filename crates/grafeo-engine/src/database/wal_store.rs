@@ -9,7 +9,7 @@ use std::sync::Arc;
 use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
-use grafeo_core::execution::operators::SharedReadTracker;
+use grafeo_core::execution::operators::{SharedReadTracker, SharedWriteTracker};
 use grafeo_core::graph::lpg::{CompareOp, Edge, LpgStore, Node};
 use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
@@ -345,6 +345,14 @@ impl GraphStore for WalGraphStore {
 
     fn unregister_read_tracker(&self, tx: TransactionId) {
         self.inner.unregister_read_tracker(tx);
+    }
+
+    fn register_write_tracker(&self, tx: TransactionId, tracker: SharedWriteTracker) {
+        self.inner.register_write_tracker(tx, tracker);
+    }
+
+    fn unregister_write_tracker(&self, tx: TransactionId) {
+        self.inner.unregister_write_tracker(tx);
     }
 
     fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {

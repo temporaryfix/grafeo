@@ -183,6 +183,21 @@ pub trait WriteTracker: Send + Sync {
     ) -> Result<(), OperatorError> {
         self.record_edge_write(transaction_id, edge_id)
     }
+
+    /// Records that `transaction_id` wrote to the `(label, property)` text index
+    /// identified by `index_key` (format: `"label:property"`). Coarse index-write
+    /// recording for anti-phantom SSI.
+    ///
+    /// Default impl is a no-op; overridden by the engine bridge
+    /// (`TransactionWriteTracker`) to call
+    /// `manager.record_write(tx, EntityId::Index(…), None)` so a concurrent
+    /// Serializable text search can form the rw-antidependency edge.
+    ///
+    /// This is intentionally infallible: the index-entity write is a
+    /// coarse SSI signal, not a first-writer-wins entity lock (two
+    /// concurrent indexed SETs to different *nodes* in the same index
+    /// are not a W-W conflict). The W-W check is for the node entity itself.
+    fn record_index_write(&self, _transaction_id: TransactionId, _index_key: &str) {}
 }
 
 /// Type alias for a shared write tracker.
@@ -225,6 +240,17 @@ pub trait ReadTracker: Send + Sync {
     ) {
         self.record_edge_read(transaction_id, edge_id);
     }
+
+    /// Records that `transaction_id` executed a text search against the
+    /// `(label, property)` text index identified by `index_key` (format:
+    /// `"label:property"`). Coarse predicate-read recording for anti-phantom SSI.
+    ///
+    /// Default impl is a no-op; overridden by the engine bridge
+    /// (`TransactionReadTracker`) to call
+    /// `manager.record_read(tx, EntityId::Index(…), None)` for Serializable
+    /// transactions, recording the read in the SSI read-registry so a concurrent
+    /// indexed SET can form the rw-antidependency edge.
+    fn record_index_read(&self, _transaction_id: TransactionId, _index_key: &str) {}
 }
 
 /// Type alias for a shared read tracker.

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use grafeo_common::types::{EdgeId, NodeId, TransactionId};
 use grafeo_core::execution::operators::ReadTracker;
 
-use super::{ConflictGranularity, IsolationLevel, STRUCT_TAG, TransactionManager, prop_tag};
+use super::{
+    ConflictGranularity, IndexId, IsolationLevel, STRUCT_TAG, TransactionManager, prop_tag,
+};
 
 /// Implements [`ReadTracker`] by forwarding to [`TransactionManager::record_read`].
 ///
@@ -89,6 +91,30 @@ impl ReadTracker for TransactionReadTracker {
                 None
             };
             let _ = self.manager.record_read(transaction_id, edge_id, tag);
+        }
+    }
+
+    /// Records a Serializable text search as a coarse **index-level predicate read**.
+    ///
+    /// A text search reads a *predicate* ("docs matching these terms") over all
+    /// documents in the `(label, property)` index. Any concurrent transaction that
+    /// inserts or updates a matching document is a phantom; the coarse SSI fix is
+    /// to record the whole index as read. A concurrent indexed SET then records the
+    /// same index as written, and the existing rw-antidependency machinery aborts
+    /// the conflicting pair (preventing the phantom).
+    ///
+    /// Only fires for Serializable; SI/ReadCommitted pay nothing.
+    fn record_index_read(&self, transaction_id: TransactionId, index_key: &str) {
+        if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
+            // The `index_key` format is "label:property". Feed it directly to
+            // `IndexId::for_text_index` by splitting on the first ':'.
+            let idx = if let Some((label, property)) = index_key.split_once(':') {
+                IndexId::for_text_index(label, property)
+            } else {
+                // Malformed key: fall back to hashing the whole string.
+                IndexId::for_text_index(index_key, "")
+            };
+            let _ = self.manager.record_read(transaction_id, idx, None);
         }
     }
 }

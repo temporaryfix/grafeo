@@ -197,6 +197,18 @@ impl GraphStore for SnapshotView<'_> {
         self.inner.unregister_read_tracker(tx);
     }
 
+    fn register_write_tracker(
+        &self,
+        tx: TransactionId,
+        tracker: crate::execution::operators::SharedWriteTracker,
+    ) {
+        self.inner.register_write_tracker(tx, tracker);
+    }
+
+    fn unregister_write_tracker(&self, tx: TransactionId) {
+        self.inner.unregister_write_tracker(tx);
+    }
+
     fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {
         self.inner.pending_node_deletes_peek(transaction_id)
     }

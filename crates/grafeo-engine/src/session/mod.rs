@@ -3966,23 +3966,33 @@ impl Session {
         *current = Some(transaction_id);
         *self.read_only_tx.lock() = read_only || self.db_read_only;
 
-        // Serializable read-tracker registration.
+        // Serializable read-tracker and write-tracker registration.
         //
-        // For Serializable transactions, register a TransactionReadTracker bridge so that
+        // For Serializable transactions, register a TransactionReadTracker bridge so
         // the store-level record_read_* chokepoints populate the SSI read-set used by
-        // commit-time validation.  For SI/ReadCommitted the check is a no-op (tracker is
-        // not registered, record_read_* costs nothing).
+        // commit-time validation.  Also register a TransactionWriteTracker so the
+        // buffered indexed-write path (buffer_text_index_set/remove) can record index
+        // writes for anti-phantom SSI (Task 7).
+        // For SI/ReadCommitted both checks are no-ops (trackers not registered).
         if self.transaction_manager.isolation_level(transaction_id)
             == Some(crate::transaction::IsolationLevel::Serializable)
         {
             let granularity = *self.conflict_granularity.lock();
-            let bridge = std::sync::Arc::new(
+            let read_bridge = std::sync::Arc::new(
                 crate::transaction::TransactionReadTracker::with_granularity(
                     Arc::clone(&self.transaction_manager),
                     granularity,
                 ),
             );
-            active.register_read_tracker(transaction_id, bridge);
+            active.register_read_tracker(transaction_id, read_bridge);
+
+            let write_bridge = std::sync::Arc::new(
+                crate::transaction::TransactionWriteTracker::with_granularity(
+                    Arc::clone(&self.transaction_manager),
+                    granularity,
+                ),
+            );
+            active.register_write_tracker(transaction_id, write_bridge);
         }
 
         // Record the initial graph as "touched" for cross-graph atomicity.
@@ -4157,8 +4167,9 @@ impl Session {
                     // unmark so the edges remain visible after conflict rollback.
                     let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
                     store.rollback_pending_edge_deletes(transaction_id, &pending_edge_deletes);
-                    // Unregister the Serializable read tracker (no-op for SI/RC).
+                    // Unregister the Serializable read/write trackers (no-op for SI/RC).
                     store.unregister_read_tracker(transaction_id);
+                    store.unregister_write_tracker(transaction_id);
                 }
                 let _ = self.transaction_manager.abort(transaction_id);
                 #[cfg(feature = "triple-store")]
@@ -4213,9 +4224,10 @@ impl Session {
             // label-index/property removal (unified-MVCC increment 1).
             let pending_deletes = store.take_pending_deletes(transaction_id);
             store.finalize_deletes_by_id(transaction_id, commit_epoch, &pending_deletes);
-            // Unregister the Serializable read tracker now that the tx is committing.
-            // No-op for SI/RC (tracker was never registered for those levels).
+            // Unregister the Serializable read/write trackers now that the tx is
+            // committing. No-op for SI/RC (trackers were never registered).
             store.unregister_read_tracker(transaction_id);
+            store.unregister_write_tracker(transaction_id);
         }
 
         // Commit succeeded: discard undo logs (make changes permanent)
@@ -4387,9 +4399,10 @@ impl Session {
             // their version chains so the edges remain visible after rollback.
             let pending_edge_deletes = store.take_pending_edge_deletes(transaction_id);
             store.rollback_pending_edge_deletes(transaction_id, &pending_edge_deletes);
-            // Unregister the Serializable read tracker on rollback.
-            // No-op for SI/RC (tracker was never registered for those levels).
+            // Unregister the Serializable read/write trackers on rollback.
+            // No-op for SI/RC (trackers were never registered for those levels).
             store.unregister_read_tracker(transaction_id);
+            store.unregister_write_tracker(transaction_id);
         }
 
         // Discard pending operations in the RDF store

@@ -19,7 +19,7 @@
 //!
 //! [`LpgStore`]: crate::graph::lpg::LpgStore
 
-use crate::execution::operators::SharedReadTracker;
+use crate::execution::operators::{SharedReadTracker, SharedWriteTracker};
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 #[cfg(feature = "lpg")]
@@ -107,6 +107,16 @@ pub trait GraphStore: Send + Sync {
 
     /// Removes the read tracker for `tx`. Called at commit/rollback. Default no-op.
     fn unregister_read_tracker(&self, _tx: TransactionId) {}
+
+    /// Attaches a write tracker for `tx` (anti-phantom index-write recording).
+    ///
+    /// Called by the engine at Serializable tx begin alongside
+    /// [`register_read_tracker`](Self::register_read_tracker). Default no-op —
+    /// only `LpgStore` (and wrappers that delegate to it) need an override.
+    fn register_write_tracker(&self, _tx: TransactionId, _tracker: SharedWriteTracker) {}
+
+    /// Removes the write tracker for `tx`. Called at commit/rollback. Default no-op.
+    fn unregister_write_tracker(&self, _tx: TransactionId) {}
 
     /// Non-draining snapshot of node ids this transaction has queued for deletion.
     /// Default: none (stores without deferred node-delete tracking return empty).

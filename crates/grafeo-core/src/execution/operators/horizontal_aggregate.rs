@@ -14,8 +14,8 @@ use grafeo_common::types::{
 use super::accumulator::AggregateFunction;
 use super::aggregate::AggregateState;
 use super::{Operator, OperatorResult};
-use crate::execution::vector::ValueVector;
 use crate::execution::DataChunk;
+use crate::execution::vector::ValueVector;
 use crate::graph::traits::GraphStoreSearch;
 
 /// Whether the horizontal aggregate operates on edges or nodes.

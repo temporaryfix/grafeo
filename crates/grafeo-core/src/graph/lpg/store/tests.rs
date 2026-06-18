@@ -3402,3 +3402,183 @@ fn single_source_post_commit_snapshot_boundary() {
         "committed-latest search must still see the promoted posting"
     );
 }
+
+// ── Task 7: IndexId predicate-read / index-write recording ──────────────────
+
+/// `search_text_visible` must call `record_read_index` on the registered
+/// read tracker, so a Serializable text search records the index read.
+#[cfg(feature = "text-index")]
+#[test]
+fn search_text_visible_calls_record_index_read() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Mutex};
+
+    // A spy ReadTracker that records every `record_index_read` call.
+    struct IndexReadSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl ReadTracker for IndexReadSpy {
+        fn record_node_read(&self, _tx: TransactionId, _id: grafeo_common::types::NodeId) {}
+        fn record_edge_read(&self, _tx: TransactionId, _id: grafeo_common::types::EdgeId) {}
+        fn record_index_read(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    let tx = TransactionId::new(7);
+    let epoch = store.current_epoch();
+
+    let typed_spy = Arc::new(IndexReadSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_read_tracker(tx, Arc::clone(&typed_spy) as SharedReadTracker);
+
+    // Execute text search — should trigger record_index_read.
+    let _ = store.search_text_visible("Doc:body", "rust", 10, epoch, tx);
+
+    let calls = typed_spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "search_text_visible must call record_index_read exactly once"
+    );
+    assert_eq!(
+        calls[0],
+        (tx, "Doc:body".to_string()),
+        "record_index_read must be called with the correct (tx, index_key)"
+    );
+    // Cleanup.
+    store.unregister_read_tracker(tx);
+}
+
+/// `buffer_text_index_set` must call `record_write_index` on the registered
+/// write tracker, so a transactional indexed SET records the index write.
+#[cfg(feature = "text-index")]
+#[test]
+fn buffer_text_index_set_calls_record_index_write() {
+    use crate::execution::operators::{SharedWriteTracker, WriteTracker};
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Mutex};
+
+    struct IndexWriteSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl WriteTracker for IndexWriteSpy {
+        fn record_node_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::NodeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_edge_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::EdgeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_index_write(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    let node = store.create_node(&["Doc"]);
+    let tx = TransactionId::new(11);
+
+    let spy = Arc::new(IndexWriteSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_write_tracker(tx, Arc::clone(&spy) as SharedWriteTracker);
+
+    // Buffer a SET on an indexed property.
+    store.set_node_property_buffered(node, "body", Value::String("graphs are cool".into()), tx);
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "buffer_text_index_set must call record_index_write exactly once"
+    );
+    assert_eq!(
+        calls[0],
+        (tx, "Doc:body".to_string()),
+        "record_index_write must be called with the correct (tx, index_key)"
+    );
+
+    store.unregister_write_tracker(tx);
+}
+
+/// `buffer_text_index_remove` must also call `record_write_index`.
+#[cfg(feature = "text-index")]
+#[test]
+fn buffer_text_index_remove_calls_record_index_write() {
+    use crate::execution::operators::{SharedWriteTracker, WriteTracker};
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Mutex};
+
+    struct IndexWriteSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl WriteTracker for IndexWriteSpy {
+        fn record_node_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::NodeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_edge_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::EdgeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_index_write(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    let node = store.create_node(&["Doc"]);
+    // First buffer a value so the node has a label entry, then test the remove path.
+    let tx = TransactionId::new(13);
+
+    let spy = Arc::new(IndexWriteSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_write_tracker(tx, Arc::clone(&spy) as SharedWriteTracker);
+
+    // Buffer a REMOVE on an indexed property.
+    store.remove_node_property_buffered(node, "body", tx);
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "buffer_text_index_remove must call record_index_write exactly once"
+    );
+    assert_eq!(
+        calls[0],
+        (tx, "Doc:body".to_string()),
+        "record_index_write must be called with the correct (tx, index_key)"
+    );
+
+    store.unregister_write_tracker(tx);
+}
