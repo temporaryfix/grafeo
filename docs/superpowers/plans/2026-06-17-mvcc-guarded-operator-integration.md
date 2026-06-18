@@ -119,6 +119,17 @@ Add to the trait with an entity-level default (delegating to `edges_from` + no r
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: shortestPath INTEGRATED + merged to `integration` @ `ae0b8728` — algos/vector/text remain guarded
 
-Design plan written against `integration` @ `208f9811` (F1+F2+Part G complete). Scope: snapshot-aware traversal (`edges_from_versioned` reusing the `is_edge_visible_versioned` recording chokepoint) → **shortestPath** Serializable integration (the tractable win) → graph-algorithm triage → **vector/text kept guarded** with a documented index-versioning path. **Touches the store traversal/visibility core** — recommend executing with fresh context, gating on Task 0's tombstone/own-create confirmation, and one operator at a time behind its acceptance test. The guards remain the sound interim answer for anything not yet integrated.
+**Done + merged (5 commits `dec609e7..ae0b8728`):**
+- **Task 0** (tombstone/own-create gate): resolved — base adjacency soft-deletes (edge retained in chunks), so `edges_from_versioned` iterates a RAW adjacency (`iter_including_deleted`, skipping the `deleted` filter) + filters by `is_edge_visible_versioned` (the version-chain authority, which records the read).
+- **Task 1** — `edges_from_versioned`/`neighbors_versioned` snapshot-aware traversal (records reads via the visibility chokepoint). LpgStore verified correct by opus review.
+- **Task 1b + completion (DISCOVERED PREREQUISITE, not in the original plan):** the Task-1 opus review **probe-confirmed a PRE-EXISTING LayeredStore bug** — base-edge AND base-node deletes were epoch-blind (`deleted_from_base_{edges,nodes}` plain sets) → a base entity deleted-after-my-snapshot was hidden from EVERY snapshot (not snapshot-isolated, post-`compact()`). FIXED: epoch+tx-stamped both tombstones (`BaseEdgeDelete`/`BaseNodeDelete{epoch, deleter}`; snapshot-aware `_at` predicates for the 5+6 versioned accessors; latest-view `contains_key` preserved for the non-versioned; `pending_base_*_deletes` driving commit-finalize + rollback; persistence keys-only, no on-disk format change). 3 opus reviews (edge fix; completion incl. 2 missed edge property accessors; node mirror = faithful). See [[grafeo-audit-findings]].
+- **Task 2** — `ShortestPathOperator` threads `(epoch, tx)`, traverses `edges_from_versioned` + records node reads (`is_node_visible_versioned`); `None` fallback = unchanged non-tx behavior.
+- **Task 3** — shortestPath Serializable guard REMOVED. Acceptance: a write-skew cycle through the shortestPath read-set aborts the second committer (proving the path reads reach the SSI read-set); disjoint paths commit; vector/text/algorithms still guarded.
+
+**Verification:** `--all-features` 7514/0; serializable suite 11/11; clippy clean; profiles + wasm; OPSEC (upstream un-pushed).
+
+**Remaining (still SOUNDLY guarded):**
+- **Task 4 — graph algorithms (CALL):** the traversal-based ones can now integrate via the SAME `edges_from_versioned` + `(epoch, tx)` plumbing (the Task-2 pattern); whole-graph/index-based ones stay guarded. NOT done.
+- **Task 5 — vector/text:** still guarded; need index versioning (HNSW/BM25 as-of-snapshot) — research-grade; the post-filter is partial (not snapshot-complete). Documented §5.
