@@ -1,7 +1,8 @@
 //! BM25-scored inverted index for full-text search.
 
 use super::tokenizer::{SimpleTokenizer, Tokenizer};
-use grafeo_common::types::NodeId;
+use super::versioned::{VersionedPosting, posting_visible};
+use grafeo_common::types::{EpochId, NodeId, TransactionId};
 use std::collections::HashMap;
 
 /// Configuration for BM25 scoring.
@@ -23,17 +24,10 @@ impl Default for BM25Config {
     }
 }
 
-/// A posting entry: document ID and term frequency.
-#[derive(Debug, Clone)]
-struct Posting {
-    node_id: NodeId,
-    term_freq: u32,
-}
-
 /// A posting list for a single term.
 #[derive(Debug, Clone, Default)]
 struct PostingList {
-    postings: Vec<Posting>,
+    postings: Vec<VersionedPosting>,
 }
 
 /// An in-memory inverted index with Okapi BM25 scoring.
@@ -70,6 +64,12 @@ pub struct InvertedIndex {
     config: BM25Config,
 }
 
+/// Viewing epoch used by the committed-latest search path.
+///
+/// Large enough that all committed postings (epoch 0 … real epochs) are
+/// visible, but small enough that PENDING (u64::MAX) inserts are not.
+const COMMITTED_EPOCH: EpochId = EpochId::new(u64::MAX - 1);
+
 impl InvertedIndex {
     /// Creates a new inverted index with the given BM25 configuration.
     #[must_use]
@@ -94,13 +94,23 @@ impl InvertedIndex {
         }
     }
 
-    /// Indexes a document (node text) into the inverted index.
+    // ── Versioned write path ────────────────────────────────────────────────
+
+    /// Indexes a document stamped with an explicit epoch and optional creator tx.
     ///
-    /// If the node was already indexed, it is first removed and re-indexed.
-    pub fn insert(&mut self, id: NodeId, text: &str) {
-        // Remove existing entry if present
+    /// If the node is already indexed under a live posting, those postings are
+    /// first soft-deleted at `epoch` / `created_by` before the new ones are added.
+    pub fn insert_versioned(
+        &mut self,
+        id: NodeId,
+        text: &str,
+        epoch: EpochId,
+        created_by: Option<TransactionId>,
+    ) {
+        // Soft-delete any currently-live postings for this node so re-insertion
+        // behaves like update (mirrors the legacy path's remove-then-add).
         if self.doc_lengths.contains_key(&id) {
-            self.remove(id);
+            self.remove_versioned(id, epoch, created_by);
         }
 
         let tokens = self.tokenizer.tokenize(text);
@@ -112,46 +122,73 @@ impl InvertedIndex {
             return;
         }
 
-        // Count term frequencies
+        // Count term frequencies.
         let mut term_freqs: HashMap<&str, u32> = HashMap::new();
         for token in &tokens {
             *term_freqs.entry(token.as_str()).or_insert(0) += 1;
         }
 
-        // Add to posting lists
+        // Append versioned postings.
         for (term, freq) in term_freqs {
             self.postings
                 .entry(term.to_string())
                 .or_default()
                 .postings
-                .push(Posting {
-                    node_id: id,
-                    term_freq: freq,
-                });
+                .push(VersionedPosting::new(id, freq, epoch, created_by));
         }
 
         self.doc_lengths.insert(id, doc_len);
         self.total_length += u64::from(doc_len);
     }
 
-    /// Removes a document from the index.
+    /// Soft-deletes all live postings for `id` by stamping `deleted_epoch` / `deleted_by`.
     ///
-    /// Returns `true` if the document was found and removed.
-    pub fn remove(&mut self, id: NodeId) -> bool {
+    /// The postings are **retained** — physical cleanup is a future GC step.
+    /// Returns `true` if any posting was live (i.e., the document existed).
+    pub fn remove_versioned(
+        &mut self,
+        id: NodeId,
+        epoch: EpochId,
+        deleted_by: Option<TransactionId>,
+    ) -> bool {
         let Some(doc_len) = self.doc_lengths.remove(&id) else {
             return false;
         };
 
         self.total_length -= u64::from(doc_len);
 
-        // Remove from all posting lists
-        self.postings.retain(|_, list| {
-            list.postings.retain(|p| p.node_id != id);
-            !list.postings.is_empty()
-        });
+        // Stamp deleted_epoch on every live posting for this node.
+        for list in self.postings.values_mut() {
+            for p in &mut list.postings {
+                if p.node_id == id && p.deleted_epoch.is_none() {
+                    p.deleted_epoch = Some(epoch);
+                    p.deleted_by = deleted_by;
+                }
+            }
+        }
 
         true
     }
+
+    // ── Legacy (behavior-preserving) wrappers ──────────────────────────────
+
+    /// Indexes a document (node text) into the inverted index.
+    ///
+    /// If the node was already indexed, it is first removed and re-indexed.
+    /// Uses epoch 0 so postings are visible to all committed-latest searches.
+    pub fn insert(&mut self, id: NodeId, text: &str) {
+        self.insert_versioned(id, text, EpochId::new(0), None);
+    }
+
+    /// Removes a document from the index.
+    ///
+    /// Returns `true` if the document was found and removed.
+    /// Uses epoch 0 so the deletion is visible to all committed-latest searches.
+    pub fn remove(&mut self, id: NodeId) -> bool {
+        self.remove_versioned(id, EpochId::new(0), None)
+    }
+
+    // ── BM25 search ────────────────────────────────────────────────────────
 
     /// BM25 term score: IDF * TF-component for a single term occurrence.
     ///
@@ -169,6 +206,7 @@ impl InvertedIndex {
     /// Searches the index using BM25 scoring.
     ///
     /// Returns up to `k` results sorted by descending BM25 score.
+    /// Uses the committed-latest view (all epoch-0 inserts, no pending deletes).
     pub fn search(&self, query: &str, k: usize) -> Vec<(NodeId, f64)> {
         let query_tokens = self.tokenizer.tokenize(query);
         if query_tokens.is_empty() || self.doc_lengths.is_empty() {
@@ -183,8 +221,19 @@ impl InvertedIndex {
             let Some(posting_list) = self.postings.get(token.as_str()) else {
                 continue;
             };
-            let df = posting_list.postings.len() as f64;
+            // Count only the visible postings for df.
+            let df = posting_list
+                .postings
+                .iter()
+                .filter(|p| posting_visible(p, COMMITTED_EPOCH, TransactionId::INVALID))
+                .count() as f64;
+            if df == 0.0 {
+                continue;
+            }
             for posting in &posting_list.postings {
+                if !posting_visible(posting, COMMITTED_EPOCH, TransactionId::INVALID) {
+                    continue;
+                }
                 let tf = f64::from(posting.term_freq);
                 let dl = f64::from(self.doc_lengths.get(&posting.node_id).copied().unwrap_or(0));
                 *scores.entry(posting.node_id).or_insert(0.0) +=
@@ -226,11 +275,20 @@ impl InvertedIndex {
             let Some(posting_list) = self.postings.get(token.as_str()) else {
                 continue;
             };
-            let df = posting_list.postings.len() as f64;
+            let df = posting_list
+                .postings
+                .iter()
+                .filter(|p| posting_visible(p, COMMITTED_EPOCH, TransactionId::INVALID))
+                .count() as f64;
+            if df == 0.0 {
+                continue;
+            }
             let tf = posting_list
                 .postings
                 .iter()
-                .find(|p| p.node_id == id)
+                .find(|p| {
+                    p.node_id == id && posting_visible(p, COMMITTED_EPOCH, TransactionId::INVALID)
+                })
                 .map_or(0.0, |p| f64::from(p.term_freq));
             if tf > 0.0 {
                 score += self.bm25_term_score(df, tf, dl, n, avg_dl);
@@ -257,8 +315,18 @@ impl InvertedIndex {
             let Some(posting_list) = self.postings.get(token.as_str()) else {
                 continue;
             };
-            let df = posting_list.postings.len() as f64;
+            let df = posting_list
+                .postings
+                .iter()
+                .filter(|p| posting_visible(p, COMMITTED_EPOCH, TransactionId::INVALID))
+                .count() as f64;
+            if df == 0.0 {
+                continue;
+            }
             for posting in &posting_list.postings {
+                if !posting_visible(posting, COMMITTED_EPOCH, TransactionId::INVALID) {
+                    continue;
+                }
                 let tf = f64::from(posting.term_freq);
                 let dl = f64::from(self.doc_lengths.get(&posting.node_id).copied().unwrap_or(0));
                 *scores.entry(posting.node_id).or_insert(0.0) +=
@@ -272,6 +340,8 @@ impl InvertedIndex {
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
+
+    // ── Query helpers ───────────────────────────────────────────────────────
 
     /// Returns true if the given node is indexed.
     #[must_use]
@@ -303,10 +373,14 @@ impl InvertedIndex {
         &self.config
     }
 
+    // ── Snapshot / restore ─────────────────────────────────────────────────
+
     /// Snapshot the index for serialization.
     ///
     /// Returns (postings, doc_lengths, total_length) where postings is
     /// a vec of (term, vec of (node_id, term_freq)).
+    ///
+    /// Only committed-latest-visible postings are included in the snapshot.
     #[must_use]
     pub fn snapshot(&self) -> (Vec<(String, Vec<(NodeId, u32)>)>, Vec<(NodeId, u32)>, u64) {
         let mut postings: Vec<(String, Vec<(NodeId, u32)>)> = self
@@ -316,10 +390,12 @@ impl InvertedIndex {
                 let entries: Vec<(NodeId, u32)> = pl
                     .postings
                     .iter()
+                    .filter(|p| posting_visible(p, COMMITTED_EPOCH, TransactionId::INVALID))
                     .map(|p| (p.node_id, p.term_freq))
                     .collect();
                 (term.clone(), entries)
             })
+            .filter(|(_, entries)| !entries.is_empty())
             .collect();
         postings.sort_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -339,6 +415,8 @@ impl InvertedIndex {
     }
 
     /// Restore the index from a snapshot. Replaces all current data.
+    ///
+    /// Restored postings are stamped with epoch 0 (always-visible).
     pub fn restore(
         &mut self,
         postings: Vec<(String, Vec<(NodeId, u32)>)>,
@@ -350,7 +428,9 @@ impl InvertedIndex {
             let posting_list = PostingList {
                 postings: entries
                     .into_iter()
-                    .map(|(node_id, term_freq)| Posting { node_id, term_freq })
+                    .map(|(node_id, term_freq)| {
+                        VersionedPosting::new(node_id, term_freq, EpochId::new(0), None)
+                    })
                     .collect(),
             };
             self.postings.insert(term, posting_list);
@@ -368,7 +448,9 @@ impl InvertedIndex {
         let postings_data: usize = self
             .postings
             .iter()
-            .map(|(term, pl)| term.len() + pl.postings.capacity() * std::mem::size_of::<Posting>())
+            .map(|(term, pl)| {
+                term.len() + pl.postings.capacity() * std::mem::size_of::<VersionedPosting>()
+            })
             .sum();
         // Doc lengths map
         let doc_lengths_bytes = self.doc_lengths.capacity()

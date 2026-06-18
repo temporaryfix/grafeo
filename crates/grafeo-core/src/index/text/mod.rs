@@ -32,6 +32,7 @@
 mod inverted_index;
 pub mod section;
 mod tokenizer;
+mod versioned;
 
 pub use inverted_index::{BM25Config, InvertedIndex};
 pub use section::TextIndexSection;
