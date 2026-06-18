@@ -1223,11 +1223,16 @@ impl LpgStore {
                 }
             }
         }
-        // TI5: promote text_index_overlay here
-        // When TI5 lands: take `text_index_overlay[transaction_id]` and apply
-        // each `(index_key, node, Some(text))` as a versioned insert and each
-        // `(index_key, node, None)` as a versioned remove into the committed
-        // `InvertedIndex`.  For now just drop the delta (it was never applied).
+        // TI5 (single-source): the committed `InvertedIndex` is promoted by the
+        // property writes above — `set_node_property` / `remove_node_property`
+        // each drive `update_text_index_on_set` / `_on_remove`, which stamp the
+        // index posting at `current_epoch()`. By this point the engine has
+        // already advanced the store epoch to the commit epoch `C` (via
+        // `finalize_entities_by_id` -> `sync_epoch(C)`, which runs BEFORE this
+        // function), so the index posting's epoch == the property version's
+        // commit epoch `C`. The per-tx `text_index_overlay` (used only for the
+        // tx's own `search_text_visible`) is therefore redundant at commit and is
+        // simply dropped — re-promoting it would double-apply the update.
         #[cfg(feature = "text-index")]
         {
             self.text_index_overlay.write().remove(&transaction_id);

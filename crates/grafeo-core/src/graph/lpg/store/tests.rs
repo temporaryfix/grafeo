@@ -3239,3 +3239,166 @@ fn search_visible_excludes_tx_removed() {
         "other transactions must still see the committed doc"
     );
 }
+
+// ── TI5: single-source commit-promote (index epoch == property commit epoch) ──
+
+/// The headline soundness invariant (spec §4a / §9.2).
+///
+/// For every node `N` and epoch `E`, the index's as-of-`E` term set for `N`
+/// MUST equal `tokenize(committed text of N's indexed property as-of E)`.
+/// The index is a consistent-by-construction projection of the property's
+/// version chain — one commit stamps both.
+///
+/// This test drives the **real** commit flow at store level: buffer the write
+/// into `text_index_overlay` / `tx_property_overlay`, advance the store epoch
+/// to the commit epoch `C` (as `finalize_entities_by_id` does via
+/// `sync_epoch(C)` BEFORE `apply_tx_overlay` runs), then `apply_tx_overlay`
+/// promotes the property AND the index in the same `set_node_property` call —
+/// both stamped at `current_epoch() == C`.
+///
+/// The property's own version chain (`read_node_property_visible(.., E, None)`)
+/// is the oracle. With the legacy epoch-0 stamping this test FAILS: every
+/// posting is created at epoch 0 so the index reports the latest text at every
+/// old epoch, disagreeing with the property's as-of-E value.
+#[cfg(all(feature = "text-index", feature = "temporal"))]
+#[test]
+fn single_source_index_matches_property_history() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use grafeo_common::types::{EpochId, PropertyKey};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    let node = store.create_node(&["Doc"]);
+    let key = PropertyKey::new("body");
+
+    // Commit a buffered node-property write at an explicit commit epoch `C`,
+    // reproducing the engine commit ordering: the store epoch is advanced to
+    // `C` (finalize_entities_by_id -> sync_epoch(C)) BEFORE apply_tx_overlay
+    // promotes the overlay (which re-applies the property + index at
+    // current_epoch() == C).
+    let commit_set = |tx: TransactionId, text: &str, c: u64| {
+        store.set_node_property_buffered(node, "body", Value::String(text.into()), tx);
+        store.sync_epoch(EpochId::new(c)); // finalize step
+        store.apply_tx_overlay(tx); // promote: stamps property + index at C
+    };
+    let commit_remove = |tx: TransactionId, c: u64| {
+        store.remove_node_property_buffered(node, "body", tx);
+        store.sync_epoch(EpochId::new(c));
+        store.apply_tx_overlay(tx);
+    };
+
+    // A short committed history of n.body across distinct commit epochs.
+    //   E1: "alpha beta"
+    //   E2: "beta gamma"   (alpha gone, gamma new)
+    //   E3: "delta"        (beta & gamma gone)
+    //   E4: property removed entirely
+    commit_set(TransactionId::new(101), "alpha beta", 1);
+    commit_set(TransactionId::new(102), "beta gamma", 2);
+    commit_set(TransactionId::new(103), "delta", 3);
+    commit_remove(TransactionId::new(104), 4);
+
+    // The full vocabulary that ever appeared.
+    let vocab = ["alpha", "beta", "gamma", "delta"];
+
+    // For every committed epoch E in [0, 4] and every term, the index's
+    // as-of-E membership MUST equal the property's as-of-E tokenization.
+    for e in 0..=4u64 {
+        let epoch = EpochId::new(e);
+
+        // Oracle: tokenize the property's committed value as-of E.
+        let oracle_terms: std::collections::HashSet<String> = store
+            .read_node_property_visible(node, &key, epoch, None)
+            .and_then(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .map(|s| {
+                s.split_whitespace()
+                    .map(str::to_string)
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        for term in vocab {
+            let in_index = !store
+                .search_text_visible("Doc:body", term, 10, epoch, TransactionId::INVALID)
+                .is_empty();
+            let in_oracle = oracle_terms.contains(term);
+            assert_eq!(
+                in_index, in_oracle,
+                "index/property divergence at epoch {e} for term '{term}': \
+                 index_has={in_index} property_has={in_oracle} (oracle={oracle_terms:?})"
+            );
+        }
+    }
+}
+
+/// After a commit at epoch `C`, the promoted index postings carry
+/// `created_epoch == C` (not the legacy epoch 0): a snapshot taken *before*
+/// `C` does not see the post-commit text, and a snapshot at/after `C` does.
+#[cfg(all(feature = "text-index", feature = "temporal"))]
+#[test]
+fn single_source_post_commit_snapshot_boundary() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use grafeo_common::types::EpochId;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    let node = store.create_node(&["Doc"]);
+
+    // Commit n.body = "quantum entanglement" at commit epoch C = 7.
+    let tx = TransactionId::new(201);
+    store.set_node_property_buffered(
+        node,
+        "body",
+        Value::String("quantum entanglement".into()),
+        tx,
+    );
+    store.sync_epoch(EpochId::new(7)); // finalize step advances store epoch to C
+    store.apply_tx_overlay(tx); // promote at current_epoch() == 7
+
+    // A pre-commit snapshot (E = 6 < 7) must NOT see the text.
+    let before = store.search_text_visible(
+        "Doc:body",
+        "quantum",
+        10,
+        EpochId::new(6),
+        TransactionId::INVALID,
+    );
+    assert!(
+        before.is_empty(),
+        "a snapshot before the commit epoch must not see the post-commit text"
+    );
+
+    // A snapshot at/after the commit epoch (E = 7) must see it.
+    let at = store.search_text_visible(
+        "Doc:body",
+        "quantum",
+        10,
+        EpochId::new(7),
+        TransactionId::INVALID,
+    );
+    assert_eq!(
+        at.len(),
+        1,
+        "a snapshot at the commit epoch must see the post-commit text"
+    );
+    assert_eq!(at[0].0, node);
+
+    // And the committed-latest search (COMMITTED_EPOCH filter) still sees it —
+    // commit epochs are all <= COMMITTED_EPOCH = MAX-1.
+    let latest = idx.read().search("quantum", 10);
+    assert_eq!(
+        latest.len(),
+        1,
+        "committed-latest search must still see the promoted posting"
+    );
+}

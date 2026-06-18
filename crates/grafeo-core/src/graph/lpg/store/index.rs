@@ -243,15 +243,28 @@ impl LpgStore {
         #[cfg(feature = "temporal")]
         let label_set = node_labels.get(&id).and_then(|log| log.latest());
         if let Some(label_ids) = label_set {
+            // Single-source invariant (TI5): stamp the index posting at the SAME
+            // epoch the property version is finalized to. On the commit path this
+            // runs inside `apply_tx_overlay` -> `set_node_property`, where
+            // `current_epoch()` is already the commit epoch `C` (the engine calls
+            // `finalize_entities_by_id` -> `sync_epoch(C)` BEFORE `apply_tx_overlay`),
+            // so the new posting's `created_epoch == C` exactly matches the
+            // property version's visibility boundary. On the auto-commit /
+            // non-transactional path `current_epoch()` is the live committed epoch,
+            // identical to the epoch stamped on the property column write in the
+            // same `set_node_property` call.
+            let epoch = self.current_epoch();
             for &label_id in label_ids {
                 if let Some(label_name) = registry.get_name(label_id) {
                     let index_key = format!("{label_name}:{key}");
                     if let Some(index) = text_indexes.get(&index_key) {
                         let mut idx = index.write();
-                        // Remove old entry first, then insert new if it's a string
-                        idx.remove(id);
+                        // Soft-delete the old posting at `epoch`, then insert the
+                        // new one at `epoch` if it's a string. A snapshot `< epoch`
+                        // sees the old text; `>= epoch` the new text.
+                        idx.remove_versioned(id, epoch, None);
                         if let Value::String(text) = value {
-                            idx.insert(id, text);
+                            idx.insert_versioned(id, text, epoch, None);
                         }
                     }
                 }
@@ -273,11 +286,16 @@ impl LpgStore {
         #[cfg(feature = "temporal")]
         let label_set = node_labels.get(&id).and_then(|log| log.latest());
         if let Some(label_ids) = label_set {
+            // Single-source invariant (TI5): stamp the deletion at the property's
+            // commit epoch `C` (see `update_text_index_on_set`). The posting's
+            // `deleted_epoch == C` so a snapshot `< C` still sees the old text and
+            // `>= C` sees the removal — matching the property version boundary.
+            let epoch = self.current_epoch();
             for &label_id in label_ids {
                 if let Some(label_name) = registry.get_name(label_id) {
                     let index_key = format!("{label_name}:{key}");
                     if let Some(index) = text_indexes.get(&index_key) {
-                        index.write().remove(id);
+                        index.write().remove_versioned(id, epoch, None);
                     }
                 }
             }
