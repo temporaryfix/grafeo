@@ -28,7 +28,7 @@ use grafeo_adapters::plugins::algorithms::{
     TopologicalSortAlgorithm,
 };
 use grafeo_adapters::plugins::{AlgorithmResult, ParameterDef, Parameters};
-use grafeo_common::types::Value;
+use grafeo_common::types::{EpochId, TransactionId, Value};
 use grafeo_common::utils::error::Result;
 use grafeo_core::graph::GraphStoreSearch;
 #[cfg(feature = "lpg")]
@@ -95,6 +95,10 @@ pub trait Procedure: Send + Sync {
 /// Vector and text search procedures additionally require
 /// [`ProcedureContext::lpg_store`] to reach the HNSW and BM25 indexes owned
 /// by the LPG store.
+///
+/// Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are set so
+/// that text search procedures can call `search_text_visible` (snapshot-pinned
+/// + SSI read recording) instead of the committed-latest `index.read().search`.
 pub struct ProcedureContext<'a> {
     /// Read-only graph store, sufficient for graph algorithms and catalog
     /// introspection (labels, edge types, property keys).
@@ -105,6 +109,13 @@ pub struct ProcedureContext<'a> {
     /// not an LPG store (e.g., pure RDF) or in contexts that do not need it.
     #[cfg(feature = "lpg")]
     pub lpg_store: Option<&'a LpgStore>,
+
+    /// Snapshot epoch for Serializable transactions.  When `Some`, text search
+    /// procedures must call `search_text_visible` rather than the raw index.
+    pub snapshot_epoch: Option<EpochId>,
+
+    /// Transaction ID paired with `snapshot_epoch` for SSI read recording.
+    pub snapshot_tx: Option<TransactionId>,
 }
 
 impl<'a> ProcedureContext<'a> {
@@ -115,6 +126,8 @@ impl<'a> ProcedureContext<'a> {
             store,
             #[cfg(feature = "lpg")]
             lpg_store: None,
+            snapshot_epoch: None,
+            snapshot_tx: None,
         }
     }
 
@@ -125,6 +138,26 @@ impl<'a> ProcedureContext<'a> {
         Self {
             store,
             lpg_store: Some(lpg_store),
+            snapshot_epoch: None,
+            snapshot_tx: None,
+        }
+    }
+
+    /// Creates a context with a graph store, LPG store, and Serializable
+    /// snapshot context (epoch + transaction ID) for SSI-recording text search.
+    #[cfg(feature = "lpg")]
+    #[must_use]
+    pub fn with_lpg_store_and_snapshot(
+        store: &'a dyn GraphStoreSearch,
+        lpg_store: &'a LpgStore,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Self {
+        Self {
+            store,
+            lpg_store: Some(lpg_store),
+            snapshot_epoch: Some(epoch),
+            snapshot_tx: Some(tx),
         }
     }
 }
@@ -659,6 +692,14 @@ impl Procedure for SearchTextProcedure {
         vec!["node_id".into(), "score".into()]
     }
 
+    /// `grafeo.search.text` is Serializable-safe: the executor supplies
+    /// `(epoch, tx)` via `ProcedureContext::snapshot_epoch` /
+    /// `::snapshot_tx`, and `execute` routes through `search_text_visible`
+    /// which records the index read for SSI conflict detection.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         let lpg = ctx.lpg_store.ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(
@@ -682,13 +723,23 @@ impl Procedure for SearchTextProcedure {
         })?;
         let k = k_limit(params, 10);
 
-        let index = lpg.get_text_index(label, property).ok_or_else(|| {
-            grafeo_common::utils::error::Error::Internal(format!(
-                "No text index found for :{label}({property}). Call CREATE TEXT INDEX first."
-            ))
-        })?;
-
-        let results = index.read().search(query, k);
+        // Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are
+        // set by the executor.  Use `search_text_visible` to merge the per-tx
+        // write delta, pin results to the snapshot epoch, and record the index
+        // read in the SSI read-set so concurrent indexed-SET writes can form an
+        // rw-antidependency edge.
+        let results = if let (Some(epoch), Some(tx)) = (ctx.snapshot_epoch, ctx.snapshot_tx) {
+            let index_key = format!("{label}:{property}");
+            lpg.search_text_visible(&index_key, query, k, epoch, tx)
+        } else {
+            // SI / RC: committed-latest, no SSI recording.
+            let index = lpg.get_text_index(label, property).ok_or_else(|| {
+                grafeo_common::utils::error::Error::Internal(format!(
+                    "No text index found for :{label}({property}). Call CREATE TEXT INDEX first."
+                ))
+            })?;
+            index.read().search(query, k)
+        };
 
         let mut result = AlgorithmResult::new(vec!["node_id".into(), "score".into()]);
         for (node_id, score) in results {

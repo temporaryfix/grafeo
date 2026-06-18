@@ -991,19 +991,16 @@ impl Planner {
     }
 
     /// Plans a text search scan operator using BM25 inverted index.
+    ///
+    /// Under Serializable isolation the operator is built with a transaction
+    /// context (`epoch` + `transaction_id`) so `execute_search` calls
+    /// `text_search_visible`, which merges the per-transaction write delta,
+    /// pins the result to the snapshot epoch, and records the index read in
+    /// the SSI read-set.  SI / RC planners produce a context-free operator
+    /// that calls the committed-latest `text_search` as before.
     #[cfg(feature = "text-index")]
     fn plan_text_scan(&self, scan: &TextScanOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use grafeo_core::execution::operators::TextScanOperator;
-
-        // TextScan reads raw BM25 indexes without MVCC visibility, so it cannot
-        // track reads for SSI conflict detection.  Reject under Serializable
-        // rather than silently return non-serializable results.
-        if self.is_serializable() {
-            return Err(Error::Internal(
-                "Serializable isolation is not yet supported with text search; use SnapshotIsolation"
-                    .to_string(),
-            ));
-        }
 
         let query_string = match &scan.query {
             LogicalExpression::Literal(Value::String(s)) => s.to_string(),
@@ -1020,30 +1017,40 @@ impl Planner {
             }
         };
 
-        let operator: Box<dyn Operator> = if let Some(k) = scan.k {
-            Box::new(TextScanOperator::top_k(
+        let base_op: TextScanOperator = if let Some(k) = scan.k {
+            TextScanOperator::top_k(
                 Arc::clone(&self.store),
                 &scan.label,
                 &scan.property,
                 &query_string,
                 k,
-            ))
+            )
         } else if let Some(threshold) = scan.threshold {
-            Box::new(TextScanOperator::with_threshold(
+            TextScanOperator::with_threshold(
                 Arc::clone(&self.store),
                 &scan.label,
                 &scan.property,
                 &query_string,
                 threshold,
-            ))
+            )
         } else {
-            Box::new(TextScanOperator::top_k(
+            TextScanOperator::top_k(
                 Arc::clone(&self.store),
                 &scan.label,
                 &scan.property,
                 &query_string,
                 100,
-            ))
+            )
+        };
+
+        // Thread (epoch, tx) into the operator for Serializable transactions so
+        // the search is snapshot-pinned and the index read is recorded for SSI.
+        let operator: Box<dyn Operator> = if self.is_serializable()
+            && let Some(tx) = self.transaction_id
+        {
+            Box::new(base_op.with_transaction_context(self.viewing_epoch, tx))
+        } else {
+            Box::new(base_op)
         };
 
         let mut columns = vec![scan.variable.clone()];
@@ -4147,10 +4154,16 @@ mod tests {
         );
     }
 
-    /// plan_text_scan must be rejected under Serializable isolation.
+    /// plan_text_scan must SUCCEED under Serializable isolation (TI8: guard removed).
+    ///
+    /// The old blanket rejection has been replaced with snapshot-aware execution:
+    /// `plan_text_scan` threads `(epoch, tx)` into `TextScanOperator` so that
+    /// `execute_search` calls `text_search_visible`, records the index read for
+    /// SSI, and merges the per-transaction write delta.  Vector scan still
+    /// rejects because HNSW has no snapshot-aware path.
     #[cfg(feature = "text-index")]
     #[test]
-    fn test_plan_text_scan_rejected_under_serializable() {
+    fn test_plan_text_scan_allowed_under_serializable() {
         use crate::query::plan::TextScanOp;
         use crate::transaction::IsolationLevel;
 
@@ -4164,18 +4177,11 @@ mod tests {
             threshold: None,
             score_column: None,
         };
-        let err = planner
-            .plan_text_scan(&op)
-            .err()
-            .expect("plan_text_scan must return Err under Serializable");
-        let msg = err.to_string();
+        let result = planner.plan_text_scan(&op);
         assert!(
-            msg.contains("text search"),
-            "error must mention text search, got: {msg}"
-        );
-        assert!(
-            msg.contains("Serializable"),
-            "error must mention Serializable, got: {msg}"
+            result.is_ok(),
+            "plan_text_scan must succeed under Serializable after TI8 guard removal, got: {:?}",
+            result.err()
         );
     }
 
@@ -4336,8 +4342,7 @@ mod tests {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    !msg.contains("graph algorithms")
-                        || !msg.contains("not yet supported"),
+                    !msg.contains("graph algorithms") || !msg.contains("not yet supported"),
                     "old blanket guard must be gone; per-procedure check applies. Got: {msg}"
                 );
             }

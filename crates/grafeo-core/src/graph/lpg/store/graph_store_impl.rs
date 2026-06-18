@@ -404,18 +404,31 @@ impl GraphStoreSearch for LpgStore {
         query: &str,
         k: usize,
     ) -> Vec<(NodeId, f64)> {
-        // TI8 plumbing gap: `GraphStoreSearch::text_search` carries no epoch/tx
-        // context, so this committed-latest path cannot be routed through
-        // `search_text_visible` without a trait signature change.  TI4's
-        // `search_text_visible` is available directly on `LpgStore` for callers
-        // that already hold epoch + tx (e.g. the transactional session layer).
-        // When TI8 adds epoch/tx to the trait, replace this with
-        // `self.search_text_visible(…)`.
         if let Some(index) = self.get_text_index(label, property) {
             index.read().search(query, k)
         } else {
             Vec::new()
         }
+    }
+
+    /// Snapshot-aware top-`k` BM25 search — records the index read for SSI.
+    ///
+    /// Builds the `"label:property"` index key and delegates to
+    /// [`LpgStore::search_text_visible`], which merges committed postings with
+    /// the per-transaction write delta and records the index read in the SSI
+    /// read-set so that a concurrent indexed SET forms an rw-antidependency.
+    #[cfg(feature = "text-index")]
+    fn text_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Vec<(grafeo_common::types::NodeId, f64)> {
+        let index_key = format!("{label}:{property}");
+        self.search_text_visible(&index_key, query, k, epoch, tx)
     }
 
     #[cfg(feature = "text-index")]

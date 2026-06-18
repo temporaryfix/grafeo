@@ -108,18 +108,34 @@ impl ProcedureCallOperator {
 
     /// Executes the procedure and resolves YIELD column mapping.
     fn execute_algorithm(&mut self) -> Result<(), OperatorError> {
-        // Under Serializable isolation, wrap the store in a SnapshotView so
-        // graph-algorithm reads are pinned to the transaction epoch and recorded
-        // into the SSI read-set.  The view is a thin borrow — no heap allocation
-        // beyond the struct itself.  SI/RC falls through to the direct-store path
-        // (snapshot_epoch is None) so there is no overhead for those transactions.
+        // Under Serializable isolation, the snapshot context is set.  Two procedure kinds:
+        //
+        // (a) Graph algorithms: `ctx.store` is a SnapshotView so reads are pinned
+        //     to the transaction epoch and recorded into the SSI read-set.  The
+        //     lpg_store is also attached (for procedures that might need it), but
+        //     graph algorithms only ever read through `ctx.store`.
+        //
+        // (b) Text search (`serializable_safe = true` since TI8): `ctx.lpg_store`
+        //     is present AND `ctx.snapshot_epoch`/`snapshot_tx` are set, so
+        //     `SearchTextProcedure::execute` calls `search_text_visible` which
+        //     records the index read for SSI.  `ctx.store` is the SnapshotView
+        //     but text search ignores it (goes through `ctx.lpg_store` directly).
+        //
+        // Both kinds wrap the store in a SnapshotView — this is cheap (no heap
+        // allocation) and ensures graph algos are always snapshot-safe.
+        //
+        // SI / RC (snapshot_epoch = None): use the direct-store path.
         let result = match (self.snapshot_epoch, self.snapshot_tx) {
             (Some(epoch), Some(tx)) => {
                 let view = grafeo_core::graph::SnapshotView::new(&*self.store, epoch, tx);
-                // The with_lpg_store path is only reached by non-serializable_safe
-                // procedures (search.vector / search.text), which are blocked by
-                // the planner under Serializable, so we always use the plain-store
-                // context here.
+                #[cfg(feature = "lpg")]
+                let ctx = match self.lpg_store.as_deref() {
+                    Some(lpg) => {
+                        ProcedureContext::with_lpg_store_and_snapshot(&view, lpg, epoch, tx)
+                    }
+                    None => ProcedureContext::new(&view),
+                };
+                #[cfg(not(feature = "lpg"))]
                 let ctx = ProcedureContext::new(&view);
                 self.procedure.execute(&ctx, &self.params).map_err(|e| {
                     OperatorError::Execution(format!("Procedure execution failed: {e}"))

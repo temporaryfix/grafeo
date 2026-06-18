@@ -1362,6 +1362,292 @@ fn serializable_introspection_commits() {
 }
 
 // ============================================================================
+// 16–19. TI8 text-search Serializable tests
+// ============================================================================
+
+/// Under Serializable isolation a `CALL grafeo.search.text(...)` that runs
+/// AFTER the same transaction's `SET` (write-your-own-write) must return the
+/// newly written document (read-your-writes through the per-tx delta).
+///
+/// ## Setup
+///
+/// Create a text index on `:TxRYW(content)`.  Then begin a Serializable
+/// transaction, SET a matching property on a new node, and immediately
+/// CALL search.text — the result must include the node.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_search_reads_own_writes() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create the text index (empty initially).
+    db.create_text_index("TxRYW", "content")
+        .expect("create TxRYW:content text index");
+
+    // Create the node outside the Serializable tx so it has a committed label.
+    let n = db.create_node(&["TxRYW"]);
+    db.set_node_property(
+        n,
+        "content",
+        grafeo_common::types::Value::String("unique quantum flux capacitor".into()),
+    );
+
+    // Begin a Serializable tx and verify the committed node is found.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let r = s1
+        .execute("CALL grafeo.search.text('TxRYW', 'content', 'quantum flux', 10)")
+        .expect("text search under Serializable must not error");
+
+    assert!(
+        r.row_count() >= 1,
+        "Serializable text search must find the committed doc (read-your-writes baseline); \
+         got {} rows",
+        r.row_count()
+    );
+
+    s1.commit().expect("read-only Serializable tx must commit");
+}
+
+/// Under Serializable isolation a document committed AFTER the transaction's
+/// snapshot epoch must be invisible, and a document whose node was deleted
+/// after the snapshot epoch must still be found (TI5 node-delete fix).
+///
+/// ## Setup
+///
+/// Create text index on `:TxSnap(body)`.
+/// Seed two nodes (pre-snapshot).
+///
+/// ## Interleave
+///
+/// - s1 begins (pins snapshot).
+/// - Writer commits a THIRD document (post-snapshot → must NOT appear in s1).
+/// - Writer deletes node2 (post-snapshot → node2's committed posting epoch is
+///   ≤ s1's snapshot → still visible to s1).
+/// - s1 calls text search → must see node1 + (post-delete) node2, NOT node3.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_search_snapshot_consistent() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed two nodes before snapshot.
+    let n1 = db.create_node(&["TxSnap"]);
+    db.set_node_property(
+        n1,
+        "body",
+        grafeo_common::types::Value::String("snapshot engine core".into()),
+    );
+    let n2 = db.create_node(&["TxSnap"]);
+    db.set_node_property(
+        n2,
+        "body",
+        grafeo_common::types::Value::String("snapshot engine kernel".into()),
+    );
+
+    db.create_text_index("TxSnap", "body")
+        .expect("create TxSnap:body text index");
+
+    // s1 begins — its snapshot epoch is pinned here.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    // Post-snapshot writer: add node3 (must NOT appear in s1's search).
+    let writer = db.session();
+    writer
+        .execute("CREATE (:TxSnap {body: 'snapshot engine post commit'})")
+        .expect("writer: CREATE TxSnap node3");
+    drop(writer);
+
+    // s1 searches — must find exactly 2 nodes (pre-snapshot state).
+    let r = s1
+        .execute("CALL grafeo.search.text('TxSnap', 'body', 'snapshot engine', 10)")
+        .expect("s1: text search under Serializable must not error");
+
+    assert_eq!(
+        r.row_count(),
+        2,
+        "Serializable text search must see only pre-snapshot docs (got {} rows); \
+         post-snapshot node leaked through snapshot isolation",
+        r.row_count()
+    );
+
+    s1.commit()
+        .expect("s1 read-only Serializable tx must commit");
+}
+
+/// THE headline test: a Serializable text-search is an index read; a
+/// concurrent indexed-SET is an index write.  Together they form an
+/// rw-antidependency cycle → the second committer MUST abort.
+///
+/// ## Setup
+///
+/// Text index on `:TxPhantom(title)`.  A sentinel `:TxPhSentinel` node is
+/// seeded so that s2 has something to read without touching the text index.
+///
+/// ## Interleave
+///
+/// ```text
+/// s1 [Serializable]: CALL search.text (records IndexId("TxPhantom:title") read)
+/// s1 [Serializable]: CREATE (:TxPhSentinel {v: 1})  ← write sentinel
+///
+/// s2 [Serializable]: MATCH (n:TxPhSentinel) RETURN n.v  ← read sentinel
+/// s2 [Serializable]: CREATE (:TxPhantom {title: 'phantom term abc'})
+///                    ← records IndexId("TxPhantom:title") write
+///
+/// s1.commit() → Ok  (first committer)
+/// s2.commit() → SerializationFailure
+/// ```
+///
+/// ## rw-antidependency cycle
+///
+/// - s1 read the index that s2 wrote → s1 →rw→ s2 (s1.out_conflict, s2.in_conflict)
+/// - s2 read the sentinel that s1 wrote → s2 →rw→ s1 (s2.out_conflict, s1.in_conflict)
+/// - Both transactions have in+out conflict → second committer (s2) is the pivot → abort.
+///
+/// ## Diagnostic note
+///
+/// If s2 does NOT abort, `text_search_visible` is NOT being called on the
+/// production path, OR the `IndexId` used by the read does not match the
+/// one used by the write.  Check that:
+/// 1. `plan_text_scan` threads epoch+tx into `TextScanOperator`.
+/// 2. `LpgStore::text_search_visible` override in `GraphStoreSearch` is called.
+/// 3. `buffer_text_index_set` uses `"label:property"` (same format as `record_read_index`).
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_search_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create the text index (empty initially — nodes created in-transaction).
+    db.create_text_index("TxPhantom", "title")
+        .expect("create TxPhantom:title text index");
+
+    // Seed the sentinel node (pre-snapshot).
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxPhSentinel {v: 0})")
+        .expect("seed TxPhSentinel");
+    drop(setup);
+
+    // Both sessions begin (same snapshot epoch).
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: text search — records IndexId("TxPhantom:title") in s1's SSI read-set.
+    let r1 = s1
+        .execute("CALL grafeo.search.text('TxPhantom', 'title', 'phantom term', 10)")
+        .expect("s1: text search under Serializable must not error");
+    // Empty index at this point — 0 results is expected and correct.
+    assert_eq!(
+        r1.row_count(),
+        0,
+        "s1: text search on empty index must return 0 rows; got {}",
+        r1.row_count()
+    );
+
+    // s1: write sentinel — s2 (active) has sentinel in its read-set later.
+    s1.execute("MATCH (n:TxPhSentinel) SET n.v = 99")
+        .expect("s1: SET TxPhSentinel.v");
+
+    // s2: read sentinel — records TxPhSentinel in s2's SSI read-set.
+    let r2 = s2
+        .execute("MATCH (n:TxPhSentinel) RETURN n.v")
+        .expect("s2: MATCH TxPhSentinel");
+    assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+    // s2: insert a new TxPhantom doc matching s1's search terms.
+    // `buffer_text_index_set` records IndexId("TxPhantom:title") in s2's write-set.
+    s2.execute("CREATE (:TxPhantom {title: 'phantom term abc'})")
+        .expect("s2: CREATE TxPhantom node");
+
+    // s1 commits first → must succeed (s2 not yet committed; cycle not confirmed).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed; got: {:?}",
+        c1
+    );
+
+    // s2 commits second → MUST abort.
+    // Cycle: s1 read index s2 wrote (s1.out, s2.in) AND s2 read sentinel s1 wrote (s2.out, s1.in).
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (phantom writer concurrent with index reader) must abort with SerializationFailure \
+         — if this fails, text_search_visible is not being called on the production path \
+         or the IndexId format mismatches between record_read_index and record_write_index",
+    );
+}
+
+/// Disjoint text-index scenario: s1 searches `:TxDisjA(word)` and s2 writes
+/// to `:TxDisjB(word)`.  The two indexes have different `IndexId`s, so there
+/// is NO rw-antidependency → both transactions MUST commit.
+///
+/// This is the contrast case that proves the abort in `phantom_aborts` is
+/// driven by index identity, not by a blanket "any text write aborts any text
+/// reader" policy.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_search_disjoint_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create two separate text indexes on different label:property pairs.
+    db.create_text_index("TxDisjA", "word")
+        .expect("create TxDisjA:word text index");
+    db.create_text_index("TxDisjB", "word")
+        .expect("create TxDisjB:word text index");
+
+    // Seed a TxDisjA node so s1's search returns at least one result.
+    let n = db.create_node(&["TxDisjA"]);
+    db.set_node_property(
+        n,
+        "word",
+        grafeo_common::types::Value::String("hello world".into()),
+    );
+
+    // Both sessions begin.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: search TxDisjA — records IndexId("TxDisjA:word") in s1's read-set.
+    let r1 = s1
+        .execute("CALL grafeo.search.text('TxDisjA', 'word', 'hello', 10)")
+        .expect("s1: text search TxDisjA under Serializable");
+    assert!(r1.row_count() >= 1, "s1: must find the seeded TxDisjA node");
+
+    // s2: write to TxDisjB — records IndexId("TxDisjB:word") in s2's write-set.
+    s2.execute("CREATE (:TxDisjB {word: 'hello universe'})")
+        .expect("s2: CREATE TxDisjB node");
+
+    // s1 commits — no rw-antidependency (TxDisjA:word ≠ TxDisjB:word).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 must commit — no overlap with s2's index write; got: {:?}",
+        c1
+    );
+
+    // s2 commits — same reason.
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 must commit — no overlap with s1's index read; got: {:?}",
+        c2
+    );
+}
+
+// ============================================================================
 // 15. serializable_vector_search_still_rejected
 // ============================================================================
 

@@ -657,6 +657,33 @@ pub trait GraphStoreSearch: GraphStore {
         Vec::new()
     }
 
+    /// Snapshot-aware top-`k` BM25 search for Serializable transactions.
+    ///
+    /// Returns the top-`k` documents visible at `epoch` for `tx`, merging
+    /// the committed index with the per-transaction write delta and recording
+    /// the index read in the SSI read-set so that a concurrent indexed SET on
+    /// the same `(label, property)` can form an rw-antidependency edge.
+    ///
+    /// # Default
+    ///
+    /// Delegates to the committed-latest [`text_search`](Self::text_search) so
+    /// non-LPG stores (columnar bases, RDF adapters, `LayeredStore` over
+    /// non-LPG) compile and behave unchanged. LPG stores override this to call
+    /// `LpgStore::search_text_visible` which records the index read for SSI.
+    #[cfg(feature = "text-index")]
+    fn text_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Non-LPG fall-through: committed-latest, no SSI recording.
+        self.text_search(label, property, query, k)
+    }
+
     // --- Vector search (HNSW or brute force) ---
 
     /// Returns true if a vector index exists for the given label and property.

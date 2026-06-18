@@ -6,7 +6,7 @@
 use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::traits::GraphStoreSearch;
-use grafeo_common::types::{LogicalType, NodeId};
+use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId};
 use std::sync::Arc;
 
 /// A scan operator that retrieves nodes by BM25 text relevance.
@@ -46,6 +46,12 @@ pub struct TextScanOperator {
     executed: bool,
     /// Rows per output DataChunk (default 2048).
     chunk_capacity: usize,
+    /// Snapshot epoch for Serializable transactions.  When `Some`, the operator
+    /// calls `text_search_visible` (records the index read for SSI conflict
+    /// detection) instead of the committed-latest `text_search`.
+    epoch: Option<EpochId>,
+    /// Transaction ID paired with `epoch` for snapshot-visible text search.
+    transaction_id: Option<TransactionId>,
 }
 
 impl TextScanOperator {
@@ -71,6 +77,8 @@ impl TextScanOperator {
             position: 0,
             executed: false,
             chunk_capacity: 2048,
+            epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -96,6 +104,8 @@ impl TextScanOperator {
             position: 0,
             executed: false,
             chunk_capacity: 2048,
+            epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -106,6 +116,21 @@ impl TextScanOperator {
         self
     }
 
+    /// Attaches Serializable snapshot context so the search is snapshot-pinned
+    /// and the index read is recorded for SSI conflict detection.
+    ///
+    /// When set, `execute_search` calls `text_search_visible(epoch, tx)` rather
+    /// than the committed-latest `text_search`.  Only use this for transactions
+    /// running under Serializable isolation; SI/RC must not call this (the
+    /// fields are `None` by default and the operator falls back to the direct
+    /// store path with no overhead).
+    #[must_use]
+    pub fn with_transaction_context(mut self, epoch: EpochId, tx: TransactionId) -> Self {
+        self.epoch = Some(epoch);
+        self.transaction_id = Some(tx);
+        self
+    }
+
     /// Executes the search on first call and caches the results.
     fn execute_search(&mut self) {
         if self.executed {
@@ -113,18 +138,30 @@ impl TextScanOperator {
         }
         self.executed = true;
 
-        self.results = if let Some(k) = self.k {
-            self.store
-                .text_search(&self.label, &self.property, &self.query, k)
-        } else if let Some(threshold) = self.threshold {
-            self.store.text_search_with_threshold(
+        self.results = match (self.k, self.threshold, self.epoch, self.transaction_id) {
+            // Serializable path: snapshot-visible search + SSI read recording.
+            (Some(k), _, Some(epoch), Some(tx)) => self.store.text_search_visible(
+                &self.label,
+                &self.property,
+                &self.query,
+                k,
+                epoch,
+                tx,
+            ),
+            // Committed-latest top-k (SI / RC / no transaction context).
+            (Some(k), _, _, _) => {
+                self.store
+                    .text_search(&self.label, &self.property, &self.query, k)
+            }
+            // Threshold mode (no snapshot path for threshold; threshold mode is
+            // not yet used under Serializable).
+            (None, Some(threshold), _, _) => self.store.text_search_with_threshold(
                 &self.label,
                 &self.property,
                 &self.query,
                 threshold,
-            )
-        } else {
-            Vec::new()
+            ),
+            _ => Vec::new(),
         };
     }
 }
