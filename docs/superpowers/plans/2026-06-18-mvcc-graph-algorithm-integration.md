@@ -117,6 +117,17 @@ impl<'a> GraphStore for SnapshotView<'a> {
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE — merged to `integration` @ `65730e89`
 
-Plan written against `integration` @ `854a6a43` (shortestPath integrated; LayeredStore base-delete snapshot-correct). Scope: graph-algorithm + introspection CALLs under Serializable via a single `SnapshotView` snapshot-recording `GraphStore` wrapper (≈14 algorithms, zero per-algorithm changes) + a per-procedure guard split; `search.vector`/`search.text` stay guarded (index versioning is a separate research project). Touches the procedure dispatch + a new store wrapper — recommend executing fresh, gating on Task 0's read-surface enumeration (the SSI-completeness invariant), behind the acceptance tests.
+**Done + merged (Tasks 0-4):**
+- **Task 0** (read-surface gate): algorithms are read-only; their entire `GraphStore` read surface is 6 methods (`node_ids`, `edges_from`, `neighbors`, `get_node`, `get_edge`, `find_nodes_by_property`), each with a recording counterpart (`find_nodes_by_property` synthesized via `is_node_visible_versioned`); `execute_parallel` uses the same methods.
+- **Task 1** — `SnapshotView` (`grafeo-core/src/graph/snapshot_view.rs`): a `GraphStoreSearch` wrapper over `(store, epoch, tx)` whose 6 reads route through the snapshot-visible, SSI-recording accessors; everything else delegates. **Opus-reviewed COMPLETE** (no algorithm read escapes recording; `find_nodes_by_property`'s committed-index residual is sound — returned set == recorded set). Carries a maintainer completeness-invariant doc.
+- **Task 2** — per-procedure `serializable_safe()` (GraphAlgorithm + introspection → true; `search.vector`/`search.text` → false, default false); the blanket CALL guard replaced with a post-resolution per-procedure check; the executor wraps the store in `SnapshotView` under Serializable (epoch+tx from the planner). Introspection catalog reads are NOT recorded (documented residual — benign).
+- **Task 3** — acceptance: `serializable_graph_algorithm_conflict_aborts` (a write-skew cycle through PageRank's whole-graph read-set aborts the second committer — proving the algorithm reads reach the SSI read-set via `SnapshotView`); snapshot-consistency (post-snapshot node invisible); introspection commits; `search.vector` still rejected.
+- **Task 4** — verification + the `SnapshotView` invariant doc + a Part-G test doc-lint fix.
+
+**Verification:** `--all-features` 7543/0; serializable suite 15/15; clippy clean (incl. `--test serializable`); profiles (`default`/`lpg`/`lpg,temporal` engine, `grafeo-core` tiered) + wasm; OPSEC (upstream un-pushed).
+
+**Residuals (documented):** whole-graph read-set ⇒ a Serializable algorithm conflicts with any concurrent graph mutation (correct, but abort-prone — use SI for snapshot-without-abort); introspection catalog reads unrecorded; `find_nodes_by_property` committed-index view (uncommitted-match incompleteness); a future algorithm calling a non-overridden `GraphStore` read must add a `SnapshotView` override (per its doc).
+
+**Still guarded:** `search.vector`/`search.text` — need index versioning (research-grade; §Subsequent steps).
