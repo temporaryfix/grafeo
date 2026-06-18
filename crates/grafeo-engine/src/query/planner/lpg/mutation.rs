@@ -724,17 +724,6 @@ impl super::Planner {
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use crate::procedures::{self, BuiltinProcedures};
 
-        // Graph algorithm procedures (PageRank, BFS, community detection, etc.)
-        // read raw graph adjacency without MVCC visibility and cannot record
-        // reads for SSI conflict detection.  Reject under Serializable rather
-        // than silently return non-serializable results.
-        if self.is_serializable() {
-            return Err(Error::Internal(
-                "Serializable isolation is not yet supported with graph algorithms; use SnapshotIsolation"
-                    .to_string(),
-            ));
-        }
-
         static PROCEDURES: std::sync::OnceLock<BuiltinProcedures> = std::sync::OnceLock::new();
         let registry = PROCEDURES.get_or_init(BuiltinProcedures::new);
 
@@ -767,6 +756,16 @@ impl super::Planner {
             ))
         })?;
 
+        // Per-procedure Serializable guard: procedures that cannot record reads
+        // for SSI (e.g. vector/text index searches) are rejected; procedures that
+        // are snapshot-safe (graph algorithms, catalog introspection) are allowed.
+        if self.is_serializable() && !procedure.serializable_safe() {
+            return Err(Error::Internal(format!(
+                "Serializable isolation is not yet supported with procedure '{}'; use SnapshotIsolation",
+                procedure.name()
+            )));
+        }
+
         // Evaluate arguments to Parameters
         let params = procedures::evaluate_arguments(&call.arguments, procedure.parameters());
 
@@ -797,6 +796,15 @@ impl super::Planner {
             yield_columns,
             canonical_columns,
         );
+        // Under Serializable isolation, pass the snapshot context so the
+        // executor can wrap the store in a SnapshotView for graph algorithms.
+        // The per-procedure guard above already ensured non-safe procedures
+        // never reach this point under Serializable.
+        if self.is_serializable()
+            && let Some(tx) = self.transaction_id
+        {
+            op = op.with_snapshot_context(self.viewing_epoch, tx);
+        }
         #[cfg(feature = "lpg")]
         if let Some(lpg_store) = self.lpg_store.as_ref() {
             op = op.with_lpg_store(Arc::clone(lpg_store));

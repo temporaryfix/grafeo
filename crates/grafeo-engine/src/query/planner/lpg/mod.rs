@@ -3952,7 +3952,7 @@ mod tests {
     fn make_planner_with_isolation(
         isolation: crate::transaction::IsolationLevel,
     ) -> (Planner, Arc<crate::transaction::TransactionManager>) {
-        use crate::transaction::{IsolationLevel, TransactionManager};
+        use crate::transaction::TransactionManager;
 
         let store = create_test_store();
         let tm = Arc::new(TransactionManager::new());
@@ -4202,5 +4202,145 @@ mod tests {
             "plan_text_scan must succeed under SnapshotIsolation, got: {:?}",
             result.err()
         );
+    }
+
+    // ==================== per-procedure Serializable guard (Task 2) ====================
+
+    /// Build a `CallProcedureOp` for a procedure by its bare name (no namespace).
+    #[cfg(feature = "algos")]
+    fn make_call_op(name: &str) -> crate::query::plan::CallProcedureOp {
+        crate::query::plan::CallProcedureOp {
+            name: vec![name.to_string()],
+            arguments: vec![],
+            yield_items: None,
+        }
+    }
+
+    /// A graph algorithm CALL must succeed under Serializable isolation.
+    ///
+    /// The blanket `is_serializable()` guard has been replaced with a
+    /// per-procedure check: `GraphAlgorithmProcedure::serializable_safe()` is
+    /// `true`, so planning must return `Ok`, not `Err`.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_pagerank_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = make_call_op("pagerank");
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL pagerank must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `connected_components` (another graph algorithm) must also succeed.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_connected_components_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = make_call_op("connected_components");
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL connected_components must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `CALL db.labels()` (introspection) must succeed under Serializable.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_labels_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = crate::query::plan::CallProcedureOp {
+            name: vec!["db".to_string(), "labels".to_string()],
+            arguments: vec![],
+            yield_items: None,
+        };
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL db.labels must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `CALL grafeo.propertyKeys()` must succeed under Serializable.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_property_keys_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = crate::query::plan::CallProcedureOp {
+            name: vec!["grafeo".to_string(), "propertyKeys".to_string()],
+            arguments: vec![],
+            yield_items: None,
+        };
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL grafeo.propertyKeys must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `CALL grafeo.search.vector` must still be rejected under Serializable
+    /// with a per-procedure error message naming the procedure.
+    #[cfg(all(feature = "algos", feature = "lpg", feature = "vector-index"))]
+    #[test]
+    fn test_plan_call_search_vector_rejected_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = crate::query::plan::CallProcedureOp {
+            name: vec![
+                "grafeo".to_string(),
+                "search".to_string(),
+                "vector".to_string(),
+            ],
+            arguments: vec![],
+            yield_items: None,
+        };
+        let err = planner
+            .plan_call_procedure(&op)
+            .err()
+            .expect("CALL grafeo.search.vector must be rejected under Serializable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search.vector") || msg.contains("Serializable"),
+            "error must identify the procedure or mention Serializable, got: {msg}"
+        );
+    }
+
+    /// The old blanket test: CALL to a graph algorithm under Serializable must
+    /// now succeed (blanket guard removed).  This replaces any prior test that
+    /// expected a blanket rejection of ALL graph algorithms under Serializable.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_graph_algorithm_no_longer_blanket_rejected_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = make_call_op("pagerank");
+        // Must NOT return an error referencing the old blanket guard message.
+        match planner.plan_call_procedure(&op) {
+            Ok(_) => { /* ideal */ }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("graph algorithms")
+                        || !msg.contains("not yet supported"),
+                    "old blanket guard must be gone; per-procedure check applies. Got: {msg}"
+                );
+            }
+        }
     }
 }

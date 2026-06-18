@@ -57,6 +57,28 @@ pub trait Procedure: Send + Sync {
     /// Returns the canonical output column names in order.
     fn output_columns(&self) -> Vec<String>;
 
+    /// Returns `true` if this procedure is safe to run under Serializable
+    /// isolation.
+    ///
+    /// A procedure is Serializable-safe when its reads can be made
+    /// snapshot-consistent and recorded into the SSI read-set so that
+    /// concurrent conflicting writes will abort it correctly.
+    ///
+    /// - Graph algorithms (`GraphAlgorithmProcedure`): `true` — the executor
+    ///   wraps the store in a [`SnapshotView`][grafeo_core::graph::SnapshotView]
+    ///   so all reads are pinned to the transaction epoch and recorded.
+    /// - Catalog introspection (`labels`, `relationshipTypes`, `propertyKeys`):
+    ///   `true` — catalog reads are delegated unchanged; `all_labels()` /
+    ///   `all_edge_types()` / `all_property_keys()` are NOT recorded into the
+    ///   SSI read-set (there is no versioned counterpart for schema reads).
+    ///   This is an accepted residual: introspection is rarely the basis for a
+    ///   write decision, and read-only introspection transactions never abort.
+    /// - Vector/text search procedures: `false` (default) — HNSW / BM25 index
+    ///   reads are not snapshot-aware and cannot be recorded for SSI.
+    fn serializable_safe(&self) -> bool {
+        false
+    }
+
     /// Executes the procedure against the supplied context and parameters.
     ///
     /// # Errors
@@ -144,6 +166,13 @@ impl Procedure for GraphAlgorithmProcedure {
         self.output_columns.clone()
     }
 
+    /// Graph algorithms are Serializable-safe: the executor wraps the store in
+    /// a `SnapshotView` so reads are pinned to the transaction epoch and
+    /// recorded for SSI conflict detection.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         self.inner.execute(ctx.store, params)
     }
@@ -171,6 +200,12 @@ impl Procedure for LabelsProcedure {
 
     fn output_columns(&self) -> Vec<String> {
         vec!["label".into()]
+    }
+
+    /// Catalog reads are safe under Serializable (residual: `all_labels()` is not
+    /// recorded into the SSI read-set — see `Procedure::serializable_safe` doc).
+    fn serializable_safe(&self) -> bool {
+        true
     }
 
     fn execute(&self, ctx: &ProcedureContext<'_>, _params: &Parameters) -> Result<AlgorithmResult> {
@@ -202,6 +237,12 @@ impl Procedure for RelationshipTypesProcedure {
         vec!["relationshipType".into()]
     }
 
+    /// Catalog reads are safe under Serializable (residual: `all_edge_types()` is not
+    /// recorded into the SSI read-set — see `Procedure::serializable_safe` doc).
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, _params: &Parameters) -> Result<AlgorithmResult> {
         let mut result = AlgorithmResult::new(vec!["relationshipType".into()]);
         for t in ctx.store.all_edge_types() {
@@ -229,6 +270,12 @@ impl Procedure for PropertyKeysProcedure {
 
     fn output_columns(&self) -> Vec<String> {
         vec!["propertyKey".into()]
+    }
+
+    /// Catalog reads are safe under Serializable (residual: `all_property_keys()` is not
+    /// recorded into the SSI read-set — see `Procedure::serializable_safe` doc).
+    fn serializable_safe(&self) -> bool {
+        true
     }
 
     fn execute(&self, ctx: &ProcedureContext<'_>, _params: &Parameters) -> Result<AlgorithmResult> {
@@ -960,6 +1007,72 @@ pub fn procedures_result(registry: &BuiltinProcedures) -> AlgorithmResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // serializable_safe classification
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn graph_algorithm_procedures_are_serializable_safe() {
+        let registry = BuiltinProcedures::new();
+        for name in ["pagerank", "connected_components", "dijkstra", "bfs"] {
+            let proc = registry
+                .get(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                proc.serializable_safe(),
+                "{name}: GraphAlgorithmProcedure must be serializable_safe() == true"
+            );
+        }
+    }
+
+    #[test]
+    fn introspection_procedures_are_serializable_safe() {
+        let registry = BuiltinProcedures::new();
+        for name in ["labels", "relationshipTypes", "propertyKeys"] {
+            let proc = registry
+                .get(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                proc.serializable_safe(),
+                "{name}: introspection procedure must be serializable_safe() == true"
+            );
+        }
+    }
+
+    #[test]
+    fn default_serializable_safe_is_false() {
+        // The trait default must be false; UnknownAlgo (defined below) doesn't
+        // override it, so GraphAlgorithmProcedure wrapping it must still be true
+        // (the wrapper overrides), but a bare struct relying on the default must
+        // return false.
+        struct BareProc;
+        impl Procedure for BareProc {
+            fn name(&self) -> &str {
+                "bare"
+            }
+            fn description(&self) -> &str {
+                "bare"
+            }
+            fn parameters(&self) -> &[ParameterDef] {
+                &[]
+            }
+            fn output_columns(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _ctx: &ProcedureContext<'_>,
+                _params: &Parameters,
+            ) -> Result<AlgorithmResult> {
+                Ok(AlgorithmResult::new(vec![]))
+            }
+        }
+        assert!(
+            !BareProc.serializable_safe(),
+            "default serializable_safe() must be false"
+        );
+    }
 
     #[test]
     fn test_registry_has_all_algorithms() {

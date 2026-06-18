@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use grafeo_adapters::plugins::{AlgorithmResult, Parameters};
-use grafeo_common::types::{LogicalType, Value};
+use grafeo_common::types::{EpochId, LogicalType, TransactionId, Value};
 use grafeo_core::execution::DataChunk;
 use grafeo_core::execution::operators::{Operator, OperatorError, OperatorResult};
 use grafeo_core::graph::GraphStoreSearch;
@@ -20,6 +20,11 @@ use crate::procedures::{Procedure, ProcedureContext};
 /// On the first call to [`next()`](Operator::next), the procedure runs and
 /// the full result is cached. Subsequent calls yield rows in chunks of
 /// `CHUNK_SIZE` until exhausted.
+///
+/// When the active transaction is Serializable and the procedure is
+/// `serializable_safe()`, the store is wrapped in a
+/// [`SnapshotView`][grafeo_core::graph::SnapshotView] so reads are pinned to
+/// the transaction epoch and recorded for SSI conflict detection.
 pub struct ProcedureCallOperator {
     store: Arc<dyn GraphStoreSearch>,
     procedure: Arc<dyn Procedure>,
@@ -42,6 +47,11 @@ pub struct ProcedureCallOperator {
     output_columns: Vec<String>,
     /// Column indices to extract from each result row (resolved after YIELD filtering).
     column_indices: Vec<usize>,
+    /// Snapshot epoch for Serializable transactions.  `None` means SI/RC: use
+    /// the store directly (no `SnapshotView` overhead).
+    snapshot_epoch: Option<EpochId>,
+    /// Transaction ID for Serializable snapshot reads and SSI recording.
+    snapshot_tx: Option<TransactionId>,
 }
 
 /// Number of rows per DataChunk.
@@ -68,6 +78,8 @@ impl ProcedureCallOperator {
             row_index: 0,
             output_columns: Vec::new(),
             column_indices: Vec::new(),
+            snapshot_epoch: None,
+            snapshot_tx: None,
         }
     }
 
@@ -80,19 +92,52 @@ impl ProcedureCallOperator {
         self
     }
 
+    /// Attaches Serializable snapshot context so graph-algorithm procedures
+    /// read from a snapshot-pinned, SSI-recording [`SnapshotView`].
+    ///
+    /// Only has an effect when the procedure is
+    /// [`serializable_safe`][crate::procedures::Procedure::serializable_safe].
+    /// SI / RC callers must not call this; the fields are `None` by default and
+    /// the operator falls back to the direct store path.
+    #[must_use]
+    pub fn with_snapshot_context(mut self, epoch: EpochId, tx: TransactionId) -> Self {
+        self.snapshot_epoch = Some(epoch);
+        self.snapshot_tx = Some(tx);
+        self
+    }
+
     /// Executes the procedure and resolves YIELD column mapping.
     fn execute_algorithm(&mut self) -> Result<(), OperatorError> {
-        #[cfg(feature = "lpg")]
-        let ctx = match self.lpg_store.as_deref() {
-            Some(lpg) => ProcedureContext::with_lpg_store(&*self.store, lpg),
-            None => ProcedureContext::new(&*self.store),
+        // Under Serializable isolation, wrap the store in a SnapshotView so
+        // graph-algorithm reads are pinned to the transaction epoch and recorded
+        // into the SSI read-set.  The view is a thin borrow — no heap allocation
+        // beyond the struct itself.  SI/RC falls through to the direct-store path
+        // (snapshot_epoch is None) so there is no overhead for those transactions.
+        let result = match (self.snapshot_epoch, self.snapshot_tx) {
+            (Some(epoch), Some(tx)) => {
+                let view = grafeo_core::graph::SnapshotView::new(&*self.store, epoch, tx);
+                // The with_lpg_store path is only reached by non-serializable_safe
+                // procedures (search.vector / search.text), which are blocked by
+                // the planner under Serializable, so we always use the plain-store
+                // context here.
+                let ctx = ProcedureContext::new(&view);
+                self.procedure.execute(&ctx, &self.params).map_err(|e| {
+                    OperatorError::Execution(format!("Procedure execution failed: {e}"))
+                })?
+            }
+            _ => {
+                #[cfg(feature = "lpg")]
+                let ctx = match self.lpg_store.as_deref() {
+                    Some(lpg) => ProcedureContext::with_lpg_store(&*self.store, lpg),
+                    None => ProcedureContext::new(&*self.store),
+                };
+                #[cfg(not(feature = "lpg"))]
+                let ctx = ProcedureContext::new(&*self.store);
+                self.procedure.execute(&ctx, &self.params).map_err(|e| {
+                    OperatorError::Execution(format!("Procedure execution failed: {e}"))
+                })?
+            }
         };
-        #[cfg(not(feature = "lpg"))]
-        let ctx = ProcedureContext::new(&*self.store);
-        let result = self
-            .procedure
-            .execute(&ctx, &self.params)
-            .map_err(|e| OperatorError::Execution(format!("Procedure execution failed: {e}")))?;
 
         // Use canonical column names if available (same length as result columns),
         // otherwise fall back to the algorithm's own column names.
