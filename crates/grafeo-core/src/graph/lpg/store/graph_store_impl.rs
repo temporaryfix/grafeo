@@ -396,6 +396,13 @@ impl GraphStoreSearch for LpgStore {
         query: &str,
         k: usize,
     ) -> Vec<(NodeId, f64)> {
+        // TI8 plumbing gap: `GraphStoreSearch::text_search` carries no epoch/tx
+        // context, so this committed-latest path cannot be routed through
+        // `search_text_visible` without a trait signature change.  TI4's
+        // `search_text_visible` is available directly on `LpgStore` for callers
+        // that already hold epoch + tx (e.g. the transactional session layer).
+        // When TI8 adds epoch/tx to the trait, replace this with
+        // `self.search_text_visible(…)`.
         if let Some(index) = self.get_text_index(label, property) {
             index.read().search(query, k)
         } else {

@@ -3,7 +3,7 @@
 use super::LpgStore;
 use dashmap::DashMap;
 #[cfg(feature = "text-index")]
-use grafeo_common::types::TransactionId;
+use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::types::{HashableValue, NodeId, PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashSet;
 #[cfg(feature = "text-index")]
@@ -293,6 +293,80 @@ impl LpgStore {
         }
         for (_, index) in text_indexes.iter() {
             index.write().remove(id);
+        }
+    }
+
+    // === Snapshot text search (TI4) ===
+
+    /// Searches a text index at `(epoch, tx)`, merging committed postings with
+    /// the transaction's buffered delta (read-your-writes).
+    ///
+    /// - Committed postings visible at `(epoch, tx)` that the tx has not
+    ///   tombstoned are included.
+    /// - Delta inserts (the tx's buffered `Some(text)` entries) appear with
+    ///   their new text, replacing any committed posting for the same node.
+    /// - Delta tombstones (`None` entries) suppress the committed posting.
+    ///
+    /// If no committed index exists for `index_key`, only delta inserts are
+    /// searched (the delta is a self-contained mini corpus).
+    ///
+    /// The `index_key` format is `"label:property"`.
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    pub fn search_text_visible(
+        &self,
+        index_key: &str,
+        query: &str,
+        k: usize,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Build delta_docs and delta_removed from the overlay for this tx.
+        let (delta_docs, delta_removed): (Vec<(NodeId, String)>, FxHashSet<NodeId>) = {
+            let overlay = self.text_index_overlay.read();
+            match overlay.get(&tx) {
+                None => (Vec::new(), FxHashSet::default()),
+                Some(delta) => {
+                    let mut docs = Vec::new();
+                    let mut removed = FxHashSet::default();
+                    for (node_id, opt_text) in delta.changes_for(index_key) {
+                        match opt_text {
+                            Some(text) => docs.push((node_id, text.clone())),
+                            None => {
+                                removed.insert(node_id);
+                            }
+                        }
+                    }
+                    (docs, removed)
+                }
+            }
+        };
+
+        // Look up the committed index.
+        let committed_idx = {
+            let text_indexes = self.text_indexes.read();
+            text_indexes.get(index_key).cloned()
+        };
+
+        match committed_idx {
+            Some(idx_arc) => {
+                let idx = idx_arc.read();
+                idx.search_visible(query, k, epoch, tx, &delta_docs, &delta_removed)
+            }
+            None => {
+                // No committed index — search only the delta docs.
+                if delta_docs.is_empty() {
+                    return Vec::new();
+                }
+                // Build a transient index from the delta and search it.
+                let mut transient = crate::index::text::InvertedIndex::new(
+                    crate::index::text::BM25Config::default(),
+                );
+                for (node_id, text) in &delta_docs {
+                    transient.insert(*node_id, text);
+                }
+                transient.search(query, k)
+            }
         }
     }
 

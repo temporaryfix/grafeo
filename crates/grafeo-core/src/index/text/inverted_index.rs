@@ -5,6 +5,7 @@ use super::versioned::{
     AggDelta, VersionedDocLen, VersionedPosting, doc_len_visible, posting_visible,
 };
 use grafeo_common::types::{EpochId, NodeId, TransactionId};
+use grafeo_common::utils::hash::FxHashSet;
 use std::collections::HashMap;
 
 /// Configuration for BM25 scoring.
@@ -441,6 +442,181 @@ impl InvertedIndex {
             .filter(|(_, score)| *score >= threshold)
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    // ── Snapshot search (TI4) ──────────────────────────────────────────────
+
+    /// Searches the index at a specific `(epoch, tx)` snapshot, merging the
+    /// committed postings with an in-flight transactional delta.
+    ///
+    /// # Parameters
+    ///
+    /// - `query` — raw query text (tokenised internally).
+    /// - `k` — maximum results to return.
+    /// - `epoch` — the snapshot epoch for committed visibility.
+    /// - `tx` — the viewing transaction (own-tx pending postings are visible to
+    ///   this tx only; `TransactionId::INVALID` for no pending own-tx).
+    /// - `delta_docs` — `(NodeId, text)` pairs the transaction has buffered as
+    ///   inserts/updates for this index.  These replace any committed posting for
+    ///   the same node.
+    /// - `delta_removed` — `NodeId`s the transaction has buffered as tombstones.
+    ///   These nodes are always excluded from the result even if they have a live
+    ///   committed posting.
+    ///
+    /// # Corpus-stat treatment
+    ///
+    /// The base corpus stats (`n`, `avg_dl`) come from `doc_count_at(epoch, tx)` /
+    /// `avgdl_at(epoch, tx)`.  Delta docs are small relative to the committed
+    /// corpus, so instead of exact bookkeeping we apply a lightweight adjustment:
+    ///
+    /// - Nodes in `delta_docs` that already had a committed posting are treated as
+    ///   *replacements* (their committed length is subtracted and their new delta
+    ///   length is added); no net count change for those nodes.
+    /// - Nodes in `delta_docs` that had *no* committed posting add 1 to `n`.
+    /// - Nodes in `delta_removed` that had a committed posting subtract 1 from `n`
+    ///   (only if they are not also in `delta_docs`).
+    ///
+    /// The **doc set** is exact: delta inserts always appear, delta tombstones
+    /// never appear.  The `avg_dl` approximation is minor for small deltas.
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &str,
+        k: usize,
+        epoch: EpochId,
+        tx: TransactionId,
+        delta_docs: &[(NodeId, String)],
+        delta_removed: &FxHashSet<NodeId>,
+    ) -> Vec<(NodeId, f64)> {
+        let query_tokens = self.tokenizer.tokenize(query);
+        if query_tokens.is_empty() || k == 0 {
+            return Vec::new();
+        }
+
+        // ── Step 1: build per-delta-doc token maps ──────────────────────────
+        // For each delta doc, tokenize and compute (term_freq_map, doc_len).
+        let delta_token_maps: Vec<(NodeId, HashMap<String, u32>, u32)> = delta_docs
+            .iter()
+            .map(|(node_id, text)| {
+                let tokens = self.tokenizer.tokenize(text);
+                // reason: token count fits u32 for any practical document
+                #[allow(clippy::cast_possible_truncation)]
+                let doc_len = tokens.len() as u32;
+                let mut freq_map: HashMap<String, u32> = HashMap::new();
+                for t in tokens {
+                    *freq_map.entry(t).or_insert(0) += 1;
+                }
+                (*node_id, freq_map, doc_len)
+            })
+            .collect();
+
+        // ── Step 2: compute effective corpus stats ──────────────────────────
+        // Base from committed view at (epoch, tx).
+        // reason: doc_count and total_length are bounded by practical corpus sizes
+        // and will never exceed i64::MAX; the cast is intentional.
+        #[allow(clippy::cast_possible_wrap)]
+        let base_n = self.doc_count_at(epoch, tx) as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let base_total = self.total_length_at(epoch, tx) as i64;
+
+        // Partition delta_docs into replacements (committed posting exists) and
+        // new inserts (no committed posting exists).
+        let mut len_adjustment: i64 = 0;
+        let mut count_adjustment: i64 = 0;
+
+        for (node_id, _, delta_len) in &delta_token_maps {
+            let committed_len = self.doc_len_at(*node_id, epoch, tx);
+            if let Some(cl) = committed_len {
+                // Replacement: subtract old length, add new length.
+                len_adjustment += i64::from(*delta_len) - i64::from(cl);
+                // No count change.
+            } else {
+                // New insert: add length and count.
+                len_adjustment += i64::from(*delta_len);
+                count_adjustment += 1;
+            }
+        }
+
+        // Tombstoned nodes that had a committed posting reduce count, unless they
+        // are also in delta_docs (which would be a set-then-remove; the net is
+        // "remove", handled by not adding them to delta_token_maps above).
+        let delta_doc_nodes: FxHashSet<NodeId> =
+            delta_token_maps.iter().map(|(n, _, _)| *n).collect();
+        for &removed_node in delta_removed {
+            if !delta_doc_nodes.contains(&removed_node)
+                && self.doc_len_at(removed_node, epoch, tx).is_some()
+            {
+                // The doc is being removed; subtract its committed length too.
+                let cl = self.doc_len_at(removed_node, epoch, tx).unwrap_or(0);
+                len_adjustment -= i64::from(cl);
+                count_adjustment -= 1;
+            }
+        }
+
+        let n_eff = (base_n + count_adjustment).max(1) as f64;
+        let total_eff = (base_total + len_adjustment).max(0) as f64;
+        let avg_dl_eff = total_eff / n_eff;
+        // Avoid division by zero: use 1.0 when corpus is effectively empty.
+        let avg_dl = if avg_dl_eff <= 0.0 { 1.0 } else { avg_dl_eff };
+
+        // ── Step 3: score candidates ────────────────────────────────────────
+        let mut scores: HashMap<NodeId, f64> = HashMap::new();
+
+        for token in &query_tokens {
+            // ── A. Committed postings visible at (epoch, tx), minus tombstones ──
+            //
+            // Also build the effective df for this term: count committed visible
+            // docs (minus tombstones, minus those overridden by delta_docs) plus
+            // delta docs that contain this term.
+            let committed_visible_for_term: Vec<&super::versioned::VersionedPosting> = self
+                .postings
+                .get(token.as_str())
+                .map(|pl| {
+                    pl.postings
+                        .iter()
+                        .filter(|p| {
+                            posting_visible(p, epoch, tx)
+                                && !delta_removed.contains(&p.node_id)
+                                && !delta_doc_nodes.contains(&p.node_id)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Delta docs that contain this token.
+            let delta_hits: Vec<(&NodeId, u32, u32)> = delta_token_maps
+                .iter()
+                .filter_map(|(nid, freq_map, dl)| {
+                    freq_map.get(token.as_str()).map(|&tf| (nid, tf, *dl))
+                })
+                .collect();
+
+            let df = (committed_visible_for_term.len() + delta_hits.len()) as f64;
+            if df == 0.0 {
+                continue;
+            }
+
+            // Score committed visible postings.
+            for posting in committed_visible_for_term {
+                let tf = f64::from(posting.term_freq);
+                let dl = f64::from(self.doc_len_at(posting.node_id, epoch, tx).unwrap_or(0));
+                *scores.entry(posting.node_id).or_insert(0.0) +=
+                    self.bm25_term_score(df, tf, dl, n_eff, avg_dl);
+            }
+
+            // Score delta inserts.
+            for (nid, tf, dl) in &delta_hits {
+                let tf_f = f64::from(*tf);
+                let dl_f = f64::from(*dl);
+                *scores.entry(**nid).or_insert(0.0) +=
+                    self.bm25_term_score(df, tf_f, dl_f, n_eff, avg_dl);
+            }
+        }
+
+        let mut results: Vec<(NodeId, f64)> = scores.into_iter().collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
         results
     }
 

@@ -3051,3 +3051,191 @@ fn tx_text_index_delta_rollback_clears_overlay() {
         "committed index must remain clean after rollback"
     );
 }
+
+// ── TI4: search_visible + search_text_visible ──────────────────────────────
+
+/// A transaction that buffers `SET n.body='quantum rust'` via the text-index
+/// delta must see that node returned by `search_text_visible` (read-your-writes),
+/// while the committed-latest `search` does not.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_search_sees_own_uncommitted_insert() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let committed_idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&committed_idx));
+
+    let node = store.create_node(&["Doc"]);
+    let tx = TransactionId::new(42);
+    let epoch = store.current_epoch();
+
+    // Buffer a text-index set for the tx (does NOT touch committed index).
+    store.set_node_property_buffered(node, "body", Value::String("quantum rust".into()), tx);
+
+    // search_text_visible at (epoch, tx) must return the node (read-your-writes).
+    let results = store.search_text_visible("Doc:body", "quantum", 10, epoch, tx);
+    assert_eq!(results.len(), 1, "tx must see its own buffered insert");
+    assert_eq!(results[0].0, node);
+
+    // The committed-latest search must NOT see it.
+    let committed_results = committed_idx.read().search("quantum", 10);
+    assert!(
+        committed_results.is_empty(),
+        "committed search must not see uncommitted insert"
+    );
+}
+
+/// A document committed at epoch E2 must NOT be returned by `search_visible`
+/// at a snapshot epoch E1 < E2.
+#[cfg(feature = "text-index")]
+#[test]
+fn search_visible_excludes_committed_after_epoch() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use grafeo_common::types::EpochId;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    // Manually insert a versioned posting at epoch 5.
+    idx.write().insert_versioned(
+        grafeo_common::types::NodeId::new(1),
+        "future document",
+        EpochId::new(5),
+        None,
+    );
+
+    // Searching at epoch 3 (before commit epoch 5) should find nothing.
+    let results_e3 = store.search_text_visible(
+        "Doc:body",
+        "future document",
+        10,
+        EpochId::new(3),
+        TransactionId::INVALID,
+    );
+    assert!(
+        results_e3.is_empty(),
+        "doc committed at E5 must be invisible at E3"
+    );
+
+    // Searching at epoch 5 should find it.
+    let results_e5 = store.search_text_visible(
+        "Doc:body",
+        "future document",
+        10,
+        EpochId::new(5),
+        TransactionId::INVALID,
+    );
+    assert_eq!(
+        results_e5.len(),
+        1,
+        "doc committed at E5 must be visible at E5"
+    );
+}
+
+/// A document deleted at epoch E2 must still be returned by `search_visible`
+/// at a snapshot E1 < E2.
+#[cfg(feature = "text-index")]
+#[test]
+fn search_visible_includes_deleted_after_epoch() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use grafeo_common::types::EpochId;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&idx));
+
+    let nid = grafeo_common::types::NodeId::new(10);
+
+    // Insert at epoch 1, delete at epoch 5.
+    idx.write()
+        .insert_versioned(nid, "ancient scroll", EpochId::new(1), None);
+    idx.write().remove_versioned(nid, EpochId::new(5), None);
+
+    // At epoch 3 the doc is still alive.
+    let results_e3 = store.search_text_visible(
+        "Doc:body",
+        "ancient scroll",
+        10,
+        EpochId::new(3),
+        TransactionId::INVALID,
+    );
+    assert_eq!(
+        results_e3.len(),
+        1,
+        "doc deleted at E5 must be visible at E3"
+    );
+
+    // At epoch 5 the doc is gone.
+    let results_e5 = store.search_text_visible(
+        "Doc:body",
+        "ancient scroll",
+        10,
+        EpochId::new(5),
+        TransactionId::INVALID,
+    );
+    assert!(
+        results_e5.is_empty(),
+        "doc deleted at E5 must be invisible at E5"
+    );
+}
+
+/// A committed document that the current tx buffered a removal for must NOT
+/// appear in `search_text_visible` for that tx.
+#[cfg(feature = "text-index")]
+#[test]
+fn search_visible_excludes_tx_removed() {
+    use crate::index::text::{BM25Config, InvertedIndex};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+    let committed_idx = Arc::new(RwLock::new(InvertedIndex::new(BM25Config::default())));
+    store.add_text_index("Doc", "body", Arc::clone(&committed_idx));
+
+    // Committed doc.
+    let node = store.create_node(&["Doc"]);
+    store.set_node_property(
+        node,
+        "body",
+        Value::String("committed knowledge graph".into()),
+    );
+
+    // Verify committed search sees it.
+    let committed = committed_idx.read().search("knowledge graph", 10);
+    assert_eq!(committed.len(), 1);
+
+    let tx = TransactionId::new(77);
+    let epoch = store.current_epoch();
+
+    // Buffer a removal of the committed doc.
+    store.remove_node_property_buffered(node, "body", tx);
+
+    // search_text_visible for tx must exclude the tx-removed doc.
+    let results = store.search_text_visible("Doc:body", "knowledge graph", 10, epoch, tx);
+    assert!(
+        results.is_empty(),
+        "tx-removed doc must be excluded from search_text_visible for that tx"
+    );
+
+    // But other transactions still see it via the committed search.
+    let other_tx_results = store.search_text_visible(
+        "Doc:body",
+        "knowledge graph",
+        10,
+        epoch,
+        TransactionId::new(99),
+    );
+    assert_eq!(
+        other_tx_results.len(),
+        1,
+        "other transactions must still see the committed doc"
+    );
+}
