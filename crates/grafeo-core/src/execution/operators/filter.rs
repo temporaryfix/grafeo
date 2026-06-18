@@ -3632,10 +3632,20 @@ impl ExpressionPredicate {
                 let label_set =
                     self.store
                         .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
-                // Try each label for a text index match.
-                let score = label_set
-                    .iter()
-                    .find_map(|label| self.store.score_text(node_id, label, property, query_str))?;
+                // Serializable path: use score_text_visible so the index predicate
+                // read is recorded for SSI anti-phantom detection.  SI/RC use the
+                // committed-latest score_text (no recording overhead).
+                let score =
+                    if let (Some(epoch), Some(tx)) = (self.viewing_epoch, self.transaction_id) {
+                        label_set.iter().find_map(|label| {
+                            self.store
+                                .score_text_visible(node_id, label, property, query_str, epoch, tx)
+                        })?
+                    } else {
+                        label_set.iter().find_map(|label| {
+                            self.store.score_text(node_id, label, property, query_str)
+                        })?
+                    };
 
                 if name == "text_match" {
                     Some(Value::Bool(score > 0.0))

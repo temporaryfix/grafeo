@@ -630,6 +630,33 @@ pub trait GraphStoreSearch: GraphStore {
         None
     }
 
+    /// Snapshot-aware per-row BM25 score for Serializable transactions.
+    ///
+    /// Records `record_read_index(tx, "label:property")` **before** scoring so
+    /// that even a zero-result per-row predicate evaluation closes the
+    /// rw-antidependency cycle against a concurrent phantom insert.  Scores the
+    /// node using postings visible at `(epoch, tx)` (committed + tx delta) rather
+    /// than committed-latest.
+    ///
+    /// # Default
+    ///
+    /// Delegates to the committed-latest [`score_text`](Self::score_text) so
+    /// non-LPG stores compile and behave unchanged.  LPG stores override this to
+    /// call `LpgStore::score_text_visible_impl` which records the index read for SSI.
+    #[cfg(feature = "text-index")]
+    fn score_text_visible(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        property: &str,
+        query: &str,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> Option<f64> {
+        // Non-LPG fall-through: committed-latest, no SSI recording.
+        self.score_text(node_id, label, property, query)
+    }
+
     /// Returns the top-`k` documents by BM25 score for a text query.
     ///
     /// Results are sorted by score descending. Returns an empty vec when no

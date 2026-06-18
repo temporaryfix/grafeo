@@ -493,6 +493,111 @@ impl InvertedIndex {
         score
     }
 
+    /// Scores a single document against a query at a specific `(epoch, tx)` snapshot.
+    ///
+    /// Like [`score_document`] but filters each posting list by
+    /// `posting_visible(epoch, tx)` and uses `avgdl_at(epoch, tx)` so the
+    /// score reflects only what was visible to the reader at snapshot time.
+    ///
+    /// A delta doc (an uncommitted insert for `node_id` in `tx`) can be supplied
+    /// via `delta_doc`: if `Some((doc_len, freq_map))` the committed posting for
+    /// `node_id` is ignored and the delta values are used instead; if the delta
+    /// signals a tombstone (`delta_removed == true`) the function returns `None`
+    /// immediately (the node is not visible).
+    ///
+    /// Returns `None` when the node has no visible entry in this index.
+    #[must_use]
+    pub fn score_document_visible(
+        &self,
+        id: NodeId,
+        query: &str,
+        epoch: EpochId,
+        tx: TransactionId,
+        delta_doc: Option<(u32, &HashMap<String, u32>)>,
+        delta_removed: bool,
+    ) -> Option<f64> {
+        // A tombstone in this tx means the node is invisible.
+        if delta_removed {
+            return None;
+        }
+
+        let query_tokens = self.tokenizer.tokenize(query);
+        if query_tokens.is_empty() {
+            return None;
+        }
+
+        // Effective doc length for `id`: delta overrides committed.
+        let dl = if let Some((delta_len, _)) = delta_doc {
+            f64::from(delta_len)
+        } else {
+            f64::from(self.doc_len_at(id, epoch, tx)?)
+        };
+
+        // Corpus stats at (epoch, tx).
+        let n = self.doc_count_at(epoch, tx);
+        if n == 0 {
+            return None;
+        }
+        let n_f = n as f64;
+        let avg_dl = self.avgdl_at(epoch, tx);
+        let avg_dl = if avg_dl <= 0.0 { 1.0 } else { avg_dl };
+
+        let mut score = 0.0;
+        for token in &query_tokens {
+            // df: committed visible postings for this term (excluding `id` if delta
+            // overrides it), plus 1 if the delta doc contains this token.
+            let Some(posting_list) = self.postings.get(token.as_str()) else {
+                // Term not in committed index; only delta could contribute.
+                if let Some((_, freq_map)) = delta_doc
+                    && let Some(&tf) = freq_map.get(token.as_str())
+                {
+                    // df = 1 (only this delta doc); score it against corpus stats.
+                    let df = 1.0_f64;
+                    score += self.bm25_term_score(df, f64::from(tf), dl, n_f, avg_dl);
+                }
+                continue;
+            };
+
+            let committed_df = posting_list
+                .postings
+                .iter()
+                .filter(|p| {
+                    posting_visible(p, epoch, tx)
+                        // If `id` is covered by a delta doc, exclude its committed posting
+                        // from df (it will be re-counted via the delta path below).
+                        && !(delta_doc.is_some() && p.node_id == id)
+                })
+                .count();
+
+            let delta_has_term = delta_doc
+                .and_then(|(_, fm)| fm.get(token.as_str()))
+                .is_some();
+
+            let df = (committed_df + usize::from(delta_has_term)) as f64;
+            if df == 0.0 {
+                continue;
+            }
+
+            // tf: delta overrides committed for `id`.
+            let tf = if let Some((_, freq_map)) = delta_doc {
+                f64::from(freq_map.get(token.as_str()).copied().unwrap_or(0))
+            } else {
+                posting_list
+                    .postings
+                    .iter()
+                    .find(|p| p.node_id == id && posting_visible(p, epoch, tx))
+                    .map_or(0.0, |p| f64::from(p.term_freq))
+            };
+
+            if tf > 0.0 {
+                score += self.bm25_term_score(df, tf, dl, n_f, avg_dl);
+            }
+        }
+
+        // Return None for documents with no query-term match (score == 0.0).
+        if score > 0.0 { Some(score) } else { None }
+    }
+
     /// Returns all documents scoring at or above `threshold` using BM25.
     ///
     /// Unlike [`Self::search`] (top-k), this returns every document above the

@@ -1577,6 +1577,24 @@ impl GraphStoreSearch for LayeredStore {
     }
 
     #[cfg(feature = "text-index")]
+    fn score_text_visible(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        property: &str,
+        query: &str,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Option<f64> {
+        if self.is_node_deleted_from_base(node_id) {
+            return None;
+        }
+        self.overlay
+            .load()
+            .score_text_visible(node_id, label, property, query, epoch, tx)
+    }
+
+    #[cfg(feature = "text-index")]
     fn text_search(
         &self,
         label: &str,

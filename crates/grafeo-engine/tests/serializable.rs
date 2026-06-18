@@ -1891,3 +1891,165 @@ fn serializable_text_query_predicate_disjoint_commits() {
         c2
     );
 }
+
+// ============================================================================
+// 22. serializable_text_filter_per_row_phantom_aborts
+// ============================================================================
+
+/// THE per-row-filter phantom hole: `MATCH (n:Doc) WHERE text_match(n.body,'q')
+/// OR n.flag = true` forces text predicate evaluation through `FilterOperator`
+/// (pushdown declined due to OR with a non-text predicate) — the per-row path
+/// previously called `score_text` which did NOT record the index read.
+///
+/// Cycle (classic phantom):
+/// - s1 runs the query → 0 results, but MUST record `IndexId("TxPerRow:body")`
+///   so the cycle below is detected.
+/// - s1 writes a sentinel.
+/// - s2 reads the sentinel (closes s2→s1 rw-edge) then inserts a new
+///   `:TxPerRow` node matching 'phantom term' (closes s1→s2 rw-edge via
+///   `record_write_index`).
+/// - s1 commits (first) → must succeed.
+/// - s2 commits (second) → MUST abort with SerializationFailure.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_filter_per_row_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create the text index (empty initially).
+    db.create_text_index("TxPerRow", "body")
+        .expect("create TxPerRow:body text index");
+
+    // Seed a sentinel node outside any explicit transaction.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxPerRowSentinel {v: 0})")
+        .expect("seed TxPerRowSentinel");
+    drop(setup);
+
+    // Both sessions begin at the same snapshot epoch.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: run a query that forces per-row filter evaluation.
+    // The OR with `n.flag = true` prevents the planner from pushing text_match
+    // down to TextScanOp, so eval_text_fn / score_text_visible is called
+    // per row inside FilterOperator.
+    // Index is empty at this point → 0 results; must still record the read.
+    let r1 = s1
+        .execute(
+            "MATCH (n:TxPerRow) WHERE text_match(n.body, 'phantom term') OR n.flag = true \
+             RETURN n",
+        )
+        .expect("s1: per-row text_match OR query must not error");
+    assert_eq!(
+        r1.row_count(),
+        0,
+        "s1: empty index → 0 results; got {}",
+        r1.row_count()
+    );
+
+    // s1: write sentinel — s2 will read it to close the rw-cycle.
+    s1.execute("MATCH (n:TxPerRowSentinel) SET n.v = 99")
+        .expect("s1: SET TxPerRowSentinel.v");
+
+    // s2: read sentinel — records TxPerRowSentinel in s2's read-set (s2→s1 edge).
+    let r2 = s2
+        .execute("MATCH (n:TxPerRowSentinel) RETURN n.v")
+        .expect("s2: MATCH TxPerRowSentinel");
+    assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+    // s2: insert a new :TxPerRow node matching s1's search term.
+    // buffer_text_index_set records IndexId("TxPerRow:body") in s2's write-set,
+    // forming the s1→s2 rw-antidependency edge.
+    s2.execute("CREATE (:TxPerRow {body: 'phantom term abc', flag: false})")
+        .expect("s2: CREATE TxPerRow node");
+
+    // s1 commits first → must succeed (cycle not confirmed yet).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed; got: {:?}",
+        c1
+    );
+
+    // s2 commits second → MUST abort.
+    // Cycle: s1 read IndexId("TxPerRow:body") via per-row text_match (s1.out,
+    // s2.in) AND s2 read sentinel s1 wrote (s2.out, s1.in).
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (phantom writer concurrent with per-row text_match reader) must abort — \
+         if this fails, score_text_visible is NOT being called on the per-row \
+         FilterOperator path (the last phantom hole is still open)",
+    );
+}
+
+// ============================================================================
+// 23. serializable_text_filter_per_row_disjoint_commits
+// ============================================================================
+
+/// Disjoint text-index scenario via the per-row filter path: s1 uses
+/// `text_match` on `:TxPerRowDisjA(body)` and s2 writes to `:TxPerRowDisjB(body)`.
+/// Different indexes → no rw-antidependency → both MUST commit.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_filter_per_row_disjoint_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    db.create_text_index("TxPerRowDisjA", "body")
+        .expect("create TxPerRowDisjA:body text index");
+    db.create_text_index("TxPerRowDisjB", "body")
+        .expect("create TxPerRowDisjB:body text index");
+
+    // Seed a TxPerRowDisjA node so the per-row scan sees at least one row.
+    let n = db.create_node(&["TxPerRowDisjA"]);
+    db.set_node_property(
+        n,
+        "body",
+        grafeo_common::types::Value::String("hello world".into()),
+    );
+
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: per-row filter on TxPerRowDisjA — records IndexId("TxPerRowDisjA:body").
+    let r1 = s1
+        .execute(
+            "MATCH (n:TxPerRowDisjA) WHERE text_match(n.body, 'hello') OR n.flag = true \
+             RETURN n",
+        )
+        .expect("s1: per-row text_match TxPerRowDisjA");
+    assert!(
+        r1.row_count() >= 1,
+        "s1: must find the seeded TxPerRowDisjA node"
+    );
+
+    // s2: write to TxPerRowDisjB — records IndexId("TxPerRowDisjB:body").
+    s2.execute("CREATE (:TxPerRowDisjB {body: 'hello universe', flag: false})")
+        .expect("s2: CREATE TxPerRowDisjB node");
+
+    // Both commit — no rw-antidependency (TxPerRowDisjA:body ≠ TxPerRowDisjB:body).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 must commit — no overlap with s2's index write; got: {:?}",
+        c1
+    );
+
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 must commit — no overlap with s1's index read; got: {:?}",
+        c2
+    );
+}

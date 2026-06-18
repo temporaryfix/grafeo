@@ -131,6 +131,16 @@ impl super::Planner {
             return Ok(result);
         }
 
+        // Serializable anti-phantom: when pushdown was declined (e.g. the text
+        // predicate is inside OR, or above an expand), proactively record any
+        // text-index reads for the scan variable so that a concurrent phantom
+        // insert can be detected even if the label scan returns 0 rows.
+        //
+        // This mirrors what `search_text_visible` does (records BEFORE any
+        // iteration), but for the per-row FilterOperator path.
+        #[cfg(feature = "text-index")]
+        self.record_text_index_reads_for_serializable(&filter.predicate, &filter.input);
+
         // Plan the input operator first
         let (input_op, columns) = self.plan_operator(&filter.input)?;
 
@@ -157,6 +167,101 @@ impl super::Planner {
         let operator = Box::new(FilterOperator::new(input_op, Box::new(predicate)));
 
         Ok((operator, columns))
+    }
+
+    /// Records text-index reads for every `text_match`/`text_score` occurrence
+    /// inside `predicate` when a Serializable transaction is active.
+    ///
+    /// Called on the generic fallthrough FilterOperator path (after all pushdown
+    /// attempts have returned `None`) so that a concurrent phantom insert is
+    /// detected even when the label scan returns 0 rows — mirroring the
+    /// upfront `record_read_index` in `search_text_visible`.
+    ///
+    /// Extracts the label from `input` when it is a bare `NodeScan`; for
+    /// deeper inputs (Expand, etc.) the label is unknown and we skip.
+    #[cfg(feature = "text-index")]
+    fn record_text_index_reads_for_serializable(
+        &self,
+        predicate: &LogicalExpression,
+        input: &LogicalOperator,
+    ) {
+        let Some(tx) = self.transaction_id else {
+            return; // not Serializable
+        };
+        let epoch = self.viewing_epoch;
+
+        // Only attempt label-based recording when the input is a bare NodeScan
+        // (label is known statically). Other inputs (Expand, Join) produce rows
+        // with known labels only at runtime.
+        let label_opt = if let LogicalOperator::NodeScan(scan) = input {
+            scan.label.as_deref()
+        } else {
+            None
+        };
+
+        // Recursively walk the predicate collecting all (property, query) pairs
+        // from text_match / text_score calls, then record a read for each one.
+        let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+        Self::collect_text_predicate_pairs(predicate, &mut pairs);
+
+        for (property, _query) in pairs {
+            if let Some(label) = label_opt {
+                // If a text index exists for this (label, property) pair, record
+                // the read. Probing `has_text_index` is O(1) (hash-map lookup).
+                if self.store.has_text_index(label, &property) {
+                    let index_key = format!("{label}:{property}");
+                    // Delegate recording through the store (which forwards to the
+                    // registered ReadTracker if one exists for `tx`).
+                    // We call `score_text_visible_impl` with a synthetic node id
+                    // that does NOT exist in the store — the impl records the
+                    // index read first, before looking up the node, so the
+                    // recording still happens even for a missing node.
+                    self.store.score_text_visible(
+                        grafeo_common::types::NodeId::new(u64::MAX),
+                        label,
+                        &property,
+                        "", // empty query: no tokens → scores 0 but recording fires
+                        epoch,
+                        tx,
+                    );
+                    let _ = index_key; // used implicitly via the store call
+                }
+            }
+        }
+    }
+
+    /// Recursively collects `(property_name, query_string)` pairs from
+    /// `text_match` and `text_score` function-call expressions.
+    #[cfg(feature = "text-index")]
+    fn collect_text_predicate_pairs(
+        expr: &LogicalExpression,
+        out: &mut Vec<(String, Option<String>)>,
+    ) {
+        match expr {
+            LogicalExpression::FunctionCall { name, args, .. }
+                if name == "text_match" || name == "text_score" =>
+            {
+                // args[0] should be a Property access; args[1] is the query string.
+                if let Some(LogicalExpression::Property { property, .. }) = args.first() {
+                    let query = args.get(1).and_then(|q| {
+                        if let LogicalExpression::Literal(Value::String(s)) = q {
+                            Some(s.to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    out.push((property.clone(), query));
+                }
+            }
+            LogicalExpression::Binary { left, right, .. } => {
+                Self::collect_text_predicate_pairs(left, out);
+                Self::collect_text_predicate_pairs(right, out);
+            }
+            LogicalExpression::Unary { operand, .. } => {
+                Self::collect_text_predicate_pairs(operand, out);
+            }
+            _ => {}
+        }
     }
 
     /// Extracts an EXISTS or NOT EXISTS subquery from a filter predicate for

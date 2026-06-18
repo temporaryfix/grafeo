@@ -396,6 +396,26 @@ impl GraphStoreSearch for LpgStore {
         Some(score)
     }
 
+    /// Snapshot-aware per-row BM25 score — records the index read for SSI.
+    ///
+    /// Builds the `"label:property"` index key and delegates to
+    /// [`LpgStore::score_text_visible_impl`], which records the index read in
+    /// the SSI read-set (anti-phantom) and then scores the node using postings
+    /// visible at `(epoch, tx)`.
+    #[cfg(feature = "text-index")]
+    fn score_text_visible(
+        &self,
+        node_id: grafeo_common::types::NodeId,
+        label: &str,
+        property: &str,
+        query: &str,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Option<f64> {
+        let index_key = format!("{label}:{property}");
+        self.score_text_visible_impl(&index_key, node_id, query, epoch, tx)
+    }
+
     #[cfg(feature = "text-index")]
     fn text_search(
         &self,

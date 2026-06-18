@@ -399,6 +399,101 @@ impl LpgStore {
         }
     }
 
+    // === Snapshot per-row score (per-row filter path, anti-phantom SSI) ===
+
+    /// Scores a single node against a text query at `(epoch, tx)`, recording
+    /// the index read for SSI conflict detection before computing the score.
+    ///
+    /// This is the snapshot-aware counterpart of
+    /// [`GraphStoreSearch::score_text`]: it records
+    /// `record_read_index(tx, index_key)` **first** (so even a non-matching row
+    /// closes the rw-antidependency cycle against a concurrent phantom insert),
+    /// then scores the node using postings visible at `(epoch, tx)`.
+    ///
+    /// The `index_key` format is `"label:property"`.
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    pub fn score_text_visible_impl(
+        &self,
+        index_key: &str,
+        node_id: NodeId,
+        query: &str,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Option<f64> {
+        // Record the index read for anti-phantom SSI — must happen even when the
+        // node ultimately scores 0.0 so that a Serializable scan that returns 0
+        // results still closes the rw-antidependency cycle if a concurrent tx
+        // inserts a matching document.
+        self.record_read_index(tx, index_key);
+
+        // Look up the per-tx delta entry for this specific node.
+        // We use `get(index_key, node_id)` to avoid iterating all changes.
+        let (delta_doc_opt, delta_removed): (
+            Option<(u32, std::collections::HashMap<String, u32>)>,
+            bool,
+        ) = {
+            let overlay = self.text_index_overlay.read();
+            match overlay.get(&tx).and_then(|d| d.get(index_key, node_id)) {
+                None => (None, false),
+                Some(None) => (None, true), // tombstone
+                Some(Some(text)) => {
+                    let tokenizer = crate::index::text::SimpleTokenizer::new();
+                    use crate::index::text::Tokenizer as _;
+                    let tokens = tokenizer.tokenize(text);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let doc_len = tokens.len() as u32;
+                    let mut freq_map = std::collections::HashMap::new();
+                    for t in tokens {
+                        *freq_map.entry(t).or_insert(0u32) += 1;
+                    }
+                    (Some((doc_len, freq_map)), false)
+                }
+            }
+        };
+
+        // Look up the committed index.
+        let committed_idx = {
+            let text_indexes = self.text_indexes.read();
+            text_indexes.get(index_key).cloned()
+        };
+
+        match committed_idx {
+            Some(idx_arc) => {
+                let idx = idx_arc.read();
+                let delta_ref = delta_doc_opt.as_ref().map(|(dl, fm)| (*dl, fm));
+                idx.score_document_visible(node_id, query, epoch, tx, delta_ref, delta_removed)
+            }
+            None => {
+                // No committed index — score only if the node is a delta insert.
+                if delta_removed {
+                    return None;
+                }
+                let (_, freq_map) = delta_doc_opt?;
+                // Build a transient single-document index for scoring.
+                // Re-fetch the raw text from the overlay so we can use `insert`.
+                let raw_text = {
+                    let overlay = self.text_index_overlay.read();
+                    overlay
+                        .get(&tx)
+                        .and_then(|d| d.get(index_key, node_id))
+                        .and_then(|opt| opt.as_deref().map(str::to_owned))
+                };
+                // Suppress unused variable warning; the raw text is only needed if
+                // we can still retrieve it (race-free since we hold no lock here, but
+                // the overlay is append-only within a transaction so it will be present).
+                let _ = freq_map;
+                let text = raw_text?;
+                let mut transient = crate::index::text::InvertedIndex::new(
+                    crate::index::text::BM25Config::default(),
+                );
+                transient.insert(node_id, &text);
+                let score = transient.score_document(node_id, query);
+                if score > 0.0 { Some(score) } else { None }
+            }
+        }
+    }
+
     // === Text-index GC ===
 
     /// Garbage collects versioned postings and aggregate-log entries in all

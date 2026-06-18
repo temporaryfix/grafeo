@@ -536,6 +536,20 @@ impl GraphStoreSearch for CdcGraphStore {
     }
 
     #[cfg(feature = "text-index")]
+    fn score_text_visible(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        property: &str,
+        query: &str,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Option<f64> {
+        self.inner
+            .score_text_visible(node_id, label, property, query, epoch, tx)
+    }
+
+    #[cfg(feature = "text-index")]
     fn text_search(
         &self,
         label: &str,
