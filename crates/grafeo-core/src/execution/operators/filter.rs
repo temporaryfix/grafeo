@@ -3957,22 +3957,139 @@ pub struct FilterOperator {
     child: Box<dyn Operator>,
     /// Predicate to apply.
     predicate: Box<dyn Predicate>,
+    /// Text-index (label, property) pairs whose reads must be recorded for SSI
+    /// anti-phantom detection.  Set by the planner via `with_text_index_reads`
+    /// when the filter carries a `text_match`/`text_score` predicate that was
+    /// NOT pushed down to a `TextScanOperator`.
+    ///
+    /// The recording fires exactly once on the **first execution poll** (or when
+    /// the operator is decomposed for push-based execution), regardless of
+    /// whether any rows are produced.  This is robust to physical-plan caching
+    /// (the operator is freshly polled every execution) and to the 0-row case
+    /// (where the per-row `eval_text_fn` path is never reached).
+    #[cfg(feature = "text-index")]
+    text_index_reads: Vec<(String, String)>,
+    /// Guard: ensures the text-index reads are recorded exactly once.
+    #[cfg(feature = "text-index")]
+    text_reads_recorded: bool,
+    /// Graph store — used only to call `score_text_visible` for index-read
+    /// recording.  `None` when `text_index_reads` is empty (default).
+    #[cfg(feature = "text-index")]
+    text_store: Option<Arc<dyn GraphStoreSearch>>,
+    /// Snapshot epoch for the recording call.  Populated by `with_text_index_reads`.
+    #[cfg(feature = "text-index")]
+    text_epoch: Option<EpochId>,
+    /// Transaction ID for the recording call.  `None` → not Serializable → skip.
+    #[cfg(feature = "text-index")]
+    text_transaction_id: Option<TransactionId>,
 }
 
 impl FilterOperator {
     /// Creates a new filter operator.
     pub fn new(child: Box<dyn Operator>, predicate: Box<dyn Predicate>) -> Self {
-        Self { child, predicate }
+        Self {
+            child,
+            predicate,
+            #[cfg(feature = "text-index")]
+            text_index_reads: Vec::new(),
+            #[cfg(feature = "text-index")]
+            text_reads_recorded: false,
+            #[cfg(feature = "text-index")]
+            text_store: None,
+            #[cfg(feature = "text-index")]
+            text_epoch: None,
+            #[cfg(feature = "text-index")]
+            text_transaction_id: None,
+        }
     }
 
-    /// Decomposes this operator into its child and predicate for push-based conversion.
+    /// Attaches text-index read pairs and the transaction context needed to
+    /// record them at execution time.
+    ///
+    /// Called by the planner instead of the old plan-time side-effect call.
+    /// The `(label, property)` pairs are derived from the complete predicate
+    /// walk in `collect_text_predicate_pairs`.  Recording fires once on the
+    /// first poll (see `record_text_index_reads_once`).
+    #[cfg(feature = "text-index")]
+    pub fn with_text_index_reads(
+        mut self,
+        pairs: Vec<(String, String)>,
+        store: Arc<dyn GraphStoreSearch>,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.text_index_reads = pairs;
+        self.text_store = Some(store);
+        self.text_epoch = Some(epoch);
+        self.text_transaction_id = transaction_id;
+        self
+    }
+
+    /// Fires the text-index read recording exactly once.
+    ///
+    /// Recorded at execution time (first poll), not plan time, so it is robust
+    /// to logical-plan caching and fires per-transaction with live context.
+    ///
+    /// Only records when a Serializable transaction is active
+    /// (`text_transaction_id.is_some()`).  Uses `score_text_visible` with
+    /// `NodeId::INVALID` as a sentinel — the implementation records the index
+    /// read before attempting to look up the node, so the recording fires even
+    /// for a non-existent node ID.
+    #[cfg(feature = "text-index")]
+    pub fn record_text_index_reads_once(&mut self) {
+        if self.text_reads_recorded {
+            return;
+        }
+        self.text_reads_recorded = true;
+
+        let Some(tx) = self.text_transaction_id else {
+            return; // Not Serializable — nothing to record.
+        };
+        let Some(epoch) = self.text_epoch else {
+            return;
+        };
+        let Some(store) = &self.text_store else {
+            return;
+        };
+
+        for (label, property) in &self.text_index_reads {
+            store.score_text_visible(NodeId::INVALID, label, property, "", epoch, tx);
+        }
+    }
+
+    /// Decomposes this operator into its child and predicate for push-based
+    /// conversion.
+    ///
+    /// Fires any pending text-index read recording before decomposition so
+    /// that the recording still happens on the push-pipeline path (where
+    /// `next()` is never called on this operator directly).
     pub fn into_parts(self) -> (Box<dyn Operator>, Box<dyn Predicate>) {
+        // Fire text-index recording for the push-pipeline path.
+        // On the pull path this fires in `next()` instead.
+        #[cfg(feature = "text-index")]
+        {
+            let tx = self.text_transaction_id;
+            let epoch = self.text_epoch;
+            if let (Some(tx), Some(epoch), Some(store)) = (tx, epoch, self.text_store.as_ref())
+                && !self.text_reads_recorded
+            {
+                for (label, property) in &self.text_index_reads {
+                    store.score_text_visible(NodeId::INVALID, label, property, "", epoch, tx);
+                }
+            }
+        }
         (self.child, self.predicate)
     }
 }
 
 impl Operator for FilterOperator {
     fn next(&mut self) -> OperatorResult {
+        // Recorded at execution time (first poll), not plan time, so it is
+        // robust to logical-plan caching and fires per-transaction with live
+        // context.
+        #[cfg(feature = "text-index")]
+        self.record_text_index_reads_once();
+
         loop {
             // Get next chunk from child
             let Some(mut chunk) = self.child.next()? else {
@@ -4015,6 +4132,12 @@ impl Operator for FilterOperator {
 
     fn reset(&mut self) {
         self.child.reset();
+        // Reset the recording guard so a re-executed plan records again on the
+        // next poll (e.g., correlated sub-plans that get reset per outer row).
+        #[cfg(feature = "text-index")]
+        {
+            self.text_reads_recorded = false;
+        }
     }
 
     fn name(&self) -> &'static str {

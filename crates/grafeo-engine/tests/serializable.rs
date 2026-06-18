@@ -2053,3 +2053,223 @@ fn serializable_text_filter_per_row_disjoint_commits() {
         c2
     );
 }
+
+// ============================================================================
+// 24. serializable_text_filter_nested_predicate_phantom_aborts
+// ============================================================================
+
+/// THE nested-predicate phantom hole: `text_match` nested inside `coalesce(…)`
+/// so the OLD incomplete predicate walk missed it.
+///
+/// The old `collect_text_predicate_pairs` only recursed into `Binary` and
+/// `Unary` nodes; it did NOT recurse into `FunctionCall` args, so
+/// `coalesce(text_match(n.body,'phantom term'), false)` was invisible to it
+/// and the 0-row plan-time recording was silently skipped.
+///
+/// Cycle (phantom):
+/// - s1 [Serializable]: `MATCH (n:TxNested) WHERE coalesce(text_match(n.body,'phantom term'), false) RETURN n`
+///   → 0 rows (empty index), but MUST record `IndexId("TxNested:body")`.
+/// - s1 writes sentinel.
+/// - s2 [Serializable]: reads sentinel (s2→s1 rw-edge), then inserts a new
+///   `:TxNested` node matching 'phantom term' (s1→s2 rw-edge via
+///   `buffer_text_index_set`).
+/// - s1 commits first → must succeed.
+/// - s2 commits second → MUST abort (SerializationFailure).
+///
+/// This test FAILS before the execution-time recording + complete walk fix
+/// (the nested text call was invisible to the old plan walk) and PASSES after.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_filter_nested_predicate_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    db.create_text_index("TxNested", "body")
+        .expect("create TxNested:body text index");
+
+    // Seed a sentinel node outside any explicit transaction.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxNestedSentinel {v: 0})")
+        .expect("seed TxNestedSentinel");
+    drop(setup);
+
+    // Both sessions start at the same snapshot epoch.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: text_match nested inside coalesce — the OLD incomplete predicate
+    // walk missed this because it did not recurse into FunctionCall args.
+    // The index is empty → 0 rows; but the recording MUST still happen
+    // after the execution-time fix.
+    let r1 = s1
+        .execute(
+            "MATCH (n:TxNested) \
+             WHERE coalesce(text_match(n.body, 'phantom term'), false) \
+             RETURN n",
+        )
+        .expect("s1: coalesce(text_match(…)) query must not error");
+    assert_eq!(
+        r1.row_count(),
+        0,
+        "s1: empty index → 0 rows; got {}",
+        r1.row_count()
+    );
+
+    // s1 writes sentinel — s2 will read it to close the rw-cycle.
+    s1.execute("MATCH (n:TxNestedSentinel) SET n.v = 99")
+        .expect("s1: SET TxNestedSentinel.v");
+
+    // s2 reads sentinel → records TxNestedSentinel in s2's read-set (s2→s1 edge).
+    let r2 = s2
+        .execute("MATCH (n:TxNestedSentinel) RETURN n.v")
+        .expect("s2: MATCH TxNestedSentinel");
+    assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+    // s2 inserts a new :TxNested node matching s1's search term.
+    // buffer_text_index_set records IndexId("TxNested:body") in s2's write-set,
+    // forming the s1→s2 rw-antidependency edge.
+    s2.execute("CREATE (:TxNested {body: 'phantom term abc'})")
+        .expect("s2: CREATE TxNested node");
+
+    // s1 commits first → must succeed (cycle not confirmed yet).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed; got: {:?}",
+        c1
+    );
+
+    // s2 commits second → MUST abort.
+    // Cycle: s1 read IndexId("TxNested:body") via coalesce(text_match(…))
+    // (s1.out, s2.in) AND s2 read sentinel that s1 wrote (s2.out, s1.in).
+    //
+    // If this assert fails: the nested text_match inside coalesce is still
+    // invisible to the predicate walk — the complete-walk + execution-time
+    // fix has not landed correctly.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (phantom writer concurrent with nested coalesce(text_match(…)) reader) \
+         must abort — if this fails, text_match nested in coalesce is not being \
+         recorded (predicate walk is incomplete or recording is still plan-time)",
+    );
+}
+
+// ============================================================================
+// 25. serializable_text_filter_execution_time_phantom_aborts
+// ============================================================================
+
+/// Proves the execution-time once-per-execution recording arm independently.
+///
+/// Uses a ≥1-row scan so the old per-row `eval_text_fn` path WOULD have
+/// recorded the read for the rows that exist — but this test verifies the
+/// recording comes from the operator's once-per-execution arm, not from
+/// per-row evaluation, by using `text_match(n.body,'phantom term') OR n.flag = true`
+/// (which forces FilterOperator, not TextScanOperator) with a seed node that
+/// has `flag = true` (so rows ARE returned even before any matching text node
+/// exists).  The phantom node inserted by s2 has `flag = false` — it would
+/// NOT have been returned in the original query — so the only way s2 aborts
+/// is if the text-index read was recorded via the once-per-execution arm.
+///
+/// Cycle:
+/// - s1 [Serializable]: query returns the flag=true node (≥1 row); records
+///   `IndexId("TxExecTime:body")` via once-per-execution arm.
+/// - s1 writes sentinel.
+/// - s2 [Serializable]: reads sentinel (s2→s1 rw-edge), then inserts a new
+///   `:TxExecTime` node with body matching 'phantom term' and `flag = false`
+///   (s1→s2 rw-edge).
+/// - s1 commits first → must succeed.
+/// - s2 commits second → MUST abort.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_filter_execution_time_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    db.create_text_index("TxExecTime", "body")
+        .expect("create TxExecTime:body text index");
+
+    // Seed a node with flag=true but no matching text — this ensures the
+    // query returns ≥1 row even before any matching text node exists.
+    let n = db.create_node(&["TxExecTime"]);
+    db.set_node_property(n, "flag", grafeo_common::types::Value::Bool(true));
+    db.set_node_property(
+        n,
+        "body",
+        grafeo_common::types::Value::String("irrelevant content".into()),
+    );
+
+    // Seed a sentinel node outside any explicit transaction.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxExecTimeSentinel {v: 0})")
+        .expect("seed TxExecTimeSentinel");
+    drop(setup);
+
+    // Both sessions start at the same snapshot epoch.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: text_match OR flag=true — the OR prevents TextScanOp pushdown,
+    // so evaluation runs through FilterOperator.  The seeded node has
+    // flag=true → at least one row returned.
+    // The once-per-execution recording arm fires first, recording
+    // IndexId("TxExecTime:body") before any row evaluation.
+    let r1 = s1
+        .execute(
+            "MATCH (n:TxExecTime) WHERE text_match(n.body, 'phantom term') OR n.flag = true \
+             RETURN n",
+        )
+        .expect("s1: text_match OR flag query must not error");
+    assert!(
+        r1.row_count() >= 1,
+        "s1: must see the seeded flag=true node; got {}",
+        r1.row_count()
+    );
+
+    // s1 writes sentinel.
+    s1.execute("MATCH (n:TxExecTimeSentinel) SET n.v = 99")
+        .expect("s1: SET TxExecTimeSentinel.v");
+
+    // s2 reads sentinel → s2→s1 rw-edge.
+    let r2 = s2
+        .execute("MATCH (n:TxExecTimeSentinel) RETURN n.v")
+        .expect("s2: MATCH TxExecTimeSentinel");
+    assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+    // s2 inserts a :TxExecTime node with body matching 'phantom term' and
+    // flag=false.  This node would NOT have appeared in s1's original query
+    // result (flag=false, text index was empty at s1's snapshot) — a true
+    // phantom.  buffer_text_index_set records IndexId("TxExecTime:body") in
+    // s2's write-set → s1→s2 rw-edge.
+    s2.execute("CREATE (:TxExecTime {body: 'phantom term abc', flag: false})")
+        .expect("s2: CREATE TxExecTime node");
+
+    // s1 commits first → must succeed.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed; got: {:?}",
+        c1
+    );
+
+    // s2 commits second → MUST abort.
+    // If this fails, the once-per-execution recording arm is not firing —
+    // the index read was NOT recorded despite the FilterOperator being used.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (phantom writer concurrent with OR-filter text_match reader) \
+         must abort — if this fails, the once-per-execution recording in \
+         FilterOperator is not working (execution-time arm not reached)",
+    );
+}

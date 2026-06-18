@@ -131,16 +131,6 @@ impl super::Planner {
             return Ok(result);
         }
 
-        // Serializable anti-phantom: when pushdown was declined (e.g. the text
-        // predicate is inside OR, or above an expand), proactively record any
-        // text-index reads for the scan variable so that a concurrent phantom
-        // insert can be detected even if the label scan returns 0 rows.
-        //
-        // This mirrors what `search_text_visible` does (records BEFORE any
-        // iteration), but for the per-row FilterOperator path.
-        #[cfg(feature = "text-index")]
-        self.record_text_index_reads_for_serializable(&filter.predicate, &filter.input);
-
         // Plan the input operator first
         let (input_op, columns) = self.plan_operator(&filter.input)?;
 
@@ -164,80 +154,102 @@ impl super::Planner {
         .with_session_context(self.session_context.clone());
 
         // Create the filter operator
-        let operator = Box::new(FilterOperator::new(input_op, Box::new(predicate)));
+        let mut operator = FilterOperator::new(input_op, Box::new(predicate));
 
-        Ok((operator, columns))
-    }
+        // Serializable anti-phantom: carry the (label, property) pairs as data
+        // on the operator so they are recorded at EXECUTION TIME (first poll),
+        // not plan time.  This is robust to logical-plan caching (the operator
+        // is freshly polled every execution) and covers the 0-row case (where
+        // the per-row `eval_text_fn` path is never reached).
+        //
+        // The complete predicate walk (`collect_text_predicate_pairs`) finds
+        // text_match/text_score calls nested inside CASE, coalesce, list
+        // comprehensions, and other expression forms that the old incomplete
+        // walk missed.
+        #[cfg(feature = "text-index")]
+        {
+            let mut raw_pairs: Vec<(String, Option<String>)> = Vec::new();
+            Self::collect_text_predicate_pairs(&filter.predicate, &mut raw_pairs);
 
-    /// Records text-index reads for every `text_match`/`text_score` occurrence
-    /// inside `predicate` when a Serializable transaction is active.
-    ///
-    /// Called on the generic fallthrough FilterOperator path (after all pushdown
-    /// attempts have returned `None`) so that a concurrent phantom insert is
-    /// detected even when the label scan returns 0 rows — mirroring the
-    /// upfront `record_read_index` in `search_text_visible`.
-    ///
-    /// Extracts the label from `input` when it is a bare `NodeScan`; for
-    /// deeper inputs (Expand, etc.) the label is unknown and we skip.
-    #[cfg(feature = "text-index")]
-    fn record_text_index_reads_for_serializable(
-        &self,
-        predicate: &LogicalExpression,
-        input: &LogicalOperator,
-    ) {
-        let Some(tx) = self.transaction_id else {
-            return; // not Serializable
-        };
-        let epoch = self.viewing_epoch;
+            // Resolve (label, property) pairs: only keep pairs for which a
+            // text index actually exists.  The label comes from the NodeScan
+            // input when available; for non-NodeScan inputs (Expand, etc.)
+            // the label is unknown statically and recording is skipped.
+            let label_opt = if let LogicalOperator::NodeScan(scan) = filter.input.as_ref() {
+                scan.label.as_deref()
+            } else {
+                None
+            };
 
-        // Only attempt label-based recording when the input is a bare NodeScan
-        // (label is known statically). Other inputs (Expand, Join) produce rows
-        // with known labels only at runtime.
-        let label_opt = if let LogicalOperator::NodeScan(scan) = input {
-            scan.label.as_deref()
-        } else {
-            None
-        };
-
-        // Recursively walk the predicate collecting all (property, query) pairs
-        // from text_match / text_score calls, then record a read for each one.
-        let mut pairs: Vec<(String, Option<String>)> = Vec::new();
-        Self::collect_text_predicate_pairs(predicate, &mut pairs);
-
-        for (property, _query) in pairs {
             if let Some(label) = label_opt {
-                // If a text index exists for this (label, property) pair, record
-                // the read. Probing `has_text_index` is O(1) (hash-map lookup).
-                if self.store.has_text_index(label, &property) {
-                    let index_key = format!("{label}:{property}");
-                    // Delegate recording through the store (which forwards to the
-                    // registered ReadTracker if one exists for `tx`).
-                    // We call `score_text_visible_impl` with a synthetic node id
-                    // that does NOT exist in the store — the impl records the
-                    // index read first, before looking up the node, so the
-                    // recording still happens even for a missing node.
-                    self.store.score_text_visible(
-                        grafeo_common::types::NodeId::new(u64::MAX),
-                        label,
-                        &property,
-                        "", // empty query: no tokens → scores 0 but recording fires
-                        epoch,
-                        tx,
+                let pairs: Vec<(String, String)> = raw_pairs
+                    .into_iter()
+                    .filter_map(|(property, _query)| {
+                        if self.store.has_text_index(label, &property) {
+                            Some((label.to_string(), property))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !pairs.is_empty() {
+                    operator = operator.with_text_index_reads(
+                        pairs,
+                        Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+                        self.viewing_epoch,
+                        self.transaction_id,
                     );
-                    let _ = index_key; // used implicitly via the store call
                 }
             }
         }
+
+        Ok((Box::new(operator), columns))
     }
 
-    /// Recursively collects `(property_name, query_string)` pairs from
-    /// `text_match` and `text_score` function-call expressions.
+    /// Recursively collects `(label, property)` pairs from every
+    /// `text_match` and `text_score` call reachable from `expr`.
+    ///
+    /// The walk covers **every** expression variant that can syntactically
+    /// contain a sub-expression:
+    ///
+    /// - `Binary` (any op, including `AND`/`OR`) — left and right
+    /// - `Unary` (including `NOT`) — operand
+    /// - `FunctionCall` args — handles `coalesce(text_match(…), …)` and
+    ///   every other function whose argument list may contain a text call
+    /// - `Case` — operand, all when-conditions, all when-results, else-clause
+    /// - `List` items
+    /// - `ListComprehension` — list_expr, filter_expr, map_expr
+    /// - `ListPredicate` — list_expr, predicate
+    /// - `Reduce` — initial, list, expression
+    /// - `IndexAccess` / `SliceAccess` — base (and start/end for slices)
+    /// - `MapProjection` literal entries
+    ///
+    /// Variants that cannot contain a sub-expression (`Literal`, `Variable`,
+    /// `Property`, `Parameter`, `Labels`, `Type`, `Id`) and subquery nodes
+    /// (`ExistsSubquery`, `CountSubquery`, `ValueSubquery`,
+    /// `PatternComprehension`) are left as-is (the subquery interior is a
+    /// separate logical plan, not walked here).
+    ///
+    /// The (label, property) pairs fed into `with_text_index_reads` use the
+    /// property name only; the label is resolved at recording time by
+    /// `score_text_visible`, which checks `has_text_index(label, property)`.
+    /// Because the predicate walk does not know which label the scan variable
+    /// is bound to (that information is in the `NodeScan` input, not the
+    /// predicate itself), we record the property and let the operator's
+    /// recording loop iterate over every registered index that matches.
+    ///
+    /// In practice the planner always knows the label when `input` is a bare
+    /// `NodeScan`; the `(label, property)` representation in the returned
+    /// `Vec` carries the label threaded in from the call site, not from the
+    /// expression itself.
     #[cfg(feature = "text-index")]
     fn collect_text_predicate_pairs(
         expr: &LogicalExpression,
         out: &mut Vec<(String, Option<String>)>,
     ) {
         match expr {
+            // ── Base case: a text function call ──────────────────────────
             LogicalExpression::FunctionCall { name, args, .. }
                 if name == "text_match" || name == "text_score" =>
             {
@@ -252,15 +264,136 @@ impl super::Planner {
                     });
                     out.push((property.clone(), query));
                 }
+                // Also recurse into args in case the text fn is itself an
+                // argument to another function (unusual but possible).
+                for arg in args {
+                    Self::collect_text_predicate_pairs(arg, out);
+                }
             }
+
+            // ── Generic FunctionCall: recurse into all arguments ─────────
+            // Handles coalesce(text_match(…), false), any user-defined fn, etc.
+            LogicalExpression::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_text_predicate_pairs(arg, out);
+                }
+            }
+
+            // ── Binary (AND / OR / comparisons / …) ─────────────────────
             LogicalExpression::Binary { left, right, .. } => {
                 Self::collect_text_predicate_pairs(left, out);
                 Self::collect_text_predicate_pairs(right, out);
             }
+
+            // ── Unary (NOT and others) ────────────────────────────────────
             LogicalExpression::Unary { operand, .. } => {
                 Self::collect_text_predicate_pairs(operand, out);
             }
-            _ => {}
+
+            // ── CASE expression ───────────────────────────────────────────
+            LogicalExpression::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    Self::collect_text_predicate_pairs(op, out);
+                }
+                for (cond, result) in when_clauses {
+                    Self::collect_text_predicate_pairs(cond, out);
+                    Self::collect_text_predicate_pairs(result, out);
+                }
+                if let Some(el) = else_clause {
+                    Self::collect_text_predicate_pairs(el, out);
+                }
+            }
+
+            // ── List literal ─────────────────────────────────────────────
+            LogicalExpression::List(items) => {
+                for item in items {
+                    Self::collect_text_predicate_pairs(item, out);
+                }
+            }
+
+            // ── Map literal ──────────────────────────────────────────────
+            LogicalExpression::Map(entries) => {
+                for (_, v) in entries {
+                    Self::collect_text_predicate_pairs(v, out);
+                }
+            }
+
+            // ── Index / slice access ─────────────────────────────────────
+            LogicalExpression::IndexAccess { base, index } => {
+                Self::collect_text_predicate_pairs(base, out);
+                Self::collect_text_predicate_pairs(index, out);
+            }
+            LogicalExpression::SliceAccess { base, start, end } => {
+                Self::collect_text_predicate_pairs(base, out);
+                if let Some(s) = start {
+                    Self::collect_text_predicate_pairs(s, out);
+                }
+                if let Some(e) = end {
+                    Self::collect_text_predicate_pairs(e, out);
+                }
+            }
+
+            // ── List comprehension ────────────────────────────────────────
+            LogicalExpression::ListComprehension {
+                list_expr,
+                filter_expr,
+                map_expr,
+                ..
+            } => {
+                Self::collect_text_predicate_pairs(list_expr, out);
+                if let Some(f) = filter_expr {
+                    Self::collect_text_predicate_pairs(f, out);
+                }
+                Self::collect_text_predicate_pairs(map_expr, out);
+            }
+
+            // ── List predicate (all/any/none/single) ─────────────────────
+            LogicalExpression::ListPredicate {
+                list_expr,
+                predicate,
+                ..
+            } => {
+                Self::collect_text_predicate_pairs(list_expr, out);
+                Self::collect_text_predicate_pairs(predicate, out);
+            }
+
+            // ── reduce() ─────────────────────────────────────────────────
+            LogicalExpression::Reduce {
+                initial,
+                list,
+                expression,
+                ..
+            } => {
+                Self::collect_text_predicate_pairs(initial, out);
+                Self::collect_text_predicate_pairs(list, out);
+                Self::collect_text_predicate_pairs(expression, out);
+            }
+
+            // ── MapProjection literal entries ─────────────────────────────
+            LogicalExpression::MapProjection { entries, .. } => {
+                for entry in entries {
+                    if let crate::query::plan::MapProjectionEntry::LiteralEntry(_, expr) = entry {
+                        Self::collect_text_predicate_pairs(expr, out);
+                    }
+                }
+            }
+
+            // Leaf nodes and subquery containers — nothing to recurse into.
+            LogicalExpression::Literal(_)
+            | LogicalExpression::Variable(_)
+            | LogicalExpression::Property { .. }
+            | LogicalExpression::Parameter(_)
+            | LogicalExpression::Labels(_)
+            | LogicalExpression::Type(_)
+            | LogicalExpression::Id(_)
+            | LogicalExpression::ExistsSubquery(_)
+            | LogicalExpression::CountSubquery(_)
+            | LogicalExpression::ValueSubquery(_)
+            | LogicalExpression::PatternComprehension { .. } => {}
         }
     }
 
