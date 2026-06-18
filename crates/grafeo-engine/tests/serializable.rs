@@ -1071,3 +1071,352 @@ fn serializable_shortest_path_disjoint_commits() {
         .expect("verify Isolated node");
     assert_eq!(iso.row_count(), 1);
 }
+
+// ============================================================================
+// 12. serializable_graph_algorithm_conflict_aborts
+// ============================================================================
+
+/// A graph algorithm CALL under Serializable isolation participates in SSI
+/// conflict detection: a genuine two-hop write-skew cycle through the
+/// algorithm's read-set causes the second committer to abort.
+///
+/// ## Why this is a two-hop cycle (not a one-hop rw-antidependency)
+///
+/// A single rw-antidependency from s2 to s1 (s2 reads what s1 wrote, or s1
+/// reads what s2 wrote) is NOT enough to abort either committer under F2
+/// incremental SSI. A cycle requires both in_conflict and out_conflict to be
+/// set on the pivot. The classic write-skew structure (see test 10) uses two
+/// crossing rw-edges to form the cycle. We replicate that structure here.
+///
+/// ## Setup
+///
+/// A small three-node graph (`:AlgoSrc`, `:AlgoDst`, `:AlgoMid`) connected by
+/// `ALGOLINK` edges, plus a disjoint `:AlgoSentinel {v: 100}` node. Distinct
+/// labels keep each session's label-scan predicate-precise (scan visits only
+/// that label's nodes).
+///
+/// ## Interleave
+///
+/// Both sessions begin before any commit (same snapshot epoch).
+///
+/// - **s1** (Serializable):
+///   1. `CALL grafeo.pagerank()` — visits ALL graph nodes/edges via
+///      `SnapshotView`; records every node (AlgoSrc, AlgoDst, AlgoMid,
+///      AlgoSentinel) AND every edge in s1's SSI read-set.
+///   2. Writes `AlgoSentinel.v = 99` — at write-time: s2 (active) has
+///      AlgoSentinel in its read-set (from step s2.1) →
+///      rw-edge s2→rw→s1: s2.out_conflict=true, s1.in_conflict=true.
+///
+/// - **s2** (Serializable):
+///   1. Reads `AlgoSentinel.v` — records AlgoSentinel in s2's read-set.
+///   2. Deletes the `ALGOLINK` edge AlgoSrc→AlgoMid — at write-time: s1
+///      (active) has that edge in its read-set (from PageRank traversal) →
+///      rw-edge s1→rw→s2: s1.out_conflict=true, s2.in_conflict=true.
+///
+/// ## rw-antidependency graph
+///
+/// ```text
+/// s1 →rw→ s2  (s1 read ALGOLINK edge; s2 deleted it)
+/// s2 →rw→ s1  (s2 read AlgoSentinel; s1 wrote AlgoSentinel)
+/// ```
+///
+/// Cycle: s1 → s2 → s1.
+///
+/// ## Expected outcome
+///
+/// s1 commits first → Ok (cycle not yet confirmed — s2 not yet committed).
+/// s2 commits second → SerializationFailure (pivot: both flags set, cycle
+/// confirmed via s1's committed AlgoSentinel write in s2's read-set).
+///
+/// If s2 does NOT abort here it means PageRank's reads did not reach the SSI
+/// read-set via SnapshotView — that would be a correctness regression.
+#[cfg(feature = "algos")]
+#[test]
+fn serializable_graph_algorithm_conflict_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed the algorithm's graph and a disjoint sentinel.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:AlgoSrc {id: 1})-[:ALGOLINK]->(:AlgoMid {id: 2})")
+        .expect("seed AlgoSrc-AlgoMid");
+    setup
+        .execute("CREATE (:AlgoMid {id: 2})-[:ALGOLINK]->(:AlgoDst {id: 3})")
+        .expect("seed AlgoMid-AlgoDst");
+    setup
+        .execute("CREATE (:AlgoSentinel {v: 100})")
+        .expect("seed AlgoSentinel");
+    drop(setup);
+
+    // Both sessions begin before any commit (same snapshot epoch).
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: run PageRank — SnapshotView routes every node/edge read through the
+    // versioned + recording API, depositing each visited entity into s1's SSI
+    // read-set.  This includes the ALGOLINK edges and all graph nodes.
+    let r1 = s1
+        .execute("CALL grafeo.pagerank()")
+        .expect("s1: CALL grafeo.pagerank() under Serializable must not error");
+    // At least the seeded nodes must appear in the result.
+    assert!(
+        r1.row_count() >= 3,
+        "s1: PageRank must return at least 3 rows (got {})",
+        r1.row_count()
+    );
+
+    // s2: read AlgoSentinel — records AlgoSentinel in s2's read-set.
+    let r2 = s2
+        .execute("MATCH (n:AlgoSentinel) RETURN n.v")
+        .expect("s2: MATCH AlgoSentinel");
+    assert_eq!(r2.row_count(), 1, "s2 must see the sentinel node");
+
+    // s1: write AlgoSentinel — s2 (active) has AlgoSentinel in its read-set →
+    // write-time detection: rw-edge s2→rw→s1: s2.out_conflict=true,
+    // s1.in_conflict=true.
+    s1.execute("MATCH (n:AlgoSentinel) SET n.v = 99")
+        .expect("s1: SET AlgoSentinel.v");
+
+    // s2: delete an ALGOLINK edge — s1 (active) has that edge in its read-set
+    // from the PageRank traversal → write-time detection: rw-edge s1→rw→s2:
+    // s1.out_conflict=true, s2.in_conflict=true.
+    s2.execute("MATCH (:AlgoSrc {id: 1})-[e:ALGOLINK]->(:AlgoMid) DELETE e")
+        .expect("s2: delete ALGOLINK edge");
+
+    // s1 commits first — must succeed (cycle not confirmed: s2 not yet committed).
+    let c1 = s1.commit();
+    assert!(c1.is_ok(), "s1 (first committer) must succeed: {:?}", c1);
+
+    // s2 commits second — must abort.
+    // s2.out_conflict=true (s2 read AlgoSentinel; s1 wrote AlgoSentinel).
+    // s2.in_conflict=true (s1 read ALGOLINK via PageRank; s2 deleted ALGOLINK).
+    // Cycle check: s1 committed after s2.start_epoch and wrote AlgoSentinel
+    // which is in s2's read-set → cycle confirmed → s2 is the pivot.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (write-skew involving PageRank read-set) must abort with SerializationFailure — \
+         if this passes, SnapshotView is not wiring PageRank reads into the SSI read-set",
+    );
+}
+
+// ============================================================================
+// 13. serializable_graph_algorithm_snapshot_consistent
+// ============================================================================
+
+/// A graph algorithm CALL under Serializable isolation sees a snapshot-
+/// consistent view of the graph: nodes/edges committed AFTER s1's snapshot
+/// epoch are NOT reflected in the algorithm's result.
+///
+/// ## Setup
+///
+/// Seed two nodes (`:SnapBase`) before s1 begins. After s1 begins (but before
+/// s1's algorithm runs), a third node is created and committed by a concurrent
+/// session. The PageRank result must reflect only 2 nodes (the pre-snapshot
+/// topology), not 3.
+///
+/// ## Why this proves snapshot consistency
+///
+/// `SnapshotView.node_ids()` calls `filter_visible_node_ids_versioned`, which
+/// filters to nodes visible at the transaction's `snapshot_epoch`. A node
+/// committed after that epoch is invisible and must therefore not appear in
+/// the algorithm's result.
+#[cfg(feature = "algos")]
+#[test]
+fn serializable_graph_algorithm_snapshot_consistent() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed two pre-snapshot nodes.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:SnapBase {id: 1})")
+        .expect("seed SnapBase node 1");
+    setup
+        .execute("CREATE (:SnapBase {id: 2})")
+        .expect("seed SnapBase node 2");
+    drop(setup);
+
+    // Begin s1 — snapshot taken here (before the post-snapshot node exists).
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    // Concurrent session creates a THIRD node and commits (post-snapshot).
+    let writer = db.session();
+    writer
+        .execute("CREATE (:SnapBase {id: 3})")
+        .expect("writer: CREATE SnapBase node 3");
+    drop(writer);
+
+    // s1 runs PageRank — must observe exactly 2 nodes (pre-snapshot topology).
+    let r1 = s1
+        .execute("CALL grafeo.pagerank()")
+        .expect("s1: CALL grafeo.pagerank() under Serializable must not error");
+
+    // The SnapshotView pins the algorithm to s1's snapshot epoch, so node 3
+    // (committed after s1 began) must be invisible.
+    assert_eq!(
+        r1.row_count(),
+        2,
+        "s1's PageRank must see only the 2 pre-snapshot nodes (snapshot consistency); \
+         got {} rows — post-snapshot node leaked through SnapshotView",
+        r1.row_count()
+    );
+
+    s1.commit()
+        .expect("s1 read-only algorithm commit must succeed");
+}
+
+// ============================================================================
+// 14. serializable_introspection_commits
+// ============================================================================
+
+/// `CALL grafeo.labels()` under Serializable isolation does NOT record per-
+/// entity reads (schema introspection reads `all_labels()`, not individual
+/// node versions), so it forms no rw-antidependencies. Concurrent disjoint
+/// writes from s2 must NOT cause either transaction to abort.
+///
+/// ## Setup
+///
+/// Seed a `:CatalogNode {id: 1}` and a separate `:DisjointNode {id: 99}`.
+///
+/// ## Interleave
+///
+/// - s1 (Serializable): `CALL grafeo.labels()` — catalog read, no per-entity
+///   SSI recording.
+/// - s2 (Serializable): creates a `:DisjointNode {id: 100}` — completely
+///   disjoint from anything s1 read.
+///
+/// ## Expected outcome
+///
+/// Both s1 and s2 must commit (`Ok`). Introspection is safe under Serializable
+/// precisely because it never forms the rw-antidependency edges that trigger
+/// SSI abort.
+#[test]
+fn serializable_introspection_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed some data so `grafeo.labels()` returns a non-empty result.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:CatalogNode {id: 1})")
+        .expect("seed CatalogNode");
+    drop(setup);
+
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: introspection — lists labels present in the graph.
+    // No per-entity reads are recorded into the SSI read-set; all_labels()
+    // has no versioned counterpart and is intentionally not tracked.
+    let r1 = s1
+        .execute("CALL grafeo.labels()")
+        .expect("s1: CALL grafeo.labels() under Serializable must not error");
+    assert!(
+        r1.row_count() >= 1,
+        "s1: labels() must see at least the CatalogNode label (got {} rows)",
+        r1.row_count()
+    );
+
+    // s2: writes a completely disjoint entity — no overlap with s1's read-set.
+    s2.execute("CREATE (:DisjointCatalog {id: 100})")
+        .expect("s2: CREATE DisjointCatalog node");
+
+    // Both must commit: introspection does not record entity reads, so no
+    // rw-antidependency can form between s1 and s2.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (introspection-only Serializable tx) must commit Ok: {:?}",
+        c1
+    );
+
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 (disjoint writer concurrent with introspection) must commit Ok: {:?}",
+        c2
+    );
+
+    // Confirm s2's write persisted.
+    let verifier = db.session();
+    let nodes = verifier
+        .execute("MATCH (n:DisjointCatalog) RETURN n.id")
+        .expect("verify DisjointCatalog");
+    assert_eq!(
+        nodes.row_count(),
+        1,
+        "s2's CREATE must be visible after commit"
+    );
+}
+
+// ============================================================================
+// 15. serializable_vector_search_still_rejected
+// ============================================================================
+
+/// Under Serializable isolation, `CALL grafeo.search.vector(...)` must be
+/// rejected with an error mentioning the procedure is not supported under
+/// Serializable. HNSW index reads cannot be made snapshot-consistent or
+/// recorded into the SSI read-set, so allowing them would silently break
+/// Serializable guarantees.
+///
+/// The rejection is enforced at planning time (the planner checks
+/// `procedure.serializable_safe() == false` and returns an error before
+/// any physical execution occurs).
+///
+/// This test is feature-gated on `vector-index` because `SearchVectorProcedure`
+/// is only compiled and registered when that feature is present. Without it,
+/// the procedure does not exist in the registry and would return "Unknown
+/// procedure" rather than the Serializable rejection.
+#[cfg(feature = "vector-index")]
+#[test]
+fn serializable_vector_search_still_rejected() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed a node so the graph is non-empty; create a vector index so the
+    // procedure can be looked up and reach the Serializable guard.
+    let setup = db.session();
+    let n = db.create_node(&["VecDoc"]);
+    db.set_node_property(
+        n,
+        "emb",
+        grafeo_common::types::Value::Vector(vec![1.0_f32, 0.0_f32, 0.0_f32].into()),
+    );
+    db.create_vector_index("VecDoc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create vector index for test");
+    drop(setup);
+
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    // Attempt a vector search under Serializable — must be rejected at the
+    // planning stage with a message indicating the procedure is not supported
+    // under Serializable isolation.
+    let result = s1.execute("CALL grafeo.search.vector('VecDoc', 'emb', [1.0, 0.0, 0.0], 1)");
+
+    assert!(
+        result.is_err(),
+        "CALL grafeo.search.vector under Serializable must return an error (got Ok)"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("Serializable")
+            || msg.contains("serializable")
+            || msg.contains("search.vector"),
+        "error message must mention Serializable isolation or the procedure name; got: {msg}"
+    );
+
+    // Roll back the aborted session cleanly (no stuck state).
+    drop(s1);
+}
