@@ -1707,3 +1707,187 @@ fn serializable_vector_search_still_rejected() {
     // Roll back the aborted session cleanly (no stuck state).
     drop(s1);
 }
+
+// ============================================================================
+// 20. serializable_text_query_predicate_phantom_aborts
+// ============================================================================
+
+/// THE query-predicate phantom hole: `MATCH (n:L) WHERE text_match(n.prop,'q')`
+/// goes through the threshold-mode `TextScanOp` path, which previously did NOT
+/// record the index read for SSI — so a concurrent phantom insert would NOT be
+/// detected.
+///
+/// ## Setup
+///
+/// Text index on `:TxPredPhantom(title)`.  A sentinel `:TxPredSentinel` node
+/// is seeded so that s2 has something to read without touching the text index.
+///
+/// ## Interleave
+///
+/// ```text
+/// s1 [Serializable]: MATCH (n:TxPredPhantom) WHERE text_match(n.title,'phantom term') RETURN n
+///                    ← threshold-mode TextScanOp records IndexId("TxPredPhantom:title") read
+/// s1 [Serializable]: CREATE (:TxPredSentinel {v: 1})  ← write sentinel
+///
+/// s2 [Serializable]: MATCH (n:TxPredSentinel) RETURN n.v  ← read sentinel
+/// s2 [Serializable]: CREATE (:TxPredPhantom {title: 'phantom term abc'})
+///                    ← records IndexId("TxPredPhantom:title") write
+///
+/// s1.commit() → Ok  (first committer)
+/// s2.commit() → SerializationFailure
+/// ```
+///
+/// ## rw-antidependency cycle
+///
+/// - s1 read the index that s2 wrote → s1 →rw→ s2 (s1.out_conflict, s2.in_conflict)
+/// - s2 read the sentinel that s1 wrote → s2 →rw→ s1 (s2.out_conflict, s1.in_conflict)
+/// - Both transactions have in+out conflict → second committer (s2) is the pivot → abort.
+///
+/// ## Diagnostic note
+///
+/// If s2 does NOT abort, `text_search_with_threshold_visible` is NOT being called
+/// on the production path (the threshold branch in `execute_search` is still routing
+/// to the committed-latest `text_search_with_threshold`).  The fix is to route the
+/// threshold branch to `text_search_with_threshold_visible` when epoch+tx are set.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_query_predicate_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create the text index (empty initially — nodes created in-transaction).
+    db.create_text_index("TxPredPhantom", "title")
+        .expect("create TxPredPhantom:title text index");
+
+    // Seed the sentinel node (pre-snapshot).
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxPredSentinel {v: 0})")
+        .expect("seed TxPredSentinel");
+    drop(setup);
+
+    // Both sessions begin (same snapshot epoch).
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: predicate-path text query — threshold-mode TextScanOp; must record
+    // IndexId("TxPredPhantom:title") in s1's SSI read-set.
+    let r1 = s1
+        .execute("MATCH (n:TxPredPhantom) WHERE text_match(n.title, 'phantom term') RETURN n")
+        .expect("s1: text_match predicate query under Serializable must not error");
+    // Empty index at this point — 0 results is expected and correct.
+    assert_eq!(
+        r1.row_count(),
+        0,
+        "s1: text_match on empty index must return 0 rows; got {}",
+        r1.row_count()
+    );
+
+    // s1: write sentinel — s2 (active) reads it later to close the rw-cycle.
+    s1.execute("MATCH (n:TxPredSentinel) SET n.v = 99")
+        .expect("s1: SET TxPredSentinel.v");
+
+    // s2: read sentinel — records TxPredSentinel in s2's SSI read-set.
+    let r2 = s2
+        .execute("MATCH (n:TxPredSentinel) RETURN n.v")
+        .expect("s2: MATCH TxPredSentinel");
+    assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+    // s2: insert a new TxPredPhantom doc matching s1's search terms.
+    // `buffer_text_index_set` records IndexId("TxPredPhantom:title") in s2's write-set.
+    s2.execute("CREATE (:TxPredPhantom {title: 'phantom term abc'})")
+        .expect("s2: CREATE TxPredPhantom node");
+
+    // s1 commits first → must succeed (s2 not yet committed; cycle not confirmed).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed; got: {:?}",
+        c1
+    );
+
+    // s2 commits second → MUST abort.
+    // Cycle: s1 read index via text_match predicate that s2 wrote (s1.out, s2.in)
+    //        AND s2 read sentinel s1 wrote (s2.out, s1.in).
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (phantom writer concurrent with text_match predicate reader) must abort — \
+         if this fails, text_search_with_threshold_visible is NOT being called on the \
+         threshold-mode TextScanOp path (the query-predicate hole is still open)",
+    );
+}
+
+// ============================================================================
+// 21. serializable_text_query_predicate_disjoint_commits
+// ============================================================================
+
+/// Disjoint text-index scenario via the query-predicate path: s1 uses
+/// `text_match` on `:TxPredDisjA(word)` and s2 writes to `:TxPredDisjB(word)`.
+/// The two indexes have different `IndexId`s → no rw-antidependency → both
+/// transactions MUST commit.
+///
+/// This is the contrast case that proves the abort in
+/// `serializable_text_query_predicate_phantom_aborts` is driven by index
+/// identity, not by a blanket policy.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_query_predicate_disjoint_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create two separate text indexes on different label:property pairs.
+    db.create_text_index("TxPredDisjA", "word")
+        .expect("create TxPredDisjA:word text index");
+    db.create_text_index("TxPredDisjB", "word")
+        .expect("create TxPredDisjB:word text index");
+
+    // Seed a TxPredDisjA node so s1's predicate query returns at least one result.
+    let n = db.create_node(&["TxPredDisjA"]);
+    db.set_node_property(
+        n,
+        "word",
+        grafeo_common::types::Value::String("hello world".into()),
+    );
+
+    // Both sessions begin.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: predicate-path query on TxPredDisjA — records IndexId("TxPredDisjA:word").
+    let r1 = s1
+        .execute("MATCH (n:TxPredDisjA) WHERE text_match(n.word, 'hello') RETURN n")
+        .expect("s1: text_match predicate query TxPredDisjA under Serializable");
+    assert!(
+        r1.row_count() >= 1,
+        "s1: must find the seeded TxPredDisjA node"
+    );
+
+    // s2: write to TxPredDisjB — records IndexId("TxPredDisjB:word") in s2's write-set.
+    s2.execute("CREATE (:TxPredDisjB {word: 'hello universe'})")
+        .expect("s2: CREATE TxPredDisjB node");
+
+    // s1 commits — no rw-antidependency (TxPredDisjA:word ≠ TxPredDisjB:word).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 must commit — no overlap with s2's index write; got: {:?}",
+        c1
+    );
+
+    // s2 commits — same reason.
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 must commit — no overlap with s1's index read; got: {:?}",
+        c2
+    );
+}

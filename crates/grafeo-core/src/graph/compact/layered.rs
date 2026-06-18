@@ -1611,6 +1611,49 @@ impl GraphStoreSearch for LayeredStore {
         results
     }
 
+    #[cfg(feature = "text-index")]
+    fn text_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        let deleted = self.deleted_from_base_nodes.read();
+        let mut results = self.overlay.load().text_search_visible(
+            label,
+            property,
+            query,
+            k + deleted.len(),
+            epoch,
+            tx,
+        );
+        results.retain(|(id, _)| !deleted.contains_key(id));
+        results.truncate(k);
+        results
+    }
+
+    #[cfg(feature = "text-index")]
+    fn text_search_with_threshold_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        let deleted = self.deleted_from_base_nodes.read();
+        let mut results = self
+            .overlay
+            .load()
+            .text_search_with_threshold_visible(label, property, query, threshold, epoch, tx);
+        results.retain(|(id, _)| !deleted.contains_key(id));
+        results
+    }
+
     #[cfg(feature = "vector-index")]
     fn has_vector_index(&self, label: &str, property: &str) -> bool {
         self.overlay.load().has_vector_index(label, property)

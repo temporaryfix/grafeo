@@ -139,7 +139,7 @@ impl TextScanOperator {
         self.executed = true;
 
         self.results = match (self.k, self.threshold, self.epoch, self.transaction_id) {
-            // Serializable path: snapshot-visible search + SSI read recording.
+            // Serializable path: snapshot-visible top-k search + SSI read recording.
             (Some(k), _, Some(epoch), Some(tx)) => self.store.text_search_visible(
                 &self.label,
                 &self.property,
@@ -153,8 +153,18 @@ impl TextScanOperator {
                 self.store
                     .text_search(&self.label, &self.property, &self.query, k)
             }
-            // Threshold mode (no snapshot path for threshold; threshold mode is
-            // not yet used under Serializable).
+            // Serializable threshold path: snapshot-visible + SSI read recording.
+            (None, Some(threshold), Some(epoch), Some(tx)) => {
+                self.store.text_search_with_threshold_visible(
+                    &self.label,
+                    &self.property,
+                    &self.query,
+                    threshold,
+                    epoch,
+                    tx,
+                )
+            }
+            // Committed-latest threshold (SI / RC / no transaction context).
             (None, Some(threshold), _, _) => self.store.text_search_with_threshold(
                 &self.label,
                 &self.property,

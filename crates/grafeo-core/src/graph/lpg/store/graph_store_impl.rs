@@ -446,6 +446,26 @@ impl GraphStoreSearch for LpgStore {
         }
     }
 
+    /// Snapshot-aware threshold BM25 search — records the index read for SSI.
+    ///
+    /// Builds the `"label:property"` index key and delegates to
+    /// [`LpgStore::search_text_with_threshold_visible`], which merges committed
+    /// postings with the per-transaction write delta and records the index read
+    /// in the SSI read-set.
+    #[cfg(feature = "text-index")]
+    fn text_search_with_threshold_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Vec<(grafeo_common::types::NodeId, f64)> {
+        let index_key = format!("{label}:{property}");
+        self.search_text_with_threshold_visible(&index_key, query, threshold, epoch, tx)
+    }
+
     #[cfg(feature = "vector-index")]
     fn has_vector_index(&self, label: &str, property: &str) -> bool {
         self.get_vector_index(label, property).is_some()

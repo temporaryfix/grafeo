@@ -541,6 +541,140 @@ impl InvertedIndex {
         results
     }
 
+    // ── Snapshot threshold search ───────────────────────────────────────────
+
+    /// Searches the index at a specific `(epoch, tx)` snapshot, returning every
+    /// document whose BM25 score meets or exceeds `threshold`.
+    ///
+    /// Mirrors [`search_visible`] but uses a threshold cutoff instead of a top-k
+    /// limit.  Committed postings are filtered by `posting_visible(epoch, tx)`;
+    /// the per-transaction delta is merged so a writer sees its own uncommitted
+    /// inserts/tombstones.
+    ///
+    /// # Parameters
+    ///
+    /// Same as [`search_visible`] except `threshold` replaces `k`.
+    #[must_use]
+    pub fn search_with_threshold_visible(
+        &self,
+        query: &str,
+        threshold: f64,
+        epoch: EpochId,
+        tx: TransactionId,
+        delta_docs: &[(NodeId, String)],
+        delta_removed: &FxHashSet<NodeId>,
+    ) -> Vec<(NodeId, f64)> {
+        let query_tokens = self.tokenizer.tokenize(query);
+        // An empty query or empty corpus never yields results.
+        if query_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        // Build per-delta-doc token maps (identical to search_visible step 1).
+        let delta_token_maps: Vec<(NodeId, HashMap<String, u32>, u32)> = delta_docs
+            .iter()
+            .map(|(node_id, text)| {
+                let tokens = self.tokenizer.tokenize(text);
+                #[allow(clippy::cast_possible_truncation)]
+                let doc_len = tokens.len() as u32;
+                let mut freq_map: HashMap<String, u32> = HashMap::new();
+                for t in tokens {
+                    *freq_map.entry(t).or_insert(0) += 1;
+                }
+                (*node_id, freq_map, doc_len)
+            })
+            .collect();
+
+        // Corpus stats (identical to search_visible step 2).
+        #[allow(clippy::cast_possible_wrap)]
+        let base_n = self.doc_count_at(epoch, tx) as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let base_total = self.total_length_at(epoch, tx) as i64;
+
+        let mut len_adjustment: i64 = 0;
+        let mut count_adjustment: i64 = 0;
+
+        for (node_id, _, delta_len) in &delta_token_maps {
+            let committed_len = self.doc_len_at(*node_id, epoch, tx);
+            if let Some(cl) = committed_len {
+                len_adjustment += i64::from(*delta_len) - i64::from(cl);
+            } else {
+                len_adjustment += i64::from(*delta_len);
+                count_adjustment += 1;
+            }
+        }
+
+        let delta_doc_nodes: FxHashSet<NodeId> =
+            delta_token_maps.iter().map(|(n, _, _)| *n).collect();
+        for &removed_node in delta_removed {
+            if !delta_doc_nodes.contains(&removed_node)
+                && self.doc_len_at(removed_node, epoch, tx).is_some()
+            {
+                let cl = self.doc_len_at(removed_node, epoch, tx).unwrap_or(0);
+                len_adjustment -= i64::from(cl);
+                count_adjustment -= 1;
+            }
+        }
+
+        let n_eff = (base_n + count_adjustment).max(1) as f64;
+        let total_eff = (base_total + len_adjustment).max(0) as f64;
+        let avg_dl_eff = total_eff / n_eff;
+        let avg_dl = if avg_dl_eff <= 0.0 { 1.0 } else { avg_dl_eff };
+
+        // Score candidates (same shape as search_visible step 3, no truncation).
+        let mut scores: HashMap<NodeId, f64> = HashMap::new();
+
+        for token in &query_tokens {
+            let committed_visible_for_term: Vec<&super::versioned::VersionedPosting> = self
+                .postings
+                .get(token.as_str())
+                .map(|pl| {
+                    pl.postings
+                        .iter()
+                        .filter(|p| {
+                            posting_visible(p, epoch, tx)
+                                && !delta_removed.contains(&p.node_id)
+                                && !delta_doc_nodes.contains(&p.node_id)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let delta_hits: Vec<(&NodeId, u32, u32)> = delta_token_maps
+                .iter()
+                .filter_map(|(nid, freq_map, dl)| {
+                    freq_map.get(token.as_str()).map(|&tf| (nid, tf, *dl))
+                })
+                .collect();
+
+            let df = (committed_visible_for_term.len() + delta_hits.len()) as f64;
+            if df == 0.0 {
+                continue;
+            }
+
+            for posting in committed_visible_for_term {
+                let tf = f64::from(posting.term_freq);
+                let dl = f64::from(self.doc_len_at(posting.node_id, epoch, tx).unwrap_or(0));
+                *scores.entry(posting.node_id).or_insert(0.0) +=
+                    self.bm25_term_score(df, tf, dl, n_eff, avg_dl);
+            }
+
+            for (nid, tf, dl) in &delta_hits {
+                let tf_f = f64::from(*tf);
+                let dl_f = f64::from(*dl);
+                *scores.entry(**nid).or_insert(0.0) +=
+                    self.bm25_term_score(df, tf_f, dl_f, n_eff, avg_dl);
+            }
+        }
+
+        let mut results: Vec<(NodeId, f64)> = scores
+            .into_iter()
+            .filter(|(_, score)| *score >= threshold)
+            .collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
     // ── Snapshot search (TI4) ──────────────────────────────────────────────
 
     /// Searches the index at a specific `(epoch, tx)` snapshot, merging the

@@ -320,6 +320,85 @@ impl LpgStore {
         }
     }
 
+    // === Snapshot threshold search (TI-threshold-visible) ===
+
+    /// Searches a text index at `(epoch, tx)` returning every document whose
+    /// BM25 score meets or exceeds `threshold`, and records the index read for
+    /// SSI conflict detection.
+    ///
+    /// Mirrors [`search_text_visible`] exactly, but uses a threshold cutoff
+    /// instead of a top-k limit.  The `index_key` format is `"label:property"`.
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    pub fn search_text_with_threshold_visible(
+        &self,
+        index_key: &str,
+        query: &str,
+        threshold: f64,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Record the index read for anti-phantom SSI — must happen even when
+        // no postings match so that a zero-result threshold scan still closes
+        // the rw-antidependency cycle if a concurrent tx inserts a matching doc.
+        self.record_read_index(tx, index_key);
+
+        // Build delta_docs and delta_removed from the overlay (identical to
+        // search_text_visible).
+        let (delta_docs, delta_removed): (Vec<(NodeId, String)>, FxHashSet<NodeId>) = {
+            let overlay = self.text_index_overlay.read();
+            match overlay.get(&tx) {
+                None => (Vec::new(), FxHashSet::default()),
+                Some(delta) => {
+                    let mut docs = Vec::new();
+                    let mut removed = FxHashSet::default();
+                    for (node_id, opt_text) in delta.changes_for(index_key) {
+                        match opt_text {
+                            Some(text) => docs.push((node_id, text.clone())),
+                            None => {
+                                removed.insert(node_id);
+                            }
+                        }
+                    }
+                    (docs, removed)
+                }
+            }
+        };
+
+        // Look up the committed index.
+        let committed_idx = {
+            let text_indexes = self.text_indexes.read();
+            text_indexes.get(index_key).cloned()
+        };
+
+        match committed_idx {
+            Some(idx_arc) => {
+                let idx = idx_arc.read();
+                idx.search_with_threshold_visible(
+                    query,
+                    threshold,
+                    epoch,
+                    tx,
+                    &delta_docs,
+                    &delta_removed,
+                )
+            }
+            None => {
+                // No committed index — search only the delta docs.
+                if delta_docs.is_empty() {
+                    return Vec::new();
+                }
+                let mut transient = crate::index::text::InvertedIndex::new(
+                    crate::index::text::BM25Config::default(),
+                );
+                for (node_id, text) in &delta_docs {
+                    transient.insert(*node_id, text);
+                }
+                transient.search_with_threshold(query, threshold)
+            }
+        }
+    }
+
     // === Text-index GC ===
 
     /// Garbage collects versioned postings and aggregate-log entries in all

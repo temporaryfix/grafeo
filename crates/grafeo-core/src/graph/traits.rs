@@ -684,6 +684,35 @@ pub trait GraphStoreSearch: GraphStore {
         self.text_search(label, property, query, k)
     }
 
+    /// Snapshot-aware threshold BM25 search for Serializable transactions.
+    ///
+    /// Returns every document visible at `epoch` for `tx` whose BM25 score
+    /// meets or exceeds `threshold`, merging the committed index with the
+    /// per-transaction write delta and recording the index read in the SSI
+    /// read-set so that a concurrent indexed SET on the same `(label, property)`
+    /// can form an rw-antidependency edge.
+    ///
+    /// # Default
+    ///
+    /// Delegates to the committed-latest
+    /// [`text_search_with_threshold`](Self::text_search_with_threshold) so
+    /// non-LPG stores compile and behave unchanged. LPG stores override this to
+    /// call `LpgStore::search_text_with_threshold_visible` which records the
+    /// index read for SSI.
+    #[cfg(feature = "text-index")]
+    fn text_search_with_threshold_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Non-LPG fall-through: committed-latest, no SSI recording.
+        self.text_search_with_threshold(label, property, query, threshold)
+    }
+
     // --- Vector search (HNSW or brute force) ---
 
     /// Returns true if a vector index exists for the given label and property.
