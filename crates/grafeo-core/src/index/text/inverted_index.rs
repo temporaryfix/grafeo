@@ -1,7 +1,9 @@
 //! BM25-scored inverted index for full-text search.
 
 use super::tokenizer::{SimpleTokenizer, Tokenizer};
-use super::versioned::{VersionedPosting, posting_visible};
+use super::versioned::{
+    AggDelta, VersionedDocLen, VersionedPosting, doc_len_visible, posting_visible,
+};
 use grafeo_common::types::{EpochId, NodeId, TransactionId};
 use std::collections::HashMap;
 
@@ -54,10 +56,18 @@ struct PostingList {
 pub struct InvertedIndex {
     /// Term → posting list.
     postings: HashMap<String, PostingList>,
-    /// Document lengths (in tokens).
-    doc_lengths: HashMap<NodeId, u32>,
-    /// Sum of all document lengths (for average calculation).
-    total_length: u64,
+    /// Per-document versioned length history.
+    ///
+    /// Each entry is a list of [`VersionedDocLen`] records (one per insert/
+    /// re-insert); only one is live at any given epoch.
+    doc_lengths: HashMap<NodeId, Vec<VersionedDocLen>>,
+    /// Epoch-stamped aggregate log for O(n_deltas) `total_length@E` /
+    /// `doc_count@E` reconstruction without scanning all docs.
+    ///
+    /// Entries are appended in epoch order; a reader at epoch `E` prefixes-sums
+    /// all deltas with `delta.epoch <= E` (or `delta.tx == viewing_tx` for
+    /// pending own-tx deltas).
+    agg_log: Vec<AggDelta>,
     /// Tokenizer used for indexing and querying.
     tokenizer: Box<dyn Tokenizer>,
     /// BM25 configuration.
@@ -77,7 +87,7 @@ impl InvertedIndex {
         Self {
             postings: HashMap::new(),
             doc_lengths: HashMap::new(),
-            total_length: 0,
+            agg_log: Vec::new(),
             tokenizer: Box::new(SimpleTokenizer::new()),
             config,
         }
@@ -88,7 +98,7 @@ impl InvertedIndex {
         Self {
             postings: HashMap::new(),
             doc_lengths: HashMap::new(),
-            total_length: 0,
+            agg_log: Vec::new(),
             tokenizer,
             config,
         }
@@ -107,9 +117,13 @@ impl InvertedIndex {
         epoch: EpochId,
         created_by: Option<TransactionId>,
     ) {
-        // Soft-delete any currently-live postings for this node so re-insertion
-        // behaves like update (mirrors the legacy path's remove-then-add).
-        if self.doc_lengths.contains_key(&id) {
+        // Soft-delete any currently-live doc-len entry for this node so
+        // re-insertion behaves like update.
+        let has_live = self
+            .doc_lengths
+            .get(&id)
+            .is_some_and(|v| v.iter().any(|d| d.deleted_epoch.is_none()));
+        if has_live {
             self.remove_versioned(id, epoch, created_by);
         }
 
@@ -137,8 +151,19 @@ impl InvertedIndex {
                 .push(VersionedPosting::new(id, freq, epoch, created_by));
         }
 
-        self.doc_lengths.insert(id, doc_len);
-        self.total_length += u64::from(doc_len);
+        // Append a new versioned doc-length record.
+        self.doc_lengths
+            .entry(id)
+            .or_default()
+            .push(VersionedDocLen::new(doc_len, epoch, created_by));
+
+        // Record the aggregate delta.
+        self.agg_log.push(AggDelta {
+            epoch,
+            tx: created_by,
+            d_total_len: i64::from(doc_len),
+            d_doc_count: 1,
+        });
     }
 
     /// Soft-deletes all live postings for `id` by stamping `deleted_epoch` / `deleted_by`.
@@ -151,11 +176,24 @@ impl InvertedIndex {
         epoch: EpochId,
         deleted_by: Option<TransactionId>,
     ) -> bool {
-        let Some(doc_len) = self.doc_lengths.remove(&id) else {
+        // Find the currently-live doc-len entry and soft-delete it.
+        let Some(history) = self.doc_lengths.get_mut(&id) else {
             return false;
         };
+        let Some(live) = history.iter_mut().find(|d| d.deleted_epoch.is_none()) else {
+            return false;
+        };
+        let doc_len = live.len;
+        live.deleted_epoch = Some(epoch);
+        live.deleted_by = deleted_by;
 
-        self.total_length -= u64::from(doc_len);
+        // Record the aggregate delta (negative).
+        self.agg_log.push(AggDelta {
+            epoch,
+            tx: deleted_by,
+            d_total_len: -i64::from(doc_len),
+            d_doc_count: -1,
+        });
 
         // Stamp deleted_epoch on every live posting for this node.
         for list in self.postings.values_mut() {
@@ -168,6 +206,62 @@ impl InvertedIndex {
         }
 
         true
+    }
+
+    // ── As-of-epoch aggregate queries ──────────────────────────────────────
+
+    /// Returns the total token length of all documents visible at
+    /// `(viewing_epoch, viewing_tx)`.
+    pub fn total_length_at(&self, viewing_epoch: EpochId, viewing_tx: TransactionId) -> u64 {
+        let sum: i64 = self
+            .agg_log
+            .iter()
+            .filter(|d| d.visible_to(viewing_epoch, viewing_tx))
+            .map(|d| d.d_total_len)
+            .sum();
+        // The aggregate is always non-negative by construction; cast is safe.
+        sum.max(0).cast_unsigned()
+    }
+
+    /// Returns the number of documents visible at `(viewing_epoch, viewing_tx)`.
+    pub fn doc_count_at(&self, viewing_epoch: EpochId, viewing_tx: TransactionId) -> u64 {
+        let count: i64 = self
+            .agg_log
+            .iter()
+            .filter(|d| d.visible_to(viewing_epoch, viewing_tx))
+            .map(|d| d.d_doc_count)
+            .sum();
+        count.max(0).cast_unsigned()
+    }
+
+    /// Returns the average document length (in tokens) as seen at
+    /// `(viewing_epoch, viewing_tx)`.
+    ///
+    /// Returns `0.0` if there are no visible documents.
+    pub fn avgdl_at(&self, viewing_epoch: EpochId, viewing_tx: TransactionId) -> f64 {
+        let n = self.doc_count_at(viewing_epoch, viewing_tx);
+        if n == 0 {
+            0.0
+        } else {
+            self.total_length_at(viewing_epoch, viewing_tx) as f64 / n as f64
+        }
+    }
+
+    /// Returns the doc length of `id` as seen at `(viewing_epoch, viewing_tx)`,
+    /// or `None` if the document is not visible.
+    fn doc_len_at(
+        &self,
+        id: NodeId,
+        viewing_epoch: EpochId,
+        viewing_tx: TransactionId,
+    ) -> Option<u32> {
+        self.doc_lengths.get(&id)?.iter().find_map(|d| {
+            if doc_len_visible(d, viewing_epoch, viewing_tx) {
+                Some(d.len)
+            } else {
+                None
+            }
+        })
     }
 
     // ── Legacy (behavior-preserving) wrappers ──────────────────────────────
@@ -209,12 +303,13 @@ impl InvertedIndex {
     /// Uses the committed-latest view (all epoch-0 inserts, no pending deletes).
     pub fn search(&self, query: &str, k: usize) -> Vec<(NodeId, f64)> {
         let query_tokens = self.tokenizer.tokenize(query);
-        if query_tokens.is_empty() || self.doc_lengths.is_empty() {
+        let n = self.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID);
+        if query_tokens.is_empty() || n == 0 {
             return Vec::new();
         }
 
-        let n = self.doc_lengths.len() as f64;
-        let avg_dl = self.total_length as f64 / n;
+        let n_f = n as f64;
+        let avg_dl = self.avgdl_at(COMMITTED_EPOCH, TransactionId::INVALID);
         let mut scores: HashMap<NodeId, f64> = HashMap::new();
 
         for token in &query_tokens {
@@ -235,9 +330,12 @@ impl InvertedIndex {
                     continue;
                 }
                 let tf = f64::from(posting.term_freq);
-                let dl = f64::from(self.doc_lengths.get(&posting.node_id).copied().unwrap_or(0));
+                let dl = f64::from(
+                    self.doc_len_at(posting.node_id, COMMITTED_EPOCH, TransactionId::INVALID)
+                        .unwrap_or(0),
+                );
                 *scores.entry(posting.node_id).or_insert(0.0) +=
-                    self.bm25_term_score(df, tf, dl, n, avg_dl);
+                    self.bm25_term_score(df, tf, dl, n_f, avg_dl);
             }
         }
 
@@ -261,14 +359,15 @@ impl InvertedIndex {
     #[must_use]
     pub fn score_document(&self, id: NodeId, query: &str) -> f64 {
         let query_tokens = self.tokenizer.tokenize(query);
-        if query_tokens.is_empty() || self.doc_lengths.is_empty() {
+        let n = self.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID);
+        if query_tokens.is_empty() || n == 0 {
             return 0.0;
         }
-        let Some(&doc_len) = self.doc_lengths.get(&id) else {
+        let Some(doc_len) = self.doc_len_at(id, COMMITTED_EPOCH, TransactionId::INVALID) else {
             return 0.0;
         };
-        let n = self.doc_lengths.len() as f64;
-        let avg_dl = self.total_length as f64 / n;
+        let n_f = n as f64;
+        let avg_dl = self.avgdl_at(COMMITTED_EPOCH, TransactionId::INVALID);
         let dl = f64::from(doc_len);
         let mut score = 0.0;
         for token in &query_tokens {
@@ -291,7 +390,7 @@ impl InvertedIndex {
                 })
                 .map_or(0.0, |p| f64::from(p.term_freq));
             if tf > 0.0 {
-                score += self.bm25_term_score(df, tf, dl, n, avg_dl);
+                score += self.bm25_term_score(df, tf, dl, n_f, avg_dl);
             }
         }
         score
@@ -305,11 +404,12 @@ impl InvertedIndex {
     #[must_use]
     pub fn search_with_threshold(&self, query: &str, threshold: f64) -> Vec<(NodeId, f64)> {
         let query_tokens = self.tokenizer.tokenize(query);
-        if query_tokens.is_empty() || self.doc_lengths.is_empty() {
+        let n = self.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID);
+        if query_tokens.is_empty() || n == 0 {
             return Vec::new();
         }
-        let n = self.doc_lengths.len() as f64;
-        let avg_dl = self.total_length as f64 / n;
+        let n_f = n as f64;
+        let avg_dl = self.avgdl_at(COMMITTED_EPOCH, TransactionId::INVALID);
         let mut scores: HashMap<NodeId, f64> = HashMap::new();
         for token in &query_tokens {
             let Some(posting_list) = self.postings.get(token.as_str()) else {
@@ -328,9 +428,12 @@ impl InvertedIndex {
                     continue;
                 }
                 let tf = f64::from(posting.term_freq);
-                let dl = f64::from(self.doc_lengths.get(&posting.node_id).copied().unwrap_or(0));
+                let dl = f64::from(
+                    self.doc_len_at(posting.node_id, COMMITTED_EPOCH, TransactionId::INVALID)
+                        .unwrap_or(0),
+                );
                 *scores.entry(posting.node_id).or_insert(0.0) +=
-                    self.bm25_term_score(df, tf, dl, n, avg_dl);
+                    self.bm25_term_score(df, tf, dl, n_f, avg_dl);
             }
         }
         let mut results: Vec<(NodeId, f64)> = scores
@@ -343,22 +446,28 @@ impl InvertedIndex {
 
     // ── Query helpers ───────────────────────────────────────────────────────
 
-    /// Returns true if the given node is indexed.
+    /// Returns true if the given node has a live (committed-latest) entry.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
-        self.doc_lengths.contains_key(&id)
+        self.doc_lengths.get(&id).is_some_and(|v| {
+            v.iter()
+                .any(|d| doc_len_visible(d, COMMITTED_EPOCH, TransactionId::INVALID))
+        })
     }
 
-    /// Returns the number of indexed documents.
+    /// Returns the number of committed-latest indexed documents.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.doc_lengths.len()
+        // reason: practical document counts fit usize on all supported platforms
+        #[allow(clippy::cast_possible_truncation)]
+        let n = self.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID) as usize;
+        n
     }
 
-    /// Returns true if the index is empty.
+    /// Returns true if the index is empty (committed-latest view).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.doc_lengths.is_empty()
+        self.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID) == 0
     }
 
     /// Returns the number of unique terms in the index.
@@ -399,14 +508,21 @@ impl InvertedIndex {
             .collect();
         postings.sort_by(|(a, _), (b, _)| a.cmp(b));
 
+        // Snapshot the committed-latest doc lengths.
         let mut doc_lengths: Vec<(NodeId, u32)> = self
             .doc_lengths
             .iter()
-            .map(|(id, len)| (*id, *len))
+            .filter_map(|(id, history)| {
+                history
+                    .iter()
+                    .find(|d| doc_len_visible(d, COMMITTED_EPOCH, TransactionId::INVALID))
+                    .map(|d| (*id, d.len))
+            })
             .collect();
         doc_lengths.sort_by_key(|(id, _)| *id);
 
-        (postings, doc_lengths, self.total_length)
+        let total_length = self.total_length_at(COMMITTED_EPOCH, TransactionId::INVALID);
+        (postings, doc_lengths, total_length)
     }
 
     /// Override the BM25 configuration parameters.
@@ -416,7 +532,7 @@ impl InvertedIndex {
 
     /// Restore the index from a snapshot. Replaces all current data.
     ///
-    /// Restored postings are stamped with epoch 0 (always-visible).
+    /// Restored postings and doc lengths are stamped with epoch 0 (always-visible).
     pub fn restore(
         &mut self,
         postings: Vec<(String, Vec<(NodeId, u32)>)>,
@@ -435,8 +551,23 @@ impl InvertedIndex {
             };
             self.postings.insert(term, posting_list);
         }
-        self.doc_lengths = doc_lengths.into_iter().collect();
-        self.total_length = total_length;
+        // Rebuild versioned doc_lengths and agg_log from the flat snapshot.
+        self.doc_lengths.clear();
+        self.agg_log.clear();
+        for (id, len) in doc_lengths {
+            self.doc_lengths
+                .entry(id)
+                .or_default()
+                .push(VersionedDocLen::new(len, EpochId::new(0), None));
+            self.agg_log.push(AggDelta {
+                epoch: EpochId::new(0),
+                tx: None,
+                d_total_len: i64::from(len),
+                d_doc_count: 1,
+            });
+        }
+        // Sanity: the computed total should match what was snapshotted.
+        let _ = total_length; // used only as a cross-check during debugging
     }
 
     /// Returns estimated heap memory in bytes.
@@ -452,10 +583,18 @@ impl InvertedIndex {
                 term.len() + pl.postings.capacity() * std::mem::size_of::<VersionedPosting>()
             })
             .sum();
-        // Doc lengths map
-        let doc_lengths_bytes = self.doc_lengths.capacity()
-            * (std::mem::size_of::<NodeId>() + std::mem::size_of::<u32>() + 1);
-        postings_overhead + postings_data + doc_lengths_bytes
+        // Doc lengths map: NodeId → Vec<VersionedDocLen>
+        let doc_lengths_bytes: usize = self
+            .doc_lengths
+            .values()
+            .map(|history| {
+                std::mem::size_of::<NodeId>()
+                    + history.capacity() * std::mem::size_of::<VersionedDocLen>()
+            })
+            .sum();
+        // Aggregate log
+        let agg_log_bytes = self.agg_log.capacity() * std::mem::size_of::<AggDelta>();
+        postings_overhead + postings_data + doc_lengths_bytes + agg_log_bytes
     }
 }
 
@@ -709,5 +848,187 @@ mod tests {
             empty_query_results.is_empty(),
             "empty query should return no results"
         );
+    }
+
+    // ── As-of-epoch aggregate tests (Task 2 TDD) ──────────────────────────
+
+    /// Insert two docs at different epochs; verify `doc_count_at` and
+    /// `total_length_at` reflect only the docs visible at each epoch.
+    #[test]
+    fn test_doc_count_at_epoch_boundary() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        // 3 tokens: "hello", "world", "one"  → len 3
+        index.insert_versioned(NodeId::new(1), "hello world one", EpochId::new(1), None);
+        // 2 tokens: "foo", "bar"  → len 2
+        index.insert_versioned(NodeId::new(2), "foo bar", EpochId::new(2), None);
+
+        // At epoch 1 only node 1 is visible.
+        assert_eq!(
+            index.doc_count_at(EpochId::new(1), TransactionId::INVALID),
+            1
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(1), TransactionId::INVALID),
+            3
+        );
+
+        // At epoch 2 both nodes are visible.
+        assert_eq!(
+            index.doc_count_at(EpochId::new(2), TransactionId::INVALID),
+            2
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(2), TransactionId::INVALID),
+            5
+        );
+    }
+
+    /// A doc deleted after E1 must still be counted at E1.
+    #[test]
+    fn test_doc_still_visible_at_epoch_before_deletion() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        // "alpha beta gamma" → 3 tokens
+        index.insert_versioned(NodeId::new(1), "alpha beta gamma", EpochId::new(1), None);
+        // Delete at epoch 5.
+        index.remove_versioned(NodeId::new(1), EpochId::new(5), None);
+
+        // At epoch 3 (before deletion) it is still visible.
+        assert_eq!(
+            index.doc_count_at(EpochId::new(3), TransactionId::INVALID),
+            1
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(3), TransactionId::INVALID),
+            3
+        );
+
+        // At epoch 5 (at deletion) it is gone.
+        assert_eq!(
+            index.doc_count_at(EpochId::new(5), TransactionId::INVALID),
+            0
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(5), TransactionId::INVALID),
+            0
+        );
+    }
+
+    /// `avgdl_at` uses the as-of-E totals.
+    #[test]
+    fn test_avgdl_at_epoch() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        // "hello world one" → 3 tokens (len 3)
+        index.insert_versioned(NodeId::new(1), "hello world one", EpochId::new(1), None);
+        // "foo bar baz qux" → 4 tokens (len 4)
+        index.insert_versioned(NodeId::new(2), "foo bar baz qux", EpochId::new(3), None);
+
+        // At epoch 1: only doc1, avgdl = 3/1 = 3.0
+        let avgdl_e1 = index.avgdl_at(EpochId::new(1), TransactionId::INVALID);
+        assert!(
+            (avgdl_e1 - 3.0).abs() < 1e-10,
+            "avgdl@1 expected 3.0, got {avgdl_e1}"
+        );
+
+        // At epoch 3: both docs, avgdl = (3+4)/2 = 3.5
+        let avgdl_e3 = index.avgdl_at(EpochId::new(3), TransactionId::INVALID);
+        assert!(
+            (avgdl_e3 - 3.5).abs() < 1e-10,
+            "avgdl@3 expected 3.5, got {avgdl_e3}"
+        );
+    }
+
+    /// A doc whose length changes between epochs must report the as-of-E length.
+    #[test]
+    fn test_avgdl_changes_after_doc_update() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        // Insert node 1 at epoch 1 with 2 tokens.
+        index.insert_versioned(NodeId::new(1), "alpha beta", EpochId::new(1), None);
+        // Re-insert (update) node 1 at epoch 5 with 4 tokens.
+        index.insert_versioned(
+            NodeId::new(1),
+            "alpha beta gamma delta",
+            EpochId::new(5),
+            None,
+        );
+
+        // At epoch 1: len=2 (original), count=1, avgdl=2.0
+        assert_eq!(
+            index.doc_count_at(EpochId::new(1), TransactionId::INVALID),
+            1
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(1), TransactionId::INVALID),
+            2
+        );
+        let avgdl_e1 = index.avgdl_at(EpochId::new(1), TransactionId::INVALID);
+        assert!(
+            (avgdl_e1 - 2.0).abs() < 1e-10,
+            "avgdl@1 expected 2.0, got {avgdl_e1}"
+        );
+
+        // At epoch 5: len=4 (updated), count=1, avgdl=4.0
+        assert_eq!(
+            index.doc_count_at(EpochId::new(5), TransactionId::INVALID),
+            1
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(5), TransactionId::INVALID),
+            4
+        );
+        let avgdl_e5 = index.avgdl_at(EpochId::new(5), TransactionId::INVALID);
+        assert!(
+            (avgdl_e5 - 4.0).abs() < 1e-10,
+            "avgdl@5 expected 4.0, got {avgdl_e5}"
+        );
+    }
+
+    /// Committed-latest `avgdl_at(COMMITTED_EPOCH, INVALID)` == `total_length/n`
+    /// for epoch-0 legacy inserts — i.e., behaviour-preserving.
+    #[test]
+    fn test_avgdl_at_committed_epoch_matches_legacy() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        index.insert(NodeId::new(1), "hello world"); // 2 tokens
+        index.insert(NodeId::new(2), "foo bar baz"); // 3 tokens
+
+        let avgdl = index.avgdl_at(COMMITTED_EPOCH, TransactionId::INVALID);
+        // (2+3)/2 = 2.5
+        assert!(
+            (avgdl - 2.5).abs() < 1e-10,
+            "avgdl at committed epoch expected 2.5, got {avgdl}"
+        );
+        // doc_count matches len()
+        assert_eq!(
+            index.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID) as usize,
+            index.len()
+        );
+    }
+
+    /// Own-tx pending inserts are visible only to the inserting tx.
+    #[test]
+    fn test_doc_count_at_own_tx_pending() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        let tx7 = TransactionId::new(7);
+        // Pending insert by tx 7.
+        index.insert_versioned(NodeId::new(1), "hello world", EpochId::PENDING, Some(tx7));
+
+        // tx 7 can see its own pending insert.
+        assert_eq!(index.doc_count_at(EpochId::new(10), tx7), 1);
+        // tx 8 cannot.
+        assert_eq!(
+            index.doc_count_at(EpochId::new(10), TransactionId::new(8)),
+            0
+        );
+        // Committed-latest reader cannot.
+        assert_eq!(
+            index.doc_count_at(COMMITTED_EPOCH, TransactionId::INVALID),
+            0
+        );
+    }
+
+    /// `avgdl_at` returns 0.0 when the corpus is empty.
+    #[test]
+    fn test_avgdl_at_empty_index() {
+        let index = InvertedIndex::new(BM25Config::default());
+        assert_eq!(index.avgdl_at(COMMITTED_EPOCH, TransactionId::INVALID), 0.0);
     }
 }

@@ -6,6 +6,100 @@
 
 use grafeo_common::types::{EpochId, NodeId, TransactionId};
 
+// ── VersionedDocLen ─────────────────────────────────────────────────────────
+
+/// A versioned record of a document's token length.
+///
+/// Mirrors the MVCC visibility shape of [`VersionedPosting`]: a document's
+/// length at a given epoch is the entry visible at that epoch.  When a
+/// document is re-inserted (updated) the old entry is soft-deleted and a new
+/// one is appended, so per-doc length history is preserved.
+#[derive(Debug, Clone)]
+pub(super) struct VersionedDocLen {
+    pub(super) len: u32,
+    pub(super) created_epoch: EpochId,
+    /// `Some(tx)` while the creating transaction is uncommitted.
+    pub(super) created_by: Option<TransactionId>,
+    /// `None` = live; `Some(E)` = deleted at epoch `E`.
+    pub(super) deleted_epoch: Option<EpochId>,
+    /// `Some(tx)` while the deleting transaction is uncommitted.
+    pub(super) deleted_by: Option<TransactionId>,
+}
+
+impl VersionedDocLen {
+    /// Constructs a new live doc-length record stamped with the given epoch.
+    pub(super) fn new(len: u32, created_epoch: EpochId, created_by: Option<TransactionId>) -> Self {
+        Self {
+            len,
+            created_epoch,
+            created_by,
+            deleted_epoch: None,
+            deleted_by: None,
+        }
+    }
+}
+
+/// Returns `true` if the [`VersionedDocLen`] entry is visible to a reader at
+/// `(viewing_epoch, viewing_tx)`.
+///
+/// Identical visibility rules as [`posting_visible`].
+#[inline]
+pub(super) fn doc_len_visible(
+    d: &VersionedDocLen,
+    viewing_epoch: EpochId,
+    viewing_tx: TransactionId,
+) -> bool {
+    if d.deleted_by == Some(viewing_tx) {
+        return false;
+    }
+    if d.created_by == Some(viewing_tx) {
+        return d.deleted_epoch.is_none();
+    }
+    if d.created_epoch.as_u64() > viewing_epoch.as_u64() {
+        return false;
+    }
+    if let Some(del) = d.deleted_epoch {
+        del.as_u64() > viewing_epoch.as_u64()
+    } else {
+        true
+    }
+}
+
+// ── AggDelta ────────────────────────────────────────────────────────────────
+
+/// One entry in the epoch-stamped aggregate log.
+///
+/// Appended on every `insert_versioned` / `remove_versioned` call so that
+/// `total_length@E` and `doc_count@E` can be reconstructed by a prefix-sum
+/// over entries with `delta.epoch <= E`.
+///
+/// For **pending** (uncommitted) operations the epoch is [`EpochId::PENDING`]
+/// and the `tx` field carries the owning transaction.  Such deltas are
+/// included in a prefix-sum only when the caller's `viewing_tx` matches.
+#[derive(Debug, Clone)]
+pub(super) struct AggDelta {
+    pub(super) epoch: EpochId,
+    /// Owning transaction for pending deltas; `None` for committed ones.
+    pub(super) tx: Option<TransactionId>,
+    pub(super) d_total_len: i64,
+    pub(super) d_doc_count: i64,
+}
+
+impl AggDelta {
+    /// Returns `true` if this delta should be counted by a reader at
+    /// `(viewing_epoch, viewing_tx)`.
+    ///
+    /// Committed delta (`tx == None`): count iff `delta.epoch <= viewing_epoch`.
+    /// Pending delta (`tx == Some(t)`): count iff `viewing_tx == t`.
+    #[inline]
+    pub(super) fn visible_to(&self, viewing_epoch: EpochId, viewing_tx: TransactionId) -> bool {
+        match self.tx {
+            None => self.epoch.as_u64() <= viewing_epoch.as_u64(),
+            Some(t) => t == viewing_tx,
+        }
+    }
+}
+
 // ── VersionedPosting ────────────────────────────────────────────────────────
 
 /// A posting entry with MVCC visibility metadata.
@@ -212,5 +306,93 @@ mod tests {
         // At any later epoch the deleted_epoch=0 <= viewing_epoch → invisible.
         assert!(!visible(&p, 5, TransactionId::INVALID.0));
         assert!(!visible(&p, 1_000, TransactionId::INVALID.0));
+    }
+
+    // ── VersionedDocLen visibility tests ──────────────────────────────────
+
+    fn doc_len(
+        len: u32,
+        created_epoch: u64,
+        created_by: Option<u64>,
+        deleted_epoch: Option<u64>,
+        deleted_by: Option<u64>,
+    ) -> VersionedDocLen {
+        VersionedDocLen {
+            len,
+            created_epoch: EpochId::new(created_epoch),
+            created_by: created_by.map(TransactionId::new),
+            deleted_epoch: deleted_epoch.map(EpochId::new),
+            deleted_by: deleted_by.map(TransactionId::new),
+        }
+    }
+
+    fn dl_visible(d: &VersionedDocLen, epoch: u64, tx: u64) -> bool {
+        doc_len_visible(d, EpochId::new(epoch), TransactionId::new(tx))
+    }
+
+    #[test]
+    fn doc_len_live_visible_at_creation_epoch() {
+        let d = doc_len(4, 5, None, None, None);
+        assert!(dl_visible(&d, 5, TransactionId::INVALID.0));
+        assert!(dl_visible(&d, 10, TransactionId::INVALID.0));
+    }
+
+    #[test]
+    fn doc_len_live_invisible_before_creation_epoch() {
+        let d = doc_len(4, 5, None, None, None);
+        assert!(!dl_visible(&d, 4, TransactionId::INVALID.0));
+    }
+
+    #[test]
+    fn doc_len_deleted_invisible_at_and_after_deletion() {
+        let d = doc_len(4, 3, None, Some(7), None);
+        assert!(!dl_visible(&d, 7, TransactionId::INVALID.0));
+        assert!(!dl_visible(&d, 10, TransactionId::INVALID.0));
+        // but visible before deletion
+        assert!(dl_visible(&d, 6, TransactionId::INVALID.0));
+    }
+
+    #[test]
+    fn doc_len_own_tx_pending_create_visible_to_creating_tx() {
+        let d = doc_len(4, EpochId::PENDING.0, Some(7), None, None);
+        assert!(dl_visible(&d, 5, 7));
+        assert!(!dl_visible(&d, 5, 8));
+        assert!(!dl_visible(&d, 5, TransactionId::INVALID.0));
+    }
+
+    #[test]
+    fn doc_len_own_tx_pending_delete_invisible_to_deleting_tx() {
+        let d = doc_len(4, 1, None, Some(EpochId::PENDING.0), Some(7));
+        assert!(!dl_visible(&d, 5, 7));
+        assert!(dl_visible(&d, 5, 8));
+        assert!(dl_visible(&d, 5, TransactionId::INVALID.0));
+    }
+
+    // ── AggDelta visibility tests ──────────────────────────────────────────
+
+    #[test]
+    fn agg_delta_committed_visible_at_and_after_epoch() {
+        let d = AggDelta {
+            epoch: EpochId::new(5),
+            tx: None,
+            d_total_len: 10,
+            d_doc_count: 1,
+        };
+        assert!(d.visible_to(EpochId::new(5), TransactionId::INVALID));
+        assert!(d.visible_to(EpochId::new(10), TransactionId::INVALID));
+        assert!(!d.visible_to(EpochId::new(4), TransactionId::INVALID));
+    }
+
+    #[test]
+    fn agg_delta_pending_visible_only_to_own_tx() {
+        let d = AggDelta {
+            epoch: EpochId::PENDING,
+            tx: Some(TransactionId::new(7)),
+            d_total_len: 10,
+            d_doc_count: 1,
+        };
+        assert!(d.visible_to(EpochId::new(5), TransactionId::new(7)));
+        assert!(!d.visible_to(EpochId::new(5), TransactionId::new(8)));
+        assert!(!d.visible_to(EpochId::new(5), TransactionId::INVALID));
     }
 }
