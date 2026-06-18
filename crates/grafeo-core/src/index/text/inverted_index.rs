@@ -265,6 +265,102 @@ impl InvertedIndex {
         })
     }
 
+    // ── Garbage collection ─────────────────────────────────────────────────
+
+    /// Garbage collects versioned postings and aggregate-log entries that are
+    /// no longer needed by any active snapshot.
+    ///
+    /// # What is collected
+    ///
+    /// A `VersionedPosting` is dead weight once its `deleted_epoch` is a
+    /// committed value (not `PENDING`) that is **at or below `horizon`**: the
+    /// deletion committed before any live transaction could have started, so no
+    /// reader will ever ask "was this doc visible at an epoch before its
+    /// deletion?"
+    ///
+    /// Concretely, a posting is removed when:
+    ///   `deleted_epoch == Some(d)` where `d != EpochId::PENDING`
+    ///     **and** `d.as_u64() <= horizon.as_u64()`
+    ///
+    /// Live postings (`deleted_epoch == None`) and postings deleted **above**
+    /// the horizon are always retained.
+    ///
+    /// The same rule applies to `VersionedDocLen` entries.
+    ///
+    /// Empty posting lists and `doc_lengths` entries are pruned after removal.
+    ///
+    /// # Aggregate log compaction
+    ///
+    /// All `AggDelta` entries with `epoch <= horizon` and `tx == None`
+    /// (committed, no pending tx) are folded into a single base entry stamped
+    /// at `horizon` (or `EpochId::new(0)` to remain visible to all epochs >=
+    /// horizon).  Entries above the horizon or with a pending `tx` are kept
+    /// verbatim.  The prefix-sum invariant is preserved: for any `E >= horizon`
+    /// the new log yields the same `total_length_at(E)` / `doc_count_at(E)`.
+    ///
+    /// Pending (`tx == Some(...)`) entries are never touched — they are owned
+    /// by in-flight transactions.
+    pub fn gc(&mut self, horizon: EpochId) {
+        let h = horizon.as_u64();
+
+        // ── 1. GC posting lists ────────────────────────────────────────────
+        self.postings.retain(|_, list| {
+            list.postings.retain(|p| {
+                // Keep if: live, or deleted ABOVE horizon, or deleted by PENDING tx.
+                match p.deleted_epoch {
+                    None => true, // live — never drop
+                    Some(d) => {
+                        // Keep if PENDING or deleted strictly above the horizon.
+                        d == EpochId::PENDING || d.as_u64() > h
+                    }
+                }
+            });
+            !list.postings.is_empty()
+        });
+
+        // ── 2. GC doc_lengths ──────────────────────────────────────────────
+        self.doc_lengths.retain(|_, history| {
+            history.retain(|d| match d.deleted_epoch {
+                None => true,
+                Some(del) => del == EpochId::PENDING || del.as_u64() > h,
+            });
+            !history.is_empty()
+        });
+
+        // ── 3. Compact the aggregate log ───────────────────────────────────
+        // Fold all committed deltas at or below `horizon` into a single base
+        // entry.  Pending (`tx == Some(...)`) entries and committed entries
+        // above `horizon` are kept verbatim.
+        let mut base_total: i64 = 0;
+        let mut base_count: i64 = 0;
+        let mut above: Vec<AggDelta> = Vec::new();
+
+        for delta in std::mem::take(&mut self.agg_log) {
+            if delta.tx.is_none() && delta.epoch.as_u64() <= h {
+                // Committed at or below horizon — fold into base.
+                base_total += delta.d_total_len;
+                base_count += delta.d_doc_count;
+            } else {
+                // Above horizon or pending — keep verbatim.
+                above.push(delta);
+            }
+        }
+
+        // Rebuild the log: base entry first (if non-zero), then the rest.
+        // Stamp the base at epoch 0 so it is visible to every E >= 0
+        // (i.e., every committed-latest or snapshot reader at any epoch >=
+        // horizon will include it in their prefix-sum).
+        if base_total != 0 || base_count != 0 {
+            self.agg_log.push(AggDelta {
+                epoch: EpochId::new(0),
+                tx: None,
+                d_total_len: base_total,
+                d_doc_count: base_count,
+            });
+        }
+        self.agg_log.extend(above);
+    }
+
     // ── Legacy (behavior-preserving) wrappers ──────────────────────────────
 
     /// Indexes a document (node text) into the inverted index.
@@ -1206,5 +1302,172 @@ mod tests {
     fn test_avgdl_at_empty_index() {
         let index = InvertedIndex::new(BM25Config::default());
         assert_eq!(index.avgdl_at(COMMITTED_EPOCH, TransactionId::INVALID), 0.0);
+    }
+
+    // ── GC tests (Task 6 TDD) ──────────────────────────────────────────────
+
+    /// `gc(horizon)` drops postings for a doc that was fully deleted below the
+    /// horizon, but keeps postings for docs deleted ABOVE the horizon (a snapshot
+    /// at horizon–1 still needs them) and for live (never-deleted) docs.
+    ///
+    /// The aggregate log after `gc` still yields the correct `avgdl_at(E)` for
+    /// any `E >= horizon`.
+    #[test]
+    fn gc_drops_postings_deleted_below_horizon() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        // Doc 1 inserted at E1=1, removed at E2=3. horizon=E3=10 (>= E2).
+        let e1 = EpochId::new(1);
+        let e2 = EpochId::new(3);
+        let e3 = EpochId::new(10);
+        // Doc 2 inserted at E1=1, removed at E4=20 (above the horizon E3=10).
+        let e4 = EpochId::new(20);
+        // Doc 3 inserted at E1=1, never deleted — always live.
+
+        index.insert_versioned(NodeId::new(1), "hello world", e1, None);
+        index.insert_versioned(NodeId::new(2), "foo bar baz", e1, None);
+        index.insert_versioned(NodeId::new(3), "live forever doc", e1, None);
+
+        index.remove_versioned(NodeId::new(1), e2, None); // deleted below horizon
+        index.remove_versioned(NodeId::new(2), e4, None); // deleted ABOVE horizon
+
+        // Before gc: all posting lists exist.
+        assert!(
+            index
+                .postings
+                .values()
+                .any(|pl| pl.postings.iter().any(|p| p.node_id == NodeId::new(1)))
+        );
+
+        // gc with horizon = e3 (>= e2, < e4).
+        index.gc(e3);
+
+        // Doc 1 postings MUST be gone (deleted_epoch=3 <= horizon=10).
+        for pl in index.postings.values() {
+            for p in &pl.postings {
+                assert_ne!(
+                    p.node_id,
+                    NodeId::new(1),
+                    "doc 1 posting must be removed after gc below horizon"
+                );
+            }
+        }
+
+        // Doc 2 postings MUST still be present (deleted_epoch=20 > horizon=10).
+        let doc2_present = index
+            .postings
+            .values()
+            .any(|pl| pl.postings.iter().any(|p| p.node_id == NodeId::new(2)));
+        assert!(
+            doc2_present,
+            "doc 2 posting must be retained — still snapshot-visible below horizon"
+        );
+
+        // Doc 3 postings MUST still be present (live, no deleted_epoch).
+        let doc3_present = index
+            .postings
+            .values()
+            .any(|pl| pl.postings.iter().any(|p| p.node_id == NodeId::new(3)));
+        assert!(doc3_present, "live doc 3 must never be dropped by gc");
+
+        // Doc 1 doc_lengths entry MUST be gone.
+        assert!(
+            index
+                .doc_lengths
+                .get(&NodeId::new(1))
+                .map_or(true, |v| v.is_empty()),
+            "doc 1 doc_lengths entry must be removed after gc"
+        );
+
+        // Aggregate at horizon and above must still be correct.
+        // At e3=10: doc1 deleted at e2=3 (not visible), doc2 deleted at e4=20 (visible),
+        // doc3 live → 2 docs, total_len = "foo bar baz"(3) + "live forever doc"(3) = 6.
+        let count_at_e3 = index.doc_count_at(e3, TransactionId::INVALID);
+        assert_eq!(count_at_e3, 2, "doc_count_at(e3) must be 2 after gc");
+        let total_at_e3 = index.total_length_at(e3, TransactionId::INVALID);
+        assert_eq!(total_at_e3, 6, "total_length_at(e3) must be 6 after gc");
+    }
+
+    /// After `gc(horizon)` with `horizon < deletion_epoch`, the posting is KEPT:
+    /// a snapshot at any epoch between insert and delete still needs to see it.
+    #[test]
+    fn gc_keeps_posting_deleted_above_horizon() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+        let e1 = EpochId::new(1);
+        let e5 = EpochId::new(5);
+        let e2 = EpochId::new(2); // horizon below deletion
+
+        index.insert_versioned(NodeId::new(99), "keep me please", e1, None);
+        index.remove_versioned(NodeId::new(99), e5, None); // deleted at 5
+
+        index.gc(e2); // horizon = 2, below deletion epoch 5
+
+        // Posting must still be present.
+        let present = index
+            .postings
+            .values()
+            .any(|pl| pl.postings.iter().any(|p| p.node_id == NodeId::new(99)));
+        assert!(present, "posting deleted above horizon must be retained");
+    }
+
+    /// `gc(horizon)` compacts the aggregate log: after compaction,
+    /// `doc_count_at(E)` and `total_length_at(E)` for `E >= horizon` equal the
+    /// pre-gc values, and for `E < horizon` the aggregate log returns a
+    /// consistent (collapsed) prefix.
+    #[test]
+    fn gc_compacts_aggregate_log() {
+        let mut index = InvertedIndex::new(BM25Config::default());
+
+        // Insert/remove several docs across multiple epochs.
+        for i in 1u64..=5 {
+            index.insert_versioned(
+                NodeId::new(i),
+                &format!("document {i} with some words"),
+                EpochId::new(i),
+                None,
+            );
+        }
+        // Remove doc 1 and doc 2 at epoch 6.
+        index.remove_versioned(NodeId::new(1), EpochId::new(6), None);
+        index.remove_versioned(NodeId::new(2), EpochId::new(6), None);
+
+        let horizon = EpochId::new(6);
+
+        // Capture pre-gc aggregate values at and above horizon.
+        let pre_count_at_h = index.doc_count_at(horizon, TransactionId::INVALID);
+        let pre_total_at_h = index.total_length_at(horizon, TransactionId::INVALID);
+        let pre_count_at_100 = index.doc_count_at(EpochId::new(100), TransactionId::INVALID);
+        let pre_total_at_100 = index.total_length_at(EpochId::new(100), TransactionId::INVALID);
+
+        let pre_agg_len = index.agg_log.len();
+
+        index.gc(horizon);
+
+        let post_agg_len = index.agg_log.len();
+        assert!(
+            post_agg_len < pre_agg_len,
+            "gc must compact the aggregate log (pre={pre_agg_len}, post={post_agg_len})"
+        );
+
+        // Aggregate values at and above horizon must be preserved.
+        assert_eq!(
+            index.doc_count_at(horizon, TransactionId::INVALID),
+            pre_count_at_h,
+            "doc_count_at(horizon) must be preserved"
+        );
+        assert_eq!(
+            index.total_length_at(horizon, TransactionId::INVALID),
+            pre_total_at_h,
+            "total_length_at(horizon) must be preserved"
+        );
+        assert_eq!(
+            index.doc_count_at(EpochId::new(100), TransactionId::INVALID),
+            pre_count_at_100,
+            "doc_count_at(100) must be preserved"
+        );
+        assert_eq!(
+            index.total_length_at(EpochId::new(100), TransactionId::INVALID),
+            pre_total_at_100,
+            "total_length_at(100) must be preserved"
+        );
     }
 }

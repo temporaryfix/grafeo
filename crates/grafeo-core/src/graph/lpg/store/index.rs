@@ -320,6 +320,23 @@ impl LpgStore {
         }
     }
 
+    // === Text-index GC ===
+
+    /// Garbage collects versioned postings and aggregate-log entries in all
+    /// text indexes that are no longer visible to any snapshot at or above
+    /// `horizon`.
+    ///
+    /// Mirrors the per-field version-chain GC in `gc_versions`: the caller
+    /// (the db-level `gc()`) provides the `min_active_epoch` so the text
+    /// indexes compact in lock-step with the rest of the MVCC store.
+    #[cfg(feature = "text-index")]
+    pub fn gc_text_indexes(&self, horizon: EpochId) {
+        let indexes = self.text_indexes.read();
+        for idx in indexes.values() {
+            idx.write().gc(horizon);
+        }
+    }
+
     // === Snapshot text search (TI4) ===
 
     /// Searches a text index at `(epoch, tx)`, merging committed postings with
