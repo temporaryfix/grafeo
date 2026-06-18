@@ -614,6 +614,26 @@ pub trait GraphStoreSearch: GraphStore {
         false
     }
 
+    /// Returns the labels of every text index registered for the given property.
+    ///
+    /// Iterates all `"label:property"` index keys, splits on the last `':'`,
+    /// and collects the label part for every entry whose property component
+    /// matches `property`.
+    ///
+    /// Used by the Serializable exec-time predicate recorder to record
+    /// `(label, property)` index reads for **every** label that indexes the
+    /// queried property — not just the scan label.  This closes the multi-label
+    /// phantom hole where the scan label (`Tagged`) has no text index on
+    /// `body` but a concurrent insert writes a node labelled `:Article:Tagged`
+    /// whose `Article:body` index write goes undetected.
+    ///
+    /// Default implementation returns `Vec::new()` (no text indexes).
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    fn text_index_labels_for_property(&self, _property: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Scores a single document against a text query for per-row filter evaluation.
     ///
     /// Returns `None` when no text index exists for the (label, property) pair.

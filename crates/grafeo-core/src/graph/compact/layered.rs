@@ -1567,6 +1567,11 @@ impl GraphStoreSearch for LayeredStore {
     }
 
     #[cfg(feature = "text-index")]
+    fn text_index_labels_for_property(&self, property: &str) -> Vec<String> {
+        self.overlay.load().text_index_labels_for_property(property)
+    }
+
+    #[cfg(feature = "text-index")]
     fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
         if self.is_node_deleted_from_base(node_id) {
             return None;

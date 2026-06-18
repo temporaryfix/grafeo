@@ -2273,3 +2273,197 @@ fn serializable_text_filter_execution_time_phantom_aborts() {
          FilterOperator is not working (execution-time arm not reached)",
     );
 }
+
+// ============================================================================
+// 26. serializable_text_multilabel_zero_row_phantom_aborts
+// ============================================================================
+
+/// THE multi-label 0-row phantom hole: the exec-time recorder previously used
+/// only the NodeScan label (`Tagged`) to gate index-recording, so if `Tagged`
+/// had no text index on `body` the recorder recorded nothing — even though a
+/// matching node could carry label `:Article:Tagged` whose `Article:body` index
+/// WOULD be written to by the phantom inserter.
+///
+/// ## Setup
+///
+/// Text index on `(Article, body)` ONLY — `Tagged` has NO index on `body`.
+///
+/// ## Interleave
+///
+/// ```text
+/// s1 [Serializable]: MATCH (n:Tagged) WHERE text_match(n.body,'phantom term') RETURN n
+///                    ← scan label is `Tagged`, which has no index on `body`
+///                    ← 0 rows (empty or no-match)
+///                    ← OLD recorder: records nothing (scan-label-gated)
+///                    ← NEW recorder: records IndexId("Article:body") because
+///                                    `text_index_labels_for_property("body")`
+///                                    enumerates ALL labels with a `body` index
+/// s1 [Serializable]: SET sentinel.v = 99  ← write sentinel
+///
+/// s2 [Serializable]: MATCH (n:TxMLSentinel) RETURN n.v  ← read sentinel → s2→s1
+/// s2 [Serializable]: CREATE (:Article:Tagged {body: 'phantom term xyz'})
+///                    ← `buffer_text_index_set` records IndexId("Article:body") → s1→s2
+///
+/// s1.commit() → Ok
+/// s2.commit() → SerializationFailure  (NEW: s1 read index s2 wrote)
+/// ```
+///
+/// This test FAILS before the property-driven fix (records nothing for `Tagged:body`)
+/// and PASSES after (records `Article:body` via `text_index_labels_for_property`).
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_multilabel_zero_row_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Text index on Article:body ONLY — Tagged has NO index on body.
+    db.create_text_index("Article", "body")
+        .expect("create Article:body text index");
+
+    // Seed the sentinel node (pre-snapshot) so s2 can close the rw-cycle.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxMLSentinel {v: 0})")
+        .expect("seed TxMLSentinel");
+    drop(setup);
+
+    // Both sessions begin at the same snapshot epoch.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: scan label is `Tagged` which has NO text index on `body`.
+    // Under the old recorder (scan-label-gated) this records NOTHING.
+    // Under the new recorder (property-driven) this records IndexId("Article:body")
+    // because text_index_labels_for_property("body") returns ["Article"].
+    // The index is empty at this point → 0 rows is expected.
+    let r1 = s1
+        .execute("MATCH (n:Tagged) WHERE text_match(n.body, 'phantom term') RETURN n")
+        .expect("s1: text_match on Tagged (no index) must not error");
+    assert_eq!(
+        r1.row_count(),
+        0,
+        "s1: no Tagged nodes with matching body → 0 rows; got {}",
+        r1.row_count()
+    );
+
+    // s1: write sentinel — s2 will read it to close the rw-cycle.
+    s1.execute("MATCH (n:TxMLSentinel) SET n.v = 99")
+        .expect("s1: SET TxMLSentinel.v");
+
+    // s2: read sentinel — records TxMLSentinel in s2's read-set (s2→s1 edge).
+    let r2 = s2
+        .execute("MATCH (n:TxMLSentinel) RETURN n.v")
+        .expect("s2: MATCH TxMLSentinel");
+    assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+    // s2: insert a node labelled BOTH :Article:Tagged with matching body.
+    // `buffer_text_index_set` records IndexId("Article:body") in s2's write-set
+    // (the Article label has the index), forming the s1→s2 rw-antidependency.
+    s2.execute("CREATE (:Article:Tagged {body: 'phantom term xyz'})")
+        .expect("s2: CREATE Article:Tagged node");
+
+    // s1 commits first → must succeed (s2 not yet committed; cycle not confirmed).
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 (first committer) must succeed; got: {:?}",
+        c1
+    );
+
+    // s2 commits second → MUST abort.
+    // Cycle: s1 read IndexId("Article:body") via text_match predicate on Tagged
+    //        (s1.out → s2.in) AND s2 read sentinel s1 wrote (s2.out → s1.in).
+    //
+    // If this fails: the exec-time recorder is still gated on the scan label
+    // (Tagged) rather than walking all labels that have an index on body.
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (phantom writer with Article:Tagged node concurrent with Tagged:body text_match \
+         reader) must abort — if this fails, the exec-time recorder is still scan-label-gated \
+         and does not enumerate all labels with a text index on the predicate property",
+    );
+}
+
+// ============================================================================
+// 27. serializable_text_multilabel_no_index_on_property_commits
+// ============================================================================
+
+/// Disjoint case: text index on `(Article, body)`, T1 queries on property
+/// `title` — NO index on `title` anywhere.  T2 writes `body` but NOT `title`.
+/// → Records nothing for `title`; both sessions commit (no false abort).
+///
+/// This proves the property-driven recorder does not generate false aborts when
+/// the predicate property has no text index registered anywhere in the store.
+#[cfg(feature = "text-index")]
+#[test]
+fn serializable_text_multilabel_no_index_on_property_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Text index on Article:body ONLY — no index on any label's title property.
+    db.create_text_index("Article", "body")
+        .expect("create Article:body text index");
+
+    // Seed a node so the store is non-empty.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:TxMLNoIdx {body: 'some content'})")
+        .expect("seed TxMLNoIdx");
+    drop(setup);
+
+    // Both sessions begin.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // s1: query on property `title` — no text index on title anywhere.
+    // text_index_labels_for_property("title") returns [] → records nothing.
+    let r1 = s1
+        .execute("MATCH (n:Tagged) WHERE text_match(n.title, 'phantom term') RETURN n")
+        .expect("s1: text_match on title (no index anywhere) must not error");
+    assert_eq!(
+        r1.row_count(),
+        0,
+        "s1: no Tagged nodes with matching title → 0 rows; got {}",
+        r1.row_count()
+    );
+
+    // s1: write something so we can detect if s2 was incorrectly aborted.
+    s1.execute("MATCH (n:TxMLNoIdx) SET n.x = 1")
+        .expect("s1: SET TxMLNoIdx.x");
+
+    // s2: read TxMLNoIdx (s2→s1 rw-edge if s1 wrote it).
+    let r2 = s2
+        .execute("MATCH (n:TxMLNoIdx) RETURN n.body")
+        .expect("s2: MATCH TxMLNoIdx");
+    assert_eq!(r2.row_count(), 1, "s2: must see the TxMLNoIdx node");
+
+    // s2: write to body — records IndexId("Article:body"), but s1 never read
+    // Article:body (it queried title, for which there is no index).
+    s2.execute("CREATE (:Article {body: 'new article body'})")
+        .expect("s2: CREATE Article node");
+
+    // s1 commits first — no rw-antidependency from s1's side for title.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 must commit — title has no text index so no index read was recorded; got: {:?}",
+        c1
+    );
+
+    // s2 commits — same reason (no matching index read in s1's read-set).
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 must commit — no rw-antidependency; title index does not exist; got: {:?}",
+        c2
+    );
+}

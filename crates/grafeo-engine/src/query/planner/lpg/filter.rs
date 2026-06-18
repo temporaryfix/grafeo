@@ -166,41 +166,44 @@ impl super::Planner {
         // text_match/text_score calls nested inside CASE, coalesce, list
         // comprehensions, and other expression forms that the old incomplete
         // walk missed.
+        //
+        // MULTI-LABEL FIX: record by PROPERTY, not by scan label.
+        //
+        // The old recorder gated recording on `has_text_index(scan_label, prop)`.
+        // That missed the case where the scan label (`Tagged`) has no text index
+        // on `prop`, but a concurrent writer inserts a multi-label node
+        // (`:Article:Tagged`) whose `Article:prop` index IS written.
+        //
+        // The fix: for each text predicate property, enumerate EVERY label that
+        // has a text index on that property via `text_index_labels_for_property`.
+        // Record (label, property) for each such label, independent of the scan
+        // label.  This is sound: the read set is a HashSet, so the per-row
+        // `eval_text_fn` path (which records the matching node's actual label)
+        // is idempotent and harmless when it overlaps.
         #[cfg(feature = "text-index")]
         {
             let mut raw_pairs: Vec<(String, Option<String>)> = Vec::new();
             Self::collect_text_predicate_pairs(&filter.predicate, &mut raw_pairs);
 
-            // Resolve (label, property) pairs: only keep pairs for which a
-            // text index actually exists.  The label comes from the NodeScan
-            // input when available; for non-NodeScan inputs (Expand, etc.)
-            // the label is unknown statically and recording is skipped.
-            let label_opt = if let LogicalOperator::NodeScan(scan) = filter.input.as_ref() {
-                scan.label.as_deref()
-            } else {
-                None
-            };
-
-            if let Some(label) = label_opt {
-                let pairs: Vec<(String, String)> = raw_pairs
-                    .into_iter()
-                    .filter_map(|(property, _query)| {
-                        if self.store.has_text_index(label, &property) {
-                            Some((label.to_string(), property))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !pairs.is_empty() {
-                    operator = operator.with_text_index_reads(
-                        pairs,
-                        Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
-                        self.viewing_epoch,
-                        self.transaction_id,
-                    );
+            // For each predicate property, record every (label, property) pair
+            // for which a text index exists — independent of the scan label.
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for (property, _query) in raw_pairs {
+                for label in self.store.text_index_labels_for_property(&property) {
+                    pairs.push((label, property.clone()));
                 }
+            }
+            // Deduplicate (same (label, property) from multiple predicates).
+            pairs.sort_unstable();
+            pairs.dedup();
+
+            if !pairs.is_empty() {
+                operator = operator.with_text_index_reads(
+                    pairs,
+                    Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+                    self.viewing_epoch,
+                    self.transaction_id,
+                );
             }
         }
 

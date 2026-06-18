@@ -388,6 +388,28 @@ impl GraphStoreSearch for LpgStore {
         self.get_text_index(label, property).is_some()
     }
 
+    /// Returns the label part of every `"label:property"` index key whose
+    /// property component equals `property`.
+    ///
+    /// The key format is `"label:property"`.  We split on the **last** `':'`
+    /// so that label names containing a colon (unusual but legal) are handled
+    /// correctly.
+    #[cfg(feature = "text-index")]
+    fn text_index_labels_for_property(&self, property: &str) -> Vec<String> {
+        self.text_indexes
+            .read()
+            .keys()
+            .filter_map(|key| {
+                let (lbl, prop) = key.rsplit_once(':')?;
+                if prop == property {
+                    Some(lbl.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     #[cfg(feature = "text-index")]
     fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
         let index = self.get_text_index(label, property)?;
