@@ -154,7 +154,7 @@ impl super::Planner {
         .with_session_context(self.session_context.clone());
 
         // Create the filter operator
-        let mut operator = FilterOperator::new(input_op, Box::new(predicate));
+        let operator = FilterOperator::new(input_op, Box::new(predicate));
 
         // Serializable anti-phantom: carry the (label, property) pairs as data
         // on the operator so they are recorded at EXECUTION TIME (first poll),
