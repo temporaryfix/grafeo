@@ -4045,3 +4045,148 @@ fn vector_search_visible_includes_deleted_after_epoch() {
         "node deleted at E5 must not be visible at E5; got {ids_e5:?}"
     );
 }
+
+// ============================================================================
+// Vector-index GC horizon tests (tiered-storage path)
+// ============================================================================
+
+/// `node_deleted_at_or_below` must return `false` for a node committed AFTER
+/// the GC horizon that has never been deleted.  The tiered branch used to
+/// return `true` here (visible_at(horizon).is_none() is true for a live node
+/// created after horizon), which would incorrectly GC the node from the HNSW.
+#[cfg(all(feature = "vector-index", feature = "tiered-storage"))]
+#[test]
+fn tiered_gc_horizon_live_node_created_after_horizon_not_gc_able() {
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+    let horizon = EpochId::new(5);
+
+    // Commit node_b at epoch 10 (after horizon) — never deleted.
+    let tx_b = TransactionId::new(10);
+    let node_b = store.create_node_versioned(&["Item"], EpochId::new(10), tx_b);
+    store.finalize_entities_by_id(tx_b, EpochId::new(10), &[node_b], &[]);
+
+    // The node is live and was created AFTER the GC horizon — must NOT be GC-able.
+    assert!(
+        !store.node_deleted_at_or_below(node_b, horizon),
+        "live node created after horizon must not be GC-able (tiered path)"
+    );
+}
+
+/// `node_deleted_at_or_below` must return `true` for a node whose committed
+/// `deleted_epoch` is at or below the GC horizon.
+#[cfg(all(feature = "vector-index", feature = "tiered-storage"))]
+#[test]
+fn tiered_gc_horizon_deleted_at_or_below_horizon_is_gc_able() {
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+    let horizon = EpochId::new(5);
+
+    // Commit node_c at epoch 2, delete it at epoch 4 (deleted_epoch <= horizon).
+    let tx_c = TransactionId::new(2);
+    let node_c = store.create_node_versioned(&["Item"], EpochId::new(2), tx_c);
+    store.finalize_entities_by_id(tx_c, EpochId::new(2), &[node_c], &[]);
+
+    let tx_del = TransactionId::new(3);
+    store.delete_node_transactional(node_c, EpochId::new(4), tx_del);
+    store.finalize_deletes_by_id(tx_del, EpochId::new(4), &[node_c]);
+
+    // deleted_epoch == 4 <= horizon 5 → GC-able.
+    assert!(
+        store.node_deleted_at_or_below(node_c, horizon),
+        "node deleted at E4 with horizon E5 must be GC-able (tiered path)"
+    );
+}
+
+/// `node_deleted_at_or_below` must return `false` for a node whose committed
+/// `deleted_epoch` is strictly above the GC horizon.
+#[cfg(all(feature = "vector-index", feature = "tiered-storage"))]
+#[test]
+fn tiered_gc_horizon_deleted_above_horizon_not_gc_able() {
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+    let horizon = EpochId::new(5);
+
+    // Commit node_d at epoch 2, delete it at epoch 6 (deleted_epoch > horizon).
+    let tx_d = TransactionId::new(2);
+    let node_d = store.create_node_versioned(&["Item"], EpochId::new(2), tx_d);
+    store.finalize_entities_by_id(tx_d, EpochId::new(2), &[node_d], &[]);
+
+    let tx_del = TransactionId::new(4);
+    store.delete_node_transactional(node_d, EpochId::new(6), tx_del);
+    store.finalize_deletes_by_id(tx_del, EpochId::new(6), &[node_d]);
+
+    // deleted_epoch == 6 > horizon 5 → not GC-able yet.
+    assert!(
+        !store.node_deleted_at_or_below(node_d, horizon),
+        "node deleted at E6 with horizon E5 must not be GC-able (tiered path)"
+    );
+}
+
+/// `gc_vector_indexes` must keep a node committed after the GC horizon
+/// searchable even after GC runs.
+///
+/// This is the end-to-end regression: the buggy tiered branch would call
+/// `is_live(node_b) = false` and drop node_b from the HNSW, making vector
+/// search return no results for a perfectly live node.
+#[cfg(all(feature = "vector-index", feature = "tiered-storage"))]
+#[test]
+fn tiered_gc_vector_indexes_keeps_created_after_horizon_live_node_searchable() {
+    use crate::index::vector::{DistanceMetric, HnswConfig, HnswIndex, VectorIndexKind};
+    use grafeo_common::types::EpochId;
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+
+    // Set up a vector index.
+    let config = HnswConfig::new(3, DistanceMetric::Cosine);
+    let idx = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+    store.add_vector_index("Widget", "embedding", Arc::clone(&idx));
+
+    let horizon = EpochId::new(5);
+
+    // node_live: committed at epoch 10 (after horizon), never deleted, has a vector.
+    let tx_live = TransactionId::new(10);
+    let node_live = store.create_node_versioned(&["Widget"], EpochId::new(10), tx_live);
+    store.finalize_entities_by_id(tx_live, EpochId::new(10), &[node_live], &[]);
+    store.set_node_property(
+        node_live,
+        "embedding",
+        Value::Vector(vec![1.0_f32, 0.0, 0.0].into()),
+    );
+
+    // Insert node_live into the HNSW manually (mirrors what the engine does on
+    // commit when a vector property is set).
+    {
+        let accessor = super::vector_accessor::SnapshotVectorAccessor {
+            store: &store,
+            property: grafeo_common::types::PropertyKey::new("embedding"),
+            epoch: EpochId::new(10),
+            tx: None,
+        };
+        use crate::index::vector::VectorAccessor as _;
+        if let Some(vec) = accessor.get_vector(node_live) {
+            idx.insert(node_live, &vec, &accessor);
+        }
+    }
+
+    // Run GC with horizon = 5 (node_live is at epoch 10, above horizon).
+    store.gc_vector_indexes(horizon);
+
+    // node_live must still be searchable after GC.
+    let results = store.search_vector_visible(
+        "Widget:embedding",
+        &[1.0, 0.0, 0.0],
+        10,
+        EpochId::new(10),
+        TransactionId::INVALID,
+    );
+    let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+    assert!(
+        ids.contains(&node_live),
+        "live node created after GC horizon must remain searchable after gc_vector_indexes; got {ids:?}"
+    );
+}

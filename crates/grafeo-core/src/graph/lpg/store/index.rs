@@ -685,7 +685,7 @@ impl LpgStore {
     /// Used by [`gc_vector_indexes`](Self::gc_vector_indexes) to decide
     /// whether a soft-deleted HNSW node can be permanently dropped.
     #[cfg(feature = "vector-index")]
-    fn node_deleted_at_or_below(&self, id: NodeId, horizon: EpochId) -> bool {
+    pub(crate) fn node_deleted_at_or_below(&self, id: NodeId, horizon: EpochId) -> bool {
         #[cfg(not(feature = "tiered-storage"))]
         {
             let nodes = self.nodes.read();
@@ -706,14 +706,19 @@ impl LpgStore {
             let Some(index) = versions.get(&id) else {
                 return false;
             };
-            // A node deleted at or below horizon is not visible at horizon.
-            // Use visible_to with a sentinel tx (SYSTEM) to get the committed view.
-            // If the node is not visible at horizon, it was either deleted at/before
-            // horizon (safe to GC from HNSW) or never existed at horizon (not in HNSW).
-            // For nodes that exist in the HNSW topology, the latter case means they
-            // were created after horizon — but GC only runs after deletes are committed,
-            // so nodes in the HNSW are always older than the GC horizon.
-            index.visible_at(horizon).is_none()
+            // GC-able iff the node has a committed delete whose epoch is at or
+            // below `horizon`.  A committed delete has a real epoch (not PENDING).
+            //
+            // Crucially, `visible_at(horizon).is_none()` is NOT a correct test:
+            // it returns `true` for a node created AFTER horizon (the node is live
+            // but younger than the horizon snapshot).  Such a node must NOT be GC'd
+            // from the HNSW — it is still alive and searchable.
+            //
+            // `version_history()` returns `(created_epoch, deleted_epoch, ref)` for
+            // every hot+cold version, mirroring the non-tiered `chain.history()` walk.
+            index.version_history().iter().any(|(_, deleted_epoch_opt, _)| {
+                matches!(deleted_epoch_opt, Some(d) if *d != EpochId::PENDING && d.as_u64() <= horizon.as_u64())
+            })
         }
     }
 
