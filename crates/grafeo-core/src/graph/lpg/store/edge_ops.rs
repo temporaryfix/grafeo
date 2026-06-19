@@ -949,6 +949,37 @@ impl LpgStore {
         ids
     }
 
+    /// Returns the committed numeric edge-type id for an edge, with NO read
+    /// recording.
+    ///
+    /// Reads the edge version chain directly (mirrors
+    /// [`committed_node_label_ids`](Self::committed_node_label_ids) on the node
+    /// side): no SSI read-set pollution and no type-name resolution. Used by the
+    /// transactional property-write paths to fan out the coarse `RelType(T)`
+    /// phantom write so an escalated `RelType(T)` reader forms an
+    /// rw-antidependency with a `SET e.p` / `REMOVE e.p`. Must NOT use
+    /// `edge_type_versioned` here — that records the writer's own read.
+    #[must_use]
+    #[cfg(not(feature = "tiered-storage"))]
+    pub(crate) fn committed_edge_type_id(&self, id: EdgeId) -> Option<EdgeTypeId> {
+        let edges = self.edges.read();
+        let chain = edges.get(&id)?;
+        let record = chain.visible_at(self.current_epoch())?;
+        Some(EdgeTypeId::from(record.type_id))
+    }
+
+    /// Returns the committed numeric edge-type id for an edge, with NO read
+    /// recording. (Tiered storage version)
+    #[must_use]
+    #[cfg(feature = "tiered-storage")]
+    pub(crate) fn committed_edge_type_id(&self, id: EdgeId) -> Option<EdgeTypeId> {
+        let versions = self.edge_versions.read();
+        let index = versions.get(&id)?;
+        let vref = index.visible_at(self.current_epoch())?;
+        let record = self.read_edge_record(&vref)?;
+        Some(EdgeTypeId::from(record.type_id))
+    }
+
     /// Gets the type of an edge by ID.
     #[must_use]
     #[cfg(not(feature = "tiered-storage"))]

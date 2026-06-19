@@ -530,7 +530,7 @@ impl LpgStore {
     /// Any label the *deleting* transaction itself added/removed in-flight has
     /// already recorded its own coarse write (via `add_label_buffered` /
     /// `remove_label_buffered`), so the committed base set is sufficient here.
-    fn committed_node_label_ids(&self, id: NodeId) -> Vec<LabelId> {
+    pub(crate) fn committed_node_label_ids(&self, id: NodeId) -> Vec<LabelId> {
         let node_labels = self.node_labels.read();
         #[cfg(not(feature = "temporal"))]
         {

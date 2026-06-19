@@ -3321,3 +3321,247 @@ fn serializable_point_read_stays_fine() {
          got: {rs:?}"
     );
 }
+
+// ============================================================================
+// GE4: escalated structural reader conflicts with a PROPERTY write
+// ============================================================================
+
+/// Resolves the real `LabelId` interned for `label` by running a throwaway
+/// escalated label scan and pulling the coarse `EntityId::Label(_)` key out of
+/// the resulting read-set. This is the same `LabelId` the store's property-write
+/// fan-out (`committed_node_label_ids`) will use, so the escalated reader and the
+/// property writer key on the identical coarse entity.
+fn resolve_label_id(db: &GrafeoDB, label: &str) -> grafeo_common::types::LabelId {
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    let mut probe = db.session();
+    probe
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin Serializable probe");
+    let tid = probe.active_transaction_id().unwrap();
+    probe
+        .execute(&format!("MATCH (n:{label}) RETURN n"))
+        .expect("probe label scan");
+    let rs = probe.transaction_manager_ref().read_set(tid);
+    probe.commit().expect("probe commit");
+
+    rs.iter()
+        .find_map(|e| match e {
+            EntityId::Label(l) => Some(*l),
+            _ => None,
+        })
+        .expect("escalated probe scan must yield a coarse EntityId::Label(_)")
+}
+
+/// LOAD-BEARING (GE4): an escalated structural label-scan reader records its read
+/// as the wildcard `(Node(n), None)`, which is compatible with ANY tag — including
+/// a property write `(Node(n), prop)`. When escalation drops the fine `Node(n)`
+/// SIREAD entry and keeps only the coarse `Label(L)` key, a concurrent `SET n.p`
+/// on a scanned `:L` node MUST still conflict. That only holds if the property
+/// write fans out the coarse `Label(L)` write (so the surviving coarse reader is
+/// found); the structural set-changes already do this, the property path did not.
+///
+/// Cycle (mirrors `escalated_reader_still_conflicts_via_label`, but T2's write is
+/// a real `SET n.p` through the store rather than a manager-direct structural
+/// write — so the store's property-write fan-out is what is under test):
+///   T1: escalated scan of Label(L_skew)  + writes a node carrying Label(L_other)
+///   T2: coarse read of Label(L_other)    + `SET n.p` on a scanned-and-dropped
+///                                           Label(L_skew) node
+///
+/// Node 0 is one T1 scanned and then *dropped* from the registry (its fine
+/// `Node(0)` SIREAD entry was collapsed into the coarse `Label(L_skew)` key). T2's
+/// real `SET node0.p` must fan out a coarse `Label(L_skew)` write that finds T1 via
+/// the surviving coarse key — forming the `T1 →rw T2` edge that makes T2 a pivot.
+/// Without the property-write fan-out that edge is silently lost and T2 commits.
+///
+/// BEFORE the fix: T2's `SET` records only `(Node(0), prop)` (fine, via commit-time
+/// write-set completion) → `readers_of(Node(0))` is empty (T1 dropped) → no
+/// `T1 →rw T2` edge → T2 is not a pivot → **T2 commits (false negative)**.
+/// AFTER the fix: `SET` fans out `Label(L_skew)` → finds T1 → `T1 →rw T2` →
+/// T2 is the dangerous-structure pivot → T2 aborts.
+#[test]
+fn serializable_escalated_reader_conflicts_with_property_write() {
+    use grafeo_common::types::{NodeId, Value};
+
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 `:Skew` nodes (the label T1 will scan-and-escalate). Node ids are
+    // assigned densely from 0 by the in-memory store, so 0..10 are the seeded ids.
+    let setup = db.session();
+    for _ in 0..10 {
+        setup
+            .create_node_with_props(&["Skew"], [("p", Value::Int64(0))])
+            .expect("seed :Skew node");
+    }
+    drop(setup);
+
+    // The real LabelId interned for `:Skew` — the property-write fan-out keys on
+    // exactly this id, so the escalated reader must read under it.
+    let l_skew = resolve_label_id(&db, "Skew");
+    // A distinct coarse key for the write-skew partner edge (disjoint from
+    // L_skew so the two writes do not W-W collide on the same Label key).
+    let l_other = grafeo_common::types::LabelId::new(l_skew.as_u32() + 1_000);
+    assert_ne!(l_skew, l_other);
+
+    // Lower the escalation threshold so T1's 10 `:Skew` reads escalate.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    // ── Begin two concurrent Serializable transactions ──────────────────────
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin T1");
+    let t1 = s1.active_transaction_id().unwrap();
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin T2");
+    let t2 = s2.active_transaction_id().unwrap();
+
+    // ── T1: drive the escalation DIRECTLY via the manager ───────────────────
+    // record_read_in_label collapses the fine Node(0..10) reads into the single
+    // coarse Label(L_skew) key. Driving it directly (rather than via a
+    // materialized `MATCH (n:Skew)`) guarantees there is NO query-materialization
+    // re-add of the fine Node(0) read masking the dropped-entry gap.
+    let mgr = s1.transaction_manager_ref();
+    for i in 0..10u64 {
+        mgr.record_read_in_label(t1, NodeId::new(i), None, l_skew)
+            .expect("record escalated :Skew read");
+    }
+
+    // Sanity: T1 escalated. Coarse Label(L_skew) present; fine Node(0) DROPPED.
+    let rs1 = mgr.read_set(t1);
+    assert!(
+        rs1.contains(&EntityId::Label(l_skew)),
+        "T1 read-set must contain the coarse EntityId::Label after escalation; got {rs1:?}"
+    );
+    assert!(
+        !rs1.contains(&EntityId::Node(NodeId::new(0))),
+        "T1's fine Node(0) read must have been collapsed away (this is the \
+         dropped-fine case the fix must cover); got {rs1:?}"
+    );
+
+    // ── T2: coarse read of the write-skew partner key Label(L_other) ────────
+    // Recorded BEFORE T1's L_other write so T1's write forms the T2 →rw T1 edge
+    // (T2.out_conflict) at write time.
+    s2.transaction_manager_ref()
+        .record_read(t2, EntityId::Label(l_other), None)
+        .expect("T2 reads Label(L_other)");
+
+    // ── T1: write the partner node carrying Label(L_other) ──────────────────
+    // Fans out a coarse Label(L_other) write → finds T2's reader → T2 →rw T1.
+    s1.transaction_manager_ref()
+        .record_node_write(t1, NodeId::new(900), &[l_other], None)
+        .expect("T1 writes Label(L_other)");
+
+    // ── T2: the REAL property write on a scanned-and-dropped :Skew node ──────
+    // This is the path under test. node0 is one T1 scanned (and dropped). The
+    // store's set_node_property_buffered must fan out a coarse Label(L_skew)
+    // write so T1's surviving coarse reader forms the T1 →rw T2 edge.
+    s2.set_node_property(NodeId::new(0), "p", Value::Int64(7))
+        .expect("T2 SET node0.p");
+
+    // ── Commit order: T1 first (Ok), then T2 (must abort) ───────────────────
+    s1.commit().expect("T1 (first committer) must succeed");
+
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "T2 (property writer on a scanned-and-dropped :Skew node) must abort — \
+         if this passes, set_node_property_buffered did NOT fan out the coarse \
+         Label(L_skew) write, so the escalated reader's dropped fine entry lost \
+         the conflict (SSI false negative)",
+    );
+}
+
+/// EDGE mirror of `serializable_escalated_reader_conflicts_with_property_write`:
+/// an escalated `RelType(T)` structural reader (fine `Edge(e)` entries dropped)
+/// must still conflict with a concurrent `SET e.p` on a scanned `:T` edge. That
+/// only holds if `set_edge_property_buffered` fans out the coarse `RelType(T)`
+/// write. Before the fix the edge property write recorded only `(Edge(e), prop)`
+/// → the dropped fine reader was missed → T2 committed (false negative).
+#[test]
+fn serializable_escalated_reader_conflicts_with_edge_property_write() {
+    use grafeo_common::types::{EdgeId, EdgeTypeId, Value};
+
+    let db = GrafeoDB::new_in_memory();
+
+    // Fresh DB: `REL` is the FIRST and only relationship type created, so the
+    // store assigns it EdgeTypeId(0) (ids are `id_to_edge_type.len()`, 0-based).
+    // Seed one `:REL` edge → EdgeId(0). The escalated reader keys on RelType(0),
+    // the exact coarse id the property-write fan-out uses (committed_edge_type_id).
+    let t_rel = EdgeTypeId::new(0);
+    let setup = db.session();
+    let a = setup.create_node(&["EA"]);
+    let b = setup.create_node(&["EB"]);
+    let edge0 = setup.create_edge(a, b, "REL");
+    assert_eq!(edge0, EdgeId::new(0), "first edge id is deterministic");
+    setup
+        .set_edge_property(edge0, "p", Value::Int64(0))
+        .expect("seed edge prop");
+    drop(setup);
+
+    // Distinct coarse partner key (disjoint from RelType(0)).
+    let t_other = EdgeTypeId::new(1_000);
+
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin T1");
+    let t1 = s1.active_transaction_id().unwrap();
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin T2");
+    let t2 = s2.active_transaction_id().unwrap();
+
+    // T1: escalate a RelType(0) scan directly via the manager (drops fine Edge(0)).
+    let mgr = s1.transaction_manager_ref();
+    for i in 0..10u64 {
+        mgr.record_read_in_rel_type(t1, EdgeId::new(i), None, t_rel)
+            .expect("record escalated :REL read");
+    }
+    let rs1 = mgr.read_set(t1);
+    assert!(
+        rs1.contains(&EntityId::RelType(t_rel)),
+        "T1 read-set must contain the coarse EntityId::RelType after escalation; got {rs1:?}"
+    );
+    assert!(
+        !rs1.contains(&EntityId::Edge(EdgeId::new(0))),
+        "T1's fine Edge(0) read must have been collapsed away; got {rs1:?}"
+    );
+
+    // T2: coarse read of the partner RelType(other) (before T1's partner write).
+    s2.transaction_manager_ref()
+        .record_read(t2, EntityId::RelType(t_other), None)
+        .expect("T2 reads RelType(other)");
+    // T1: write an edge carrying RelType(other) → forms T2 →rw T1.
+    s1.transaction_manager_ref()
+        .record_edge_write(t1, EdgeId::new(900), t_other, None)
+        .expect("T1 writes RelType(other)");
+
+    // T2: the REAL edge property write on the scanned-and-dropped :REL edge.
+    s2.set_edge_property(EdgeId::new(0), "p", Value::Int64(7))
+        .expect("T2 SET edge0.p");
+
+    s1.commit().expect("T1 (first committer) must succeed");
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "T2 (edge property writer on a scanned-and-dropped :REL edge) must abort — \
+         if this passes, set_edge_property_buffered did NOT fan out the coarse \
+         RelType(0) write (SSI false negative)",
+    );
+}

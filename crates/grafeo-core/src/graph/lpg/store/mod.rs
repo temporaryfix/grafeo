@@ -1364,4 +1364,48 @@ impl LpgStore {
             let _ = t.record_edge_write_with_type(tx, edge_id, rel_type);
         }
     }
+
+    /// Fans out **only** the coarse `Label(L)` phantom write(s) for a node — NO
+    /// fine `Node` entity write.
+    ///
+    /// Used by the transactional **property-write** paths
+    /// (`set_node_property_buffered` / `remove_node_property_buffered`): the fine
+    /// `Node(n)` write is recorded elsewhere (operator under its property tag, or
+    /// commit-time write-set completion), so this records only the coarse guard.
+    /// Re-recording the fine `Node` write here (as
+    /// [`record_coarse_node_write`](Self::record_coarse_node_write) does for
+    /// structural ops) would inject a `None`-tagged wildcard `Node` write that
+    /// breaks Property-granularity disjointness — see
+    /// [`record_node_labels_write`](crate::execution::operators::WriteTracker::record_node_labels_write).
+    ///
+    /// Silent no-op for SYSTEM and when no write tracker is registered (SI/RC).
+    #[inline]
+    pub(crate) fn record_coarse_node_labels_only(
+        &self,
+        tx: TransactionId,
+        labels: &[LabelId],
+    ) {
+        if tx == TransactionId::SYSTEM {
+            return;
+        }
+        if let Some(t) = self.write_trackers.read().get(&tx) {
+            let _ = t.record_node_labels_write(tx, labels);
+        }
+    }
+
+    /// Fans out **only** the coarse `RelType(T)` phantom write for an edge — NO
+    /// fine `Edge` entity write. Edge mirror of
+    /// [`record_coarse_node_labels_only`](Self::record_coarse_node_labels_only),
+    /// used by the edge property-write paths.
+    ///
+    /// Silent no-op for SYSTEM and when no write tracker is registered (SI/RC).
+    #[inline]
+    pub(crate) fn record_coarse_edge_type_only(&self, tx: TransactionId, rel_type: EdgeTypeId) {
+        if tx == TransactionId::SYSTEM {
+            return;
+        }
+        if let Some(t) = self.write_trackers.read().get(&tx) {
+            let _ = t.record_edge_type_write(tx, rel_type);
+        }
+    }
 }

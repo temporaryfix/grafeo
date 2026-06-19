@@ -92,6 +92,36 @@ impl WriteTracker for TransactionWriteTracker {
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 
+    /// Fans out only the coarse `Label(L)` phantom writes (no fine `Node` write).
+    ///
+    /// Calls [`TransactionManager::record_node_labels_write`]. Used by the store's
+    /// property-write paths so an escalated `Label(L)` reader is caught without
+    /// adding a `None`-tagged fine `Node` write that would defeat Property
+    /// granularity (the fine write is recorded elsewhere under its property tag).
+    fn record_node_labels_write(
+        &self,
+        transaction_id: TransactionId,
+        labels: &[LabelId],
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_node_labels_write(transaction_id, labels)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Fans out only the coarse `RelType(T)` phantom write (no fine `Edge` write).
+    ///
+    /// Calls [`TransactionManager::record_edge_type_write`]. Edge mirror of
+    /// [`record_node_labels_write`](Self::record_node_labels_write).
+    fn record_edge_type_write(
+        &self,
+        transaction_id: TransactionId,
+        rel_type: EdgeTypeId,
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_edge_type_write(transaction_id, rel_type)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
     fn record_node_property_write(
         &self,
         transaction_id: TransactionId,

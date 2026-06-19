@@ -232,6 +232,48 @@ pub trait WriteTracker: Send + Sync {
         self.record_edge_write(transaction_id, edge_id)
     }
 
+    /// Records **only** the coarse `Label(L)` phantom write(s) for `labels`,
+    /// WITHOUT recording the fine `Node` entity write.
+    ///
+    /// Used by the transactional property-write paths (`SET n.p` / `REMOVE n.p`):
+    /// the fine `Node(n)` write was already recorded by the operator (under its
+    /// property tag) or is completed at commit time, so re-recording it here as an
+    /// entity-level (`None`) write would be a wildcard that defeats Property
+    /// granularity. We only need the coarse `Label(L)` guard so an escalated
+    /// structural `Label(L)` reader (whose fine `Node(n)` entry was dropped) still
+    /// forms the rw-antidependency.
+    ///
+    /// Default implementation is a no-op: non-engine trackers (and SI/RC, where no
+    /// tracker is registered) do not track coarse keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on any write-write conflict.
+    fn record_node_labels_write(
+        &self,
+        _transaction_id: TransactionId,
+        _labels: &[LabelId],
+    ) -> Result<(), OperatorError> {
+        Ok(())
+    }
+
+    /// Records **only** the coarse `RelType(T)` phantom write for an edge, WITHOUT
+    /// recording the fine `Edge` entity write. Edge mirror of
+    /// [`record_node_labels_write`](Self::record_node_labels_write).
+    ///
+    /// Default implementation is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on any write-write conflict.
+    fn record_edge_type_write(
+        &self,
+        _transaction_id: TransactionId,
+        _rel_type: EdgeTypeId,
+    ) -> Result<(), OperatorError> {
+        Ok(())
+    }
+
     /// Records that `transaction_id` wrote to the `(label, property)` text index
     /// identified by `index_key` (format: `"label:property"`). Coarse index-write
     /// recording for anti-phantom SSI.

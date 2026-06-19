@@ -381,6 +381,51 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Fans out **only** the coarse `Label(L)` writes for a node — WITHOUT
+    /// recording the fine `Node(node)` entity write.
+    ///
+    /// Use this when the fine entity write has already been recorded (with its
+    /// own — possibly property-level — tag) by the operator/commit-completion
+    /// path, and only the coarse phantom guard is still missing. This is the
+    /// property-write case: `SET n.p` already recorded `(Node(n), prop)`; adding
+    /// `(Node(n), None)` here (as the full [`record_node_write`](Self::record_node_write)
+    /// would) is a `None`-tagged wildcard that destroys Property-granularity
+    /// disjointness, so we record the labels alone.
+    ///
+    /// The coarse `Label(L)` key is always `None`-tagged (a label scan is a
+    /// structural read), matching the escalated reader's coarse key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `record_write` call detects a conflict.
+    pub fn record_node_labels_write(
+        &self,
+        transaction_id: TransactionId,
+        labels: &[LabelId],
+    ) -> Result<()> {
+        for &label in labels {
+            self.record_write(transaction_id, EntityId::Label(label), None)?;
+        }
+        Ok(())
+    }
+
+    /// Fans out **only** the coarse `RelType(T)` write for an edge — WITHOUT
+    /// recording the fine `Edge(edge)` entity write. Edge mirror of
+    /// [`record_node_labels_write`](Self::record_node_labels_write); see there
+    /// for why the fine entity write is intentionally omitted on the
+    /// property-write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `record_write` call detects a conflict.
+    pub fn record_edge_type_write(
+        &self,
+        transaction_id: TransactionId,
+        rel_type: EdgeTypeId,
+    ) -> Result<()> {
+        self.record_write(transaction_id, EntityId::RelType(rel_type), None)
+    }
+
     /// Records a write operation for the transaction.
     ///
     /// Uses first-writer-wins: if another active transaction has already

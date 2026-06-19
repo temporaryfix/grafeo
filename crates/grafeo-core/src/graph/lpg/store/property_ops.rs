@@ -1025,6 +1025,22 @@ impl LpgStore {
             .or_default()
             .node_props
             .insert((id, PropertyKey::new(key)), super::PropOp::Set(value));
+
+        // Coarse SSI phantom-write fan-out: a property SET is a write to `id`, and
+        // an escalated structural `Label(L)` reader records each scanned node as the
+        // wildcard `(Node(n), None)` (compatible with any tag, including this
+        // property write). Escalation drops the fine `Node(n)` SIREAD entry, so the
+        // only way that reader is still caught is the coarse `Label(L)` write.
+        //
+        // We fan out ONLY the coarse Label(L) key (not the fine Node write): the
+        // fine `Node(id)` write is already recorded by the SET operator under its
+        // property tag (or completed at commit time), so re-recording a None-tagged
+        // fine Node write here would be a wildcard that defeats Property
+        // granularity. Uses the non-recording committed label set (NOT
+        // read_node_labels_visible, which would pollute the writer's read-set).
+        // No-op for SI/RC and SYSTEM.
+        let label_ids = self.committed_node_label_ids(id);
+        self.record_coarse_node_labels_only(transaction_id, &label_ids);
     }
 
     /// Buffers an uncommitted node property removal (tombstone) into the delta.
@@ -1054,6 +1070,14 @@ impl LpgStore {
             .or_default()
             .node_props
             .insert((id, PropertyKey::new(key)), super::PropOp::Remove);
+
+        // Coarse SSI phantom-write fan-out (see `set_node_property_buffered`): a
+        // property REMOVE is also a write to `id` and must fan out ONLY the coarse
+        // `Label(L)` (fine Node write already recorded under its property tag) so an
+        // escalated structural reader (whose fine `Node(n)` entry was dropped) is
+        // caught.
+        let label_ids = self.committed_node_label_ids(id);
+        self.record_coarse_node_labels_only(transaction_id, &label_ids);
     }
 
     /// Buffers an uncommitted edge property write into the transaction's delta.
@@ -1071,6 +1095,18 @@ impl LpgStore {
             .or_default()
             .edge_props
             .insert((id, PropertyKey::new(key)), super::PropOp::Set(value));
+
+        // Coarse SSI phantom-write fan-out (edge mirror of the node path): a
+        // property SET on an edge is a write to `id`, and an escalated
+        // `RelType(T)` reader records each scanned edge as the wildcard
+        // `(Edge(e), None)`. Escalation drops the fine `Edge(e)` SIREAD entry, so
+        // the coarse `RelType(T)` write is the only way that reader is caught. Fan
+        // out ONLY the coarse RelType(T) key (fine Edge write already recorded
+        // under its property tag). `committed_edge_type_id` reads the edge record
+        // with NO read recording.
+        if let Some(rel_type) = self.committed_edge_type_id(id) {
+            self.record_coarse_edge_type_only(transaction_id, rel_type);
+        }
     }
 
     /// Buffers an uncommitted edge property removal (tombstone) into the delta.
@@ -1087,6 +1123,14 @@ impl LpgStore {
             .or_default()
             .edge_props
             .insert((id, PropertyKey::new(key)), super::PropOp::Remove);
+
+        // Coarse SSI phantom-write fan-out (see `set_edge_property_buffered`): a
+        // property REMOVE on an edge is also a write to `id` and must fan out ONLY
+        // the coarse `RelType(T)` (fine Edge write already recorded under its
+        // property tag) so an escalated `RelType(T)` reader is caught.
+        if let Some(rel_type) = self.committed_edge_type_id(id) {
+            self.record_coarse_edge_type_only(transaction_id, rel_type);
+        }
     }
 
     /// Snapshot-consistent node property read (the unified-MVCC read accessor).
