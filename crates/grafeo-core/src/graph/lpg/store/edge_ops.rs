@@ -257,7 +257,7 @@ impl LpgStore {
         let record = *record;
         drop(edges);
         let edge = self.build_edge(id, &record)?;
-        self.record_read_edge(transaction_id, id);
+        self.record_read_edge_in_rel_type(transaction_id, id, EdgeTypeId::from(record.type_id));
         Some(edge)
     }
 
@@ -281,7 +281,7 @@ impl LpgStore {
         }
         drop(versions);
         let edge = self.build_edge(id, &record)?;
-        self.record_read_edge(transaction_id, id);
+        self.record_read_edge_in_rel_type(transaction_id, id, EdgeTypeId::from(record.type_id));
         Some(edge)
     }
 
@@ -1085,15 +1085,18 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        let visible = self.edges.read().get(&id).is_some_and(|chain| {
+        let visible_type = self.edges.read().get(&id).and_then(|chain| {
             chain
                 .visible_to(epoch, transaction_id)
-                .is_some_and(|r| !r.is_deleted())
+                .filter(|r| !r.is_deleted())
+                .map(|r| r.type_id)
         });
-        if visible {
-            self.record_read_edge(transaction_id, id);
+        if let Some(type_id) = visible_type {
+            self.record_read_edge_in_rel_type(transaction_id, id, EdgeTypeId::from(type_id));
+            true
+        } else {
+            false
         }
-        visible
     }
 
     /// Checks if an edge is visible to a specific transaction.
@@ -1106,15 +1109,20 @@ impl LpgStore {
         epoch: EpochId,
         transaction_id: TransactionId,
     ) -> bool {
-        let visible = self.edge_versions.read().get(&id).is_some_and(|index| {
-            index.visible_to(epoch, transaction_id).is_some_and(|vref| {
-                self.read_edge_record(&vref)
-                    .is_some_and(|r| !r.is_deleted())
-            })
-        });
-        if visible {
-            self.record_read_edge(transaction_id, id);
+        let vref = self
+            .edge_versions
+            .read()
+            .get(&id)
+            .and_then(|index| index.visible_to(epoch, transaction_id));
+        let visible_type = vref
+            .and_then(|vref| self.read_edge_record(&vref))
+            .filter(|r| !r.is_deleted())
+            .map(|r| r.type_id);
+        if let Some(type_id) = visible_type {
+            self.record_read_edge_in_rel_type(transaction_id, id, EdgeTypeId::from(type_id));
+            true
+        } else {
+            false
         }
-        visible
     }
 }

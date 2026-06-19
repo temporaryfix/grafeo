@@ -1251,9 +1251,8 @@ impl LpgStore {
     /// override escalates fine `Edge` reads to `EntityId::RelType(T)` at
     /// threshold (GE3).
     ///
-    /// Currently wired for future edge-type scan escalation; not yet called
-    /// from any scan site (edge-type scan wiring is a subsequent task).
-    #[allow(dead_code)]
+    /// Called from `is_edge_visible_versioned` and `get_edge_versioned` (both
+    /// cfg variants) so every edge-read path escalates by intrinsic type.
     #[inline]
     pub(crate) fn record_read_edge_in_rel_type(
         &self,
@@ -1380,11 +1379,7 @@ impl LpgStore {
     ///
     /// Silent no-op for SYSTEM and when no write tracker is registered (SI/RC).
     #[inline]
-    pub(crate) fn record_coarse_node_labels_only(
-        &self,
-        tx: TransactionId,
-        labels: &[LabelId],
-    ) {
+    pub(crate) fn record_coarse_node_labels_only(&self, tx: TransactionId, labels: &[LabelId]) {
         if tx == TransactionId::SYSTEM {
             return;
         }

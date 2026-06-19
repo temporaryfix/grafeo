@@ -2905,6 +2905,59 @@ fn edges_from_versioned_records_reads() {
     );
 }
 
+/// A >T edge traversal of type `R` escalates the edge reads to the coarse
+/// `RelType(R)` predicate via the store chokepoint: the spy sees
+/// `record_read_edge_in_rel_type`, not bare `record_read_edge`.
+#[test]
+fn edge_reads_escalate_by_intrinsic_type_at_chokepoint() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use grafeo_common::types::EdgeTypeId;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Spy {
+        fine: Mutex<Vec<EdgeId>>,
+        coarse: Mutex<Vec<(EdgeId, EdgeTypeId)>>,
+    }
+    impl ReadTracker for Spy {
+        fn record_node_read(&self, _t: TransactionId, _i: NodeId) {}
+        fn record_edge_read(&self, _t: TransactionId, id: EdgeId) {
+            self.fine.lock().push(id);
+        }
+        fn record_read_edge_in_rel_type(&self, _t: TransactionId, id: EdgeId, rt: EdgeTypeId) {
+            self.coarse.lock().push((id, rt));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["N"]);
+    let b = store.create_node(&["N"]);
+    let e0 = store.new_epoch();
+    let edge = store.create_edge_versioned(a, b, "R", e0, TransactionId::SYSTEM);
+    let e1 = store.new_epoch();
+    store.finalize_entities_by_id(TransactionId::SYSTEM, e1, &[], &[edge]);
+
+    let tx = TransactionId::new(40);
+    let spy = Arc::new(Spy::default());
+    store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+    // Visibility check (the traversal filter path) records via the coarse path.
+    assert!(store.is_edge_visible_versioned(edge, e1, tx));
+    // Materialization path too.
+    let _ = store.get_edge_versioned(edge, e1, tx);
+
+    let coarse = spy.coarse.lock().clone();
+    assert!(
+        coarse.iter().any(|(id, _)| *id == edge),
+        "edge read must route through record_read_edge_in_rel_type, got coarse={coarse:?}"
+    );
+    assert!(
+        spy.fine.lock().is_empty(),
+        "edge reads must NOT use bare record_read_edge once escalation-aware"
+    );
+}
+
 // ── TI3: per-tx text-index delta ─────────────────────────────────────────────
 
 /// Under a transaction, setting an indexed text property buffers the change into
