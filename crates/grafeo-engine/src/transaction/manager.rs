@@ -1,11 +1,11 @@
 //! Transaction manager.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use grafeo_common::types::{EdgeId, EdgeTypeId, EpochId, LabelId, NodeId, TransactionId};
 use grafeo_common::utils::error::{Error, Result, TransactionError};
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::{PropTag, ReadRegistry, prop_compatible};
@@ -217,6 +217,19 @@ pub struct TransactionInfo {
     /// the reader end of some `self →rw writer`). Used for F2 incremental SSI
     /// pivot detection.
     pub out_conflict: bool,
+    /// Read-set escalation buckets: maps a coarse predicate key
+    /// (`EntityId::Label(L)` / `EntityId::RelType(T)`) to the fine
+    /// `(EntityId::Node / Edge, PropTag)` reads recorded beneath it during a
+    /// label-/type-scan. When a bucket exceeds the escalation threshold the
+    /// fine entries are collapsed into the single coarse key (see
+    /// [`TransactionManager::record_read_in_label`]). Only populated for
+    /// Serializable transactions that actually scan by predicate.
+    pub scan_buckets: FxHashMap<EntityId, Vec<(EntityId, PropTag)>>,
+    /// Predicate keys that have already been promoted (escalated). Once a
+    /// predicate is here, further reads under it skip the fine entry entirely
+    /// (the coarse `predicate` key in `read_set` already covers them via GE2's
+    /// write fan-out), so no fine bookkeeping or rw-detection is re-run.
+    pub escalated: FxHashSet<EntityId>,
 }
 
 impl TransactionInfo {
@@ -230,6 +243,8 @@ impl TransactionInfo {
             read_set: HashSet::new(),
             in_conflict: false,
             out_conflict: false,
+            scan_buckets: FxHashMap::default(),
+            escalated: FxHashSet::default(),
         }
     }
 }
@@ -256,6 +271,16 @@ pub struct TransactionManager {
     /// the committed reader's `TransactionId` -> its commit epoch. A later
     /// concurrent writer can then still form the in-edge `reader →rw writer`.
     retired_readers: RwLock<FxHashMap<TransactionId, EpochId>>,
+    /// Read-set escalation threshold `T`: once a Serializable transaction has
+    /// recorded more than `T` fine reads under a single label/type predicate,
+    /// the fine `Node`/`Edge` entries are collapsed into the coarse
+    /// `Label(L)` / `RelType(T)` key (see
+    /// [`Self::record_read_in_label`]). Defaults to `256`; GE5 will make this
+    /// configurable per-session. `usize::MAX` effectively disables promotion.
+    ///
+    /// Stored as an atomic so the test setter and the `&self` read path in
+    /// `record_read_in_label` need no extra lock.
+    escalation_threshold: AtomicUsize,
 }
 
 impl TransactionManager {
@@ -272,6 +297,8 @@ impl TransactionManager {
             committed_epochs: RwLock::new(FxHashMap::default()),
             read_registry: ReadRegistry::new(),
             retired_readers: RwLock::new(FxHashMap::default()),
+            // GE3 default; GE5 will make this session-configurable.
+            escalation_threshold: AtomicUsize::new(256),
         }
     }
 
@@ -632,6 +659,193 @@ impl TransactionManager {
         // Apply rw-antidependency edges now that the transactions lock is released.
         for writer in concurrent_writers {
             self.set_rw_edge(transaction_id, writer);
+        }
+
+        Ok(())
+    }
+
+    /// Sets the read-set escalation threshold `T` (test/diagnostics hook).
+    ///
+    /// A value of `usize::MAX` effectively disables promotion (no bucket can
+    /// exceed it). GE5 will route session configuration through here.
+    pub fn set_escalation_threshold(&self, threshold: usize) {
+        self.escalation_threshold
+            .store(threshold, Ordering::Relaxed);
+    }
+
+    /// Records a fine node read that occurred *while scanning label `label`*
+    /// (e.g. a `MATCH (n:L)` visit), with read-set escalation.
+    ///
+    /// While the predicate `Label(L)` has not yet escalated, each visited node
+    /// is recorded as a normal fine `Node(n)` read (full rw-antidependency
+    /// detection + SIREAD registration, identical to [`record_read`]). Once
+    /// more than `escalation_threshold` distinct fine reads have accumulated
+    /// under `Label(L)`, the fine entries are **promoted**: collapsed into the
+    /// single coarse `Label(L)` key (see [`Self::promote_read_bucket`]). After
+    /// promotion, subsequent reads under `Label(L)` are no-ops at the fine
+    /// level — the coarse key already covers them, and GE2's write fan-out
+    /// (`record_node_write` → coarse `Label(L)` write) guarantees any writer of
+    /// a node carrying `L` still forms the rw-edge against this reader.
+    ///
+    /// Symmetric with [`Self::record_read_in_rel_type`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active (propagated from the
+    /// underlying [`record_read`] calls).
+    pub fn record_read_in_label(
+        &self,
+        transaction_id: TransactionId,
+        node: NodeId,
+        tag: PropTag,
+        label: LabelId,
+    ) -> Result<()> {
+        self.record_read_in_predicate(
+            transaction_id,
+            EntityId::Node(node),
+            tag,
+            EntityId::Label(label),
+        )
+    }
+
+    /// Records a fine edge read that occurred *while scanning relationship type
+    /// `rel`* (e.g. a `MATCH ()-[:T]->()` visit), with read-set escalation.
+    ///
+    /// Symmetric with [`Self::record_read_in_label`]: collapses fine `Edge(e)`
+    /// reads into the coarse `RelType(T)` key once the threshold is exceeded.
+    /// Drop-safety relies on GE2's edge write fan-out (`record_edge_write` →
+    /// coarse `RelType(T)` write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_read_in_rel_type(
+        &self,
+        transaction_id: TransactionId,
+        edge: EdgeId,
+        tag: PropTag,
+        rel: EdgeTypeId,
+    ) -> Result<()> {
+        self.record_read_in_predicate(
+            transaction_id,
+            EntityId::Edge(edge),
+            tag,
+            EntityId::RelType(rel),
+        )
+    }
+
+    /// Shared implementation for [`record_read_in_label`](Self::record_read_in_label)
+    /// and [`record_read_in_rel_type`](Self::record_read_in_rel_type).
+    ///
+    /// `fine` is the per-row key (`Node`/`Edge`); `predicate` is the coarse
+    /// scan key (`Label`/`RelType`).
+    ///
+    /// # Lock discipline
+    ///
+    /// Never holds the `transactions` write lock across a `read_registry` call.
+    /// The fine `record_read` (and the coarse one inside `promote_read_bucket`)
+    /// each acquire and release the lock internally; the bucket bookkeeping
+    /// here takes the lock only to push/inspect and releases it before any
+    /// registry op.
+    fn record_read_in_predicate(
+        &self,
+        transaction_id: TransactionId,
+        fine: EntityId,
+        tag: PropTag,
+        predicate: EntityId,
+    ) -> Result<()> {
+        // Already escalated: the coarse `predicate` key is in read_set and the
+        // SIREAD registry; it covers this read. Do NOT add a fine entry and do
+        // NOT re-run rw-detection. (A quick read-lock check.)
+        {
+            let txns = self.transactions.read();
+            match txns.get(&transaction_id) {
+                Some(info) if info.escalated.contains(&predicate) => return Ok(()),
+                Some(_) => {}
+                // Unknown tx: let the fine record_read below produce the
+                // canonical "not found" error.
+                None => {}
+            }
+        }
+
+        // Not escalated yet: record the fine read normally (fine entry + its own
+        // rw-detection + SIREAD registration). No lock held across this call.
+        self.record_read(transaction_id, fine, tag)?;
+
+        // Push the fine entry into this predicate's bucket and decide whether we
+        // crossed the threshold. Lock held only for the push/length check.
+        let should_promote = {
+            let mut txns = self.transactions.write();
+            let Some(info) = txns.get_mut(&transaction_id) else {
+                return Ok(());
+            };
+            let bucket = info.scan_buckets.entry(predicate).or_default();
+            bucket.push((fine, tag));
+            bucket.len() > self.escalation_threshold.load(Ordering::Relaxed)
+            // transactions write lock drops here
+        };
+
+        if should_promote {
+            self.promote_read_bucket(transaction_id, predicate)?;
+        }
+
+        Ok(())
+    }
+
+    /// Promotes a predicate's accumulated fine reads into the coarse key.
+    ///
+    /// Steps (order is load-bearing — see inline notes):
+    /// (a) `record_read(tx, predicate, None)` records the **coarse** read with
+    ///     its own rw-detection. This is what catches a concurrent `Label(L)`
+    ///     writer (incl. a `CREATE (:L)` during the scan) that the fine reads
+    ///     alone could not see — and it is sound to subsequently drop the fine
+    ///     entries because GE2's write fan-out records the coarse key for every
+    ///     structural change to a node/edge under this predicate.
+    /// (b) Under the `transactions` lock, drain the bucket, remove every fine
+    ///     `(entity, tag)` from `read_set`, mark `predicate` escalated, and
+    ///     clear the bucket. Release the lock, **then** remove each fine SIREAD
+    ///     entry from the registry via `remove_reader_entity` (registry ops only
+    ///     after the lock is released — the critical deadlock-avoidance rule).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the coarse `record_read` fails (tx not active).
+    fn promote_read_bucket(
+        &self,
+        transaction_id: TransactionId,
+        predicate: EntityId,
+    ) -> Result<()> {
+        // (a) Coarse read WITH rw-detection (catches concurrent Label/RelType
+        //     writers the fine reads missed). No lock held across this call.
+        self.record_read(transaction_id, predicate, None)?;
+
+        // (b) Collapse: take the fine entries and drop them from read_set +
+        //     mark escalated, all under one transactions-lock acquisition.
+        //     Registry removals happen AFTER the lock is released.
+        let fine_entries: Vec<(EntityId, PropTag)> = {
+            let mut txns = self.transactions.write();
+            let Some(info) = txns.get_mut(&transaction_id) else {
+                return Ok(());
+            };
+            let entries = info
+                .scan_buckets
+                .get_mut(&predicate)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            for entry in &entries {
+                info.read_set.remove(entry);
+            }
+            info.escalated.insert(predicate);
+            entries
+            // transactions write lock drops here
+        };
+
+        // Release the per-row SIREAD locks now that the coarse key covers them.
+        // (registry has its own sharded locks; never call this under the
+        // transactions write lock.)
+        for (entity, tag) in fine_entries {
+            self.read_registry
+                .remove_reader_entity(entity, transaction_id, tag);
         }
 
         Ok(())
@@ -3179,6 +3393,222 @@ mod tests {
             mgr.conflict_flags(tx_w),
             (false, false),
             "node writer with no labels must have no conflict flags"
+        );
+    }
+
+    // --- GE3: read-set Node->Label / Edge->RelType escalation at threshold T ---
+
+    /// Crossing the threshold collapses the fine `Node` reads under a predicate
+    /// into the single coarse `Label(L)` key: after promotion the read-set holds
+    /// `Label(L)` and ZERO `Node(_)` for the promoted rows; a read under a
+    /// *different* label stays fine.
+    #[test]
+    fn escalation_promotes_at_threshold() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let lbl9 = LabelId::new(9);
+        let lbl8 = LabelId::new(8);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // 10 fine reads under Label(9) → bucket exceeds 4 → promotes.
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, lbl9)
+                .unwrap();
+        }
+        // One read under a different label (8) — must stay fine.
+        mgr.record_read_in_label(tx, NodeId::new(100), None, lbl8)
+            .unwrap();
+
+        let rs = mgr.read_set_tagged(tx);
+
+        // Coarse Label(9) key present.
+        assert!(
+            rs.contains(&(EntityId::Label(lbl9), None)),
+            "Label(9) coarse key must be in read_set after promotion"
+        );
+        // ZERO fine Node entries for the promoted (Label(9)) rows 0..10.
+        for i in 0..10u64 {
+            assert!(
+                !rs.contains(&(EntityId::Node(NodeId::new(i)), None)),
+                "fine Node({i}) must have been collapsed away after promotion"
+            );
+        }
+        // The Label(8) read stayed fine (its bucket never crossed the threshold).
+        assert!(
+            rs.contains(&(EntityId::Node(NodeId::new(100)), None)),
+            "read under non-escalated Label(8) must remain a fine Node entry"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(lbl8), None)),
+            "Label(8) must NOT be promoted (under threshold)"
+        );
+
+        // Size is bounded: not ~10 fine entries, just the coarse key + the one
+        // fine Label(8) read.
+        assert!(
+            rs.len() <= 3,
+            "read_set must be bounded after promotion, got {}",
+            rs.len()
+        );
+    }
+
+    /// With `escalation_threshold = usize::MAX`, no bucket can ever cross it, so
+    /// every read stays fine: 10 `Node` entries, no `Label` key.
+    #[test]
+    fn escalation_threshold_max_no_promote() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(usize::MAX);
+        let lbl9 = LabelId::new(9);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, lbl9)
+                .unwrap();
+        }
+
+        let rs = mgr.read_set_tagged(tx);
+        for i in 0..10u64 {
+            assert!(
+                rs.contains(&(EntityId::Node(NodeId::new(i)), None)),
+                "fine Node({i}) must remain (no promotion at usize::MAX)"
+            );
+        }
+        assert!(
+            !rs.contains(&(EntityId::Label(lbl9), None)),
+            "Label(9) must NOT appear when promotion is disabled"
+        );
+    }
+
+    /// LOAD-BEARING: dropping the fine entries on promotion must NOT lose a
+    /// conflict. It is only safe because GE2's write fan-out records the coarse
+    /// `Label(L)` key for every structural change to a node carrying `L`.
+    ///
+    /// We build a genuine two-transaction write-skew whose cycle can ONLY close
+    /// through coarse keys (two distinct labels, so the writes don't W-W collide
+    /// on the same `Label` key):
+    ///   tx1: escalated scan of Label(5)  + writes node W1 carrying Label(6)
+    ///   tx2: coarse read of Label(6)     + writes node 0 carrying Label(5)
+    ///
+    /// Node 0 is one tx1 *scanned and then dropped* from the registry. tx2's
+    /// `record_node_write(node0, [L5])` fans out to a coarse `Label(5)` write
+    /// that must still find tx1 — whose `Label(5)` read survives ONLY as the
+    /// coarse key (its fine `Node(_)` SIREAD entries were collapsed). That edge
+    /// (tx1 →rw tx2) is what gives tx2 its `in_conflict`; without the coarse
+    /// recording the drop would silently lose it and tx2 would NOT be a pivot.
+    /// The symmetric `Label(6)` edge closes the cycle, aborting the second
+    /// committer (tx2).
+    #[test]
+    fn escalated_reader_still_conflicts_via_label() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let lbl5 = LabelId::new(5);
+        let lbl6 = LabelId::new(6);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx1 scans > T nodes of Label(5) → escalates → coarse Label(5);
+        // its fine Node(0..10) reads are dropped from the registry.
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx1, NodeId::new(i), None, lbl5)
+                .unwrap();
+        }
+        // Sanity: tx1 escalated — coarse Label(5) present, fine Node(0) dropped
+        // from BOTH the read_set and the SIREAD registry.
+        let rs1 = mgr.read_set_tagged(tx1);
+        assert!(rs1.contains(&(EntityId::Label(lbl5), None)));
+        assert!(!rs1.contains(&(EntityId::Node(NodeId::new(0)), None)));
+        assert!(
+            !mgr.read_registry
+                .readers_of_compatible(EntityId::Node(NodeId::new(0)), None)
+                .contains(&tx1),
+            "tx1's fine Node(0) reader must be dropped from the registry"
+        );
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Label(lbl5), None)
+                .contains(&tx1),
+            "tx1's coarse Label(5) reader must remain in the registry"
+        );
+
+        // tx2 reads Label(6) (coarse).
+        mgr.record_read(tx2, EntityId::Label(lbl6), None).unwrap();
+
+        // Writes (disjoint coarse keys → no W-W collision):
+        // tx1 writes node W1 carrying Label(6) → Label(6) fan-out finds tx2.
+        mgr.record_node_write(tx1, NodeId::new(900), &[lbl6], None)
+            .unwrap();
+        // tx2 writes node 0 carrying Label(5) → Label(5) fan-out must find tx1
+        // via the COARSE key (fine Node(0) was dropped). THIS is the drop-safety.
+        mgr.record_node_write(tx2, NodeId::new(0), &[lbl5], None)
+            .unwrap();
+
+        // Both txs are pivots: each has an inbound and an outbound rw-edge.
+        // tx2.in_conflict in particular was set via the coarse Label(5) key
+        // after its fine Node(0) reader had been dropped — the load-bearing bit.
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (true, true),
+            "tx1 must have both edges (in via Label(5) write-target reader, out via Label(6))"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, true),
+            "tx2 must have both edges — in via the coarse Label(5) key (post-drop)"
+        );
+
+        // tx1 commits first (no committed concurrent writer yet → not a pivot).
+        assert!(
+            mgr.commit(tx1).is_ok(),
+            "first committer (tx1) must succeed"
+        );
+        // tx2 is now the dangerous-structure pivot: in+out, and tx1 (committed
+        // after tx2's start) wrote Label(6) which is in tx2's read_set.
+        let r2 = mgr.commit(tx2);
+        assert!(
+            r2.is_err(),
+            "tx2 must fail to serialize — the fine-entry drop did not lose the conflict (coarse Label(5) carried it)"
+        );
+        assert!(
+            r2.unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "expected SerializationFailure for the escalated-reader conflict"
+        );
+    }
+
+    /// After promotion the fine SIREAD entries are gone from the registry but the
+    /// coarse key is present: `readers_of_compatible(Node(0))` is empty for the
+    /// tx, while `readers_of_compatible(Label(9))` returns it.
+    #[test]
+    fn promotion_drops_from_registry() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let lbl9 = LabelId::new(9);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, lbl9)
+                .unwrap();
+        }
+
+        // Fine reader removed from the registry for a promoted row.
+        let fine = mgr
+            .read_registry
+            .readers_of_compatible(EntityId::Node(NodeId::new(0)), None);
+        assert!(
+            !fine.contains(&tx),
+            "fine Node(0) reader must be removed from the registry after promotion"
+        );
+
+        // Coarse key reader present.
+        let coarse = mgr
+            .read_registry
+            .readers_of_compatible(EntityId::Label(lbl9), None);
+        assert!(
+            coarse.contains(&tx),
+            "coarse Label(9) reader must be present in the registry after promotion"
         );
     }
 }

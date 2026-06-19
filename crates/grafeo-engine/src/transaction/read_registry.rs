@@ -106,6 +106,56 @@ impl ReadRegistry {
             }
         }
     }
+
+    /// Remove a single `(entity, tx, tag)` reader entry from the registry.
+    ///
+    /// Unlike [`remove_reader`](Self::remove_reader) (which drops *all* of a
+    /// finished reader's entries), this surgically removes only the one
+    /// `(tx, tag)` pair under `entity`. Used by read-set escalation: when the
+    /// fine `Node(n)` / `Edge(e)` reads beneath a `Label(L)` / `RelType(T)`
+    /// predicate are collapsed into the coarse key, each fine SIREAD lock must
+    /// be released individually while the reader is still active (so a later
+    /// writer of that fine entity no longer finds the now-dropped reader).
+    ///
+    /// The shard is keyed by `entity` hash. The reverse `by_tx` index is also
+    /// updated: the `entity` occurrence for `tx` is removed only when this was
+    /// the tx's last entry under `entity` (i.e. no other tag for the same
+    /// `(entity, tx)` remains), keeping `by_tx` consistent for a later
+    /// [`remove_reader`](Self::remove_reader) sweep.
+    ///
+    /// A no-op if the entry is absent (idempotent).
+    pub fn remove_reader_entity(&self, entity: EntityId, tx: TransactionId, tag: PropTag) {
+        let mut sh = self.shard(&entity).write();
+        let removed = if let Some(set) = sh.get_mut(&entity) {
+            let removed = set.remove(&(tx, tag));
+            if set.is_empty() {
+                sh.remove(&entity);
+            }
+            removed
+        } else {
+            false
+        };
+        // Determine whether `tx` still has any other entry under `entity`
+        // (a different tag). If not, drop the `entity` occurrence from by_tx.
+        let tx_still_reads_entity = sh
+            .get(&entity)
+            .is_some_and(|set| set.iter().any(|(t, _)| *t == tx));
+        drop(sh);
+
+        if removed && !tx_still_reads_entity {
+            let mut by_tx = self.by_tx.write();
+            if let Some(entities) = by_tx.get_mut(&tx) {
+                // Remove a single occurrence of `entity` (push appends one per
+                // distinct (entity) first-insert, so at most one is present).
+                if let Some(pos) = entities.iter().position(|e| *e == entity) {
+                    entities.swap_remove(pos);
+                }
+                if entities.is_empty() {
+                    by_tx.remove(&tx);
+                }
+            }
+        }
+    }
 }
 
 impl Default for ReadRegistry {
@@ -202,6 +252,51 @@ mod tests {
 
         let r = reg.readers_of_compatible(node1, None);
         assert_eq!(r.len(), 1, "duplicate record_reader must not double-insert");
+    }
+
+    /// `remove_reader_entity` removes exactly one (entity, tx, tag) entry and
+    /// leaves every other entry (other entities for the same tx, other txs on
+    /// the same entity) untouched. A later `remove_reader` still cleans up the
+    /// tx's remaining entries.
+    #[test]
+    fn test_remove_reader_entity_surgical() {
+        let reg = ReadRegistry::new();
+        let t1 = txid(1);
+        let t2 = txid(2);
+
+        let node1 = EntityId::Node(NodeId::new(1));
+        let node2 = EntityId::Node(NodeId::new(2));
+
+        reg.record_reader(node1, t1, None);
+        reg.record_reader(node1, t2, None);
+        reg.record_reader(node2, t1, None);
+
+        // Remove only (node1, t1, None).
+        reg.remove_reader_entity(node1, t1, None);
+
+        // node1 keeps t2; t1 dropped.
+        assert_eq!(
+            reg.readers_of_compatible(node1, None),
+            vec![t2],
+            "node1 must keep t2 after removing (node1, t1)"
+        );
+        // node2 still has t1 (untouched).
+        assert_eq!(
+            reg.readers_of_compatible(node2, None),
+            vec![t1],
+            "node2 must still have t1"
+        );
+
+        // Removing an absent entry is a no-op.
+        reg.remove_reader_entity(node1, t1, None);
+        assert_eq!(reg.readers_of_compatible(node1, None), vec![t2]);
+
+        // A subsequent remove_reader(t1) cleans up node2 (by_tx stayed consistent).
+        reg.remove_reader(t1);
+        assert!(
+            reg.readers_of_compatible(node2, None).is_empty(),
+            "remove_reader(t1) must still drop node2 (by_tx tracked it)"
+        );
     }
 
     /// None is a wildcard: a reader stored with None is compatible with any
