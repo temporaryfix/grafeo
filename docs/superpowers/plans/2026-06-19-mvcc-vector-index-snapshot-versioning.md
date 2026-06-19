@@ -137,6 +137,23 @@ On `integration` @ `fb6ffd04`+. **Reuses the merged text cycle:**
 
 ---
 
-## STATUS: NOT STARTED
+## STATUS: COMPLETE — merged to `integration` @ `853b2fc2`
 
-Plan written against `integration` @ `fb6ffd04`+ (spec committed). Scope: snapshot-versioned HNSW vector search under Serializable via B‴ (snapshot-filtered candidate generator over the node/property MVCC chains; no index-internal version history). Heavily reuses the merged text cycle (`EntityId::Index`, the recording bridges + completeness sweep, GC-at-horizon, `read_node_property_visible`, `is_node_visible_versioned`). Execute subagent-driven, one task behind its gate; the re-embed-as-of-E test (Task 7) and the recording-completeness sweep are the load-bearing checks. On completion: **zero Serializable guards remain** — the isolation surface is complete.
+Snapshot-versioned HNSW vector search under Serializable is **done and merged** (23 files, +3252/−129). **The last Serializable guard is removed — the entire isolation surface is complete.** B‴ shape: the HNSW is a snapshot-filtered candidate generator over the node/property MVCC chains, NOT an index-internal version history.
+
+**Tasks (all landed):**
+- **VI1** retain-deleted topology (hard-delete → soft-delete; keep nodes+links for connectivity; `contains_including_deleted`) — behavior-preserving.
+- **VI2** `search_visible` (traverse-all, collect-visible, widen `ef` ×4, accessor-scored; quantized rescore via the *passed* accessor).
+- **VI3** `SnapshotVectorAccessor` (as-of-E via `read_node_property_visible`, RYW-honouring).
+- **VI4** `vector_search_visible` (node-chain visibility + as-of-E accessor + tx-overlay read-your-writes) + trait method + 4 wrapper delegations.
+- **VI5** `EntityId::Index` recording (generalized `IndexId::for_index`; read on search, write on indexed-vector SET/REMOVE — reuses the text bridges).
+- **VI6** GC (rebuild dropping deleted-below-horizon) + the tiered `node_deleted_at_or_below` fix (`version_history()` delete-epoch, not visibility — don't GC created-after-horizon live nodes).
+- **VI7** integration + guard removal (Scan/Join/Procedure routed + recorded execution-time; `plan_vector_scan` guard deleted) + acceptance.
+- **VI8** the **re-embed-as-of-E** soundness test + **un-guarded MMR** → all search procedures `serializable_safe=true`.
+- A build fix: a concurrent commit (`0abbf55b`) had dropped a feature-conditional `mut` in `filter.rs`, breaking `--all-features`; restored via `cfg_attr`.
+
+**Verification:** `--all-features` 7647/0; serializable **33/33** (full+temporal — reads-own-writes, snapshot-consistent, re-embed-as-of-E, phantom-aborts on CALL+scan, multi-label, MMR); clippy; profiles (`default`/`lpg`/`lpg,vector-index`/`lpg,text-index,vector-index`) + wasm; **effectively zero planner guards** (the one `mutation.rs` per-procedure message is dormant — every procedure passes). **Opus final review: "FULLY and ROBUSTLY sound — safe to merge"** (3 probes: quantized as-of-E rescore, GC-keeps-live-reembed, GC-drops-deleted; no residual hole). The recording-completeness sweep was done up-front (the text lesson) → **one round, no whack-a-mole**.
+
+**Residuals (documented, §8):** candidate-gen recall on re-embedded regions (best-effort, `ef`-tunable); GC = full rebuild; as-of-E *scoring* requires `temporal` (engine-consistent; anti-phantom fires regardless).
+
+**The Serializable arc is finished:** F1 → F2 → Part G → shortestPath → graph algorithms → text index → **vector index**. Zero guards remain.
