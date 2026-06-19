@@ -23,6 +23,16 @@ Make HNSW kNN vector search **snapshot-consistent** (kNN over the as-of-epoch *v
 2. **Predicate-filtered traversal** — traverse the full graph for connectivity, collect only visible candidates, widen `ef` for recall.
 3. **Relocating index maintenance from the engine `crud.rs` layer into the store** so the single-source invariant holds.
 
+### 3a. Why entry-value-versioning (not the node-chain shortcut) — load-bearing
+
+A tempting simplification — derive visibility purely from the node version chain (`is_node_visible_versioned`) and keep the HNSW committed-latest, like the label index — is **unsound under re-embedding**. A node re-embedded `V0 → V1` at `C1`, read by a Serializable search at snapshot `E < C1`, would be scored with `V1` (committed in E's *future*) — a non-snapshot-consistent read that voids SSI's foundation (SSI assumes SI reads; the coarse `EntityId::Index` recording aborts only *dangerous structures*, not every rw-edge, so it does not rescue a non-SI read). It is sound only if vectors are immutable-after-set. Because re-embedding (content updates, model upgrades) is a legitimate operation, the index must version the vector **value** — old entry `deleted@C`, new entry `created@C` — exactly as text versioned postings for content changes. The vector's content-change *is* re-embedding, so this is the precise analog, not redundant machinery.
+
+**Considered and rejected:**
+- **(B′) node-chain-only** — the unsound shortcut above (future-value reads under re-embed).
+- **(B‴) candidate-generate on the latest graph, re-score from the property version chain, filter by node visibility** — sound and avoids duplicating vectors in the index, but candidate generation on the *latest* graph degrades recall for re-embedded regions, and the **Quantized** variant cannot re-score from its internal codes without re-quantizing the as-of-E vector. A real option if value duplication becomes a memory problem; not chosen.
+
+Entry-value-versioning (this spec) is chosen for **soundness + quantized coverage + consistency with text**.
+
 ## 4. Decisions (from brainstorming)
 
 - **Completeness bar:** full snapshot set + best-effort recall — the result *set* is the as-of-E visible vectors + read-your-writes; ANN ranking stays approximate (inherent); `ef` widened to compensate for filtered-out invisibles.
