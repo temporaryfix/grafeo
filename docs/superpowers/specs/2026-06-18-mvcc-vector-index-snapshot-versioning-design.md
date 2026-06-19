@@ -1,92 +1,82 @@
 # Snapshot-Versioned HNSW Vector Search under Serializable — Design
 
-**Status:** Design (approved in brainstorming 2026-06-18). Next: implementation plan via writing-plans. This removes the **last** Serializable guard.
+**Status:** Design (approved in brainstorming 2026-06-18, revised to B‴ after grounding 2026-06-19). Next: implementation plan. This removes the **last** Serializable guard.
 
 ## 1. Goal
 
-Make HNSW kNN vector search **snapshot-consistent** (kNN over the as-of-epoch *visible* vectors + read-your-writes, recall preserved by widening `ef`) and **SSI-sound** (a coarse `EntityId::Index` predicate-read so a Serializable vector search aborts against a concurrent indexed write — the kNN phantom), then remove the vector-search guard. This is the **second instance** of the MVCC-secondary-index pattern the text cycle established; vector reuses the pattern and adds HNSW-specific filtered traversal.
+Make HNSW kNN vector search **snapshot-consistent** (kNN over the as-of-epoch *visible* nodes, scored with their as-of-epoch vector values, + read-your-writes, recall preserved by widening `ef`) and **SSI-sound** (a coarse `EntityId::Index` predicate-read so a Serializable vector search aborts against a concurrent indexed write — the kNN phantom), then remove the vector-search guard. Reuses the text cycle's `EntityId::Index` recording + per-tx delta + GC-at-horizon, and the node/property MVCC the store already has.
 
 ## 2. Context (current state)
 
-- The vector index is `VectorIndexKind = Hnsw(HnswIndex) | Quantized(QuantizedHnswIndex)` (`crates/grafeo-core/src/index/vector/`), keyed `"label:property"` in `LpgStore::vector_indexes`. `insert(id, vec, accessor)` / `remove(id)` / `search*`.
-- **Maintained at the engine `crud.rs` layer**, not the store: node create/delete/set-vector-property call `index.insert`/`index.remove` directly (`crates/grafeo-engine/src/database/crud.rs`), committed-latest. (The text index, by contrast, lived in the store.)
-- **`remove()` is a HARD delete** (`hnsw.rs:745`): it removes the node from the graph and re-links neighbors — there is no soft-delete/tombstone today.
-- `search_with_filter` is a **naive post-filter**: `search(k.max(allowlist.len()))` then `.filter(allowlist.contains)` — O(N) when the visible set is large (the common case), and structurally cannot do read-your-writes or see deleted-after-snapshot vectors.
-- No epoch awareness, no read recording → guarded under Serializable (`plan_vector_scan`, `query/planner/lpg/mod.rs:1078`; `CALL grafeo.search.vector` rejected; `SearchVectorProcedure.serializable_safe()==false`).
+- `VectorIndexKind = Hnsw(HnswIndex) | Quantized(QuantizedHnswIndex)` (`crates/grafeo-core/src/index/vector/`), keyed `"label:property"` in `LpgStore::vector_indexes`.
+- **The full-precision `HnswIndex` stores NO vectors** — `HnswNode { neighbors: Vec<Vec<NodeId>> }` is *topology only* (`hnsw.rs:129`); `insert(id, vec, accessor)` builds topology and uses the `VectorAccessor` for distances; vectors live in node-properties. `VectorAccessor::get_vector(id) -> Option<Arc<[f32]>>` (`accessor.rs:33`). Full-precision (`VectorIndexKind::Hnsw`) is the **default**.
+- **`QuantizedHnswIndex` DOES store vectors internally** (`vectors: HashMap<NodeId, Arc<[f32]>>` for rescoring + `scalar_vectors`/`binary_vectors`) — coarse quantized search then full-precision **rescore**.
+- **`remove()` is a HARD delete** (`hnsw.rs:745`) — removes the node + re-links neighbors; no soft-delete today.
+- Maintained at the engine `crud.rs` layer (committed-latest, `index.insert`/`remove` on node create/delete/set-vector). `search_with_filter` is a naive O(N) post-filter. No epoch awareness, no recording → guarded (`plan_vector_scan`, `query/planner/lpg/mod.rs:1078`; `CALL grafeo.search.vector` rejected; `SearchVectorProcedure.serializable_safe()==false`).
 
-## 3. Reused vs new
+## 3. The load-bearing insight (why B‴, not text's index-internal versioning)
 
-**Reused from the text cycle (merged `ac1c5420`) — unchanged:** the `EntityId::Index(IndexId)` conflict key + read/write-tracker bridges; the per-tx-delta + commit-promote + GC-at-horizon shape; the single-source discipline (index epoch == property commit epoch); the **execution-time, operator-chokepoint, property-keyed recording** lesson ([[project_serializable_guard_recording]]); the per-procedure `serializable_safe` guard.
+Text versioned its postings because **text stores the indexed data in the index** (the postings), and a node's term-membership changes. **Vector does not store the indexed data in the (full-precision) index** — the vectors are in the node-property MVCC version chain, *already snapshot-versioned*. So the snapshot-correct vector value is `read_node_property_visible(N, prop, E, tx)` — **existing infra** — not something to re-version inside the HNSW.
 
-**New (HNSW-specific):**
-1. **Versioned entries on a hard-delete index** — add `created_epoch`/`deleted_epoch` and convert `remove()` from hard-delete to **soft-delete-with-epoch** (retain the node + its links for connectivity; GC hard-rebuilds below the horizon).
-2. **Predicate-filtered traversal** — traverse the full graph for connectivity, collect only visible candidates, widen `ef` for recall.
-3. **Relocating index maintenance from the engine `crud.rs` layer into the store** so the single-source invariant holds.
+Therefore the index is a **snapshot-filtered candidate generator over the node/property version chains**, not a parallel version history:
+- **Visibility** (which nodes) comes from the node version chain — `is_node_visible_versioned(N, E, tx)` (the SnapshotView predicate the graph-algorithm cycle already uses).
+- **Vector values** (for distance/score) come from the property version chain — a **snapshot-aware `VectorAccessor`** reading `read_node_property_visible`. This is sound under **re-embedding**: a node re-embedded `V0→V1` is scored with its as-of-E value (`V0` for a snapshot before the change), never a future value. (The unsound shortcut — score with the index's/committed-latest value — would read the future and void SSI's SI-read foundation.)
+- **The index itself carries no per-entry epochs and no value copies.** Its only MVCC change is **retaining deleted nodes** (soft-delete instead of hard-delete) so connectivity holds and deleted-after-snapshot nodes resolve; GC prunes them below the horizon.
 
-### 3a. Why entry-value-versioning (not the node-chain shortcut) — load-bearing
-
-A tempting simplification — derive visibility purely from the node version chain (`is_node_visible_versioned`) and keep the HNSW committed-latest, like the label index — is **unsound under re-embedding**. A node re-embedded `V0 → V1` at `C1`, read by a Serializable search at snapshot `E < C1`, would be scored with `V1` (committed in E's *future*) — a non-snapshot-consistent read that voids SSI's foundation (SSI assumes SI reads; the coarse `EntityId::Index` recording aborts only *dangerous structures*, not every rw-edge, so it does not rescue a non-SI read). It is sound only if vectors are immutable-after-set. Because re-embedding (content updates, model upgrades) is a legitimate operation, the index must version the vector **value** — old entry `deleted@C`, new entry `created@C` — exactly as text versioned postings for content changes. The vector's content-change *is* re-embedding, so this is the precise analog, not redundant machinery.
-
-**Considered and rejected:**
-- **(B′) node-chain-only** — the unsound shortcut above (future-value reads under re-embed).
-- **(B‴) candidate-generate on the latest graph, re-score from the property version chain, filter by node visibility** — sound and avoids duplicating vectors in the index, but candidate generation on the *latest* graph degrades recall for re-embedded regions, and the **Quantized** variant cannot re-score from its internal codes without re-quantizing the as-of-E vector. A real option if value duplication becomes a memory problem; not chosen.
-
-Entry-value-versioning (this spec) is chosen for **soundness + quantized coverage + consistency with text**.
+**Rejected:** (A) index-internal entry-value-versioning — for full-precision there is nothing to version (it stores no vectors); doing it means *adding* a versioned vector store that duplicates the property chain. The earlier draft chose A on the wrong assumption that the index stores vectors; the grounding (topology-only) reverses it.
 
 ## 4. Decisions (from brainstorming)
 
-- **Completeness bar:** full snapshot set + best-effort recall — the result *set* is the as-of-E visible vectors + read-your-writes; ANN ranking stays approximate (inherent); `ef` widened to compensate for filtered-out invisibles.
-- **HNSW approach:** predicate-filtered traversal (not per-epoch snapshots — memory-prohibitive; not the naive post-filter — O(N) + incomplete).
-- **Single-source locus:** move vector-index maintenance into the **store** (consistent with text; clean single-source), accepting the refactor.
-- **Recording:** coarse `EntityId::Index` (index-level is the natural grain for kNN — there's no term-level analog), execution-time at the operator chokepoint.
+- **Completeness bar:** full snapshot set + best-effort recall — result *set* is the as-of-E visible nodes; scoring uses as-of-E vectors (sound); ANN ranking inherently approximate; `ef` widened to compensate for filtered-out invisibles.
+- **HNSW approach:** predicate-filtered traversal (not per-epoch snapshots; not naive post-filter).
+- **Visibility + values from the node/property version chains** (B‴), not an index-internal history.
+- **Recording:** coarse `EntityId::Index` (index-level is the natural kNN grain), execution-time at the operator chokepoint.
 
 ## 5. Architecture
 
-### 5a. Versioned HNSW entries (hard-delete → soft-delete + epochs)
+### 5a. Retain-deleted topology (the only HNSW structural change)
 
-Each entry gains `created_epoch: EpochId`, `created_by: Option<TransactionId>`, `deleted_epoch: Option<EpochId>`, `deleted_by: Option<TransactionId>`. Visibility-at-(E,tx) is identical to `posting_visible`/`VersionInfo::is_visible_to`. **`remove(id, epoch, tx)` becomes a soft-delete:** stamp `deleted_epoch`, **keep the node and its bidirectional links** (so it remains a routing hop for connectivity and is still visible to snapshots `< epoch`). `insert(id, vec, epoch, tx, accessor)` stamps `created_epoch`. (Applies to both `HnswIndex` and `QuantizedHnswIndex`.) **Task 0 verification:** confirm the beam-search (`search_layer`) can route *through* a soft-deleted node while excluding it from results.
+`remove(id)` becomes a **soft-delete**: keep the node and its bidirectional links (so it remains a routing hop and is still reachable for snapshots that should see it) instead of hard-removing + re-linking. Re-embedding (`SET n.vec = …`) re-inserts `id`, overwriting its topology position toward the new vector (committed-latest topology). Applies to `HnswIndex` and `QuantizedHnswIndex`. No per-entry epochs. **Task 0 verification:** confirm the beam search routes *through* a retained node while the filter (5b) excludes it from results; confirm re-insert of an existing id updates rather than duplicates.
 
-### 5b. Predicate-filtered search
+### 5b. Predicate-filtered, as-of-E-scored search
 
-`search_visible(query, k, ef, is_visible: impl Fn(NodeId) -> bool) -> Vec<(NodeId, f32)>`: run the existing beam search, but at **result collection** skip any candidate where `!is_visible(id)` — **while still traversing through it** (its neighbors are explored) so connectivity is preserved. Widen the effective `ef` (e.g. `ef.max(k * F)` for a small factor F, tunable) so the result heap fills with `k` visible despite skipped invisibles. `is_visible(id)` = entry-visible-at-(E,tx) AND not tx-removed.
+`search_visible(query, k, ef, is_visible: impl Fn(NodeId)->bool, accessor: &impl VectorAccessor) -> Vec<(NodeId, f32)>`: run the beam search over the (latest) topology — traversing *through* all nodes for connectivity — but **collect into results only** candidates where `is_visible(id)`; widen the effective `ef` (e.g. `ef.max(k * F)`, F tunable) to keep the result heap filled despite skipped invisibles. **Distances/scores use the supplied accessor**, which the caller makes snapshot-aware (5c). For `Quantized`, the coarse phase uses internal codes (latest) for candidate gen, and the **rescore** phase uses the snapshot-aware accessor for as-of-E full-precision scores.
 
-### 5c. Per-transaction vector delta
+### 5c. Snapshot-aware accessor (as-of-E values, the soundness mechanism)
 
-The transaction's uncommitted vector inserts/removes for the index (`Vec<(NodeId, Vec<f32>)>` + a removed set). Searched by **brute force** (k is small, the uncommitted set is small): compute distances to the query, merge into the top-k from 5b; a delta-removed node is excluded. Read-your-writes. Mirrors `TextIndexDelta`; lives in a `vector_index_overlay` next to `text_index_overlay`.
+A `SnapshotVectorAccessor { store, property, epoch, tx }` impl of `VectorAccessor`: `get_vector(id)` = `read_node_property_visible(id, property, epoch, tx)` converted to `&[f32]` (the as-of-E committed vector, or the tx's own uncommitted value via the overlay path `read_node_property_visible` already honours). Under SI/RC the operator passes the existing committed-latest accessor (byte-unchanged). Under Serializable it passes the snapshot-aware one.
 
-### 5d. Single-source — store-maintained, stamped at the property commit
+### 5d. Per-transaction read-your-writes
 
-Relocate the `crud.rs` vector insert/remove into the store as `update_vector_index_on_set`/`_on_remove` (mirroring `update_text_index_on_set`). Under a transaction they buffer into `vector_index_overlay[tx]`; the non-transactional/auto-commit path mutates the committed index directly at `current_epoch()`. **Commit-promote** in `apply_tx_overlay` stamps each promoted entry's epoch = the commit epoch `C` — **the same `C` that finalizes the vector property version** (single-source). The store supplies a `VectorAccessor` over its node-properties for HNSW neighbor-distance lookups during insert. Rollback/abort drops `vector_index_overlay[tx]`.
-
-> **INVARIANT (acceptance):** for every node `N` and epoch `E`, an entry for `N` is visible in the index at E iff `N`'s indexed vector property is visible (and equals that value) at E — the index is a consistent-by-construction projection of the vector property's version chain. One commit stamps both.
+The transaction's uncommitted vectors come from the existing `tx_property_overlay` (its buffered `SET n.vec`). Two parts: (i) a node the tx **re-embedded/created** is scored with the tx's value — already handled because `read_node_property_visible(.., tx)` returns the tx's buffered value; (ii) a node the tx **created** that isn't in the committed topology yet is found by **brute-forcing the tx's buffered vectors for this index** against the query and merging into top-k; a node the tx **deleted** is filtered by `is_visible` (= `is_node_visible_versioned(.., tx)` returns not-visible). No separate `vector_index_overlay` — derive from `tx_property_overlay`.
 
 ### 5e. GC
 
-Soft-deleted entries with `deleted_epoch <= min_active_epoch` are reclaimed by an **HNSW rebuild** (the graph is rebuilt from the live entries) — HNSW has no cheap in-place hard delete. Triggered from the same horizon-driven GC path as the store/text GC; bounded by the active-tx horizon.
+Soft-deleted nodes whose node version chain shows `deleted_epoch <= min_active_epoch` are reclaimed by an **HNSW rebuild** from the still-live nodes (HNSW has no cheap in-place hard delete). Triggered from the same horizon-driven GC path as the store/text GC.
 
 ### 5f. SSI recording (coarse `EntityId::Index`)
 
-`IndexId::for_text_index` generalizes to any `(label, property)` index (rename/alias to `for_index`). A Serializable vector search records `read(EntityId::Index(idx))` **execution-time at the operator chokepoint** — `VectorScanOperator`, `VectorJoinOperator`, and `SearchVectorProcedure` (record once, regardless of rows, via the established once-per-execution mechanism). A vector-property write (the store's `update_vector_index_on_*`) records `write(EntityId::Index(idx))`. The kNN phantom — a concurrent insert of a vector closer than the current k-th — is caught (it wrote the index; the search read it). Coarse (any indexed-vector write conflicts); no term-level analog.
+`IndexId::for_text_index` generalizes to `IndexId::for_index(label, property)` (text keeps working). A Serializable vector search records `read(EntityId::Index(idx))` **execution-time at the operator chokepoint** — `VectorScanOperator`, `VectorJoinOperator`, and `SearchVectorProcedure` (record once per execution, regardless of rows, via the established mechanism). A vector-property write (the `crud.rs`/store path that does `index.insert`/`remove`) records `write(EntityId::Index(idx))`. The kNN phantom (a concurrent insert of a closer vector) is caught. Apply the **text recording-completeness sweep** ([[project_serializable_guard_recording]]) across every vector entry point.
 
 ## 6. Integration + guard removal
 
-- Route `VectorScanOperator`/`VectorJoinOperator` + `SearchVectorProcedure` through `search_visible(epoch, tx)` (+ the per-tx delta + the `EntityId::Index` read) under Serializable; committed-latest `search` under SI/RC (byte-unchanged).
-- Flip `SearchVectorProcedure.serializable_safe()` → `true`; drop the `plan_vector_scan` guard (`mod.rs:1078`); update the guard-assertion tests (`test_plan_vector_scan_rejected_under_serializable` → allowed; `test_plan_call_search_vector_rejected_under_serializable`). **No guard remains** after this.
+- Route `VectorScanOperator`/`VectorJoinOperator` + `SearchVectorProcedure` through `search_visible` with the snapshot-aware accessor + the `is_node_visible_versioned` predicate + the tx-overlay brute-force + the `EntityId::Index` read, under Serializable; committed-latest path under SI/RC (byte-unchanged).
+- Flip `SearchVectorProcedure.serializable_safe()` → `true`; drop the `plan_vector_scan` guard (`mod.rs:1078`); update the guard-assertion tests. **No Serializable guard remains in the planner after this.**
 
 ## 7. Acceptance criteria
 
-1. **Completeness:** under Serializable, vector search (a) returns the transaction's own uncommitted matching vectors (read-your-writes); (b) excludes vectors committed after the snapshot; (c) includes vectors whose node was deleted after the snapshot; (d) preserves recall via widened `ef` (a recall test: with a fraction of entries soft-deleted-but-visible, recall stays within tolerance of the unfiltered baseline).
-2. **Single-source invariant (§5d) — tested:** mutate a node's vector across epochs (insert / re-embed / delete-node) and assert the index's as-of-E entry set/values equal the vector property's as-of-E version chain.
-3. **SSI soundness (anti-phantom):** a Serializable vector search concurrent with a transaction inserting a closer vector → a serialization failure; a disjoint write (different indexed property) → both commit. Recorded at every vector entry point (Scan / Join / CALL) — apply the text recording-completeness sweep.
-4. **SI / Read-Committed unchanged:** committed-latest search + results identical to today; versioning additive; delta + recording Serializable-only.
-5. **Guard removed:** `CALL grafeo.search.vector` + vector scan/join plan & run under Serializable. **Zero Serializable guards remain in the planner.**
+1. **Completeness:** under Serializable, vector search (a) returns the transaction's own uncommitted vectors (read-your-writes); (b) excludes nodes committed after the snapshot; (c) includes nodes deleted after the snapshot; (d) preserves recall via widened `ef` (recall within tolerance of the unfiltered baseline with a fraction of nodes soft-deleted-but-visible).
+2. **As-of-E scoring under re-embed — tested (the soundness crux):** re-embed a node's vector across epochs; a Serializable search at an earlier snapshot ranks it by its **as-of-E** vector (via the snapshot-aware accessor), never the latest. Oracle = `read_node_property_visible`.
+3. **SSI soundness (anti-phantom):** a Serializable vector search concurrent with a transaction inserting a closer vector → serialization failure; a disjoint write → both commit. Recorded at every entry point (Scan / Join / CALL) — apply the recording-completeness sweep.
+4. **SI / Read-Committed unchanged:** committed-latest search results identical to today (retain + filter-at-current produce the same set; the committed accessor is used; recording Serializable-only).
+5. **Guard removed:** `CALL grafeo.search.vector` + vector scan/join plan & run under Serializable. **Zero Serializable guards remain.**
 6. Full `--all-features` + `--features full` green; clippy; profiles + wasm; OPSEC (un-pushed).
 
 ## 8. Residuals / risks
 
-- **HNSW soft-delete + connectivity (the #1 risk):** routing through soft-deleted nodes while excluding them from results must be correct in the beam search; a re-link bug or an entry-point on a deleted node degrades recall or correctness. Mitigation: Task-0 verification + the recall test.
-- **GC = full rebuild** — O(index) cost when entries fall below the horizon; amortized/triggered like the store GC. Acceptable; note it.
-- **Recall under heavy churn** — many invisible entries widen the effective search; `ef` factor is tunable; documented.
-- **Single-source relocation** — moving maintenance from `crud.rs` to the store touches the create/delete/set-vector paths; the existing vector tests are the regression guard; stamp at the same `C` as the property (the text commit-flow trace is the template).
-- **Quantized vs full HNSW** — both variants need the versioned-entry + filtered-search treatment; the quantized path stores vectors internally (no accessor) — verify the soft-delete + filter apply there too.
-- **`EntityId::Index` already exists** (text) — vector reuses it; only the recording call-sites (vector operators) are new.
+- **Recall under re-embed / heavy churn (the #1 caveat):** candidate generation runs on the *latest* topology while scoring as-of-E, so re-embedded regions (and many soft-deleted nodes) can lower recall; `ef` factor is tunable; documented, accepted under "best-effort recall."
+- **HNSW soft-delete + connectivity:** routing through retained-deleted nodes while excluding them from results must be correct; an entry-point landing on a logically-deleted node must still function. Task-0 verification + the recall test.
+- **GC = full rebuild** — O(index) when nodes fall below the horizon; amortized/triggered like the store GC.
+- **Accessor cost:** `read_node_property_visible` per scored candidate (a version-chain lookup) — negligible beside the distance computations, but real; the committed-latest SI/RC path keeps the cheap accessor.
+- **Quantized rescore path** must use the snapshot-aware accessor for the full-precision rescore (its internal `vectors` map is latest-only); verify the coarse→rescore split honours as-of-E.
+- **Topology completeness invariant:** every node with a committed (visible) vector must be in the topology (until GC) or it's a false-negative candidate — the existing `crud.rs` maintenance guarantees this; retain-on-delete preserves it.
