@@ -1725,6 +1725,32 @@ impl GraphStoreSearch for LayeredStore {
         results.retain(|(id, _)| !deleted.contains_key(id));
         results
     }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Delegate to the overlay (LpgStore), then filter nodes deleted from
+        // the base so stale hits do not leak through the layered view.
+        let deleted = self.deleted_from_base_nodes.read();
+        let mut results = self.overlay.load().vector_search_visible(
+            label,
+            property,
+            query,
+            k + deleted.len(),
+            epoch,
+            tx,
+        );
+        results.retain(|(id, _)| !deleted.contains_key(id));
+        results.truncate(k);
+        results
+    }
 }
 
 // ── GraphStoreMut implementation ───────────────────────────────────

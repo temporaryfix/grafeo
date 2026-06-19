@@ -646,6 +646,20 @@ impl GraphStoreSearch for SnapshotView<'_> {
         self.inner
             .vector_search_with_threshold(label, property, query, threshold, metric)
     }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        self.inner
+            .vector_search_visible(label, property, query, k, epoch, tx)
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

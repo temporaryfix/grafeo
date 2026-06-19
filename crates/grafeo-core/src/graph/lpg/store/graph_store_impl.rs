@@ -605,6 +605,27 @@ impl GraphStoreSearch for LpgStore {
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
+
+    /// Snapshot-aware top-`k` vector search — delegates to
+    /// [`LpgStore::search_vector_visible`], which uses snapshot visibility,
+    /// as-of-`epoch` scoring via `SnapshotVectorAccessor`, and a brute-force
+    /// tx-overlay merge for read-your-writes completeness.
+    #[cfg(feature = "vector-index")]
+    fn vector_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Vec<(grafeo_common::types::NodeId, f64)> {
+        let index_key = format!("{label}:{property}");
+        self.search_vector_visible(&index_key, query, k, epoch, tx)
+            .into_iter()
+            .map(|(id, d)| (id, f64::from(d)))
+            .collect()
+    }
 }
 
 impl GraphStoreMut for LpgStore {

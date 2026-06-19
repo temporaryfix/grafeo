@@ -812,6 +812,39 @@ pub trait GraphStoreSearch: GraphStore {
     ) -> Vec<(NodeId, f64)> {
         Vec::new()
     }
+
+    /// Snapshot-aware top-`k` vector search for transactions.
+    ///
+    /// Returns the `k` nearest nodes visible at `epoch` for `tx`, using the
+    /// committed HNSW index for graph-traversal connectivity while scoring each
+    /// candidate with the snapshot-consistent vector (as-of `epoch`, with
+    /// read-your-writes for `tx`'s own uncommitted `SET`s).
+    ///
+    /// Uncommitted vector writes buffered by `tx` on nodes that carry `label`
+    /// are brute-force merged into the result so they appear even before the
+    /// HNSW graph has been updated.
+    ///
+    /// # Default
+    ///
+    /// Delegates to the committed-latest [`vector_search`](Self::vector_search)
+    /// so non-LPG stores (columnar bases, RDF adapters, `LayeredStore` over
+    /// non-LPG) compile and behave unchanged.  LPG stores override this to
+    /// call `LpgStore::vector_search_visible`.
+    ///
+    /// The `label` and `property` form `"label:property"` for the index key.
+    #[cfg(feature = "vector-index")]
+    fn vector_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Non-LPG fall-through: committed-latest, no snapshot isolation.
+        self.vector_search(Some(label), property, query, k, DistanceMetric::Cosine)
+    }
 }
 
 /// Write operations for graph mutation.

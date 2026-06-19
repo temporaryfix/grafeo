@@ -3582,3 +3582,186 @@ fn buffer_text_index_remove_calls_record_index_write() {
 
     store.unregister_write_tracker(tx);
 }
+
+// ── VI4: vector_search_visible (snapshot visibility + as-of-E scoring + read-your-writes) ──
+
+/// A transaction that buffers `SET n.embedding = <vector near query>` via
+/// `set_node_property_buffered` must have that node returned by
+/// `search_vector_visible` (read-your-writes), while the committed-latest
+/// `vector_search` does not see it.
+#[cfg(feature = "vector-index")]
+#[test]
+fn vector_search_visible_reads_own_writes() {
+    use crate::graph::GraphStoreSearch;
+    use crate::index::vector::{DistanceMetric, HnswConfig, HnswIndex, VectorIndexKind};
+    use std::sync::Arc;
+
+    let store = LpgStore::new().unwrap();
+
+    // Build a small HNSW index for (Doc, embedding).
+    let config = HnswConfig::new(3, DistanceMetric::Euclidean);
+    let idx = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+    store.add_vector_index("Doc", "embedding", Arc::clone(&idx));
+
+    // Commit node A with a vector far from query.
+    let node_a = store.create_node(&["Doc"]);
+    let far_vec: Arc<[f32]> = vec![10.0_f32, 10.0, 10.0].into();
+    store.set_node_property(node_a, "embedding", Value::Vector(Arc::clone(&far_vec)));
+    // Insert A into the HNSW index.
+    let accessor_a = crate::graph::lpg::store::vector_accessor::SnapshotVectorAccessor {
+        store: &store,
+        property: grafeo_common::types::PropertyKey::new("embedding"),
+        epoch: store.current_epoch(),
+        tx: None,
+    };
+    idx.insert(node_a, &far_vec, &accessor_a);
+
+    let epoch = store.current_epoch();
+    let tx = TransactionId::new(42);
+
+    // Node B: created in this tx (PENDING), buffered with a vector near query.
+    let node_b = store.create_node_versioned(&["Doc"], epoch, tx);
+    let near_vec: Arc<[f32]> = vec![0.1_f32, 0.1, 0.1].into();
+    store.set_node_property_buffered(
+        node_b,
+        "embedding",
+        Value::Vector(Arc::clone(&near_vec)),
+        tx,
+    );
+
+    // search_vector_visible at (epoch, tx) must return B (read-your-writes).
+    let results = store.search_vector_visible("Doc:embedding", &[0.0, 0.0, 0.0], 2, epoch, tx);
+    let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+    assert!(
+        ids.contains(&node_b),
+        "tx must see its own buffered vector insert B; got {ids:?}"
+    );
+
+    // The committed-latest vector_search must NOT see B.
+    let committed_results = GraphStoreSearch::vector_search(
+        &store,
+        Some("Doc"),
+        "embedding",
+        &[0.0, 0.0, 0.0],
+        10,
+        DistanceMetric::Euclidean,
+    );
+    let committed_ids: Vec<_> = committed_results.iter().map(|(id, _)| *id).collect();
+    assert!(
+        !committed_ids.contains(&node_b),
+        "committed search must not see uncommitted insert B; got {committed_ids:?}"
+    );
+}
+
+/// A node committed after the snapshot `epoch` must not appear in
+/// `search_vector_visible` at that epoch.
+#[cfg(all(feature = "vector-index", feature = "temporal"))]
+#[test]
+fn vector_search_visible_excludes_committed_after_epoch() {
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+
+    // No HNSW index — brute-force-only path.
+    // Node A committed at epoch 1.  Must call finalize_entities_by_id to promote
+    // the PENDING version to the real commit epoch (mirrors the engine path).
+    let tx1 = TransactionId::new(1);
+    let node_a = store.create_node_versioned(&["Doc"], EpochId::new(1), tx1);
+    store.set_node_property_buffered(
+        node_a,
+        "embedding",
+        Value::Vector(vec![0.1_f32, 0.0, 0.0].into()),
+        tx1,
+    );
+    store.finalize_entities_by_id(tx1, EpochId::new(1), &[node_a], &[]);
+    store.apply_tx_overlay(tx1);
+
+    // Node B committed at epoch 5.
+    let tx2 = TransactionId::new(2);
+    let node_b = store.create_node_versioned(&["Doc"], EpochId::new(5), tx2);
+    store.set_node_property_buffered(
+        node_b,
+        "embedding",
+        Value::Vector(vec![0.2_f32, 0.0, 0.0].into()),
+        tx2,
+    );
+    store.finalize_entities_by_id(tx2, EpochId::new(5), &[node_b], &[]);
+    store.apply_tx_overlay(tx2);
+
+    // At epoch 3 (between the two commits) only A is visible.
+    let results_e3 = store.search_vector_visible(
+        "Doc:embedding",
+        &[0.0, 0.0, 0.0],
+        10,
+        EpochId::new(3),
+        TransactionId::INVALID,
+    );
+    let ids_e3: Vec<_> = results_e3.iter().map(|(id, _)| *id).collect();
+    assert!(
+        ids_e3.contains(&node_a),
+        "node A committed at E1 must be visible at E3; got {ids_e3:?}"
+    );
+    assert!(
+        !ids_e3.contains(&node_b),
+        "node B committed at E5 must not be visible at E3; got {ids_e3:?}"
+    );
+}
+
+/// A node whose delete commits AFTER the snapshot `epoch` must still appear in
+/// `search_vector_visible` at that epoch (delete-after-epoch stays visible).
+#[cfg(all(feature = "vector-index", feature = "temporal"))]
+#[test]
+fn vector_search_visible_includes_deleted_after_epoch() {
+    use crate::graph::GraphStoreMut;
+    use grafeo_common::types::EpochId;
+
+    let store = LpgStore::new().unwrap();
+
+    // Commit node A at epoch 1.  Must call finalize_entities_by_id to promote
+    // the PENDING version to the real commit epoch (matches the engine path).
+    let tx1 = TransactionId::new(1);
+    let node_a = store.create_node_versioned(&["Doc"], EpochId::new(1), tx1);
+    store.set_node_property_buffered(
+        node_a,
+        "embedding",
+        Value::Vector(vec![0.1_f32, 0.0, 0.0].into()),
+        tx1,
+    );
+    // Finalize the node version chain (PENDING → E1) and promote properties.
+    store.finalize_entities_by_id(tx1, EpochId::new(1), &[node_a], &[]);
+    store.apply_tx_overlay(tx1);
+
+    // Delete A at epoch 5 via the trait (which calls delete_node_transactional).
+    let tx_del = TransactionId::new(3);
+    GraphStoreMut::delete_node_versioned(&store, node_a, EpochId::new(5), tx_del);
+    store.sync_epoch(EpochId::new(5));
+    store.finalize_deletes_by_id(tx_del, EpochId::new(5), &[node_a]);
+
+    // At epoch 3 (before delete) node A should be visible.
+    let results_e3 = store.search_vector_visible(
+        "Doc:embedding",
+        &[0.0, 0.0, 0.0],
+        10,
+        EpochId::new(3),
+        TransactionId::INVALID,
+    );
+    let ids_e3: Vec<_> = results_e3.iter().map(|(id, _)| *id).collect();
+    assert!(
+        ids_e3.contains(&node_a),
+        "node deleted at E5 must still be visible at E3; got {ids_e3:?}"
+    );
+
+    // At epoch 5 (at delete epoch) node A should be gone.
+    let results_e5 = store.search_vector_visible(
+        "Doc:embedding",
+        &[0.0, 0.0, 0.0],
+        10,
+        EpochId::new(5),
+        TransactionId::INVALID,
+    );
+    let ids_e5: Vec<_> = results_e5.iter().map(|(id, _)| *id).collect();
+    assert!(
+        !ids_e5.contains(&node_a),
+        "node deleted at E5 must not be visible at E5; got {ids_e5:?}"
+    );
+}

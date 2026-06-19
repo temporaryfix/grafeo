@@ -2,7 +2,7 @@
 
 use super::LpgStore;
 use dashmap::DashMap;
-#[cfg(feature = "text-index")]
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
 use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::types::{HashableValue, NodeId, PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashSet;
@@ -12,7 +12,9 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 #[cfg(feature = "vector-index")]
-use crate::index::vector::VectorIndexKind;
+use super::vector_accessor::{SnapshotVectorAccessor, value_to_vector};
+#[cfg(feature = "vector-index")]
+use crate::index::vector::{VectorAccessor, VectorIndexKind, compute_distance};
 
 impl LpgStore {
     /// Creates an index on a node property for O(1) lookups by value.
@@ -177,6 +179,157 @@ impl LpgStore {
     #[must_use]
     pub fn get_vector_index_by_key(&self, key: &str) -> Option<Arc<VectorIndexKind>> {
         self.vector_indexes.read().get(key).cloned()
+    }
+
+    // === Snapshot vector search (VI4) ===
+
+    /// Searches a vector index at `(epoch, tx)`, returning the `k` nearest
+    /// **visible** nodes scored **as-of-E**, with read-your-writes support for
+    /// the writing transaction's uncommitted vector `SET`s.
+    ///
+    /// ## Algorithm
+    ///
+    /// 1. Delegate to `VectorIndexKind::search_visible` with a snapshot
+    ///    visibility predicate and a `SnapshotVectorAccessor` that reads each
+    ///    node's vector as-of `epoch` (or from the tx's uncommitted delta for
+    ///    read-your-writes).
+    /// 2. Brute-force merge the tx's uncommitted property delta for the target
+    ///    `property`, so nodes whose vector was `SET` in this tx but are not yet
+    ///    in the committed HNSW graph also appear in the result (read-your-writes
+    ///    completeness).  A same-tx node that is already in the HNSW result has
+    ///    its entry replaced so the score reflects the uncommitted value.
+    /// 3. Re-sort and truncate to `k`.
+    ///
+    /// If no committed index exists for `index_key` the method falls back to
+    /// brute-force over the tx overlay only.
+    ///
+    /// The `index_key` format is `"label:property"`.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
+    pub fn search_vector_visible(
+        &self,
+        index_key: &str,
+        query: &[f32],
+        k: usize,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Vec<(NodeId, f32)> {
+        // Parse "label:property" — split on the FIRST ':' matching `get_vector_index`.
+        let Some((label, property_str)) = index_key.split_once(':') else {
+            return Vec::new();
+        };
+        let property_key = PropertyKey::new(property_str);
+
+        // Build the snapshot accessor (as-of-E + tx read-your-writes).
+        let accessor = SnapshotVectorAccessor {
+            store: self,
+            property: property_key.clone(),
+            epoch,
+            tx: Some(tx),
+        };
+
+        // Visibility predicate: node-chain snapshot visibility at (epoch, tx).
+        let is_visible = |id: NodeId| self.is_node_visible_versioned(id, epoch, tx);
+
+        // Look up the committed index.
+        let committed_idx = self.get_vector_index_by_key(index_key);
+
+        // Determine the distance metric from the committed index (fallback: Cosine).
+        let metric = committed_idx
+            .as_deref()
+            .map_or(crate::index::vector::DistanceMetric::Cosine, |idx| {
+                idx.config().metric
+            });
+
+        // Step 1: search the committed HNSW or brute-force all committed nodes.
+        let mut results: Vec<(NodeId, f32)> = match &committed_idx {
+            Some(idx) => {
+                let ef = idx.config().ef.max(k * 4);
+                idx.search_visible(query, k, ef, &is_visible, &accessor)
+            }
+            None => {
+                // No HNSW — brute-force scan all nodes visible at (epoch, tx)
+                // that have the target property.
+                //
+                // Note: label filtering is intentionally omitted here because
+                // `finalize_deletes_by_id` removes a node's label-chain entry
+                // so `read_node_labels_visible` returns an empty set for
+                // soft-deleted nodes even at pre-delete epochs.  Using the
+                // accessor as the only filter is correct: a node that had
+                // `embedding` committed at or before `epoch` (under the
+                // temporal version chain) will return `Some(vec)`; nodes that
+                // never had the property return `None`.
+                let all_ids = self.all_node_ids();
+                let mut bf: Vec<(NodeId, f32)> = all_ids
+                    .into_iter()
+                    .filter(|&id| is_visible(id))
+                    .filter_map(|id| {
+                        // Get the snapshot-consistent vector via the accessor.
+                        // Returns None if the node doesn't have the property at (epoch, tx).
+                        let vec = accessor.get_vector(id)?;
+                        let dist = compute_distance(query, &vec, metric);
+                        Some((id, dist))
+                    })
+                    .collect();
+                bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                bf.truncate(k);
+                bf
+            }
+        };
+
+        // Step 2: brute-force merge the tx's uncommitted property delta.
+        //
+        // Walk every (node, property) entry in the tx overlay.  For entries whose
+        // property matches our target and whose node carries `label` (visible to
+        // the tx), compute the distance and merge into `results`.  A committed
+        // entry for the same node_id is replaced (the uncommitted value wins).
+        let overlay_entries: Vec<(NodeId, Value)> = {
+            let overlay = self.tx_property_overlay.read();
+            match overlay.get(&tx) {
+                None => Vec::new(),
+                Some(delta) => delta
+                    .node_props
+                    .iter()
+                    .filter_map(|((node_id, prop_key), op)| {
+                        if prop_key != &property_key {
+                            return None;
+                        }
+                        match op {
+                            super::PropOp::Set(v) => Some((*node_id, v.clone())),
+                            super::PropOp::Remove => None,
+                        }
+                    })
+                    .collect(),
+            }
+        };
+
+        for (node_id, value) in overlay_entries {
+            // Only include nodes that are visible at (epoch, tx) — this
+            // filters tx-deleted nodes via is_node_visible_versioned.
+            if !is_visible(node_id) {
+                continue;
+            }
+            // Only include nodes that carry the target label (tx-visible label check).
+            let labels = self.read_node_labels_visible(node_id, epoch, Some(tx));
+            if !labels.iter().any(|l| l.as_str() == label) {
+                continue;
+            }
+            let Some(vector) = value_to_vector(&value) else {
+                continue;
+            };
+            let dist = compute_distance(query, &vector, metric);
+            // Replace any committed hit for the same node (uncommitted value wins).
+            if let Some(existing) = results.iter_mut().find(|(id, _)| *id == node_id) {
+                existing.1 = dist;
+            } else {
+                results.push((node_id, dist));
+            }
+        }
+
+        // Step 3: re-sort and take k.
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        results
     }
 
     /// Stores a text index for a label+property pair.
