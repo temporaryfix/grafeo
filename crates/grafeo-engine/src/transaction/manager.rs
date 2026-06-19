@@ -28,10 +28,21 @@ impl IndexId {
     /// function as [`grafeo_common::utils::hash::stable_hash`], so it survives
     /// process restarts (though the conflict machinery is in-memory only, so
     /// stability across restarts is a bonus, not a requirement).
+    ///
+    /// Used for both text and vector indexes — any `(label, property)` index
+    /// pair gets a unique, stable `IndexId` regardless of index kind.
     #[must_use]
-    pub fn for_text_index(label: &str, property: &str) -> Self {
+    pub fn for_index(label: &str, property: &str) -> Self {
         let key = format!("{label}:{property}");
         Self(grafeo_common::utils::hash::hash_one(&key))
+    }
+
+    /// Alias for [`for_index`](Self::for_index) — kept for backward compatibility
+    /// with existing text-index call-sites.
+    #[inline]
+    #[must_use]
+    pub fn for_text_index(label: &str, property: &str) -> Self {
+        Self::for_index(label, property)
     }
 }
 
@@ -2546,6 +2557,65 @@ mod tests {
         assert_ne!(id1, id3, "(Doc,body) must differ from (Doc,title)");
         assert_ne!(id1, id4, "(Doc,body) must differ from (Article,body)");
         assert_ne!(id3, id4, "(Doc,title) must differ from (Article,body)");
+    }
+
+    // --- Task 5: for_index generalization + for_text_index alias ---
+
+    #[test]
+    fn for_index_stable_and_distinguishing() {
+        // IndexId::for_index must be stable (same input → same id) and
+        // distinguish different (label, property) pairs — covers the vector index path.
+        let id1 = IndexId::for_index("Doc", "embedding");
+        let id2 = IndexId::for_index("Doc", "embedding");
+        let id3 = IndexId::for_index("Doc", "title");
+        let id4 = IndexId::for_index("Article", "embedding");
+
+        assert_eq!(id1, id2, "same inputs must produce equal IndexId");
+        assert_ne!(id1, id3, "(Doc,embedding) must differ from (Doc,title)");
+        assert_ne!(
+            id1, id4,
+            "(Doc,embedding) must differ from (Article,embedding)"
+        );
+        assert_ne!(id3, id4, "(Doc,title) must differ from (Article,embedding)");
+    }
+
+    #[test]
+    fn for_text_index_is_alias_for_for_index() {
+        // for_text_index must return the same value as for_index for the same pair,
+        // guaranteeing that existing text call-sites and new vector call-sites
+        // produce the same IndexId for the same (label, property).
+        let via_generic = IndexId::for_index("Doc", "body");
+        let via_alias = IndexId::for_text_index("Doc", "body");
+        assert_eq!(
+            via_generic, via_alias,
+            "for_text_index must be an alias for for_index"
+        );
+    }
+
+    #[test]
+    fn index_rw_edge_vector_index_id() {
+        // tx1 (Serializable) records a vector-index read; tx2 (Serializable) records
+        // a vector-index write on the same IndexId::for_index pair → rw-edge:
+        // tx1.out_conflict, tx2.in_conflict. Mirrors the text cycle test shape.
+        let mgr = TransactionManager::new();
+        let idx = IndexId::for_index("Doc", "embedding");
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx1, EntityId::Index(idx), None).unwrap();
+        mgr.record_write(tx2, EntityId::Index(idx), None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "tx1 (reader) must have out_conflict after vector index write by tx2"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "tx2 (writer) must have in_conflict after vector index read by tx1"
+        );
     }
 
     #[test]

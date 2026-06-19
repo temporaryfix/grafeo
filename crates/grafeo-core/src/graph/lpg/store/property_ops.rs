@@ -1012,6 +1012,13 @@ impl LpgStore {
         #[cfg(feature = "text-index")]
         self.buffer_text_index_set(id, key, &value, transaction_id);
 
+        // Coarse index-write recording for anti-phantom SSI — vector index path
+        // (Task 5). For every label of `id` that has a vector index on `key`,
+        // record the index write so the rw-detection can form the edge. No-op
+        // for SI/ReadCommitted (no write tracker registered).
+        #[cfg(feature = "vector-index")]
+        self.buffer_vector_index_write_record(id, key, transaction_id);
+
         self.tx_property_overlay
             .write()
             .entry(transaction_id)
@@ -1035,6 +1042,11 @@ impl LpgStore {
         // Buffer the text-index removal.
         #[cfg(feature = "text-index")]
         self.buffer_text_index_remove(id, key, transaction_id);
+
+        // Coarse index-write recording for anti-phantom SSI — vector index path
+        // (Task 5). Mirrors the SET path above.
+        #[cfg(feature = "vector-index")]
+        self.buffer_vector_index_write_record(id, key, transaction_id);
 
         self.tx_property_overlay
             .write()

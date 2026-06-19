@@ -1239,11 +1239,12 @@ impl LpgStore {
         self.write_trackers.write().remove(&tx);
     }
 
-    /// Records that `tx` executed a text search on `index_key` (`"label:property"`).
+    /// Records that `tx` executed an index search on `index_key` (`"label:property"`).
     ///
     /// Forwards to the registered [`ReadTracker::record_index_read`] if one is
     /// present for `tx`. Silent no-op for SI/ReadCommitted (no tracker registered).
-    #[cfg(feature = "text-index")]
+    /// Used for both text and vector indexes.
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
     #[inline]
     pub(crate) fn record_read_index(&self, tx: TransactionId, index_key: &str) {
         if let Some(t) = self.read_trackers.read().get(&tx) {
@@ -1251,11 +1252,11 @@ impl LpgStore {
         }
     }
 
-    /// Records that `tx` wrote to the text index identified by `index_key`
+    /// Records that `tx` wrote to the index identified by `index_key`
     /// (`"label:property"` format). Forwards to the registered
     /// [`WriteTracker::record_index_write`] if present.
-    /// Silent no-op for SI/ReadCommitted.
-    #[cfg(feature = "text-index")]
+    /// Silent no-op for SI/ReadCommitted. Used for both text and vector indexes.
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
     #[inline]
     pub(crate) fn record_write_index(&self, tx: TransactionId, index_key: &str) {
         if let Some(t) = self.write_trackers.read().get(&tx) {

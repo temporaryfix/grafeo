@@ -3707,6 +3707,286 @@ fn vector_search_visible_excludes_committed_after_epoch() {
     );
 }
 
+// ── Task 5: Vector-index read/write recording for anti-phantom SSI ──────────
+
+/// `search_vector_visible` must call `record_read_index` on the registered
+/// read tracker, so a Serializable vector search records the index read.
+/// Mirrors `search_text_visible_calls_record_index_read` for the vector path.
+#[cfg(feature = "vector-index")]
+#[test]
+fn search_vector_visible_calls_record_index_read() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use crate::index::vector::{DistanceMetric, HnswConfig, HnswIndex, VectorIndexKind};
+    use std::sync::{Arc, Mutex};
+
+    // A spy ReadTracker that records every `record_index_read` call.
+    struct IndexReadSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl ReadTracker for IndexReadSpy {
+        fn record_node_read(&self, _tx: TransactionId, _id: grafeo_common::types::NodeId) {}
+        fn record_edge_read(&self, _tx: TransactionId, _id: grafeo_common::types::EdgeId) {}
+        fn record_index_read(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    // Add a vector index so the index_key is known.
+    let config = HnswConfig::new(3, DistanceMetric::Cosine);
+    let idx = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+    store.add_vector_index("Doc", "embedding", Arc::clone(&idx));
+
+    let tx = TransactionId::new(17);
+    let epoch = store.current_epoch();
+
+    let spy = Arc::new(IndexReadSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+    // Execute a vector search — should trigger record_index_read as FIRST action.
+    let _ = store.search_vector_visible("Doc:embedding", &[0.0, 1.0, 0.0], 5, epoch, tx);
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "search_vector_visible must call record_index_read exactly once; got {calls:?}"
+    );
+    assert_eq!(
+        calls[0],
+        (tx, "Doc:embedding".to_string()),
+        "record_index_read must be called with the correct (tx, index_key)"
+    );
+
+    store.unregister_read_tracker(tx);
+}
+
+/// `search_vector_visible` must record the index read even when there are no
+/// results (zero-result search must still close the anti-phantom rw-edge).
+#[cfg(feature = "vector-index")]
+#[test]
+fn search_vector_visible_records_index_read_when_no_results() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use std::sync::{Arc, Mutex};
+
+    struct IndexReadSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl ReadTracker for IndexReadSpy {
+        fn record_node_read(&self, _tx: TransactionId, _id: grafeo_common::types::NodeId) {}
+        fn record_edge_read(&self, _tx: TransactionId, _id: grafeo_common::types::EdgeId) {}
+        fn record_index_read(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    // No index registered — brute-force path with no nodes.
+    let store = LpgStore::new().unwrap();
+    let tx = TransactionId::new(19);
+    let epoch = store.current_epoch();
+
+    let spy = Arc::new(IndexReadSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+    let results = store.search_vector_visible("Doc:embedding", &[0.0, 0.0, 1.0], 5, epoch, tx);
+    assert!(results.is_empty(), "no nodes → empty results");
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "zero-result vector search must still call record_index_read; got {calls:?}"
+    );
+
+    store.unregister_read_tracker(tx);
+}
+
+/// A buffered `SET` on a vector-indexed property must call `record_write_index`
+/// on the registered write tracker. Mirrors `buffer_text_index_set_calls_record_index_write`.
+#[cfg(feature = "vector-index")]
+#[test]
+fn set_node_property_buffered_calls_record_index_write_for_vector() {
+    use crate::execution::operators::{SharedWriteTracker, WriteTracker};
+    use crate::index::vector::{DistanceMetric, HnswConfig, HnswIndex, VectorIndexKind};
+    use std::sync::{Arc, Mutex};
+
+    struct IndexWriteSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl WriteTracker for IndexWriteSpy {
+        fn record_node_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::NodeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_edge_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::EdgeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_index_write(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let config = HnswConfig::new(3, DistanceMetric::Cosine);
+    let idx = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+    store.add_vector_index("Doc", "embedding", Arc::clone(&idx));
+
+    let node = store.create_node(&["Doc"]);
+    let tx = TransactionId::new(23);
+
+    let spy = Arc::new(IndexWriteSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_write_tracker(tx, Arc::clone(&spy) as SharedWriteTracker);
+
+    // Buffer a SET on a vector-indexed property.
+    store.set_node_property_buffered(
+        node,
+        "embedding",
+        Value::Vector(vec![1.0_f32, 0.0, 0.0].into()),
+        tx,
+    );
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "set_node_property_buffered must call record_index_write exactly once for a vector-indexed property; got {calls:?}"
+    );
+    assert_eq!(
+        calls[0],
+        (tx, "Doc:embedding".to_string()),
+        "record_index_write must be called with the correct (tx, index_key)"
+    );
+
+    store.unregister_write_tracker(tx);
+}
+
+/// A buffered `REMOVE` on a vector-indexed property must also call `record_write_index`.
+#[cfg(feature = "vector-index")]
+#[test]
+fn remove_node_property_buffered_calls_record_index_write_for_vector() {
+    use crate::execution::operators::{SharedWriteTracker, WriteTracker};
+    use crate::index::vector::{DistanceMetric, HnswConfig, HnswIndex, VectorIndexKind};
+    use std::sync::{Arc, Mutex};
+
+    struct IndexWriteSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl WriteTracker for IndexWriteSpy {
+        fn record_node_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::NodeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_edge_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::EdgeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_index_write(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let config = HnswConfig::new(3, DistanceMetric::Cosine);
+    let idx = Arc::new(VectorIndexKind::Hnsw(HnswIndex::new(config)));
+    store.add_vector_index("Doc", "embedding", Arc::clone(&idx));
+
+    let node = store.create_node(&["Doc"]);
+    let tx = TransactionId::new(29);
+
+    let spy = Arc::new(IndexWriteSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_write_tracker(tx, Arc::clone(&spy) as SharedWriteTracker);
+
+    // Buffer a REMOVE on a vector-indexed property.
+    store.remove_node_property_buffered(node, "embedding", tx);
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "remove_node_property_buffered must call record_index_write exactly once for a vector-indexed property; got {calls:?}"
+    );
+    assert_eq!(
+        calls[0],
+        (tx, "Doc:embedding".to_string()),
+        "record_index_write must be called with the correct (tx, index_key)"
+    );
+
+    store.unregister_write_tracker(tx);
+}
+
+/// A buffered SET on a property that is NOT covered by any vector index must NOT
+/// call `record_write_index` (no spurious index-write recording).
+#[cfg(feature = "vector-index")]
+#[test]
+fn set_node_property_buffered_no_record_when_not_vector_indexed() {
+    use crate::execution::operators::{SharedWriteTracker, WriteTracker};
+    use std::sync::{Arc, Mutex};
+
+    struct IndexWriteSpy {
+        calls: Mutex<Vec<(TransactionId, String)>>,
+    }
+    impl WriteTracker for IndexWriteSpy {
+        fn record_node_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::NodeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_edge_write(
+            &self,
+            _tx: TransactionId,
+            _id: grafeo_common::types::EdgeId,
+        ) -> Result<(), crate::execution::operators::OperatorError> {
+            Ok(())
+        }
+        fn record_index_write(&self, tx: TransactionId, key: &str) {
+            self.calls.lock().unwrap().push((tx, key.to_string()));
+        }
+    }
+
+    // No vector index registered at all.
+    let store = LpgStore::new().unwrap();
+    let node = store.create_node(&["Doc"]);
+    let tx = TransactionId::new(31);
+
+    let spy = Arc::new(IndexWriteSpy {
+        calls: Mutex::new(Vec::new()),
+    });
+    store.register_write_tracker(tx, Arc::clone(&spy) as SharedWriteTracker);
+
+    store.set_node_property_buffered(node, "embedding", Value::from("not a vector"), tx);
+
+    let calls = spy.calls.lock().unwrap().clone();
+    assert!(
+        calls.is_empty(),
+        "no index registered → record_write_index must not be called; got {calls:?}"
+    );
+
+    store.unregister_write_tracker(tx);
+}
+
 /// A node whose delete commits AFTER the snapshot `epoch` must still appear in
 /// `search_vector_visible` at that epoch (delete-after-epoch stays visible).
 #[cfg(all(feature = "vector-index", feature = "temporal"))]

@@ -214,6 +214,14 @@ impl LpgStore {
         epoch: EpochId,
         tx: TransactionId,
     ) -> Vec<(NodeId, f32)> {
+        // Coarse predicate-read recording for anti-phantom SSI (Task 5).
+        // A Serializable vector search reads every node matching the query in
+        // this index; a concurrent indexed SET is a phantom. Record the whole
+        // index as read so the existing rw-detection can form the edge. This is
+        // a no-op for SI/ReadCommitted (no read tracker registered for `tx`).
+        // Must fire BEFORE any early-return so a zero-result search still records.
+        self.record_read_index(tx, index_key);
+
         // Parse "label:property" — split on the FIRST ':' matching `get_vector_index`.
         let Some((label, property_str)) = index_key.split_once(':') else {
             return Vec::new();
@@ -751,6 +759,44 @@ impl LpgStore {
     // `remove_node_property_buffered` (property_ops.rs) when the property is
     // covered by a text index.  They buffer the change into `text_index_overlay`
     // WITHOUT touching the committed `InvertedIndex`.
+
+    /// Records a vector-index write for anti-phantom SSI (Task 5).
+    ///
+    /// For every label of `id` that has a vector index on `key`, calls
+    /// `record_write_index` so the SSI rw-detection can form the anti-phantom
+    /// edge. Does NOT buffer anything into an overlay — the value is already
+    /// captured by `tx_property_overlay` via `set_node_property_buffered` /
+    /// `remove_node_property_buffered`.
+    ///
+    /// No-op for SI/ReadCommitted (no write tracker registered).
+    #[cfg(feature = "vector-index")]
+    pub(super) fn buffer_vector_index_write_record(
+        &self,
+        id: NodeId,
+        key: &str,
+        transaction_id: TransactionId,
+    ) {
+        let vector_indexes = self.vector_indexes.read();
+        if vector_indexes.is_empty() {
+            return;
+        }
+        let registry = self.label_registry.read();
+        let node_labels = self.node_labels.read();
+        #[cfg(not(feature = "temporal"))]
+        let label_set = node_labels.get(&id);
+        #[cfg(feature = "temporal")]
+        let label_set = node_labels.get(&id).and_then(|log| log.latest());
+        if let Some(label_ids) = label_set {
+            for &label_id in label_ids {
+                if let Some(label_name) = registry.get_name(label_id) {
+                    let index_key = format!("{label_name}:{key}");
+                    if vector_indexes.contains_key(&index_key) {
+                        self.record_write_index(transaction_id, &index_key);
+                    }
+                }
+            }
+        }
+    }
 
     /// Buffers a text-index set for a transactional node property write.
     ///
