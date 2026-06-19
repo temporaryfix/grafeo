@@ -19,6 +19,8 @@ mod schema;
 mod search;
 mod statistics;
 mod traversal;
+#[cfg(feature = "vector-index")]
+pub(crate) mod vector_accessor;
 mod versioning;
 
 #[cfg(test)]
