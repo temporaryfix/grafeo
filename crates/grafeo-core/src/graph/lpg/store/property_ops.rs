@@ -1191,6 +1191,13 @@ impl LpgStore {
     ///
     /// If the label name is not yet in the registry (has never been used) the
     /// remove is a no-op: there is nothing to remove.
+    ///
+    /// Also records a coarse `Label(L)` phantom write so a concurrent escalated
+    /// `Label(L)` reader forms an rw-antidependency with this `REMOVE n:L`
+    /// operation: removing label L from a node changes the `:L` set, and an
+    /// escalated reader (which dropped its fine `Node(n)` read) only catches the
+    /// conflict via the coarse key. Mirrors the set-addition path
+    /// [`add_label_buffered`](Self::add_label_buffered).
     #[doc(hidden)]
     pub fn remove_label_buffered(&self, id: NodeId, label: &str, transaction_id: TransactionId) {
         if let Some(label_id) = self.label_registry.read().get_id(label) {
@@ -1200,6 +1207,8 @@ impl LpgStore {
                 .or_default()
                 .node_labels
                 .insert((id, label_id), super::LabelOp::Remove);
+            // Phantom coarse write: removing label L from a node changes the :L set.
+            self.record_coarse_node_write(transaction_id, id, &[LabelId::from(label_id)]);
         }
     }
 

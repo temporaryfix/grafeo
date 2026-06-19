@@ -518,6 +518,37 @@ impl LpgStore {
         }
     }
 
+    /// Returns the committed label IDs currently registered for a node.
+    ///
+    /// Reads the `node_labels` map directly (no read recording, no registry
+    /// name resolution). Used by the transactional delete path to fan out a
+    /// coarse `Label(L)` phantom write for every label the node leaves — the
+    /// committed set is still present at the delete site because transactional
+    /// deletes defer `node_labels`/`label_index` removal to
+    /// [`finalize_deletes_by_id`](Self::finalize_deletes_by_id).
+    ///
+    /// Any label the *deleting* transaction itself added/removed in-flight has
+    /// already recorded its own coarse write (via `add_label_buffered` /
+    /// `remove_label_buffered`), so the committed base set is sufficient here.
+    fn committed_node_label_ids(&self, id: NodeId) -> Vec<LabelId> {
+        let node_labels = self.node_labels.read();
+        #[cfg(not(feature = "temporal"))]
+        {
+            node_labels
+                .get(&id)
+                .map(|set| set.iter().copied().map(LabelId::from).collect())
+                .unwrap_or_default()
+        }
+        #[cfg(feature = "temporal")]
+        {
+            node_labels
+                .get(&id)
+                .and_then(|log| log.latest())
+                .map(|set| set.iter().copied().map(LabelId::from).collect())
+                .unwrap_or_default()
+        }
+    }
+
     /// Deletes a node and all its edges (using latest epoch).
     pub fn delete_node(&self, id: NodeId) -> bool {
         self.delete_node_at_epoch(id, self.current_epoch())
@@ -668,6 +699,10 @@ impl LpgStore {
                 return false;
             }
 
+            // Capture the node's committed labels BEFORE tombstoning, for the
+            // coarse phantom write below (the node leaves every label set).
+            let label_ids = self.committed_node_label_ids(id);
+
             // Stamp PENDING so the deleter sees it gone, others still see it.
             chain.mark_deleted(EpochId::PENDING, transaction_id);
             drop(nodes);
@@ -679,6 +714,10 @@ impl LpgStore {
                 .entry(transaction_id)
                 .or_default()
                 .push(id);
+
+            // Phantom coarse write: deleting the node removes it from every :L
+            // set, so an escalated Label(L) reader must form an rw-antidependency.
+            self.record_coarse_node_write(transaction_id, id, &label_ids);
 
             true
         } else {
@@ -714,6 +753,10 @@ impl LpgStore {
                 return false;
             }
 
+            // Capture the node's committed labels BEFORE tombstoning, for the
+            // coarse phantom write below (the node leaves every label set).
+            let label_ids = self.committed_node_label_ids(id);
+
             // Stamp PENDING so the deleter sees it gone, others still see it.
             index.mark_deleted(EpochId::PENDING, transaction_id);
             drop(versions);
@@ -724,6 +767,10 @@ impl LpgStore {
                 .entry(transaction_id)
                 .or_default()
                 .push(id);
+
+            // Phantom coarse write: deleting the node removes it from every :L
+            // set, so an escalated Label(L) reader must form an rw-antidependency.
+            self.record_coarse_node_write(transaction_id, id, &label_ids);
 
             true
         } else {

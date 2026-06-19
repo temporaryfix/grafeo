@@ -329,3 +329,148 @@ fn create_edge_write_set_includes_rel_type() {
         ws
     );
 }
+
+// ============================================================================
+// GE2-symmetric: coarse Label/RelType fan-out on structural set-REMOVALS
+// ============================================================================
+//
+// GE3 escalates a label scan's structural node reads into a single
+// `EntityId::Label(L)` read and drops the fine `Node(n)` entries. For that to
+// stay serializable, every write that mutates the `:L` set the reader scanned
+// must record `EntityId::Label(L)` — otherwise the writer's
+// `readers_of(Node(n))` finds nothing (dropped) and the escalated reader is
+// missed. Set-additions (create_node / add_label / create_edge) were wired by
+// GE2; these tests pin the symmetric set-REMOVAL chokepoints.
+
+/// A transactional `DELETE` of a `:L` node fans out a coarse `EntityId::Label(_)`
+/// write for every label the node carried (it leaves every label set).
+///
+/// Symmetric with `create_label_node_write_set_includes_label`: an escalated
+/// `Label(L)` reader must form an rw-antidependency with any writer that removes
+/// a node carrying that label.
+#[test]
+fn delete_node_write_set_includes_label() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create a (label-bearing, edge-free) node outside any transaction.
+    let setup = db.session();
+    let nid = setup.create_node(&["Doomed"]);
+    drop(setup);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .unwrap();
+    let tid = session.active_transaction_id().unwrap();
+
+    // Delete the pre-existing node inside the tx (transactional delete path).
+    assert!(session.delete_node(nid), "delete must succeed");
+
+    session.commit().unwrap();
+
+    let ws = session
+        .transaction_manager_ref()
+        .get_write_set(tid)
+        .expect("write-set must be readable after commit");
+
+    let label_entries: Vec<_> = ws
+        .iter()
+        .filter(|e| matches!(e, EntityId::Label(_)))
+        .collect();
+    assert!(
+        !label_entries.is_empty(),
+        "write-set must contain EntityId::Label(_) after DELETE of a labeled node, but got {:?}",
+        ws
+    );
+}
+
+/// `REMOVE n:L` (remove_label_buffered path) inside a transaction fans out a
+/// coarse `EntityId::Label(_)` write for the removed label (the node leaves the
+/// `:L` set).
+#[test]
+fn remove_label_write_set_includes_label() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create a node carrying the label to be removed, outside any transaction.
+    let setup = db.session();
+    setup
+        .create_node_with_props(
+            &["Person", "Temp"],
+            [("name", grafeo_common::types::Value::from("Alix"))],
+        )
+        .expect("create node");
+    drop(setup);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .unwrap();
+    let tid = session.active_transaction_id().unwrap();
+
+    // Remove a label from the pre-existing node inside the tx.
+    session
+        .execute("MATCH (n:Person {name: 'Alix'}) REMOVE n:Temp")
+        .unwrap();
+
+    session.commit().unwrap();
+
+    let ws = session
+        .transaction_manager_ref()
+        .get_write_set(tid)
+        .expect("write-set must be readable after commit");
+
+    let label_entries: Vec<_> = ws
+        .iter()
+        .filter(|e| matches!(e, EntityId::Label(_)))
+        .collect();
+    assert!(
+        !label_entries.is_empty(),
+        "write-set must contain EntityId::Label(_) after REMOVE n:L, but got {:?}",
+        ws
+    );
+}
+
+/// A transactional `DELETE` of an edge fans out a coarse `EntityId::RelType(_)`
+/// write for the edge's relationship type (the edge leaves the `:T` set).
+///
+/// Symmetric with `create_edge_write_set_includes_rel_type`: an escalated
+/// `RelType(T)` reader must form an rw-antidependency with any writer that
+/// removes an edge of that type. Note the existing `write_set_includes_deleted_edge`
+/// only asserts the fine `EntityId::Edge` key — this pins the coarse key.
+#[test]
+fn delete_edge_write_set_includes_rel_type() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create two nodes and an edge outside any transaction.
+    let setup = db.session();
+    let a = setup.create_node(&["A"]);
+    let b = setup.create_node(&["B"]);
+    let eid = setup.create_edge(a, b, "KNOWS");
+    drop(setup);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .unwrap();
+    let tid = session.active_transaction_id().unwrap();
+
+    // Delete the edge inside the tx (transactional edge-delete path).
+    assert!(session.delete_edge(eid), "delete must succeed");
+
+    session.commit().unwrap();
+
+    let ws = session
+        .transaction_manager_ref()
+        .get_write_set(tid)
+        .expect("write-set must be readable after commit");
+
+    let rel_type_entries: Vec<_> = ws
+        .iter()
+        .filter(|e| matches!(e, EntityId::RelType(_)))
+        .collect();
+    assert!(
+        !rel_type_entries.is_empty(),
+        "write-set must contain EntityId::RelType(_) after DELETE edge, but got {:?}",
+        ws
+    );
+}

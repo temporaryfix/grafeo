@@ -518,8 +518,8 @@ impl LpgStore {
             // check would still see the record (PENDING `deleted_epoch` =
             // u64::MAX > epoch) and push a DUPLICATE pending entry, making
             // `finalize_edge_deletes_by_id` double-decrement the counts.
-            let (src, dst) = match chain.visible_to(epoch, transaction_id) {
-                Some(record) => (record.src, record.dst),
+            let (src, dst, type_id) = match chain.visible_to(epoch, transaction_id) {
+                Some(record) => (record.src, record.dst, record.type_id),
                 None => return false,
             };
 
@@ -534,6 +534,10 @@ impl LpgStore {
                 .entry(transaction_id)
                 .or_default()
                 .push((src, id, dst));
+
+            // Phantom coarse write: deleting the edge removes it from the :T set,
+            // so an escalated RelType(T) reader must form an rw-antidependency.
+            self.record_coarse_edge_write(transaction_id, id, EdgeTypeId::from(type_id));
 
             true
         } else {
@@ -565,9 +569,9 @@ impl LpgStore {
             // check would still see the record (PENDING `deleted_epoch` =
             // u64::MAX > epoch) and push a DUPLICATE pending entry, making
             // `finalize_edge_deletes_by_id` double-decrement the counts.
-            let (src, dst) = match index.visible_to(epoch, transaction_id) {
+            let (src, dst, type_id) = match index.visible_to(epoch, transaction_id) {
                 Some(version_ref) => match self.read_edge_record(&version_ref) {
-                    Some(record) => (record.src, record.dst),
+                    Some(record) => (record.src, record.dst, record.type_id),
                     None => return false,
                 },
                 None => return false,
@@ -584,6 +588,10 @@ impl LpgStore {
                 .entry(transaction_id)
                 .or_default()
                 .push((src, id, dst));
+
+            // Phantom coarse write: deleting the edge removes it from the :T set,
+            // so an escalated RelType(T) reader must form an rw-antidependency.
+            self.record_coarse_edge_write(transaction_id, id, EdgeTypeId::from(type_id));
 
             true
         } else {
