@@ -201,6 +201,7 @@ mod read_registry;
 
 pub(crate) use conflict_key::prop_tag;
 pub(crate) use conflict_key::{PropTag, STRUCT_TAG, prop_compatible};
+pub use grafeo_common::types::EdgeTypeId as RelTypeId;
 pub use manager::{
     ConflictGranularity, EntityId, IndexId, IsolationLevel, TransactionInfo, TransactionManager,
     TransactionState,

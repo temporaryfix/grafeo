@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use grafeo_common::types::{EdgeId, EpochId, NodeId, TransactionId};
+use grafeo_common::types::{EdgeId, EdgeTypeId, EpochId, LabelId, NodeId, TransactionId};
 use grafeo_common::utils::error::{Error, Result, TransactionError};
 use grafeo_common::utils::hash::FxHashMap;
 use parking_lot::RwLock;
@@ -156,6 +156,12 @@ pub enum EntityId {
     /// A `(label, property)` text index — used for coarse predicate-read
     /// recording to prevent phantom reads in Serializable text searches.
     Index(IndexId),
+    /// A node label — coarse conflict key for label-scan predicate reads
+    /// (e.g. `MATCH (n:Person)`) to prevent phantom reads at Serializable.
+    Label(LabelId),
+    /// A relationship type — coarse conflict key for relationship-type-scan
+    /// predicate reads (e.g. `MATCH ()-[:KNOWS]->()`) at Serializable.
+    RelType(EdgeTypeId),
 }
 
 impl From<NodeId> for EntityId {
@@ -173,6 +179,18 @@ impl From<EdgeId> for EntityId {
 impl From<IndexId> for EntityId {
     fn from(id: IndexId) -> Self {
         Self::Index(id)
+    }
+}
+
+impl From<LabelId> for EntityId {
+    fn from(id: LabelId) -> Self {
+        Self::Label(id)
+    }
+}
+
+impl From<EdgeTypeId> for EntityId {
+    fn from(id: EdgeTypeId) -> Self {
+        Self::RelType(id)
     }
 }
 
@@ -2705,6 +2723,208 @@ mod tests {
             (false, true),
             "tx_r must have out_conflict: index read after concurrent committed index write"
         );
+    }
+
+    // --- Task 1: EntityId::Label + EntityId::RelType coarse conflict keys ---
+
+    #[test]
+    fn entity_id_label_reltype_hash_eq() {
+        // The two new variants are distinct HashSet keys; From works.
+        use std::collections::HashSet;
+
+        let l7 = LabelId::new(7);
+        let l8 = LabelId::new(8);
+        let rt1 = EdgeTypeId::new(1);
+        let rt2 = EdgeTypeId::new(2);
+
+        // From impls
+        let eid_l7: EntityId = l7.into();
+        let eid_l8: EntityId = l8.into();
+        let eid_rt1: EntityId = rt1.into();
+        let eid_rt2: EntityId = rt2.into();
+
+        assert!(matches!(eid_l7, EntityId::Label(_)));
+        assert!(matches!(eid_l8, EntityId::Label(_)));
+        assert!(matches!(eid_rt1, EntityId::RelType(_)));
+        assert!(matches!(eid_rt2, EntityId::RelType(_)));
+
+        // Equality
+        assert_eq!(eid_l7, EntityId::Label(l7));
+        assert_ne!(eid_l7, eid_l8);
+        assert_ne!(eid_l7, eid_rt1);
+
+        // HashSet keys are distinct
+        let mut set: HashSet<EntityId> = HashSet::new();
+        set.insert(eid_l7);
+        set.insert(eid_l8);
+        set.insert(eid_rt1);
+        set.insert(eid_rt2);
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(&EntityId::Label(l7)));
+        assert!(set.contains(&EntityId::Label(l8)));
+        assert!(set.contains(&EntityId::RelType(rt1)));
+        assert!(set.contains(&EntityId::RelType(rt2)));
+
+        // Label and RelType with same inner value are distinct
+        let l0 = LabelId::new(0);
+        let rt0 = EdgeTypeId::new(0);
+        assert_ne!(EntityId::Label(l0), EntityId::RelType(rt0));
+    }
+
+    #[test]
+    fn label_rw_edge() {
+        // Mirrors the write-skew / index_rw_edge pattern:
+        // tx1 and tx2 both read Label(7); tx1 writes Label(7), tx2 writes a node.
+        // tx1 commits first; tx2 has out_conflict (read Label(7) which tx1 wrote)
+        // AND in_conflict (tx1 read Label(7) which tx2... wait — only tx1 wrote Label).
+        //
+        // Correct dangerous-structure:
+        //   tx1 reads Label(7) AND writes NodeId(1)
+        //   tx2 reads NodeId(1) AND writes Label(7)
+        //   → tx1 →rw tx2  (tx1 read Label(7), tx2 wrote Label(7))
+        //   → tx2 →rw tx1  (tx2 read NodeId(1), tx1 wrote NodeId(1))
+        //   Both flags set on tx1 and tx2; first committer succeeds,
+        //   second committer is aborted as pivot.
+        //
+        // This also covers: same label → conflict; different label → no conflict.
+        // EntityId::RelType symmetric section follows.
+
+        let lbl7 = LabelId::new(7);
+        let lbl8 = LabelId::new(8);
+
+        // --- Label rw-edge: same label id forms a dangerous-structure pivot ---
+        {
+            let mgr = TransactionManager::new();
+            let node1 = NodeId::new(1);
+
+            let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            // tx1 reads Label(7), writes NodeId(1)
+            mgr.record_read(tx1, EntityId::Label(lbl7), None).unwrap();
+            mgr.record_write(tx1, node1, None).unwrap();
+
+            // tx2 reads NodeId(1), writes Label(7)
+            // record_write(tx2, node1) would fail W-W — use record_read for node1 only
+            mgr.record_read(tx2, node1, None).unwrap();
+            mgr.record_write(tx2, EntityId::Label(lbl7), None).unwrap();
+
+            // tx1 →rw tx2: tx1 read Label(7), tx2 wrote Label(7)
+            // tx2 →rw tx1: tx2 read NodeId(1), tx1 wrote NodeId(1)
+            assert_eq!(
+                mgr.conflict_flags(tx1),
+                (true, true),
+                "tx1 must have both flags: in_conflict (tx2→rw→tx1) and out_conflict (tx1→rw→tx2)"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx2),
+                (true, true),
+                "tx2 must have both flags: in_conflict (tx1→rw→tx2) and out_conflict (tx2→rw→tx1)"
+            );
+
+            // tx1 commits first → succeeds (no prior committed writer yet)
+            mgr.commit(tx1).unwrap();
+
+            // tx2 tries to commit → must be aborted (pivot closed)
+            let r2 = mgr.commit(tx2);
+            assert!(
+                r2.is_err(),
+                "tx2 must be aborted: label rw-edge closes a dangerous-structure pivot; got: {r2:?}"
+            );
+            assert!(
+                r2.unwrap_err()
+                    .to_string()
+                    .contains("Serialization failure"),
+                "expected SerializationFailure"
+            );
+        }
+
+        // --- Label rw-edge: different label ids must NOT conflict ---
+        {
+            let mgr = TransactionManager::new();
+            let tx3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx4 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            mgr.record_read(tx3, EntityId::Label(lbl8), None).unwrap();
+            mgr.record_write(tx4, EntityId::Label(lbl7), None).unwrap();
+
+            assert_eq!(
+                mgr.conflict_flags(tx3),
+                (false, false),
+                "different label ids must not form an rw-edge"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx4),
+                (false, false),
+                "different label ids must not form an rw-edge on writer side"
+            );
+        }
+
+        // --- RelType rw-edge: same rel type id forms a dangerous-structure pivot ---
+        {
+            let mgr = TransactionManager::new();
+            let rt5 = EdgeTypeId::new(5);
+            let node2 = NodeId::new(2);
+
+            let tx5 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx6 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            // tx5 reads RelType(5), writes NodeId(2)
+            mgr.record_read(tx5, EntityId::RelType(rt5), None).unwrap();
+            mgr.record_write(tx5, node2, None).unwrap();
+
+            // tx6 reads NodeId(2), writes RelType(5)
+            mgr.record_read(tx6, node2, None).unwrap();
+            mgr.record_write(tx6, EntityId::RelType(rt5), None).unwrap();
+
+            assert_eq!(
+                mgr.conflict_flags(tx5),
+                (true, true),
+                "tx5 must have both flags for reltype pivot"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx6),
+                (true, true),
+                "tx6 must have both flags for reltype pivot"
+            );
+
+            mgr.commit(tx5).unwrap();
+            let r6 = mgr.commit(tx6);
+            assert!(
+                r6.is_err(),
+                "tx6 must be aborted: reltype rw-edge closes pivot; got: {r6:?}"
+            );
+            assert!(
+                r6.unwrap_err()
+                    .to_string()
+                    .contains("Serialization failure"),
+                "expected SerializationFailure for reltype pivot"
+            );
+        }
+
+        // --- RelType: different rel type ids must NOT conflict ---
+        {
+            let mgr = TransactionManager::new();
+            let rt5 = EdgeTypeId::new(5);
+            let rt6 = EdgeTypeId::new(6);
+
+            let tx7 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx8 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            mgr.record_read(tx7, EntityId::RelType(rt6), None).unwrap();
+            mgr.record_write(tx8, EntityId::RelType(rt5), None).unwrap();
+
+            assert_eq!(
+                mgr.conflict_flags(tx7),
+                (false, false),
+                "different rel type ids must not form an rw-edge"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx8),
+                (false, false),
+                "different rel type ids must not form an rw-edge on writer side"
+            );
+        }
     }
 
     // --- Part G Task 2: all-None tags reproduce existing write-skew abort ---
