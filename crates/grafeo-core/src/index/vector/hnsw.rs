@@ -601,6 +601,63 @@ impl HnswIndex {
         }
     }
 
+    /// Garbage collects soft-deleted nodes that are no longer needed.
+    ///
+    /// Rebuilds the HNSW topology from scratch, re-inserting only nodes
+    /// where `is_live(id)` returns `true` and `accessor.get_vector(id)`
+    /// returns `Some`. Nodes that are soft-deleted and not live (i.e., their
+    /// delete epoch is at or below the GC horizon) are permanently removed
+    /// from the topology; live soft-deleted nodes (above horizon) are
+    /// retained by re-inserting them.
+    ///
+    /// After GC, the `deleted` set is cleared — every node in the rebuilt
+    /// topology is live.
+    ///
+    /// A full rebuild is used (HNSW has no cheap in-place hard-delete).
+    /// GC is amortized and runs infrequently relative to inserts/deletes.
+    pub fn gc(&self, is_live: &dyn Fn(NodeId) -> bool, accessor: &dyn VectorAccessor) {
+        // Wrap the dyn accessor in a Sized newtype so it can be passed to
+        // the generic insert method.
+        struct DynRef<'a>(&'a dyn VectorAccessor);
+        impl VectorAccessor for DynRef<'_> {
+            fn get_vector(&self, id: NodeId) -> Option<Arc<[f32]>> {
+                self.0.get_vector(id)
+            }
+        }
+        let wrapped = DynRef(accessor);
+
+        // Collect all node IDs currently in the topology (including deleted).
+        let all_ids: Vec<NodeId> = {
+            let nodes = self.nodes.read();
+            match &*nodes {
+                TopologyBackend::Heap(map) => map.keys().copied().collect(),
+                TopologyBackend::Mmap(topo) => topo.iter_node_ids().collect(),
+            }
+        };
+
+        // Build a fresh HNSW with the same config, re-inserting only live nodes.
+        let fresh = HnswIndex::new(self.config.clone());
+        for id in all_ids {
+            if !is_live(id) {
+                continue;
+            }
+            let Some(vec) = accessor.get_vector(id) else {
+                continue;
+            };
+            fresh.insert(id, &vec, &wrapped);
+        }
+
+        // Swap topology, entry_point, max_level, and clear deleted.
+        let fresh_nodes = fresh.nodes.into_inner();
+        let fresh_ep = fresh.entry_point.into_inner();
+        let fresh_ml = fresh.max_level.into_inner();
+
+        *self.nodes.write() = fresh_nodes;
+        *self.entry_point.write() = fresh_ep;
+        *self.max_level.write() = fresh_ml;
+        self.deleted.write().clear();
+    }
+
     /// Searches for the k nearest neighbors to the query vector.
     ///
     /// Returns a vector of (NodeId, distance) pairs sorted by distance
@@ -2807,6 +2864,79 @@ mod tests {
 
         // Removing non-existent node returns false
         assert!(!index.remove(NodeId::new(99)));
+    }
+
+    // ── GC tests ──────────────────────────────────────────────────────
+
+    /// GC drops nodes below the horizon and keeps nodes above it.
+    /// A live-but-soft-deleted node (is_live=true despite being in the
+    /// deleted set) is retained by the GC rebuild.
+    #[test]
+    fn gc_drops_deleted_below_horizon() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=5 {
+            let v: f32 = i as f32 / 6.0;
+            map.insert(NodeId::new(i), vec![v, v, v, v].into());
+        }
+        let accessor = make_accessor(&map);
+
+        for i in 1u64..=5 {
+            let v = map[&NodeId::new(i)].clone();
+            index.insert(NodeId::new(i), &v, &accessor);
+        }
+        assert_eq!(index.len(), 5);
+
+        // Soft-delete node 3.
+        assert!(index.remove(NodeId::new(3)));
+        assert_eq!(index.len(), 4);
+        // Still in topology as a routing hop.
+        assert!(index.contains_including_deleted(NodeId::new(3)));
+
+        // GC with is_live = "not node 3" (simulates delete committed below horizon).
+        index.gc(&|id| id != NodeId::new(3), &accessor);
+
+        // Node 3 must be gone from the topology entirely.
+        assert!(
+            !index.contains_including_deleted(NodeId::new(3)),
+            "GC must remove node 3 from topology"
+        );
+        // Remaining live nodes are all present and searchable.
+        for i in [1u64, 2, 4, 5] {
+            assert!(
+                index.contains(NodeId::new(i)),
+                "live node {i} must still be present after GC"
+            );
+        }
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 4, &accessor);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            !ids.contains(&3),
+            "node 3 must not appear in search after GC: {ids:?}"
+        );
+        assert_eq!(
+            index.len(),
+            4,
+            "index must report 4 live nodes after GC; got {}",
+            index.len()
+        );
+
+        // GC with is_live = all nodes — every node in the topology is kept.
+        // (Node 3 is already gone from a previous GC; the others are kept.)
+        index.gc(&|_id| true, &accessor);
+        assert_eq!(
+            index.len(),
+            4,
+            "all-live GC must retain the 4 remaining nodes"
+        );
+        for i in [1u64, 2, 4, 5] {
+            assert!(
+                index.contains(NodeId::new(i)),
+                "node {i} must be retained by all-live GC"
+            );
+        }
     }
 
     /// Connectivity preservation: after soft-deleting a "bridge" node,

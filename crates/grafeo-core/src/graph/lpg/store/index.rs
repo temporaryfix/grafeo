@@ -672,6 +672,96 @@ impl LpgStore {
         }
     }
 
+    // === Vector-index GC ===
+
+    /// Returns `true` if `id` was deleted at a committed epoch that is at or
+    /// below `horizon`, meaning no active snapshot can see it as alive.
+    ///
+    /// Specifically: the node's latest-version `deleted_epoch` must be
+    /// `Some(d)` with `d <= horizon` AND not `EpochId::PENDING`
+    /// (PENDING means the delete has not yet committed).  A node that is
+    /// still live, or whose delete committed *above* `horizon`, returns `false`.
+    ///
+    /// Used by [`gc_vector_indexes`](Self::gc_vector_indexes) to decide
+    /// whether a soft-deleted HNSW node can be permanently dropped.
+    #[cfg(feature = "vector-index")]
+    fn node_deleted_at_or_below(&self, id: NodeId, horizon: EpochId) -> bool {
+        #[cfg(not(feature = "tiered-storage"))]
+        {
+            let nodes = self.nodes.read();
+            let Some(chain) = nodes.get(&id) else {
+                // Not in the chain at all — treat as not live, but not "deleted below
+                // horizon" in the HNSW sense (it was never inserted).
+                return false;
+            };
+            // Walk all versions; if ANY version has a committed deleted_epoch <= horizon,
+            // the node is considered garbage-collectable.
+            chain.history().any(|(info, _)| {
+                matches!(info.deleted_epoch, Some(d) if d != EpochId::PENDING && d.as_u64() <= horizon.as_u64())
+            })
+        }
+        #[cfg(feature = "tiered-storage")]
+        {
+            let versions = self.node_versions.read();
+            let Some(index) = versions.get(&id) else {
+                return false;
+            };
+            // A node deleted at or below horizon is not visible at horizon.
+            // Use visible_to with a sentinel tx (SYSTEM) to get the committed view.
+            // If the node is not visible at horizon, it was either deleted at/before
+            // horizon (safe to GC from HNSW) or never existed at horizon (not in HNSW).
+            // For nodes that exist in the HNSW topology, the latter case means they
+            // were created after horizon — but GC only runs after deletes are committed,
+            // so nodes in the HNSW are always older than the GC horizon.
+            index.visible_at(horizon).is_none()
+        }
+    }
+
+    /// Garbage collects soft-deleted nodes in all vector indexes that are no
+    /// longer visible to any active snapshot at or above `horizon`.
+    ///
+    /// For each vector index, rebuilds the HNSW topology retaining only nodes
+    /// whose version chain shows no committed delete at or below `horizon`.
+    /// Uses a committed-latest accessor (no tx context) so the rebuild reads
+    /// the vectors as-of the current epoch.
+    ///
+    /// Mirrors `gc_text_indexes`: the caller (the db-level `gc()`) provides
+    /// `min_active_epoch` so the vector indexes compact in lock-step.
+    #[cfg(feature = "vector-index")]
+    pub fn gc_vector_indexes(&self, horizon: EpochId) {
+        // Snapshot the index map (cheap Arc clones); avoids holding the
+        // write lock during the (potentially expensive) rebuild.
+        let indexes: Vec<(String, Arc<VectorIndexKind>)> = {
+            let guard = self.vector_indexes.read();
+            guard
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+
+        let current = self.current_epoch();
+
+        for (key, index) in indexes {
+            // Parse "label:property" to build the accessor.
+            let Some((_, property_str)) = key.split_once(':') else {
+                continue;
+            };
+            let property_key = PropertyKey::new(property_str);
+
+            // Committed-latest accessor (no tx): reads each node's vector at
+            // the current epoch, which is what a GC rebuild should use.
+            let accessor = super::vector_accessor::SnapshotVectorAccessor {
+                store: self,
+                property: property_key,
+                epoch: current,
+                tx: None,
+            };
+
+            let is_live = |id: NodeId| !self.node_deleted_at_or_below(id, horizon);
+            index.gc(&is_live, &accessor);
+        }
+    }
+
     // === Snapshot text search (TI4) ===
 
     /// Searches a text index at `(epoch, tx)`, merging committed postings with

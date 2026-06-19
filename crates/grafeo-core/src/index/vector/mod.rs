@@ -376,6 +376,20 @@ impl VectorIndexKind {
         }
     }
 
+    /// Garbage collects soft-deleted nodes below the GC horizon.
+    ///
+    /// Rebuilds the HNSW topology retaining only nodes where `is_live(id)`
+    /// is `true`. For the plain HNSW variant, `accessor` is used to supply
+    /// each live node's vector during the rebuild; for the quantized variant,
+    /// vectors are read from the internal store and `accessor` is unused
+    /// (callers may pass a no-op).
+    pub fn gc(&self, is_live: &dyn Fn(NodeId) -> bool, accessor: &dyn VectorAccessor) {
+        match self {
+            Self::Hnsw(idx) => idx.gc(is_live, accessor),
+            Self::Quantized(idx) => idx.gc(is_live),
+        }
+    }
+
     /// Returns the quantization type, if this is a quantized index.
     #[must_use]
     pub fn quantization_type(&self) -> Option<QuantizationType> {

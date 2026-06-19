@@ -2200,6 +2200,8 @@ impl GrafeoDB {
             self.lpg_store().gc_versions(min_epoch);
             #[cfg(feature = "text-index")]
             self.lpg_store().gc_text_indexes(min_epoch);
+            #[cfg(feature = "vector-index")]
+            self.lpg_store().gc_vector_indexes(min_epoch);
         }
         #[cfg(all(feature = "lpg", feature = "cdc"))]
         let current_epoch = self.transaction_manager.current_epoch();

@@ -598,6 +598,35 @@ impl QuantizedHnswIndex {
         self.hnsw.remove(id)
     }
 
+    /// Garbage collects soft-deleted nodes that are no longer needed.
+    ///
+    /// Delegates to the inner `HnswIndex::gc` using an accessor backed by
+    /// this index's internal `vectors` map, then drops non-live nodes from
+    /// all internal quantized-code maps (`scalar_vectors`, `binary_vectors`,
+    /// `product_codes`) and from `vectors`.
+    ///
+    /// After GC, only nodes where `is_live(id)` returns `true` remain in
+    /// every internal map.
+    pub fn gc(&self, is_live: &dyn Fn(NodeId) -> bool) {
+        // Collect the full-precision vector map snapshot for the accessor.
+        let vector_snapshot: HashMap<NodeId, Arc<[f32]>> = {
+            let vectors = self.vectors.read();
+            vectors.iter().map(|(&id, v)| (id, Arc::clone(v))).collect()
+        };
+        let accessor =
+            move |id: NodeId| -> Option<Arc<[f32]>> { vector_snapshot.get(&id).cloned() };
+
+        // Rebuild the HNSW topology via gc, using internal vectors.
+        self.hnsw.gc(is_live, &accessor);
+
+        // Drop non-live entries from all internal maps.
+        self.vectors.write().retain(|id, _| is_live(*id));
+        self.scalar_vectors.write().retain(|id, _| is_live(*id));
+        self.binary_vectors.write().retain(|id, _| is_live(*id));
+        self.product_codes.write().retain(|id, _| is_live(*id));
+        // training_samples only holds pre-training data; no per-node retention needed.
+    }
+
     /// Batch insert multiple vectors.
     pub fn batch_insert<'a, I>(&self, vectors: I)
     where
@@ -1237,6 +1266,58 @@ mod tests {
             index.heap_memory_bytes() > empty_mem,
             "memory should grow after insert"
         );
+    }
+
+    // ── GC tests (quantized) ──────────────────────────────────────────
+
+    /// GC on QuantizedHnswIndex drops the below-horizon node from the
+    /// topology and all internal maps; retains live nodes.
+    #[test]
+    fn gc_quantized_drops_deleted_below_horizon() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        for i in 1u64..=5 {
+            let v: f32 = i as f32 / 6.0;
+            index.insert(NodeId::new(i), &[v, v, v, v]);
+        }
+        assert_eq!(index.len(), 5);
+
+        // Soft-delete node 3.
+        assert!(index.remove(NodeId::new(3)));
+        assert_eq!(index.len(), 4);
+        assert!(index.contains_including_deleted(NodeId::new(3)));
+
+        // GC: node 3 is not live (deleted below horizon).
+        index.gc(&|id| id != NodeId::new(3));
+
+        // Node 3 gone from topology and internal maps.
+        assert!(
+            !index.contains_including_deleted(NodeId::new(3)),
+            "GC must remove node 3 from topology"
+        );
+        assert_eq!(index.len(), 4);
+
+        // Remaining nodes present and searchable.
+        for i in [1u64, 2, 4, 5] {
+            assert!(
+                index.contains(NodeId::new(i)),
+                "live node {i} must survive GC"
+            );
+        }
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 4);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            !ids.contains(&3),
+            "node 3 must not appear in search: {ids:?}"
+        );
+
+        // All-live GC retains everything.
+        index.gc(&|_id| true);
+        assert_eq!(index.len(), 4);
+        for i in [1u64, 2, 4, 5] {
+            assert!(index.contains(NodeId::new(i)));
+        }
     }
 
     // ── Soft-delete (MVCC) tests ──────────────────────────────────────
