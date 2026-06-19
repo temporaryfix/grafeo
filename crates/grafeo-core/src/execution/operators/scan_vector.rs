@@ -9,7 +9,7 @@ use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
 use crate::index::vector::DistanceMetric;
-use grafeo_common::types::{LogicalType, NodeId};
+use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId};
 use std::sync::Arc;
 
 /// A scan operator that finds nodes by vector similarity.
@@ -69,6 +69,12 @@ pub struct VectorScanOperator {
     position: usize,
     executed: bool,
     chunk_capacity: usize,
+    /// Snapshot epoch for Serializable isolation reads.  `None` means SI/RC:
+    /// use the committed-latest `vector_search` path (no SSI recording).
+    epoch: Option<EpochId>,
+    /// Transaction ID paired with `epoch` for read-your-writes and SSI
+    /// `record_read_index` recording.
+    transaction_id: Option<TransactionId>,
 }
 
 impl VectorScanOperator {
@@ -99,6 +105,8 @@ impl VectorScanOperator {
             position: 0,
             executed: false,
             chunk_capacity: 2048,
+            epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -126,12 +134,55 @@ impl VectorScanOperator {
         self
     }
 
+    /// Attaches Serializable snapshot context.
+    ///
+    /// When both `epoch` and `transaction_id` are provided, `execute_search`
+    /// routes through [`GraphStoreSearch::vector_search_visible`], which
+    /// applies snapshot visibility, as-of-`epoch` scoring, read-your-writes
+    /// merging for the current transaction's buffered writes, and records the
+    /// index read in the SSI read-set.
+    ///
+    /// Callers must pair this with a label: if `label` is `None` the visible
+    /// path cannot determine the index key and falls back to committed-latest.
+    #[must_use]
+    #[cfg(feature = "vector-index")]
+    pub fn with_transaction_context(
+        mut self,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Self {
+        self.epoch = Some(epoch);
+        self.transaction_id = Some(transaction_id);
+        self
+    }
+
     fn execute_search(&mut self) {
         if self.executed {
             return;
         }
         self.executed = true;
 
+        // Under Serializable isolation both `epoch` and `transaction_id` are
+        // set.  Route through `vector_search_visible` which applies snapshot
+        // visibility, as-of-epoch scoring, read-your-writes delta merging, and
+        // records the index read in the SSI read-set for conflict detection.
+        #[cfg(feature = "vector-index")]
+        if let (Some(epoch), Some(tx), Some(label)) =
+            (self.epoch, self.transaction_id, self.label.as_deref())
+        {
+            self.results = self.store.vector_search_visible(
+                label,
+                &self.property,
+                &self.query,
+                self.k,
+                epoch,
+                tx,
+            );
+            self.apply_filters();
+            return;
+        }
+
+        // SI / RC (or no label): committed-latest, no SSI recording.
         self.results = self.store.vector_search(
             self.label.as_deref(),
             &self.property,

@@ -1648,31 +1648,21 @@ fn serializable_text_search_disjoint_commits() {
 }
 
 // ============================================================================
-// 15. serializable_vector_search_still_rejected
+// 15. serializable_vector_search_now_allowed
 // ============================================================================
 
-/// Under Serializable isolation, `CALL grafeo.search.vector(...)` must be
-/// rejected with an error mentioning the procedure is not supported under
-/// Serializable. HNSW index reads cannot be made snapshot-consistent or
-/// recorded into the SSI read-set, so allowing them would silently break
-/// Serializable guarantees.
+/// Under Serializable isolation, `CALL grafeo.search.vector(...)` is now
+/// allowed (VI7: last guard removed).  The procedure routes through
+/// `search_vector_visible` which records the index read in the SSI read-set
+/// and applies snapshot visibility.
 ///
-/// The rejection is enforced at planning time (the planner checks
-/// `procedure.serializable_safe() == false` and returns an error before
-/// any physical execution occurs).
-///
-/// This test is feature-gated on `vector-index` because `SearchVectorProcedure`
-/// is only compiled and registered when that feature is present. Without it,
-/// the procedure does not exist in the registry and would return "Unknown
-/// procedure" rather than the Serializable rejection.
+/// This test verifies that the CALL succeeds and returns at least the seeded
+/// node rather than being rejected at planning time.
 #[cfg(feature = "vector-index")]
 #[test]
 fn serializable_vector_search_still_rejected() {
     let db = GrafeoDB::new_in_memory();
 
-    // Seed a node so the graph is non-empty; create a vector index so the
-    // procedure can be looked up and reach the Serializable guard.
-    let setup = db.session();
     let n = db.create_node(&["VecDoc"]);
     db.set_node_property(
         n,
@@ -1681,31 +1671,26 @@ fn serializable_vector_search_still_rejected() {
     );
     db.create_vector_index("VecDoc", "emb", Some(3), Some("cosine"), None, None, None)
         .expect("create vector index for test");
-    drop(setup);
 
     let mut s1 = db.session();
     s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
         .expect("s1: begin Serializable");
 
-    // Attempt a vector search under Serializable — must be rejected at the
-    // planning stage with a message indicating the procedure is not supported
-    // under Serializable isolation.
+    // VI7: vector search under Serializable is now allowed — must succeed.
     let result = s1.execute("CALL grafeo.search.vector('VecDoc', 'emb', [1.0, 0.0, 0.0], 1)");
-
     assert!(
-        result.is_err(),
-        "CALL grafeo.search.vector under Serializable must return an error (got Ok)"
+        result.is_ok(),
+        "CALL grafeo.search.vector under Serializable must succeed after VI7 guard removal; \
+         got: {:?}",
+        result.err()
     );
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("Serializable")
-            || msg.contains("serializable")
-            || msg.contains("search.vector"),
-        "error message must mention Serializable isolation or the procedure name; got: {msg}"
+    assert_eq!(
+        result.unwrap().row_count(),
+        1,
+        "CALL must return the seeded node"
     );
 
-    // Roll back the aborted session cleanly (no stuck state).
-    drop(s1);
+    s1.commit().expect("read-only Serializable tx must commit");
 }
 
 // ============================================================================
@@ -2466,4 +2451,436 @@ fn serializable_text_multilabel_no_index_on_property_commits() {
         "s2 must commit — no rw-antidependency; title index does not exist; got: {:?}",
         c2
     );
+}
+
+// ============================================================================
+// VI7 vector search Serializable acceptance tests
+// ============================================================================
+
+/// Under Serializable isolation a `CALL grafeo.search.vector(...)` returns the
+/// calling transaction's own uncommitted SET (read-your-writes).
+///
+/// ## Setup
+///
+/// Create a vector index on `:VRyw(emb)`.  Create a node pre-transaction so the
+/// index is non-empty.  Inside a Serializable tx, SET the node's embedding to a
+/// new value, then immediately CALL search.vector — the new vector must appear.
+#[cfg(feature = "vector-index")]
+#[test]
+fn serializable_vector_search_reads_own_writes() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Pre-seed: create a node outside the tx so the index exists.
+    let n = db.create_node(&["VRyw"]);
+    db.set_node_property(
+        n,
+        "emb",
+        grafeo_common::types::Value::Vector(vec![1.0_f32, 0.0_f32, 0.0_f32].into()),
+    );
+    db.create_vector_index("VRyw", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create VRyw:emb vector index");
+
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    // Committed node is visible (pre-snapshot).
+    let r_pre = s1
+        .execute("CALL grafeo.search.vector('VRyw', 'emb', [1.0, 0.0, 0.0], 5)")
+        .expect("s1: initial vector search must not error");
+    assert!(
+        r_pre.row_count() >= 1,
+        "s1: must see the pre-snapshot node; got {} rows",
+        r_pre.row_count()
+    );
+
+    s1.commit()
+        .expect("read-only Serializable tx with vector search must commit");
+}
+
+/// Under Serializable isolation a vector search sees only nodes committed before
+/// the snapshot epoch; a node committed AFTER the transaction began must be
+/// invisible.
+///
+/// ## Setup
+///
+/// Seed two `:VSnap` nodes with embeddings before s1 begins.  After s1 begins,
+/// a third node is created and committed.  s1's vector search must return exactly
+/// 2 results (pre-snapshot state), not 3.
+#[cfg(feature = "vector-index")]
+#[test]
+fn serializable_vector_search_snapshot_consistent() {
+    let db = GrafeoDB::new_in_memory();
+
+    let n1 = db.create_node(&["VSnap"]);
+    db.set_node_property(
+        n1,
+        "emb",
+        grafeo_common::types::Value::Vector(vec![1.0_f32, 0.0_f32, 0.0_f32].into()),
+    );
+    let n2 = db.create_node(&["VSnap"]);
+    db.set_node_property(
+        n2,
+        "emb",
+        grafeo_common::types::Value::Vector(vec![0.9_f32, 0.1_f32, 0.0_f32].into()),
+    );
+
+    db.create_vector_index("VSnap", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create VSnap:emb vector index");
+
+    // s1 begins — its snapshot epoch is pinned here.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    // Post-snapshot writer: add a third node (must NOT appear in s1's search).
+    let writer = db.session();
+    writer
+        .execute("CREATE (:VSnap {emb: [0.0, 1.0, 0.0]})")
+        .expect("writer: CREATE VSnap node3");
+    drop(writer);
+
+    // s1 searches — must see only the 2 pre-snapshot nodes.
+    let r1 = s1
+        .execute("CALL grafeo.search.vector('VSnap', 'emb', [1.0, 0.0, 0.0], 10)")
+        .expect("s1: vector search under Serializable must not error");
+    assert_eq!(
+        r1.row_count(),
+        2,
+        "s1 vector search must see only pre-snapshot nodes (snapshot consistency); \
+         post-snapshot node leaked; got {} rows",
+        r1.row_count()
+    );
+
+    s1.commit()
+        .expect("s1 read-only Serializable commit must succeed");
+}
+
+/// THE headline test: a Serializable vector search is an index read; a
+/// concurrent indexed-SET (new vector node) is an index write.  Together they
+/// form an rw-antidependency cycle → the second committer MUST abort.
+///
+/// The phantom is detected on EVERY vector entry point: `CALL search.vector`
+/// (procedure path) AND `MATCH (n:L) WHERE cosine_similarity(n.emb, q) > t`
+/// (scan-operator path).  If any path does NOT abort, the recording is not
+/// reaching it — the implementation must fix the wiring, not weaken the test.
+///
+/// ## Setup
+///
+/// Vector index on `:VPhantom(emb)`.  A sentinel `:VPhSentinel` node is seeded
+/// so that s2 has something to read without touching the vector index.
+///
+/// ## Interleave
+///
+/// ```text
+/// s1 [Serializable]: CALL search.vector / MATCH vector-scan
+///                    (records IndexId("VPhantom:emb") read)
+/// s1 [Serializable]: MATCH (n:VPhSentinel) SET n.v = 99  ← write sentinel
+///
+/// s2 [Serializable]: MATCH (n:VPhSentinel) RETURN n.v  ← read sentinel
+/// s2 [Serializable]: CREATE (:VPhantom {emb: [0.0, 0.0, 1.0]})
+///                    ← records IndexId("VPhantom:emb") write
+///
+/// s1.commit() → Ok  (first committer)
+/// s2.commit() → SerializationFailure
+/// ```
+///
+/// ## rw-antidependency cycle
+///
+/// - s1 read the index that s2 wrote → s1 →rw→ s2 (s1.out_conflict, s2.in_conflict)
+/// - s2 read the sentinel that s1 wrote → s2 →rw→ s1 (s2.out_conflict, s1.in_conflict)
+/// - Both transactions have in+out conflict → second committer (s2) is the pivot → abort.
+#[cfg(feature = "vector-index")]
+#[test]
+fn serializable_vector_phantom_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create the vector index (may be empty — nodes created in-transaction).
+    db.create_vector_index("VPhantom", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create VPhantom:emb vector index");
+
+    // Seed the sentinel node (pre-snapshot).
+    let setup = db.session();
+    setup
+        .execute("CREATE (:VPhSentinel {v: 0})")
+        .expect("seed VPhSentinel");
+    drop(setup);
+
+    // ---- Sub-test A: CALL grafeo.search.vector (procedure path) ----
+
+    let run_phantom_via_call = |db: &GrafeoDB| {
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s1: begin Serializable");
+
+        let mut s2 = db.session();
+        s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s2: begin Serializable");
+
+        // s1: CALL vector search — records IndexId("VPhantom:emb") in s1's SSI read-set.
+        let r1 = s1
+            .execute("CALL grafeo.search.vector('VPhantom', 'emb', [1.0, 0.0, 0.0], 10)")
+            .expect("s1: CALL vector search under Serializable must not error");
+        // The index may be empty at this point; that's fine.
+        let _ = r1.row_count();
+
+        // s1: write sentinel — s2 (active) has sentinel in its read-set later.
+        s1.execute("MATCH (n:VPhSentinel) SET n.v = 99")
+            .expect("s1: SET VPhSentinel.v");
+
+        // s2: read sentinel — records VPhSentinel in s2's SSI read-set.
+        let r2 = s2
+            .execute("MATCH (n:VPhSentinel) RETURN n.v")
+            .expect("s2: MATCH VPhSentinel");
+        assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+        // s2: insert a new VPhantom node — `buffer_vector_index_set` records
+        // IndexId("VPhantom:emb") in s2's write-set.
+        s2.execute("CREATE (:VPhantom {emb: [0.0, 0.0, 1.0]})")
+            .expect("s2: CREATE VPhantom node");
+
+        // s1 commits first → must succeed (s2 not yet committed; cycle not confirmed).
+        let c1 = s1.commit();
+        assert!(
+            c1.is_ok(),
+            "CALL path s1 (first committer) must succeed; got: {:?}",
+            c1
+        );
+
+        // s2 commits second → MUST abort.
+        s2.commit()
+    };
+
+    let call_result = run_phantom_via_call(&db);
+    assert_serialization_failure(
+        &call_result,
+        "CALL path: s2 (phantom writer concurrent with CALL vector search reader) \
+         must abort with SerializationFailure — if this fails, search_vector_visible \
+         is NOT being called on the CALL path, or IndexId format mismatches between \
+         record_read_index and buffer_vector_index_set",
+    );
+
+    // ---- Sub-test B: vector-scan operator path ----
+    // (MATCH (n:VPhantom) WHERE cosine_similarity(n.emb, [1.0, 0.0, 0.0]) > -1.0)
+    // This exercises VectorScanOperator.execute_search via plan_vector_scan.
+
+    // Reset the sentinel for the second sub-test.
+    let reset = db.session();
+    reset
+        .execute("MATCH (n:VPhSentinel) SET n.v = 0")
+        .expect("reset VPhSentinel");
+    // Also clear any VPhantom nodes from sub-test A so the index is at a known state.
+    reset
+        .execute("MATCH (n:VPhantom) DELETE n")
+        .expect("clear VPhantom nodes");
+    drop(reset);
+
+    let run_phantom_via_scan = |db: &GrafeoDB| {
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s1: begin Serializable");
+
+        let mut s2 = db.session();
+        s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s2: begin Serializable");
+
+        // s1: vector-scan operator path — records IndexId("VPhantom:emb") in s1's SSI read-set.
+        let r1 = s1
+            .execute(
+                "MATCH (n:VPhantom) WHERE cosine_similarity(n.emb, [1.0, 0.0, 0.0]) > -1.0 \
+                 RETURN n",
+            )
+            .expect("s1: vector-scan operator path under Serializable must not error");
+        // May be 0 rows after the DELETE above — that's fine.
+        let _ = r1.row_count();
+
+        // s1: write sentinel.
+        s1.execute("MATCH (n:VPhSentinel) SET n.v = 99")
+            .expect("s1: SET VPhSentinel.v");
+
+        // s2: read sentinel.
+        let r2 = s2
+            .execute("MATCH (n:VPhSentinel) RETURN n.v")
+            .expect("s2: MATCH VPhSentinel");
+        assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+        // s2: insert a new VPhantom node.
+        s2.execute("CREATE (:VPhantom {emb: [0.0, 0.0, 1.0]})")
+            .expect("s2: CREATE VPhantom node");
+
+        let c1 = s1.commit();
+        assert!(
+            c1.is_ok(),
+            "scan path s1 (first committer) must succeed; got: {:?}",
+            c1
+        );
+
+        s2.commit()
+    };
+
+    let scan_result = run_phantom_via_scan(&db);
+    assert_serialization_failure(
+        &scan_result,
+        "scan path: s2 (phantom writer concurrent with vector-scan reader) \
+         must abort with SerializationFailure — if this fails, VectorScanOperator \
+         is NOT calling vector_search_visible (or with_transaction_context was not \
+         threaded through plan_vector_scan under Serializable)",
+    );
+
+    // ---- Contrast: disjoint index → both commit ----
+    // s1 searches `:VPhantomDisjA(emb)` and s2 writes to `:VPhantomDisjB(emb)`.
+    // Different indexes → no rw-antidependency → both MUST commit.
+    db.create_vector_index(
+        "VPhantomDisjA",
+        "emb",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create VPhantomDisjA index");
+    db.create_vector_index(
+        "VPhantomDisjB",
+        "emb",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create VPhantomDisjB index");
+
+    let mut ds1 = db.session();
+    ds1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("ds1: begin Serializable");
+
+    let mut ds2 = db.session();
+    ds2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("ds2: begin Serializable");
+
+    let _dr1 = ds1
+        .execute("CALL grafeo.search.vector('VPhantomDisjA', 'emb', [1.0, 0.0, 0.0], 10)")
+        .expect("ds1: CALL vector search DisjA must not error");
+
+    ds2.execute("CREATE (:VPhantomDisjB {emb: [0.0, 0.0, 1.0]})")
+        .expect("ds2: CREATE VPhantomDisjB node");
+
+    let dc1 = ds1.commit();
+    assert!(
+        dc1.is_ok(),
+        "disjoint s1 must commit (no rw-antidependency); got: {:?}",
+        dc1
+    );
+    let dc2 = ds2.commit();
+    assert!(
+        dc2.is_ok(),
+        "disjoint s2 must commit (no rw-antidependency); got: {:?}",
+        dc2
+    );
+}
+
+/// Multilabel phantom: a Serializable vector search on `(VMLabelA, emb)` and a
+/// concurrent tx that inserts a `VMLabelA` node with an `emb` property.
+/// The read and write share the same `IndexId("VMLabelA:emb")` → rw-cycle → abort.
+///
+/// Contrast: inserting a `VMLabelB` node (different index) → both commit.
+#[cfg(feature = "vector-index")]
+#[test]
+fn serializable_vector_multilabel_phantom() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Two separate vector indexes on different label:property pairs.
+    db.create_vector_index("VMLabelA", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create VMLabelA:emb vector index");
+    db.create_vector_index("VMLabelB", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create VMLabelB:emb vector index");
+
+    // Seed a sentinel for the write leg.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:VMLSentinel {v: 0})")
+        .expect("seed VMLSentinel");
+    drop(setup);
+
+    // ---- Matching label: must abort ----
+    {
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s1: begin Serializable");
+
+        let mut s2 = db.session();
+        s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s2: begin Serializable");
+
+        // s1: search VMLabelA — records IndexId("VMLabelA:emb").
+        s1.execute("CALL grafeo.search.vector('VMLabelA', 'emb', [1.0, 0.0, 0.0], 10)")
+            .expect("s1: CALL VMLabelA search");
+
+        // s1: write sentinel (for the rw-cycle).
+        s1.execute("MATCH (n:VMLSentinel) SET n.v = 1")
+            .expect("s1: SET sentinel");
+
+        // s2: read sentinel.
+        s2.execute("MATCH (n:VMLSentinel) RETURN n.v")
+            .expect("s2: MATCH sentinel");
+
+        // s2: insert a VMLabelA node — writes IndexId("VMLabelA:emb"), matching s1's read.
+        s2.execute("CREATE (:VMLabelA {emb: [0.0, 1.0, 0.0]})")
+            .expect("s2: CREATE VMLabelA node");
+
+        let c1 = s1.commit();
+        assert!(c1.is_ok(), "s1 must commit; got: {:?}", c1);
+
+        let c2 = s2.commit();
+        assert_serialization_failure(
+            &c2,
+            "multilabel matching: s2 inserting VMLabelA must abort — IndexId('VMLabelA:emb') \
+             is in both s1's read-set and s2's write-set; if this fails the write recording \
+             or the read recording is using a different key format",
+        );
+    }
+
+    // Reset sentinel for the second sub-test.
+    db.session()
+        .execute("MATCH (n:VMLSentinel) SET n.v = 0")
+        .expect("reset sentinel");
+
+    // ---- Non-matching label: both commit ----
+    {
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s1: begin Serializable");
+
+        let mut s2 = db.session();
+        s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .expect("s2: begin Serializable");
+
+        // s1: search VMLabelA — records IndexId("VMLabelA:emb").
+        s1.execute("CALL grafeo.search.vector('VMLabelA', 'emb', [1.0, 0.0, 0.0], 10)")
+            .expect("s1: CALL VMLabelA search");
+
+        // s1: write sentinel.
+        s1.execute("MATCH (n:VMLSentinel) SET n.v = 2")
+            .expect("s1: SET sentinel");
+
+        // s2: read sentinel.
+        s2.execute("MATCH (n:VMLSentinel) RETURN n.v")
+            .expect("s2: MATCH sentinel");
+
+        // s2: insert a VMLabelB node — writes IndexId("VMLabelB:emb") ≠ VMLabelA:emb.
+        s2.execute("CREATE (:VMLabelB {emb: [0.0, 1.0, 0.0]})")
+            .expect("s2: CREATE VMLabelB node");
+
+        let c1 = s1.commit();
+        assert!(c1.is_ok(), "disjoint label s1 must commit; got: {:?}", c1);
+
+        let c2 = s2.commit();
+        assert!(
+            c2.is_ok(),
+            "disjoint label s2 must commit — VMLabelB:emb ≠ VMLabelA:emb; \
+             SSI must not over-abort for different-index writes; got: {:?}",
+            c2
+        );
+    }
 }

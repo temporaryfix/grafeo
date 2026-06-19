@@ -440,6 +440,15 @@ impl Procedure for SearchVectorProcedure {
         vec!["node_id".into(), "distance".into()]
     }
 
+    /// `grafeo.search.vector` is Serializable-safe: the executor supplies
+    /// `(epoch, tx)` via `ProcedureContext::snapshot_epoch` /
+    /// `::snapshot_tx`, and `execute` routes through
+    /// `LpgStore::search_vector_visible` which records the index read for
+    /// SSI conflict detection.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         use grafeo_core::index::vector::{PropertyVectorAccessor, VectorAccessorKind};
 
@@ -457,6 +466,26 @@ impl Procedure for SearchVectorProcedure {
         let query = coerce_params_to_vector(params, "query")?;
         let k = k_limit(params, 10);
 
+        // Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are
+        // set by the executor.  Route through `search_vector_visible` to merge
+        // the per-tx write delta, pin results to the snapshot epoch, and record
+        // the index read in the SSI read-set so concurrent indexed-SET writes
+        // form an rw-antidependency edge.
+        if let (Some(epoch), Some(tx)) = (ctx.snapshot_epoch, ctx.snapshot_tx) {
+            let index_key = format!("{label}:{property}");
+            let results = lpg.search_vector_visible(&index_key, &query, k, epoch, tx);
+
+            let mut result = AlgorithmResult::new(vec!["node_id".into(), "distance".into()]);
+            for (node_id, distance) in results {
+                result.rows.push(vec![
+                    node_id_to_value(node_id),
+                    Value::Float64(f64::from(distance)),
+                ]);
+            }
+            return Ok(result);
+        }
+
+        // SI / RC: committed-latest, no SSI recording.
         let index = lpg.get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
                 "No vector index found for :{label}({property}). Call CREATE VECTOR INDEX first."

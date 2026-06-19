@@ -279,6 +279,26 @@ impl VectorJoinOperator {
 
     /// Performs vector search for the current query.
     fn search_right_side(&self, query: &[f32]) -> Vec<(NodeId, f32)> {
+        // Under Serializable isolation both `viewing_epoch` and `transaction_id`
+        // are set and `right_label` must be present.  Route through
+        // `vector_search_visible` which records the index read in the SSI
+        // read-set and applies snapshot visibility + read-your-writes merging.
+        #[cfg(feature = "vector-index")]
+        if let (Some(epoch), Some(tx), Some(label)) =
+            (self.viewing_epoch, self.transaction_id, &self.right_label)
+        {
+            // vector_search_visible returns f64 distances; callers of
+            // search_right_side compare/filter using f32.  Precision loss is
+            // intentional: distances are embeddings-precision (f32 granularity).
+            #[allow(clippy::cast_possible_truncation)]
+            return self
+                .store
+                .vector_search_visible(label, &self.right_property, query, self.k, epoch, tx)
+                .into_iter()
+                .map(|(id, d)| (id, d as f32))
+                .collect();
+        }
+
         #[cfg(feature = "vector-index")]
         {
             if let Some(ref index) = self.index {

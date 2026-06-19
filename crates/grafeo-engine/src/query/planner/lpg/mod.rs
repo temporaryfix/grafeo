@@ -1070,16 +1070,6 @@ impl Planner {
         use grafeo_core::execution::operators::VectorScanOperator;
         use grafeo_core::index::vector::DistanceMetric;
 
-        // VectorScan reads raw HNSW indexes without MVCC visibility, so it cannot
-        // track reads for SSI conflict detection.  Reject under Serializable
-        // rather than silently return non-serializable results.
-        if self.is_serializable() {
-            return Err(Error::Internal(
-                "Serializable isolation is not yet supported with vector search; use SnapshotIsolation"
-                    .to_string(),
-            ));
-        }
-
         // Hybrid shape `VectorScan(input=graph_pattern)` is not supported by
         // the physical VectorScanOperator: it has no input slot and would
         // silently drop upstream bindings. Reject rather than plan it
@@ -1141,6 +1131,16 @@ impl Planner {
             operator = operator.with_max_distance(dist);
         }
 
+        // Thread (epoch, tx) into the operator for Serializable transactions so
+        // the search is snapshot-pinned and the index read is recorded for SSI.
+        let operator: Box<dyn Operator> = if self.is_serializable()
+            && let Some(tx) = self.transaction_id
+        {
+            Box::new(operator.with_transaction_context(self.viewing_epoch, tx))
+        } else {
+            Box::new(operator)
+        };
+
         let mut columns = vec![scan.variable.clone()];
         // VectorScan always projects a score column keyed by the resolved
         // metric (after index-driven fallback) so downstream score reuse
@@ -1161,7 +1161,7 @@ impl Planner {
             &scan.query_vector,
         ));
 
-        Ok((Box::new(operator), columns))
+        Ok((operator, columns))
     }
 
     /// Resolves a LogicalExpression to a Vec<f32> for vector operations.
@@ -4086,7 +4086,11 @@ mod tests {
         }
     }
 
-    /// plan_vector_scan must be rejected under Serializable isolation.
+    /// plan_vector_scan must SUCCEED under Serializable isolation (VI7: guard removed).
+    ///
+    /// The guard has been replaced with snapshot-aware execution: `plan_vector_scan`
+    /// threads `(epoch, tx)` into `VectorScanOperator` so `execute_search` routes
+    /// through `vector_search_visible`, recording the index read for SSI.
     #[cfg(feature = "vector-index")]
     #[test]
     fn test_plan_vector_scan_rejected_under_serializable() {
@@ -4108,18 +4112,12 @@ mod tests {
             max_distance: None,
             input: None,
         };
-        let err = planner
-            .plan_vector_scan(&op)
-            .err()
-            .expect("plan_vector_scan must return Err under Serializable");
-        let msg = err.to_string();
+        // Guard has been removed: planning MUST succeed.
+        let result = planner.plan_vector_scan(&op);
         assert!(
-            msg.contains("vector search"),
-            "error must mention vector search, got: {msg}"
-        );
-        assert!(
-            msg.contains("Serializable"),
-            "error must mention Serializable, got: {msg}"
+            result.is_ok(),
+            "plan_vector_scan must succeed under Serializable (VI7: guard removed), got: {:?}",
+            result.err()
         );
     }
 
@@ -4159,8 +4157,8 @@ mod tests {
     /// The old blanket rejection has been replaced with snapshot-aware execution:
     /// `plan_text_scan` threads `(epoch, tx)` into `TextScanOperator` so that
     /// `execute_search` calls `text_search_visible`, records the index read for
-    /// SSI, and merges the per-transaction write delta.  Vector scan still
-    /// rejects because HNSW has no snapshot-aware path.
+    /// SSI, and merges the per-transaction write delta.  Vector scan also
+    /// succeeds under Serializable after VI7 (guard removed).
     #[cfg(feature = "text-index")]
     #[test]
     fn test_plan_text_scan_allowed_under_serializable() {
@@ -4298,8 +4296,11 @@ mod tests {
         );
     }
 
-    /// `CALL grafeo.search.vector` must still be rejected under Serializable
-    /// with a per-procedure error message naming the procedure.
+    /// `CALL grafeo.search.vector` must SUCCEED under Serializable isolation
+    /// (VI7: guard removed; `SearchVectorProcedure::serializable_safe()` is now `true`).
+    ///
+    /// The procedure routes through `search_vector_visible` which records the
+    /// index read for SSI conflict detection.
     #[cfg(all(feature = "algos", feature = "lpg", feature = "vector-index"))]
     #[test]
     fn test_plan_call_search_vector_rejected_under_serializable() {
@@ -4315,14 +4316,13 @@ mod tests {
             arguments: vec![],
             yield_items: None,
         };
-        let err = planner
-            .plan_call_procedure(&op)
-            .err()
-            .expect("CALL grafeo.search.vector must be rejected under Serializable");
-        let msg = err.to_string();
+        // Guard has been removed: CALL must succeed under Serializable.
+        let result = planner.plan_call_procedure(&op);
         assert!(
-            msg.contains("search.vector") || msg.contains("Serializable"),
-            "error must identify the procedure or mention Serializable, got: {msg}"
+            result.is_ok(),
+            "CALL grafeo.search.vector must succeed under Serializable (VI7: guard removed); \
+             got: {:?}",
+            result.err()
         );
     }
 
