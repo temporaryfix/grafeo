@@ -564,27 +564,37 @@ impl QuantizedHnswIndex {
         self.vectors.read().get(&id).cloned()
     }
 
-    /// Returns true if the index contains the given ID.
+    /// Returns true if the index contains a **live** (non-deleted) vector
+    /// with the given ID.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
         self.hnsw.contains(id)
     }
 
-    /// Removes a vector from the index.
+    /// Returns `true` if the topology contains `id`, regardless of whether
+    /// it has been soft-deleted.
+    ///
+    /// Used by GC passes and tests to verify the node was retained as a
+    /// routing hop after soft-deletion.
+    #[must_use]
+    pub fn contains_including_deleted(&self, id: NodeId) -> bool {
+        self.hnsw.contains_including_deleted(id)
+    }
+
+    /// Soft-deletes a vector from the index.
+    ///
+    /// The node is **retained** in the HNSW topology as a routing hop and
+    /// its vectors/codes are kept for potential future rescore or GC.
+    /// It is excluded from search results and from [`Self::len`] /
+    /// [`Self::contains`].
+    ///
+    /// Returns `true` if the ID was present (and is now marked deleted).
+    /// Returns `false` if the ID was not in the topology at all.
+    ///
+    /// Re-inserting a deleted ID via [`Self::insert`] un-deletes it.
     pub fn remove(&self, id: NodeId) -> bool {
-        self.vectors.write().remove(&id);
-        match self.quantization_type {
-            QuantizationType::None => {}
-            QuantizationType::Scalar => {
-                self.scalar_vectors.write().remove(&id);
-            }
-            QuantizationType::Binary => {
-                self.binary_vectors.write().remove(&id);
-            }
-            QuantizationType::Product { .. } => {
-                self.product_codes.write().remove(&id);
-            }
-        }
+        // Do NOT remove from vectors/codes maps — keep them for routing-hop
+        // rescore and GC. Only soft-delete in the underlying topology.
         self.hnsw.remove(id)
     }
 
@@ -1104,5 +1114,76 @@ mod tests {
             index.heap_memory_bytes() > empty_mem,
             "memory should grow after insert"
         );
+    }
+
+    // ── Soft-delete (MVCC) tests ──────────────────────────────────────
+
+    /// Soft-delete on QuantizedHnswIndex: deleted node absent from
+    /// results but topology preserved for routing.
+    #[test]
+    fn soft_delete_retains_topology_quantized() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        index.insert(NodeId::new(1), &[0.1, 0.1, 0.1, 0.1]);
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5]);
+        index.insert(NodeId::new(3), &[0.9, 0.9, 0.9, 0.9]);
+        assert_eq!(index.len(), 3);
+
+        // Soft-delete node 2
+        assert!(index.remove(NodeId::new(2)));
+
+        // Search must not return node 2
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 3);
+        assert!(
+            results.iter().all(|(id, _)| *id != NodeId::new(2)),
+            "soft-deleted node 2 must not appear in results: {results:?}"
+        );
+
+        // Public API
+        assert!(!index.contains(NodeId::new(2)));
+        assert!(index.contains_including_deleted(NodeId::new(2)));
+        assert_eq!(index.len(), 2);
+
+        // Re-insert un-deletes
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5]);
+        assert!(index.contains(NodeId::new(2)));
+        assert_eq!(index.len(), 3);
+
+        // Remove of non-existent returns false
+        assert!(!index.remove(NodeId::new(99)));
+    }
+
+    /// Connectivity: after soft-deleting middle nodes, far-end live
+    /// nodes remain findable through the deleted routing hops.
+    #[test]
+    fn soft_delete_routes_through_deleted_quantized() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean).with_m(4);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        for i in 1u64..=7 {
+            let v = (i as f32) / 8.0;
+            index.insert(NodeId::new(i), &[v, v, v, v]);
+        }
+        assert_eq!(index.len(), 7);
+
+        // Delete middle
+        index.remove(NodeId::new(3));
+        index.remove(NodeId::new(4));
+        index.remove(NodeId::new(5));
+        assert_eq!(index.len(), 4);
+
+        let results = index.search(&[0.85, 0.85, 0.85, 0.85], 4);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            ids.contains(&6) || ids.contains(&7),
+            "live nodes 6 or 7 must be reachable after deleting middle nodes; got {ids:?}"
+        );
+        for (id, _) in &results {
+            assert!(
+                !matches!(id.as_u64(), 3 | 4 | 5),
+                "deleted node {id:?} must not appear in results"
+            );
+        }
     }
 }

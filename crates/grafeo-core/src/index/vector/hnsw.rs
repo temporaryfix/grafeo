@@ -237,6 +237,15 @@ impl Iterator for HnswNeighborsIter<'_> {
 /// Thread-safe approximate nearest neighbor index supporting concurrent
 /// reads and exclusive writes. This index is topology-only: vectors are
 /// read through a [`VectorAccessor`] rather than stored internally.
+///
+/// # Soft-delete (MVCC)
+///
+/// Deleted nodes are retained in the graph topology as routing hops for
+/// snapshot isolation. `remove(id)` marks `id` in `deleted` rather than
+/// erasing it. Search excludes deleted nodes from *results* but still
+/// traverses them during beam/greedy search, so live nodes reachable only
+/// through a deleted hop remain findable. A separate GC pass (not in this
+/// struct) compacts the graph by rebuilding without dead nodes.
 pub struct HnswIndex {
     /// Index configuration.
     config: HnswConfig,
@@ -249,6 +258,9 @@ pub struct HnswIndex {
     max_level: RwLock<usize>,
     /// Random number generator for level selection.
     rng: RwLock<rand::rngs::StdRng>,
+    /// Soft-deleted node IDs. These nodes remain in `nodes` as routing
+    /// hops but are excluded from search results and from `len`/`contains`.
+    deleted: RwLock<HashSet<NodeId>>,
 }
 
 impl HnswIndex {
@@ -261,6 +273,7 @@ impl HnswIndex {
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
+            deleted: RwLock::new(HashSet::new()),
         }
     }
 
@@ -276,6 +289,7 @@ impl HnswIndex {
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
+            deleted: RwLock::new(HashSet::new()),
         }
     }
 
@@ -288,6 +302,7 @@ impl HnswIndex {
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
             rng: RwLock::new(rand::rngs::StdRng::seed_from_u64(seed)),
+            deleted: RwLock::new(HashSet::new()),
         }
     }
 
@@ -297,16 +312,19 @@ impl HnswIndex {
         &self.config
     }
 
-    /// Returns the number of vectors in the index.
+    /// Returns the number of **live** (non-deleted) vectors in the index.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.nodes.read().len()
+        self.nodes
+            .read()
+            .len()
+            .saturating_sub(self.deleted.read().len())
     }
 
-    /// Returns true if the index is empty.
+    /// Returns true if there are no live (non-deleted) vectors in the index.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
+        self.len() == 0
     }
 
     /// Snapshot the topology for serialization.
@@ -346,6 +364,9 @@ impl HnswIndex {
     /// mutations work without needing a reload. Equivalent to constructing
     /// a fresh index and calling `insert` for each node, but skips the
     /// graph-build cost.
+    ///
+    /// Also clears the soft-deleted set, since the snapshot is a clean
+    /// point-in-time image with no pending deletes.
     pub fn restore_topology(
         &self,
         entry_point: Option<NodeId>,
@@ -360,6 +381,7 @@ impl HnswIndex {
         *backend = TopologyBackend::Heap(fresh);
         *self.entry_point.write() = entry_point;
         *self.max_level.write() = max_level;
+        self.deleted.write().clear();
     }
 
     /// Adopt a [`MmapTopology`] as the topology backend (Phase 7c).
@@ -429,6 +451,9 @@ impl HnswIndex {
         );
 
         let level = self.random_level();
+
+        // Un-delete if this ID was previously soft-deleted.
+        self.deleted.write().remove(&id);
 
         // Create the new node (topology only)
         let node = HnswNode {
@@ -637,9 +662,13 @@ impl HnswIndex {
         let ef_search = ef.max(k);
         let candidates = self.search_layer(&nodes, accessor, query, current_ep, ef_search, 0);
 
-        // Return top k
+        // Collect top-k, filtering soft-deleted nodes from results.
+        // The beam still routed through deleted nodes above (connectivity),
+        // but they must not appear in what is returned to the caller.
+        let deleted = self.deleted.read();
         candidates
             .into_iter()
+            .filter(|n| !deleted.contains(&n.id))
             .take(k)
             .map(|n| (n.id, n.distance))
             .collect()
@@ -664,8 +693,9 @@ impl HnswIndex {
         if allowlist.is_empty() {
             return Vec::new();
         }
-        // Auto-scale ef based on selectivity ratio
-        let total = self.nodes.read().len();
+        // Auto-scale ef based on selectivity ratio.
+        // Use live count (excludes soft-deleted) so selectivity is accurate.
+        let total = self.len();
         let selectivity = if total == 0 {
             1.0
         } else {
@@ -731,45 +761,59 @@ impl HnswIndex {
         let candidates = self
             .search_layer_filtered(&nodes, accessor, query, current_ep, ef_search, 0, allowlist);
 
-        // Return top k
+        // Collect top-k; also exclude soft-deleted nodes (beam traversed them,
+        // but they must not appear in results).
+        let deleted = self.deleted.read();
         candidates
             .into_iter()
+            .filter(|n| !deleted.contains(&n.id))
             .take(k)
             .map(|n| (n.id, n.distance))
             .collect()
     }
 
-    /// Removes a vector from the index.
+    /// Soft-deletes a vector from the index.
     ///
-    /// Returns true if the vector was found and removed.
+    /// The node is **retained** in the topology as a routing hop for
+    /// snapshot isolation and graph connectivity. It is excluded from
+    /// search results and from [`Self::len`] / [`Self::contains`].
+    ///
+    /// Returns `true` if the ID was present (and is now marked deleted).
+    /// Returns `false` if the ID was not in the topology at all.
+    ///
+    /// Re-inserting a deleted ID via [`Self::insert`] un-deletes it.
+    ///
+    /// Works on both heap-backed and mmap-backed topologies (the topology
+    /// is never mutated; only the in-memory `deleted` set is updated).
     pub fn remove(&self, id: NodeId) -> bool {
-        let mut nodes = self.nodes.write();
-        let mut entry_point = self.entry_point.write();
-
-        let nodes_map = nodes.as_heap_mut();
-
-        if nodes_map.remove(&id).is_none() {
+        // A node that is already soft-deleted is not "present" from the
+        // caller's perspective — removing it again returns false.
+        if self.deleted.read().contains(&id) {
             return false;
         }
-
-        // Remove bidirectional links
-        for (_, node) in nodes_map.iter_mut() {
-            for neighbors in &mut node.neighbors {
-                neighbors.retain(|&n| n != id);
-            }
+        // Verify the node exists in the topology (works on both backends).
+        if !self.nodes.read().contains(id) {
+            return false;
         }
-
-        // Update entry point if needed
-        if *entry_point == Some(id) {
-            *entry_point = nodes_map.keys().next().copied();
-        }
-
+        // Mark as soft-deleted; topology and links are untouched.
+        self.deleted.write().insert(id);
         true
     }
 
-    /// Returns true if the index contains a vector with the given ID.
+    /// Returns `true` if the index contains a **live** (non-deleted) vector
+    /// with the given ID.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
+        self.nodes.read().contains(id) && !self.deleted.read().contains(&id)
+    }
+
+    /// Returns `true` if the topology contains `id`, regardless of whether
+    /// it has been soft-deleted.
+    ///
+    /// Used by GC passes and tests to verify the node was retained as a
+    /// routing hop after soft-deletion.
+    #[must_use]
+    pub fn contains_including_deleted(&self, id: NodeId) -> bool {
         self.nodes.read().contains(id)
     }
 
@@ -2393,18 +2437,25 @@ mod tests {
         index.insert(NodeId::new(2), &[0.0, 0.0, 0.0, 0.0], &accessor);
     }
 
-    /// Removing on an mmap-backed index must panic.
+    /// Soft-delete on an mmap-backed index must work without panic:
+    /// the node is marked deleted in the in-memory `deleted` set and
+    /// excluded from search results, but the topology is untouched.
     #[test]
-    #[should_panic(expected = "mmap mode")]
-    fn vincent_mmap_backed_remove_panics() {
+    fn vincent_mmap_backed_remove_soft_deletes() {
         let config = HnswConfig::new(4, DistanceMetric::Cosine);
-        let nodes = vec![(NodeId::new(1), vec![vec![]])];
-        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes);
+        let nodes_data = vec![(NodeId::new(1), vec![vec![]])];
+        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes_data);
         let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
 
         let index = HnswIndex::new(config);
         index.adopt_mmap_topology(topo);
-        index.remove(NodeId::new(1));
+
+        // Soft-delete must succeed on mmap-backed index
+        assert!(index.remove(NodeId::new(1)));
+        // Node is still in topology but excluded from public API
+        assert!(!index.contains(NodeId::new(1)));
+        assert!(index.contains_including_deleted(NodeId::new(1)));
+        assert_eq!(index.len(), 0);
     }
 
     /// `restore_topology` after `adopt_mmap_topology` must put the
@@ -2605,6 +2656,96 @@ mod tests {
                 intersection,
                 heap_results.len(),
                 "query {q}: recall@10 must be 100% (heap={heap_results:?}, mmap={mmap_results:?})"
+            );
+        }
+    }
+
+    // ── Soft-delete (MVCC) tests ──────────────────────────────────────
+
+    /// Soft-delete: node is removed from search results but the topology
+    /// is preserved so other live nodes remain reachable.
+    #[test]
+    fn soft_delete_retains_topology() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        map.insert(NodeId::new(1), vec![0.1, 0.1, 0.1, 0.1].into());
+        map.insert(NodeId::new(2), vec![0.5, 0.5, 0.5, 0.5].into());
+        map.insert(NodeId::new(3), vec![0.9, 0.9, 0.9, 0.9].into());
+        let accessor = make_accessor(&map);
+
+        index.insert(NodeId::new(1), &[0.1, 0.1, 0.1, 0.1], &accessor);
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5], &accessor);
+        index.insert(NodeId::new(3), &[0.9, 0.9, 0.9, 0.9], &accessor);
+        assert_eq!(index.len(), 3);
+
+        // Soft-delete node 2
+        assert!(index.remove(NodeId::new(2)));
+
+        // Search must not return node 2
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 3, &accessor);
+        assert!(
+            results.iter().all(|(id, _)| *id != NodeId::new(2)),
+            "soft-deleted node 2 must not appear in results: {results:?}"
+        );
+
+        // Public API: deleted node is not "live"
+        assert!(!index.contains(NodeId::new(2)));
+        // Topology still holds it (routing hop)
+        assert!(index.contains_including_deleted(NodeId::new(2)));
+        // len counts live nodes only
+        assert_eq!(index.len(), 2);
+
+        // Re-insert (un-delete): node 2 is live again
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5], &accessor);
+        assert!(index.contains(NodeId::new(2)));
+        assert_eq!(index.len(), 3);
+
+        // Removing non-existent node returns false
+        assert!(!index.remove(NodeId::new(99)));
+    }
+
+    /// Connectivity preservation: after soft-deleting a "bridge" node,
+    /// remaining live nodes are still findable via search.
+    #[test]
+    fn soft_delete_routes_through_deleted() {
+        // Build a 7-node index; after deleting several middle nodes,
+        // the cluster at the far end must still be reachable.
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean).with_m(4);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        // Linear chain: 1 → 2 → 3 → 4 → 5 → 6 → 7
+        for i in 1u64..=7 {
+            let v = (i as f32) / 8.0;
+            map.insert(NodeId::new(i), vec![v, v, v, v].into());
+        }
+        let accessor = make_accessor(&map);
+        for i in 1u64..=7 {
+            let v = (i as f32) / 8.0;
+            index.insert(NodeId::new(i), &[v, v, v, v], &accessor);
+        }
+        assert_eq!(index.len(), 7);
+
+        // Delete nodes 3, 4, 5 (middle of the chain)
+        index.remove(NodeId::new(3));
+        index.remove(NodeId::new(4));
+        index.remove(NodeId::new(5));
+        assert_eq!(index.len(), 4);
+
+        // Node 6 and 7 must still be findable
+        let results = index.search(&[0.85, 0.85, 0.85, 0.85], 4, &accessor);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            ids.contains(&6) || ids.contains(&7),
+            "live nodes 6 or 7 must be reachable after deleting middle nodes; got {ids:?}"
+        );
+        // No deleted nodes in results
+        for (id, _) in &results {
+            assert!(
+                !matches!(id.as_u64(), 3 | 4 | 5),
+                "deleted node {id:?} must not appear in results"
             );
         }
     }
