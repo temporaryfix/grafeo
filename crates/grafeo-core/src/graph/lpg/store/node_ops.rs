@@ -1,6 +1,6 @@
 use super::LpgStore;
 use crate::graph::lpg::{Node, NodeRecord};
-use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::types::{EdgeId, EpochId, LabelId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::Ordering;
 
@@ -156,6 +156,12 @@ impl LpgStore {
             EpochId::PENDING
         };
 
+        // Resolve label IDs before registering (so we can fan out coarse writes).
+        let label_ids: Vec<LabelId> = labels
+            .iter()
+            .map(|l| LabelId::from(self.get_or_create_label_id(l)))
+            .collect();
+
         #[cfg(not(feature = "temporal"))]
         self.register_node_labels(id, labels);
         #[cfg(feature = "temporal")]
@@ -164,6 +170,11 @@ impl LpgStore {
         let chain = VersionChain::with_initial(record, version_epoch, transaction_id);
         self.nodes.write().insert(id, chain);
         self.record_pending_node(transaction_id, id);
+
+        // Phantom coarse write: record Label(L) for each new node label so a
+        // concurrent escalated Label(L) reader forms an rw-antidependency.
+        self.record_coarse_node_write(transaction_id, id, &label_ids);
+
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
         id
     }
@@ -193,6 +204,12 @@ impl LpgStore {
             EpochId::PENDING
         };
 
+        // Resolve label IDs before registering (so we can fan out coarse writes).
+        let label_ids: Vec<LabelId> = labels
+            .iter()
+            .map(|l| LabelId::from(self.get_or_create_label_id(l)))
+            .collect();
+
         #[cfg(not(feature = "temporal"))]
         self.register_node_labels(id, labels);
         #[cfg(feature = "temporal")]
@@ -219,6 +236,9 @@ impl LpgStore {
         }
         drop(versions);
         self.record_pending_node(transaction_id, id);
+
+        // Phantom coarse write: record Label(L) for each new node label.
+        self.record_coarse_node_write(transaction_id, id, &label_ids);
 
         self.live_node_count.fetch_add(1, Ordering::Relaxed);
         id

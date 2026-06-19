@@ -4,7 +4,7 @@ use super::LpgStore;
 use super::PropertyUndoEntry;
 #[cfg(feature = "temporal")]
 use grafeo_common::types::EpochId;
-use grafeo_common::types::{EdgeId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::types::{EdgeId, LabelId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
 use std::sync::atomic::Ordering;
 
@@ -1170,6 +1170,10 @@ impl LpgStore {
     ///
     /// Uses the same `get_or_create_label_id` path as `add_label` so the
     /// buffered `u32` id agrees with `label_index` / `node_labels`.
+    ///
+    /// Also records a coarse `Label(L)` phantom write so a concurrent
+    /// escalated `Label(L)` reader forms an rw-antidependency with this
+    /// `SET n:L` operation.
     #[doc(hidden)]
     pub fn add_label_buffered(&self, id: NodeId, label: &str, transaction_id: TransactionId) {
         let label_id = self.get_or_create_label_id(label);
@@ -1179,6 +1183,8 @@ impl LpgStore {
             .or_default()
             .node_labels
             .insert((id, label_id), super::LabelOp::Add);
+        // Phantom coarse write: adding label L to a node changes the :L set.
+        self.record_coarse_node_write(transaction_id, id, &[LabelId::from(label_id)]);
     }
 
     /// Buffers an uncommitted label remove into the transaction's delta.

@@ -1,7 +1,9 @@
 use super::LpgStore;
 use crate::graph::lpg::{Edge, EdgeRecord};
 use arcstr::ArcStr;
-use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::types::{
+    EdgeId, EdgeTypeId, EpochId, NodeId, PropertyKey, TransactionId, Value,
+};
 use std::sync::atomic::Ordering;
 
 #[cfg(not(feature = "tiered-storage"))]
@@ -84,6 +86,11 @@ impl LpgStore {
 
         self.live_edge_count.fetch_add(1, Ordering::Relaxed);
         self.increment_edge_type_count(type_id);
+
+        // Phantom coarse write: record RelType(T) so a concurrent escalated
+        // RelType(T) reader forms an rw-antidependency with this CREATE edge.
+        self.record_coarse_edge_write(transaction_id, id, EdgeTypeId::from(type_id));
+
         id
     }
 
@@ -142,6 +149,10 @@ impl LpgStore {
 
         self.live_edge_count.fetch_add(1, Ordering::Relaxed);
         self.increment_edge_type_count(type_id);
+
+        // Phantom coarse write: record RelType(T) for phantom detection.
+        self.record_coarse_edge_write(transaction_id, id, EdgeTypeId::from(type_id));
+
         id
     }
 

@@ -300,6 +300,60 @@ impl TransactionManager {
             .map(|info| info.isolation_level)
     }
 
+    /// Records a node write and fans out coarse `Label(L)` writes for each label.
+    ///
+    /// Calls `record_write(EntityId::Node(node), tag)` **and**, for every
+    /// `label` in `labels`, `record_write(EntityId::Label(label), None)`.
+    ///
+    /// Both the fine node write and the coarse label writes participate in
+    /// first-writer-wins W-W detection and write-time rw-antidependency detection.
+    /// Any conflict on any entity returns an error immediately.
+    ///
+    /// This is the load-bearing path for phantom detection: a concurrent
+    /// escalated `Label(L)` reader conflicts with ANY writer that touches a
+    /// node carrying label `L` — including `CREATE (:L)` and `SET n:L`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `record_write` call detects a conflict.
+    pub fn record_node_write(
+        &self,
+        transaction_id: TransactionId,
+        node: NodeId,
+        labels: &[LabelId],
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_write(transaction_id, EntityId::Node(node), tag)?;
+        for &label in labels {
+            self.record_write(transaction_id, EntityId::Label(label), None)?;
+        }
+        Ok(())
+    }
+
+    /// Records an edge write and fans out a coarse `RelType(T)` write.
+    ///
+    /// Calls `record_write(EntityId::Edge(edge), tag)` **and**
+    /// `record_write(EntityId::RelType(rel_type), None)`.
+    ///
+    /// Symmetric with [`record_node_write`](Self::record_node_write): a
+    /// concurrent escalated `RelType(T)` reader conflicts with any writer
+    /// that touches an edge of that type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `record_write` call detects a conflict.
+    pub fn record_edge_write(
+        &self,
+        transaction_id: TransactionId,
+        edge: EdgeId,
+        rel_type: EdgeTypeId,
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_write(transaction_id, EntityId::Edge(edge), tag)?;
+        self.record_write(transaction_id, EntityId::RelType(rel_type), None)?;
+        Ok(())
+    }
+
     /// Records a write operation for the transaction.
     ///
     /// Uses first-writer-wins: if another active transaction has already
@@ -2966,6 +3020,165 @@ mod tests {
                 .to_string()
                 .contains("Serialization failure"),
             "expected SerializationFailure"
+        );
+    }
+
+    // --- GE2: record_node_write fan-out to Label coarse conflict keys ---
+
+    /// A Serializable reader of Label(5) conflicts with a node write that
+    /// fans out to Label(5) via `record_node_write`.
+    ///
+    /// Interleave:
+    ///   tx1 (Ser): record_read(Label(5)) → registered in read_registry.
+    ///   tx2 (Ser): record_node_write(node, &[LabelId(5)], None) → fans out
+    ///              to Label(5) → write-time detection: tx1.out_conflict=true,
+    ///              tx2.in_conflict=true.
+    ///   A second call with labels=[LabelId(6)] must produce NO conflict with tx1.
+    #[test]
+    fn node_write_fans_out_to_label() {
+        let mgr = TransactionManager::new();
+        let lbl5 = LabelId::new(5);
+        let lbl6 = LabelId::new(6);
+        let node = NodeId::new(1);
+        let node2 = NodeId::new(2);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx1 records a Label(5) read (simulates escalated scan of :Label5)
+        mgr.record_read(tx1, EntityId::Label(lbl5), None).unwrap();
+
+        // tx2 writes a node with label LabelId(5)
+        // → record_write(Node(node), None) + record_write(Label(5), None)
+        mgr.record_node_write(tx2, node, &[lbl5], None).unwrap();
+
+        // tx1 must have out_conflict (it read Label(5), tx2 wrote Label(5))
+        // tx2 must have in_conflict (tx1 was a concurrent Label(5) reader)
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "tx1 (Label reader) must get out_conflict from node write fanning to Label(5)"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "tx2 (node writer) must get in_conflict from Label(5) reader"
+        );
+
+        // A node write with a DIFFERENT label must NOT conflict with the Label(5) reader.
+        let tx3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_node_write(tx3, node2, &[lbl6], None).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(tx3),
+            (false, false),
+            "node write with Label(6) must not conflict with Label(5) reader"
+        );
+    }
+
+    /// `record_node_write` with multiple labels fans out to all of them.
+    /// A reader of any matching label detects the conflict.
+    #[test]
+    fn node_write_fans_out_to_all_labels() {
+        let mgr = TransactionManager::new();
+        let lbl_a = LabelId::new(10);
+        let lbl_b = LabelId::new(11);
+        let node = NodeId::new(42);
+
+        let tx_r_a = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx_r_b = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx_r_a, EntityId::Label(lbl_a), None)
+            .unwrap();
+        mgr.record_read(tx_r_b, EntityId::Label(lbl_b), None)
+            .unwrap();
+
+        // Write a node with BOTH labels → fans out to both Label(10) and Label(11)
+        mgr.record_node_write(tx_w, node, &[lbl_a, lbl_b], None)
+            .unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx_r_a),
+            (false, true),
+            "Label(10) reader must get out_conflict"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx_r_b),
+            (false, true),
+            "Label(11) reader must get out_conflict"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx_w),
+            (true, false),
+            "node writer must have in_conflict from both readers"
+        );
+    }
+
+    /// `record_edge_write` fans out to RelType coarse write.
+    /// A RelType(T) reader conflicts; a different-type reader does not.
+    #[test]
+    fn edge_write_fans_out_to_rel_type() {
+        let mgr = TransactionManager::new();
+        let rt5 = EdgeTypeId::new(5);
+        let rt6 = EdgeTypeId::new(6);
+        let edge = EdgeId::new(100);
+        let edge2 = EdgeId::new(101);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx1 records a RelType(5) read
+        mgr.record_read(tx1, EntityId::RelType(rt5), None).unwrap();
+
+        // tx2 writes an edge of type rt5 → fans out to RelType(5)
+        mgr.record_edge_write(tx2, edge, rt5, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "RelType reader must get out_conflict from edge write fanning to RelType(5)"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "edge writer must get in_conflict from RelType(5) reader"
+        );
+
+        // An edge write of a DIFFERENT type must NOT conflict with RelType(5) reader.
+        let tx3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_edge_write(tx3, edge2, rt6, None).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(tx3),
+            (false, false),
+            "edge write with RelType(6) must not conflict with RelType(5) reader"
+        );
+    }
+
+    /// `record_node_write` with no labels only records the node entity —
+    /// no coarse Label writes, no spurious conflicts with Label readers.
+    #[test]
+    fn node_write_no_labels_no_label_conflict() {
+        let mgr = TransactionManager::new();
+        let lbl = LabelId::new(99);
+        let node = NodeId::new(7);
+
+        let tx_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx_r, EntityId::Label(lbl), None).unwrap();
+
+        // Write a node with NO labels → no fan-out to any Label
+        mgr.record_node_write(tx_w, node, &[], None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx_r),
+            (false, false),
+            "Label reader must not conflict with node write that has no labels"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx_w),
+            (false, false),
+            "node writer with no labels must have no conflict flags"
         );
     }
 }

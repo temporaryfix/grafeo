@@ -18,17 +18,16 @@
 #![cfg(feature = "lpg")]
 
 use grafeo_common::types::NodeId;
-use grafeo_engine::{GrafeoDB, transaction::EntityId};
+use grafeo_engine::{
+    GrafeoDB,
+    transaction::{EntityId, IsolationLevel},
+};
 
 // ============================================================================
 // Helper
 // ============================================================================
 
-fn assert_node_in_ws(
-    ws: &std::collections::HashSet<EntityId>,
-    id: NodeId,
-    label: &str,
-) {
+fn assert_node_in_ws(ws: &std::collections::HashSet<EntityId>, id: NodeId, label: &str) {
     assert!(
         ws.contains(&EntityId::Node(id)),
         "write-set must contain {} (id={:?}), but it contains {:?}",
@@ -84,7 +83,11 @@ fn write_set_complete_from_chokepoints() {
 
     // (b) SET a property on pre-existing node  → tx_property_overlay node_props
     session
-        .set_node_property(prop_label_target, "x", grafeo_common::types::Value::Int64(42))
+        .set_node_property(
+            prop_label_target,
+            "x",
+            grafeo_common::types::Value::Int64(42),
+        )
         .unwrap();
 
     // (c) SET a label on the same pre-existing node  → tx_property_overlay node_labels
@@ -194,6 +197,135 @@ fn write_set_includes_created_edge() {
         ws.contains(&EntityId::Edge(eid)),
         "write-set must contain the created edge {:?}, got {:?}",
         eid,
+        ws
+    );
+}
+
+// ============================================================================
+// GE2: coarse Label/RelType fan-out — phantom write chokepoints
+// ============================================================================
+
+/// `create_node` inside a transaction fans out a coarse `EntityId::Label(_)` write
+/// for each label assigned to the new node.
+///
+/// This is the load-bearing chokepoint for GE3's phantom detection: an escalated
+/// `Label(L)` reader must form an rw-antidependency with any writer that creates
+/// a node carrying that label.
+#[test]
+fn create_label_node_write_set_includes_label() {
+    let db = GrafeoDB::new_in_memory();
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .unwrap();
+    let tid = session.active_transaction_id().unwrap();
+
+    // Create a node with label "Foo" inside the transaction.
+    let _nid = session.create_node(&["Foo"]);
+
+    session.commit().unwrap();
+
+    let ws = session
+        .transaction_manager_ref()
+        .get_write_set(tid)
+        .expect("write-set must be readable after commit");
+
+    // The write-set must contain at least one EntityId::Label(_) entry — the
+    // coarse phantom write recorded by create_node_versioned via record_coarse_node_write.
+    let label_entries: Vec<_> = ws
+        .iter()
+        .filter(|e| matches!(e, EntityId::Label(_)))
+        .collect();
+    assert!(
+        !label_entries.is_empty(),
+        "write-set must contain EntityId::Label(_) after create_node, but got {:?}",
+        ws
+    );
+}
+
+/// `SET n:L` (add_label_buffered path) inside a transaction also fans out a coarse
+/// `EntityId::Label(_)` write for the newly added label.
+#[test]
+fn add_label_write_set_includes_label() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create a node outside any transaction.
+    let setup = db.session();
+    let nid = setup.create_node(&["Base"]);
+    drop(setup);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .unwrap();
+    let tid = session.active_transaction_id().unwrap();
+
+    // Add a label to the pre-existing node inside the tx.
+    session
+        .execute(&format!(
+            "MATCH (n) WHERE id(n) = {} SET n:NewLabel",
+            nid.as_u64()
+        ))
+        .unwrap();
+
+    session.commit().unwrap();
+
+    let ws = session
+        .transaction_manager_ref()
+        .get_write_set(tid)
+        .expect("write-set must be readable after commit");
+
+    let label_entries: Vec<_> = ws
+        .iter()
+        .filter(|e| matches!(e, EntityId::Label(_)))
+        .collect();
+    assert!(
+        !label_entries.is_empty(),
+        "write-set must contain EntityId::Label(_) after SET n:L, but got {:?}",
+        ws
+    );
+}
+
+/// `create_edge` inside a transaction fans out a coarse `EntityId::RelType(_)` write
+/// for the relationship type of the new edge.
+///
+/// This is the load-bearing chokepoint for GE3's phantom detection on the edge side:
+/// an escalated `RelType(T)` reader must form an rw-antidependency with any writer
+/// that creates an edge of that type.
+#[test]
+fn create_edge_write_set_includes_rel_type() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Create endpoint nodes outside any transaction.
+    let setup = db.session();
+    let a = setup.create_node(&["A"]);
+    let b = setup.create_node(&["B"]);
+    drop(setup);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .unwrap();
+    let tid = session.active_transaction_id().unwrap();
+
+    // Create an edge of type "KNOWS" inside the tx.
+    let _eid = session.create_edge(a, b, "KNOWS");
+
+    session.commit().unwrap();
+
+    let ws = session
+        .transaction_manager_ref()
+        .get_write_set(tid)
+        .expect("write-set must be readable after commit");
+
+    let rel_type_entries: Vec<_> = ws
+        .iter()
+        .filter(|e| matches!(e, EntityId::RelType(_)))
+        .collect();
+    assert!(
+        !rel_type_entries.is_empty(),
+        "write-set must contain EntityId::RelType(_) after create_edge, but got {:?}",
         ws
     );
 }

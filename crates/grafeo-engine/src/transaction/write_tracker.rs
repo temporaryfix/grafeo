@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use grafeo_common::types::{EdgeId, NodeId, TransactionId};
+use grafeo_common::types::{EdgeId, EdgeTypeId, LabelId, NodeId, TransactionId};
 use grafeo_core::execution::operators::{OperatorError, WriteTracker};
 
 use super::{ConflictGranularity, IndexId, TransactionManager, prop_tag};
@@ -55,6 +55,40 @@ impl WriteTracker for TransactionWriteTracker {
     ) -> Result<(), OperatorError> {
         self.manager
             .record_write(transaction_id, edge_id, None)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Records a node write with coarse `Label(L)` fan-out for each label.
+    ///
+    /// Calls [`TransactionManager::record_node_write`] which records both
+    /// `EntityId::Node(node_id)` and `EntityId::Label(L)` for every `L`
+    /// in `labels`. Used by `CreateNodeOperator` (which knows its labels)
+    /// and the store's `create_node_versioned` phantom-write path.
+    fn record_node_write_with_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        labels: &[LabelId],
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_node_write(transaction_id, node_id, labels, None)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Records an edge write with coarse `RelType(T)` fan-out.
+    ///
+    /// Calls [`TransactionManager::record_edge_write`] which records both
+    /// `EntityId::Edge(edge_id)` and `EntityId::RelType(rel_type)`.
+    /// Used by `CreateEdgeOperator` and the store's `create_edge_versioned`
+    /// phantom-write path.
+    fn record_edge_write_with_type(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        rel_type: EdgeTypeId,
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_edge_write(transaction_id, edge_id, rel_type, None)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 

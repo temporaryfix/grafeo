@@ -38,7 +38,7 @@ use dashmap::DashMap;
 #[cfg(not(feature = "tiered-storage"))]
 use grafeo_common::mvcc::VersionChain;
 use grafeo_common::types::{
-    EdgeId, EpochId, HashableValue, NodeId, PropertyKey, TransactionId, Value,
+    EdgeId, EdgeTypeId, EpochId, HashableValue, LabelId, NodeId, PropertyKey, TransactionId, Value,
 };
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
@@ -1261,6 +1261,63 @@ impl LpgStore {
     pub(crate) fn record_write_index(&self, tx: TransactionId, index_key: &str) {
         if let Some(t) = self.write_trackers.read().get(&tx) {
             t.record_index_write(tx, index_key);
+        }
+    }
+
+    /// Records a node write with coarse `Label(L)` fan-out for each label.
+    ///
+    /// Forwards to the registered write tracker's
+    /// [`record_node_write_with_labels`](crate::execution::operators::WriteTracker::record_node_write_with_labels).
+    /// Silent no-op when no write tracker is registered for `tx`
+    /// (SI/ReadCommitted, or the system transaction).
+    ///
+    /// This is the phantom-write chokepoint for `create_node_versioned` and
+    /// `add_label_buffered`: every node create or label-add under a Serializable
+    /// transaction must record the coarse `Label(L)` write so a concurrent
+    /// escalated `Label(L)` reader forms an rw-antidependency.
+    ///
+    /// Errors are silently ignored: if the write tracker returns a conflict
+    /// the conflict will also be caught at the node-entity level by the
+    /// operator-level `record_node_write` call that precedes this one.
+    /// The phantom Label/RelType write is a supplementary coarse record —
+    /// it must not double-abort an already-doomed transaction.
+    #[inline]
+    pub(crate) fn record_coarse_node_write(
+        &self,
+        tx: TransactionId,
+        node_id: NodeId,
+        labels: &[LabelId],
+    ) {
+        if tx == TransactionId::SYSTEM {
+            return;
+        }
+        if let Some(t) = self.write_trackers.read().get(&tx) {
+            // Ignore conflict result: phantom coarse write; entity-level W-W
+            // is checked by the operator before mutating the store.
+            let _ = t.record_node_write_with_labels(tx, node_id, labels);
+        }
+    }
+
+    /// Records an edge write with coarse `RelType(T)` fan-out.
+    ///
+    /// Forwards to the registered write tracker's
+    /// [`record_edge_write_with_type`](crate::execution::operators::WriteTracker::record_edge_write_with_type).
+    /// Silent no-op when no write tracker is registered for `tx`.
+    ///
+    /// Errors are silently ignored (same rationale as
+    /// [`record_coarse_node_write`](Self::record_coarse_node_write)).
+    #[inline]
+    pub(crate) fn record_coarse_edge_write(
+        &self,
+        tx: TransactionId,
+        edge_id: EdgeId,
+        rel_type: EdgeTypeId,
+    ) {
+        if tx == TransactionId::SYSTEM {
+            return;
+        }
+        if let Some(t) = self.write_trackers.read().get(&tx) {
+            let _ = t.record_edge_write_with_type(tx, edge_id, rel_type);
         }
     }
 }

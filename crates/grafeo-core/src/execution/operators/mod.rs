@@ -117,7 +117,7 @@ pub use vector_join::VectorJoinOperator;
 
 use std::sync::Arc;
 
-use grafeo_common::types::{EdgeId, NodeId, TransactionId};
+use grafeo_common::types::{EdgeId, EdgeTypeId, LabelId, NodeId, TransactionId};
 use thiserror::Error;
 
 use super::DataChunk;
@@ -180,6 +180,54 @@ pub trait WriteTracker: Send + Sync {
         transaction_id: TransactionId,
         edge_id: EdgeId,
         _key: &str,
+    ) -> Result<(), OperatorError> {
+        self.record_edge_write(transaction_id, edge_id)
+    }
+
+    /// Records a node write **with coarse label fan-out**.
+    ///
+    /// Records `EntityId::Node(node_id)` write **and** a coarse
+    /// `EntityId::Label(L)` write for each `L` in `labels`.  The coarse
+    /// label write is the phantom guard: a concurrent escalated
+    /// `Label(L)` reader (e.g. from `MATCH (n:L)` scan escalation in
+    /// GE3) will form an rw-antidependency with this write.
+    ///
+    /// Default implementation falls back to the entity-only
+    /// `record_node_write` (no label fan-out) for backward compatibility
+    /// with non-engine trackers.  The engine bridge overrides this to
+    /// call [`TransactionManager::record_node_write`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on any write-write conflict (first-writer-wins).
+    fn record_node_write_with_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        _labels: &[LabelId],
+    ) -> Result<(), OperatorError> {
+        self.record_node_write(transaction_id, node_id)
+    }
+
+    /// Records an edge write **with coarse rel-type fan-out**.
+    ///
+    /// Records `EntityId::Edge(edge_id)` write **and**
+    /// `EntityId::RelType(rel_type)` write.  Symmetric with
+    /// [`record_node_write_with_labels`](Self::record_node_write_with_labels):
+    /// a concurrent escalated `RelType(T)` reader conflicts with any
+    /// writer of an edge of that type.
+    ///
+    /// Default implementation falls back to the entity-only
+    /// `record_edge_write`.  The engine bridge overrides this.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on any write-write conflict.
+    fn record_edge_write_with_type(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        _rel_type: EdgeTypeId,
     ) -> Result<(), OperatorError> {
         self.record_edge_write(transaction_id, edge_id)
     }
