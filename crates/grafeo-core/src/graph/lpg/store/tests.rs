@@ -2716,28 +2716,34 @@ fn test_read_node_labels_visible_records_node() {
 
 #[test]
 fn test_nodes_by_label_visible_records_each_returned_node() {
+    use grafeo_common::types::LabelId;
     use visible_read_recording::fixture;
-    let (store, tx, _n_visible, n_deleted, _e, spy) = fixture();
+    let (store, tx, n_visible, n_deleted, _e, spy) = fixture();
+    let epoch = store.current_epoch();
 
-    // n_deleted was deleted so nodes_by_label returns only n_visible
-    let ids = store.nodes_by_label_visible("Person", Some(tx));
-    // The label index doesn't filter by tx-visibility; it returns n_visible
-    // (n_deleted was removed from the label_index by delete_node)
-    for &id in &ids {
-        assert!(
-            spy.nodes.lock().contains(&id),
-            "each returned node must be recorded"
-        );
-    }
+    // GE3: recording happens in filter_visible_node_ids_in_label_versioned,
+    // not in nodes_by_label_visible (nodes_by_label_visible is now a pure
+    // ID-merge function; the MVCC filter records with label context).
+    let label_id = store.label_id("Person").expect("Person label must exist");
+    let all_ids = store.nodes_by_label_visible("Person", Some(tx));
+    let ids =
+        store.filter_visible_node_ids_in_label_versioned(&all_ids, epoch, tx, LabelId(label_id));
+
+    // Only n_visible should survive the MVCC filter (n_deleted is deleted).
+    assert!(ids.contains(&n_visible), "n_visible must be in the result");
+    assert!(
+        !ids.contains(&n_deleted),
+        "deleted node must be filtered out by MVCC"
+    );
+    // The spy must have recorded n_visible (via label-context recording).
+    assert!(
+        spy.nodes.lock().contains(&n_visible),
+        "n_visible must be recorded by filter_visible_node_ids_in_label_versioned"
+    );
     assert!(
         !spy.nodes.lock().contains(&n_deleted),
-        "deleted node removed from label_index must not be recorded"
+        "deleted node must not be recorded"
     );
-
-    // tx=None → no recording
-    spy.nodes.lock().clear();
-    let _ = store.nodes_by_label_visible("Person", None);
-    assert!(spy.nodes.lock().is_empty(), "tx=None must not record");
 }
 
 // ── edges_from_versioned / neighbors_versioned ───────────────────────────────

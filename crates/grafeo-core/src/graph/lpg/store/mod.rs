@@ -1222,6 +1222,50 @@ impl LpgStore {
         }
     }
 
+    /// Records that `tx` read `id` while scanning label `label_id` (e.g. from
+    /// `MATCH (n:L)`). Delegates to
+    /// [`ReadTracker::record_read_node_in_label`]; the default implementation
+    /// falls back to entity-level recording, so behaviour is identical to
+    /// [`record_read_node`](Self::record_read_node) for non-engine trackers.
+    ///
+    /// The engine override routes through the manager's `record_read_in_label`
+    /// so fine `Node` reads under a single label predicate escalate to the
+    /// coarse `EntityId::Label(L)` key once the threshold is exceeded (GE3).
+    #[inline]
+    pub(crate) fn record_read_node_in_label(
+        &self,
+        tx: TransactionId,
+        id: NodeId,
+        label_id: LabelId,
+    ) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_read_node_in_label(tx, id, label_id);
+        }
+    }
+
+    /// Records that `tx` read `id` while scanning relationship type `rel_type`
+    /// (e.g. from `MATCH ()-[:T]->()`). Symmetric with
+    /// [`record_read_node_in_label`](Self::record_read_node_in_label).
+    ///
+    /// Delegates to [`ReadTracker::record_read_edge_in_rel_type`]; the engine
+    /// override escalates fine `Edge` reads to `EntityId::RelType(T)` at
+    /// threshold (GE3).
+    ///
+    /// Currently wired for future edge-type scan escalation; not yet called
+    /// from any scan site (edge-type scan wiring is a subsequent task).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn record_read_edge_in_rel_type(
+        &self,
+        tx: TransactionId,
+        id: EdgeId,
+        rel_type: EdgeTypeId,
+    ) {
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_read_edge_in_rel_type(tx, id, rel_type);
+        }
+    }
+
     // ── Write-tracker: per-transaction registration for indexed-SET anti-phantom ──
 
     /// Attaches `tracker` to `tx` so that subsequent buffered indexed-property

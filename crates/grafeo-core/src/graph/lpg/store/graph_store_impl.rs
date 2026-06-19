@@ -373,6 +373,26 @@ impl GraphStore for LpgStore {
         LpgStore::filter_visible_node_ids_versioned(self, ids, epoch, transaction_id)
     }
 
+    fn filter_visible_node_ids_in_label_versioned(
+        &self,
+        ids: &[NodeId],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+        label_id: grafeo_common::types::LabelId,
+    ) -> Vec<NodeId> {
+        LpgStore::filter_visible_node_ids_in_label_versioned(
+            self,
+            ids,
+            epoch,
+            transaction_id,
+            label_id,
+        )
+    }
+
+    fn label_id_for_scan(&self, label: &str) -> Option<grafeo_common::types::LabelId> {
+        LpgStore::label_id(self, label).map(grafeo_common::types::LabelId)
+    }
+
     fn get_node_history(&self, id: NodeId) -> Vec<(EpochId, Option<EpochId>, Node)> {
         LpgStore::get_node_history(self, id)
     }

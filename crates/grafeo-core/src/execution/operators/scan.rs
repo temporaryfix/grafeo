@@ -3,7 +3,7 @@
 use super::{Operator, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
-use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId};
+use grafeo_common::types::{EpochId, LabelId, LogicalType, NodeId, TransactionId};
 use std::sync::Arc;
 
 /// A scan operator that reads nodes from storage.
@@ -88,21 +88,35 @@ impl ScanOperator {
         // which merges the tx's buffered label delta (adds buffered-adds, drops
         // buffered-removes) so the writer sees read-your-writes without
         // polluting the committed label_index for other sessions.
-        let all_ids = match &self.label {
-            Some(label) => self
-                .store
-                .nodes_by_label_visible(label, self.transaction_id),
-            None if self.viewing_epoch.is_some() => self.store.all_node_ids(),
-            None => self.store.node_ids(),
+        //
+        // GE3: also resolve the label's numeric id so the MVCC filter can use
+        // the labeled recording path (record_read_node_in_label) for escalation.
+        let (all_ids, scan_label_id) = match &self.label {
+            Some(label) => {
+                let ids = self
+                    .store
+                    .nodes_by_label_visible(label, self.transaction_id);
+                let lid: Option<LabelId> = self.store.label_id_for_scan(label);
+                (ids, lid)
+            }
+            None if self.viewing_epoch.is_some() => (self.store.all_node_ids(), None),
+            None => (self.store.node_ids(), None),
         };
 
         // Filter by visibility if we have tx context.
         // Uses batch methods that hold a single lock for all IDs instead of
         // acquiring/releasing per node (avoids N+1 lock pattern).
+        // When a label id is available, use the escalation-aware path (GE3);
+        // otherwise fall back to plain fine recording.
         self.batch = if let Some(epoch) = self.viewing_epoch {
             if let Some(tx) = self.transaction_id {
-                self.store
-                    .filter_visible_node_ids_versioned(&all_ids, epoch, tx)
+                if let Some(label_id) = scan_label_id {
+                    self.store
+                        .filter_visible_node_ids_in_label_versioned(&all_ids, epoch, tx, label_id)
+                } else {
+                    self.store
+                        .filter_visible_node_ids_versioned(&all_ids, epoch, tx)
+                }
             } else {
                 self.store.filter_visible_node_ids(&all_ids, epoch)
             }

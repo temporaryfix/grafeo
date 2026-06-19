@@ -299,6 +299,39 @@ pub trait ReadTracker: Send + Sync {
     /// transactions, recording the read in the SSI read-registry so a concurrent
     /// indexed SET can form the rw-antidependency edge.
     fn record_index_read(&self, _transaction_id: TransactionId, _index_key: &str) {}
+
+    /// Records that `transaction_id` read `node_id` as part of a label scan for
+    /// `label_id` (e.g. `MATCH (n:L)`). Enables read-set escalation: the engine
+    /// bridge accumulates fine `Node` reads under the `Label(L)` predicate bucket
+    /// and promotes the bucket to a single coarse `EntityId::Label(L)` key once
+    /// the escalation threshold is exceeded.
+    ///
+    /// Default implementation falls back to `record_node_read` (fine, no
+    /// predicate), so non-engine trackers remain correct.
+    fn record_read_node_in_label(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        _label_id: LabelId,
+    ) {
+        self.record_node_read(transaction_id, node_id);
+    }
+
+    /// Records that `transaction_id` read `edge_id` as part of a relationship-type
+    /// scan for `rel_type` (e.g. `MATCH ()-[:T]->()`). Symmetric with
+    /// [`record_read_node_in_label`](Self::record_read_node_in_label): enables
+    /// escalation to a coarse `EntityId::RelType(T)` key.
+    ///
+    /// Default implementation falls back to `record_edge_read` (fine, no
+    /// predicate), so non-engine trackers remain correct.
+    fn record_read_edge_in_rel_type(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        _rel_type: EdgeTypeId,
+    ) {
+        self.record_edge_read(transaction_id, edge_id);
+    }
 }
 
 /// Type alias for a shared read tracker.

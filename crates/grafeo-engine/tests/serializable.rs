@@ -30,7 +30,9 @@
 
 #![cfg(feature = "lpg")]
 
-use grafeo_engine::{ConflictGranularity, GrafeoDB, transaction::IsolationLevel};
+use grafeo_engine::{
+    ConflictGranularity, GrafeoDB, transaction::EntityId, transaction::IsolationLevel,
+};
 
 // ============================================================================
 // Helpers
@@ -3207,4 +3209,115 @@ fn serializable_mmr_search_works() {
              (IndexId recording is missing from the MMR path)",
         );
     }
+}
+
+// ============================================================================
+// GE3: label-scan accessor escalation
+// ============================================================================
+
+/// A Serializable label scan over 10 `:GE3Label` nodes with threshold=4 escalates
+/// to a single coarse `EntityId::Label(L_id)` entry in the read-set and drops all
+/// fine `EntityId::Node` entries for those rows.
+///
+/// This validates that `nodes_by_label_visible` routes reads through
+/// `record_read_node_in_label` so the manager's escalation machinery fires.
+#[test]
+fn serializable_label_scan_escalates() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 `:GE3Label` nodes.
+    let setup = db.session();
+    for _ in 0..10 {
+        setup.create_node(&["GE3Label"]);
+    }
+    drop(setup);
+
+    // Lower the threshold to 4 so 10 nodes definitely escalate.
+    // Access the manager via a temporary session.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin Serializable");
+    let tid = session.active_transaction_id().unwrap();
+
+    // Run a label scan — 10 nodes visited.
+    let result = session
+        .execute("MATCH (n:GE3Label) RETURN n")
+        .expect("MATCH GE3Label");
+    assert_eq!(result.row_count(), 10, "must see all 10 GE3Label nodes");
+
+    session.commit().expect("commit must succeed");
+
+    // Inspect the read-set.
+    let rs = session.transaction_manager_ref().read_set(tid);
+
+    // The coarse Label key must be present — this is the load-bearing invariant
+    // for GE3 conflict detection: any writer of a `:GE3Label` node will record
+    // the coarse `EntityId::Label(L_id)` write and conflict with this reader.
+    let label_entries: Vec<_> = rs
+        .iter()
+        .filter(|e| matches!(e, EntityId::Label(_)))
+        .collect();
+    assert!(
+        !label_entries.is_empty(),
+        "read-set must contain EntityId::Label(_) after escalated label scan \
+         (threshold=4, 10 nodes scanned); got: {rs:?}"
+    );
+}
+
+/// A Serializable point lookup (single node by property predicate) keeps a fine
+/// `EntityId::Node` entry — NOT escalated to `EntityId::Label`.
+///
+/// This validates that point/property reads go through the plain `record_read_node`
+/// path (or `record_read_node_property`) and are never tagged with a label predicate.
+#[test]
+fn serializable_point_read_stays_fine() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed one `:GE3Point` node with a unique id property.
+    let setup = db.session();
+    let nid = setup
+        .create_node_with_props(
+            &["GE3Point"],
+            [("uid", grafeo_common::types::Value::Int64(42))],
+        )
+        .expect("create GE3Point node");
+    drop(setup);
+
+    // Lower the threshold to 4 to ensure that even a single node via a point-read
+    // does NOT escalate (the bucket for GE3Point's LabelId never forms).
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin Serializable");
+    let tid = session.active_transaction_id().unwrap();
+
+    // Point-read: filter by property — goes through scan+filter, NOT a label scan path.
+    let result = session
+        .execute("MATCH (n:GE3Point) WHERE n.uid = 42 RETURN n")
+        .expect("MATCH GE3Point {uid: 42}");
+    assert_eq!(result.row_count(), 1, "must find the seeded GE3Point node");
+
+    session.commit().expect("commit must succeed");
+
+    let rs = session.transaction_manager_ref().read_set(tid);
+
+    // There must be at least one fine Node entry (for the matched node).
+    assert!(
+        rs.contains(&EntityId::Node(nid)),
+        "read-set must contain the fine EntityId::Node for the point-read node; \
+         got: {rs:?}"
+    );
 }

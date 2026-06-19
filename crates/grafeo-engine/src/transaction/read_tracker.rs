@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use grafeo_common::types::{EdgeId, NodeId, TransactionId};
+use grafeo_common::types::{EdgeId, EdgeTypeId, LabelId, NodeId, TransactionId};
 use grafeo_core::execution::operators::ReadTracker;
 
 use super::{
@@ -91,6 +91,42 @@ impl ReadTracker for TransactionReadTracker {
                 None
             };
             let _ = self.manager.record_read(transaction_id, edge_id, tag);
+        }
+    }
+
+    fn record_read_node_in_label(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        label_id: LabelId,
+    ) {
+        if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
+            let tag = if self.granularity == ConflictGranularity::Property {
+                Some(STRUCT_TAG)
+            } else {
+                None
+            };
+            let _ = self
+                .manager
+                .record_read_in_label(transaction_id, node_id, tag, label_id);
+        }
+    }
+
+    fn record_read_edge_in_rel_type(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        rel_type: EdgeTypeId,
+    ) {
+        if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
+            let tag = if self.granularity == ConflictGranularity::Property {
+                Some(STRUCT_TAG)
+            } else {
+                None
+            };
+            let _ = self
+                .manager
+                .record_read_in_rel_type(transaction_id, edge_id, tag, rel_type);
         }
     }
 

@@ -376,9 +376,6 @@ impl LpgStore {
                             })
                             .collect();
                         ids.sort_unstable();
-                        for &id in &ids {
-                            self.record_read_node(tx, id);
-                        }
                         return ids;
                     }
                 }
@@ -423,10 +420,6 @@ impl LpgStore {
 
         let mut ids: Vec<NodeId> = visible.into_iter().collect();
         ids.sort_unstable();
-        // Record each returned node for the Serializable read-set.
-        for &id in &ids {
-            self.record_read_node(tx, id);
-        }
         ids
     }
 

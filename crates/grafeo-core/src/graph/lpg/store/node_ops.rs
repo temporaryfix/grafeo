@@ -1116,6 +1116,74 @@ impl LpgStore {
         visible
     }
 
+    /// Label-scan variant of [`filter_visible_node_ids_versioned`]: MVCC-filters
+    /// `ids` and records each visible node under the `label_id` predicate bucket
+    /// (GE3 escalation path). Reads are tagged with `label_id` so the manager's
+    /// `record_read_in_label` machinery can promote fine `Node` entries to the
+    /// coarse `EntityId::Label(L)` key once the escalation threshold is exceeded.
+    ///
+    /// This is the canonical recording chokepoint for `MATCH (n:L)` scans. All
+    /// other node read chokepoints use [`record_read_node`](Self::record_read_node)
+    /// (fine, no predicate) — only label-scan-driven reads go through here.
+    #[must_use]
+    #[cfg(not(feature = "tiered-storage"))]
+    pub(crate) fn filter_visible_node_ids_in_label_versioned(
+        &self,
+        ids: &[NodeId],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+        label_id: LabelId,
+    ) -> Vec<NodeId> {
+        let nodes = self.nodes.read();
+        let visible: Vec<NodeId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                nodes.get(id).is_some_and(|chain| {
+                    chain
+                        .visible_to(epoch, transaction_id)
+                        .is_some_and(|r| !r.is_deleted())
+                })
+            })
+            .collect();
+        drop(nodes);
+        for &id in &visible {
+            self.record_read_node_in_label(transaction_id, id, label_id);
+        }
+        visible
+    }
+
+    /// Label-scan variant of [`filter_visible_node_ids_versioned`]: tiered-storage
+    /// edition. Symmetric with the non-tiered variant above.
+    #[must_use]
+    #[cfg(feature = "tiered-storage")]
+    pub(crate) fn filter_visible_node_ids_in_label_versioned(
+        &self,
+        ids: &[NodeId],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+        label_id: LabelId,
+    ) -> Vec<NodeId> {
+        let versions = self.node_versions.read();
+        let visible: Vec<NodeId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                versions.get(id).is_some_and(|index| {
+                    index.visible_to(epoch, transaction_id).is_some_and(|vref| {
+                        self.read_node_record(&vref)
+                            .is_some_and(|r| !r.is_deleted())
+                    })
+                })
+            })
+            .collect();
+        drop(versions);
+        for &id in &visible {
+            self.record_read_node_in_label(transaction_id, id, label_id);
+        }
+        visible
+    }
+
     /// Returns the number of nodes (non-deleted at current epoch).
     #[must_use]
     #[cfg(not(feature = "tiered-storage"))]

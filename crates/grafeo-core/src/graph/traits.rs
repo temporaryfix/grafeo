@@ -29,7 +29,7 @@ use crate::graph::lpg::{Edge, Node};
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
-use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::types::{EdgeId, EpochId, LabelId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
@@ -476,6 +476,15 @@ pub trait GraphStore: Send + Sync {
         Vec::new()
     }
 
+    /// Returns the numeric `LabelId` for a label name, or `None` if the label
+    /// has never been interned. Used by `ScanOperator` to obtain the label's
+    /// predicate key for GE3 read-set escalation.
+    ///
+    /// Default returns `None`; overridden by `LpgStore`.
+    fn label_id_for_scan(&self, _label: &str) -> Option<LabelId> {
+        None
+    }
+
     // --- Visibility checks (fast path, avoids building full entities) ---
 
     /// Checks if a node is visible at the given epoch without building the full Node.
@@ -540,6 +549,23 @@ pub trait GraphStore: Send + Sync {
             .copied()
             .filter(|id| self.is_node_visible_versioned(*id, epoch, transaction_id))
             .collect()
+    }
+
+    /// Label-scan variant of [`filter_visible_node_ids_versioned`]: MVCC-filters
+    /// `ids` and records each visible node under the `label_id` predicate bucket
+    /// for GE3 read-set escalation (GE3 activation).
+    ///
+    /// Default implementation delegates to [`filter_visible_node_ids_versioned`]
+    /// (fine recording, no escalation) — overridden by engine-attached implementations
+    /// such as `LpgStore` to use `record_read_node_in_label`.
+    fn filter_visible_node_ids_in_label_versioned(
+        &self,
+        ids: &[NodeId],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+        _label_id: LabelId,
+    ) -> Vec<NodeId> {
+        self.filter_visible_node_ids_versioned(ids, epoch, transaction_id)
     }
 
     // --- History ---
