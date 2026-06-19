@@ -1356,6 +1356,109 @@ impl HnswIndex {
     }
 }
 
+// ── Visible-predicate search (snapshot-aware) ──────────────────────────────
+//
+// EF widening factor: the beam is run with ef * VISIBLE_EF_FACTOR so that
+// filtering invisible nodes still leaves ≥ k visible candidates.
+pub(super) const VISIBLE_EF_FACTOR: usize = 4;
+
+impl HnswIndex {
+    /// Snapshot-aware predicate-filtered search.
+    ///
+    /// Traverses **all** graph neighbors (deleted + invisible nodes remain
+    /// routing hops and are never skipped during traversal), but only
+    /// returns candidates that satisfy `is_visible(id)`.
+    ///
+    /// Distances are computed via the supplied `accessor`, not from any
+    /// internal storage. This lets the caller wire in a snapshot-aware
+    /// accessor (returning as-of-snapshot vectors) at a later stage.
+    ///
+    /// If `accessor.get_vector(id)` returns `None` for a candidate the
+    /// candidate is silently skipped (no vector at that snapshot).
+    ///
+    /// The beam width is widened to `ef.max(k * VISIBLE_EF_FACTOR)` so
+    /// that filtering invisible nodes still leaves ≥ k results.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not match the configured `dimensions`.
+    ///
+    /// # Returns
+    ///
+    /// Up to `k` (id, distance) pairs sorted by distance (ascending).
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        assert_eq!(
+            query.len(),
+            self.config.dimensions,
+            "Query dimensions mismatch: expected {}, got {}",
+            self.config.dimensions,
+            query.len()
+        );
+
+        let nodes = self.nodes.read();
+        let entry_point = self.entry_point.read();
+        let max_level = *self.max_level.read();
+
+        if entry_point.is_none() || nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let ep = entry_point.expect("entry_point confirmed Some above");
+
+        // The private beam helpers are generic over `impl VectorAccessor`
+        // (monomorphised, require `Sized`). To accept a `&dyn VectorAccessor`
+        // we wrap it in a thin newtype that *is* `Sized`.
+        struct DynAccessorRef<'a>(&'a dyn VectorAccessor);
+        impl VectorAccessor for DynAccessorRef<'_> {
+            fn get_vector(&self, id: NodeId) -> Option<Arc<[f32]>> {
+                self.0.get_vector(id)
+            }
+        }
+        let wrapped = DynAccessorRef(accessor);
+
+        // Greedy descent from top layer to layer 1 — traverse through all nodes.
+        let mut current_ep = ep;
+        for lc in (1..=max_level).rev() {
+            current_ep = self.search_layer_single(&nodes, &wrapped, query, current_ep, lc);
+        }
+
+        // Widen the beam so invisible nodes can be skipped without exhausting
+        // the candidate pool.
+        let ef_search = ef.max(k.saturating_mul(VISIBLE_EF_FACTOR));
+
+        // Full beam at layer 0 — all neighbors traversed, no pruning.
+        let candidates = self.search_layer(&nodes, &wrapped, query, current_ep, ef_search, 0);
+
+        // Collect visible candidates, scored by the supplied accessor.
+        // If the accessor returns None for a node (no vector at this snapshot),
+        // skip it.
+        let mut results: Vec<(NodeId, f32)> = candidates
+            .into_iter()
+            .filter(|n| is_visible(n.id))
+            .filter_map(|n| {
+                // Re-score with the passed accessor in case it differs from the
+                // one used during graph traversal (the beam already used it, so
+                // this is just a consistency pass — same cost, always correct).
+                accessor
+                    .get_vector(n.id)
+                    .map(|v| (n.id, self.vector_distance(query, &v)))
+            })
+            .collect();
+
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        results
+    }
+}
+
 impl std::fmt::Debug for HnswIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HnswIndex")
@@ -2791,5 +2894,97 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(mmap_index.len(), 0);
         assert!(mmap_index.is_empty());
+    }
+
+    // ── search_visible (snapshot-aware predicate filter) tests ──────────────
+
+    /// search_visible returns only IDs that pass is_visible; invisible IDs
+    /// (5, 7) must be absent from results. With 10 nodes and 2 invisible,
+    /// k≤8 should return min(k, 8) results.
+    #[test]
+    fn search_visible_excludes_invisible() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        // Insert ids 1..=10 with distinct vectors.
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=10 {
+            let v: Vec<f32> = (0..4).map(|j| ((i - 1) * 4 + j) as f32 / 40.0).collect();
+            map.insert(NodeId::new(i), Arc::from(v.as_slice()));
+        }
+        let accessor = make_accessor(&map);
+
+        for i in 1u64..=10 {
+            let v = map[&NodeId::new(i)].clone();
+            index.insert(NodeId::new(i), &v, &accessor);
+        }
+        assert_eq!(index.len(), 10);
+
+        let is_visible = |id: NodeId| id != NodeId::new(5) && id != NodeId::new(7);
+
+        // Query near the centre; ask for up to 8 results.
+        let query = [0.25f32, 0.25, 0.25, 0.25];
+        let results = index.search_visible(&query, 8, 20, &is_visible, &accessor);
+
+        // Must not contain 5 or 7.
+        for (id, _) in &results {
+            assert!(
+                *id != NodeId::new(5) && *id != NodeId::new(7),
+                "invisible node {id:?} appeared in search_visible results"
+            );
+        }
+        // 10 total − 2 invisible = 8 visible; asking for k=8 → must return 8.
+        assert_eq!(
+            results.len(),
+            8,
+            "expected 8 visible results, got {}: {results:?}",
+            results.len()
+        );
+        // Results must be sorted by distance (ascending).
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].1 <= results[i].1,
+                "results not sorted at index {i}: {:?}",
+                results
+            );
+        }
+    }
+
+    /// With half the nodes invisible, search_visible(k=3) must still return 3
+    /// visible results (the widened ef compensates for filtering losses).
+    #[test]
+    fn search_visible_widens_for_recall() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=20 {
+            let v: Vec<f32> = (0..4).map(|j| ((i - 1) * 4 + j) as f32 / 80.0).collect();
+            map.insert(NodeId::new(i), Arc::from(v.as_slice()));
+        }
+        let accessor = make_accessor(&map);
+        for i in 1u64..=20 {
+            let v = map[&NodeId::new(i)].clone();
+            index.insert(NodeId::new(i), &v, &accessor);
+        }
+
+        // Odd IDs are invisible (10 invisible, 10 visible).
+        let is_visible = |id: NodeId| id.as_u64() % 2 == 0;
+
+        let query = [0.25f32, 0.25, 0.25, 0.25];
+        let results = index.search_visible(&query, 3, 10, &is_visible, &accessor);
+
+        // Must return exactly 3 (10 visible nodes exist, k=3).
+        assert_eq!(
+            results.len(),
+            3,
+            "expected 3 visible results from widened ef; got {results:?}"
+        );
+        for (id, _) in &results {
+            assert!(
+                id.as_u64() % 2 == 0,
+                "odd (invisible) node {id:?} appeared in results"
+            );
+        }
     }
 }

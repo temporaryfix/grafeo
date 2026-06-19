@@ -324,6 +324,27 @@ impl VectorIndexKind {
         }
     }
 
+    /// Snapshot-aware predicate-filtered search.
+    ///
+    /// Traverses the full graph for connectivity, returns only nodes that
+    /// satisfy `is_visible`, and scores via the supplied `accessor`.
+    /// The beam is widened by `VISIBLE_EF_FACTOR` (4×) so filtering still
+    /// yields `k` results. Uses `&dyn` so the caller can pass trait objects.
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        match self {
+            Self::Hnsw(idx) => idx.search_visible(query, k, ef, is_visible, accessor),
+            Self::Quantized(idx) => idx.search_visible(query, k, ef, is_visible, accessor),
+        }
+    }
+
     /// Snapshot the HNSW topology for serialization.
     #[must_use]
     pub fn snapshot_topology(&self) -> (Option<NodeId>, usize, Vec<(NodeId, Vec<Vec<NodeId>>)>) {

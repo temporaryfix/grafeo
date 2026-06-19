@@ -760,6 +760,66 @@ impl QuantizedHnswIndex {
     pub fn heap_memory_bytes(&self) -> usize {
         self.hnsw.heap_memory_bytes() + self.memory_usage()
     }
+
+    /// Snapshot-aware predicate-filtered search with external accessor rescoring.
+    ///
+    /// Coarse-search the quantized graph over a widened pool (`ef` is widened
+    /// by `VISIBLE_EF_FACTOR` from the HNSW layer), then **rescore every
+    /// candidate using the supplied `accessor`** (the snapshot-aware
+    /// as-of-E accessor, NOT the internal `vectors` map). Filter by
+    /// `is_visible` and return the top-k.
+    ///
+    /// If `accessor.get_vector(id)` returns `None` for a candidate the
+    /// candidate is silently dropped (no vector at that snapshot).
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        // Widen the candidate pool at the HNSW level so that filtering
+        // invisible nodes still leaves ≥ k candidates for rescoring.
+        // We reuse the VISIBLE_EF_FACTOR from the plain HNSW layer.
+        use super::hnsw::VISIBLE_EF_FACTOR;
+        let ef_wide = ef.max(k.saturating_mul(VISIBLE_EF_FACTOR));
+
+        // Coarse-search: use the internal full-precision accessor for graph
+        // traversal (same accessor the existing search methods use).
+        let internal_accessor = self.accessor();
+        let num_candidates = if self.rescore {
+            k.saturating_mul(self.rescore_factor)
+                .saturating_mul(VISIBLE_EF_FACTOR)
+                .max(ef_wide)
+        } else {
+            ef_wide
+        };
+
+        let candidates =
+            self.hnsw
+                .search_with_ef(query, num_candidates, ef_wide, &internal_accessor);
+
+        // Rescore with the supplied snapshot accessor and apply the visibility
+        // predicate.  This is the key difference from the plain search path:
+        // distances come from `accessor`, not from `self.vectors`.
+        let metric = self.config().metric;
+        let mut results: Vec<(NodeId, f32)> = candidates
+            .into_iter()
+            .filter(|(id, _)| is_visible(*id))
+            .filter_map(|(id, _)| {
+                accessor.get_vector(id).map(|v| {
+                    let exact_dist = compute_distance(query, &v, metric);
+                    (id, exact_dist)
+                })
+            })
+            .collect();
+
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        results
+    }
 }
 
 impl std::fmt::Debug for QuantizedHnswIndex {
@@ -1101,6 +1161,69 @@ mod tests {
 
         let after = index2.search(&vectors[10], 5);
         assert_eq!(before.len(), after.len());
+    }
+
+    // ── search_visible tests (quantized) ───────────────────────────────────
+
+    /// search_visible on a QuantizedHnswIndex excludes invisible nodes, and
+    /// ranking follows the **passed accessor** (not the internally-stored
+    /// vectors). We insert one set of vectors, pass a different accessor, and
+    /// assert the results follow the accessor's geometry.
+    #[test]
+    fn search_visible_quantized() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        // Insert ids 1..=10 with "build" vectors spread across [0,1]^4.
+        for i in 1u64..=10 {
+            let v: Vec<f32> = (0..4).map(|j| ((i - 1) * 4 + j) as f32 / 40.0).collect();
+            index.insert(NodeId::new(i), &v);
+        }
+        assert_eq!(index.len(), 10);
+
+        // Override accessor: map every node to a single known vector so we
+        // control ranking independently of the inserted vectors.
+        // Node 1 maps to [0.0; 4], node 2 to [0.1, 0,0,0], ..., node 10 to
+        // [0.9, 0,0,0]. The query [0.95,0,0,0] is closest to node 10 then 9…
+        let mut override_map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=10 {
+            let v: Arc<[f32]> = Arc::from(vec![(i as f32 - 1.0) / 10.0, 0.0, 0.0, 0.0]);
+            override_map.insert(NodeId::new(i), v);
+        }
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { override_map.get(&id).cloned() };
+
+        // Invisible nodes: 5 and 7.
+        let is_visible = |id: NodeId| id != NodeId::new(5) && id != NodeId::new(7);
+
+        let query = [0.95f32, 0.0, 0.0, 0.0];
+        let results = index.search_visible(&query, 5, 20, &is_visible, &accessor);
+
+        // No invisible nodes.
+        for (id, _) in &results {
+            assert!(
+                *id != NodeId::new(5) && *id != NodeId::new(7),
+                "invisible node {id:?} in quantized search_visible results"
+            );
+        }
+        // Must return exactly 5 (8 visible, k=5).
+        assert_eq!(results.len(), 5, "expected 5 results; got {results:?}");
+
+        // Closest to [0.95,0,0,0] in override_map is node 10 ([0.9,0,0,0], dist=0.05),
+        // then node 9 ([0.8,0,0,0], dist=0.15), etc. The override accessor must
+        // dictate the ranking: node 10 must be first.
+        assert_eq!(
+            results[0].0,
+            NodeId::new(10),
+            "node 10 should be closest in override accessor; got {results:?}"
+        );
+
+        // Distances computed by override accessor must be ascending.
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].1 <= results[i].1,
+                "results not sorted at index {i}: {results:?}"
+            );
+        }
     }
 
     #[test]
