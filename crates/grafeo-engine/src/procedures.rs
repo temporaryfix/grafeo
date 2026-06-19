@@ -73,8 +73,12 @@ pub trait Procedure: Send + Sync {
     ///   SSI read-set (there is no versioned counterpart for schema reads).
     ///   This is an accepted residual: introspection is rarely the basis for a
     ///   write decision, and read-only introspection transactions never abort.
-    /// - Vector/text search procedures: `false` (default) — HNSW / BM25 index
-    ///   reads are not snapshot-aware and cannot be recorded for SSI.
+    /// - Vector/text search procedures (`search.vector`, `search.mmr`,
+    ///   `search.text`): `true` — all three route through `*_visible` APIs
+    ///   that record index reads for SSI conflict detection when
+    ///   `snapshot_epoch`/`snapshot_tx` are set. The default `false` applies
+    ///   only to hypothetical future procedures that have not yet been made
+    ///   snapshot-aware.
     fn serializable_safe(&self) -> bool {
         false
     }
@@ -587,6 +591,17 @@ impl Procedure for SearchMmrProcedure {
         vec!["node_id".into(), "distance".into()]
     }
 
+    /// `grafeo.search.mmr` is Serializable-safe: the executor supplies
+    /// `(epoch, tx)` via `ProcedureContext::snapshot_epoch` /
+    /// `::snapshot_tx`, and `execute` routes the initial candidate fetch
+    /// through `LpgStore::search_vector_visible` which records the index
+    /// read for SSI conflict detection and applies snapshot visibility.
+    /// The MMR re-rank is deterministic post-processing and does not add
+    /// additional reads beyond those already recorded by the candidate fetch.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         use grafeo_core::index::vector::{
             PropertyVectorAccessor, VectorAccessor, VectorAccessorKind, mmr_select,
@@ -616,6 +631,71 @@ impl Procedure for SearchMmrProcedure {
         )]
         let lambda = params.get_float("lambda").unwrap_or(0.5) as f32;
 
+        // Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are
+        // set by the executor.  Route through `search_vector_visible` to merge
+        // the per-tx write delta, pin candidates to the snapshot epoch, and
+        // record the index read in the SSI read-set so concurrent indexed-SET
+        // writes form an rw-antidependency edge.
+        //
+        // For the MMR re-rank we retrieve each candidate's as-of-epoch vector
+        // via `read_node_property_visible` so the pairwise similarity in
+        // `mmr_select` is also consistent with the snapshot (same epoch/tx).
+        if let (Some(epoch), Some(tx)) = (ctx.snapshot_epoch, ctx.snapshot_tx) {
+            let index_key = format!("{label}:{property}");
+            let initial = lpg.search_vector_visible(&index_key, &query, fetch_k, epoch, tx);
+            if initial.is_empty() {
+                return Ok(AlgorithmResult::new(vec![
+                    "node_id".into(),
+                    "distance".into(),
+                ]));
+            }
+
+            // Fetch as-of-epoch vectors for MMR pairwise comparison.
+            let prop_key = grafeo_common::types::PropertyKey::new(property);
+            let candidates: Vec<(grafeo_common::types::NodeId, f32, std::sync::Arc<[f32]>)> =
+                initial
+                    .into_iter()
+                    .filter_map(|(id, dist)| {
+                        let val = lpg.read_node_property_visible(id, &prop_key, epoch, Some(tx))?;
+                        match val {
+                            Value::Vector(v) => Some((id, dist, v)),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+
+            if candidates.is_empty() {
+                return Ok(AlgorithmResult::new(vec![
+                    "node_id".into(),
+                    "distance".into(),
+                ]));
+            }
+
+            let candidate_refs: Vec<(grafeo_common::types::NodeId, f32, &[f32])> = candidates
+                .iter()
+                .map(|(id, dist, vec)| (*id, *dist, vec.as_ref()))
+                .collect();
+
+            // Determine the distance metric from the committed index (fallback: Cosine).
+            let metric = lpg
+                .get_vector_index_by_key(&index_key)
+                .as_deref()
+                .map_or(grafeo_core::index::vector::DistanceMetric::Cosine, |idx| {
+                    idx.config().metric
+                });
+            let selected = mmr_select(&query, &candidate_refs, k, lambda, metric);
+
+            let mut result = AlgorithmResult::new(vec!["node_id".into(), "distance".into()]);
+            for (node_id, distance) in selected {
+                result.rows.push(vec![
+                    node_id_to_value(node_id),
+                    Value::Float64(f64::from(distance)),
+                ]);
+            }
+            return Ok(result);
+        }
+
+        // SI / RC: committed-latest, no SSI recording.
         let index = lpg.get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
                 "No vector index found for :{label}({property}). Call CREATE VECTOR INDEX first."
@@ -1116,6 +1196,26 @@ mod tests {
             assert!(
                 proc.serializable_safe(),
                 "{name}: introspection procedure must be serializable_safe() == true"
+            );
+        }
+    }
+
+    /// All built-in search procedures are Serializable-safe after VI7+MMR
+    /// un-guarding.  Any future search procedure that is NOT yet snapshot-aware
+    /// must document why and set `serializable_safe() == false` deliberately.
+    #[cfg(all(feature = "lpg", feature = "vector-index", feature = "text-index"))]
+    #[test]
+    fn all_search_procedures_are_serializable_safe() {
+        let registry = BuiltinProcedures::new();
+        for name in ["search.vector", "search.mmr", "search.text"] {
+            let proc = registry
+                .get(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                proc.serializable_safe(),
+                "{name}: search procedure must be serializable_safe() == true \
+                 (VI7+MMR un-guarding: every search procedure routes through \
+                 the snapshot-visible API when epoch+tx are set)"
             );
         }
     }

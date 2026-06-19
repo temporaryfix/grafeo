@@ -2884,3 +2884,327 @@ fn serializable_vector_multilabel_phantom() {
         );
     }
 }
+
+// ============================================================================
+// VI8-A. serializable_vector_reembed_scores_as_of_epoch
+// ============================================================================
+
+/// THE soundness crux: a re-embedded vector is scored at its **as-of-epoch**
+/// value, never the latest — otherwise SI's snapshot-read foundation is
+/// violated.
+///
+/// ## Design under test
+///
+/// `search_vector_visible(index_key, query, k, C1, tx)` builds a
+/// `SnapshotVectorAccessor` that calls `read_node_property_visible(N, "embedding",
+/// C1, ...)`.  When the property version chain for N has:
+///   - epoch C1 → V0 (close to Q)
+///   - epoch C2 → V1 (far from Q, a re-embedding committed after C1)
+///
+/// a search at snapshot epoch C1 must score N by V0 and return it among the
+/// top results.  If the accessor instead read the latest value (V1, far from Q)
+/// the node would rank last — proving the test is guarded against the wrong
+/// implementation.
+///
+/// ## The oracle
+///
+/// `db.store().read_node_property_visible(N, key, C1, None)` must equal V0.
+/// This is the same call path the `SnapshotVectorAccessor` exercises internally.
+///
+/// ## Why it would FAIL with latest-vector scoring
+///
+/// V1 = [0.0, 0.0, 1.0] is orthogonal to the query Q = [1.0, 0.0, 0.0].
+/// Under cosine distance, distance(V1, Q) ≈ 1.0 (maximum).
+/// V0 = [1.0, 0.0, 0.0] is identical to Q, so distance(V0, Q) = 0.0 (minimum).
+/// If the search returned results sorted by latest-vector distance, N would rank
+/// last (distance ~1.0).  Under as-of-C1 scoring, N must rank first (distance 0.0).
+/// The test asserts N appears in the top-1 result, which would fail if V1 were used.
+#[cfg(all(feature = "vector-index", feature = "temporal"))]
+#[test]
+fn serializable_vector_reembed_scores_as_of_epoch() {
+    use grafeo_common::types::{PropertyKey, Value};
+
+    let db = grafeo_engine::GrafeoDB::new_in_memory();
+
+    // Seed node N with V0 = [1.0, 0.0, 0.0] (identical to query Q).
+    let n = db.create_node(&["Doc"]);
+    db.set_node_property(
+        n,
+        "embedding",
+        Value::Vector(vec![1.0_f32, 0.0_f32, 0.0_f32].into()),
+    );
+
+    // Create a second node with a neutral vector so the index has at least 2
+    // entries and the HNSW is non-trivial.
+    let n2 = db.create_node(&["Doc"]);
+    db.set_node_property(
+        n2,
+        "embedding",
+        Value::Vector(vec![0.0_f32, 1.0_f32, 0.0_f32].into()),
+    );
+
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create Doc:embedding vector index");
+
+    // Snapshot C1: capture the epoch after the initial commit of V0.
+    let c1 = db.current_epoch();
+
+    // Re-embed N to V1 = [0.0, 0.0, 1.0] (orthogonal to Q — far from query).
+    // This creates epoch C2 > C1 in the property version chain.
+    let setup2 = db.session();
+    setup2
+        .execute("MATCH (n:Doc) WHERE id(n) = 0 SET n.embedding = [0.0, 0.0, 1.0]")
+        .ok(); // CQL id() may not be supported; use direct API
+    drop(setup2);
+
+    // Direct API: buffer the re-embedding, then commit it at a new epoch.
+    // This advances the epoch so C2 > C1.
+    let tx2 = grafeo_common::types::TransactionId::new(42);
+    db.store().set_node_property_buffered(
+        n,
+        "embedding",
+        Value::Vector(vec![0.0_f32, 0.0_f32, 1.0_f32].into()),
+        tx2,
+    );
+    db.store()
+        .sync_epoch(grafeo_common::types::EpochId::new(c1.as_u64() + 1));
+    db.store().apply_tx_overlay(tx2);
+
+    let c2 = db.current_epoch();
+    assert!(c2 > c1, "C2 must be > C1 after re-embedding commit");
+
+    // Oracle: read_node_property_visible(N, "embedding", C1, None) must be V0.
+    let prop_key = PropertyKey::new("embedding");
+    let oracle_v0 = db
+        .store()
+        .read_node_property_visible(n, &prop_key, c1, None);
+    assert_eq!(
+        oracle_v0,
+        Some(Value::Vector(vec![1.0_f32, 0.0_f32, 0.0_f32].into())),
+        "oracle: read_node_property_visible at C1 must return V0 = [1.0, 0.0, 0.0]; \
+         got: {:?}",
+        oracle_v0
+    );
+
+    // Oracle: read_node_property_visible(N, "embedding", C2, None) must be V1.
+    let oracle_v1 = db
+        .store()
+        .read_node_property_visible(n, &prop_key, c2, None);
+    assert_eq!(
+        oracle_v1,
+        Some(Value::Vector(vec![0.0_f32, 0.0_f32, 1.0_f32].into())),
+        "oracle: read_node_property_visible at C2 must return V1 = [0.0, 0.0, 1.0]; \
+         got: {:?}",
+        oracle_v1
+    );
+
+    // THE CRUX: search_vector_visible at snapshot C1 must score N by V0.
+    // Query Q = [1.0, 0.0, 0.0]; V0 is identical to Q (distance 0.0);
+    // V1 is orthogonal to Q (distance ~1.0).
+    // → N must appear as the top-1 result at C1 (scored by V0, distance 0.0).
+    let index_key = "Doc:embedding";
+    let query = vec![1.0_f32, 0.0_f32, 0.0_f32];
+    let tx_probe = grafeo_common::types::TransactionId::new(99); // no overlay for this tx
+
+    let results_at_c1 = db
+        .store()
+        .search_vector_visible(index_key, &query, 1, c1, tx_probe);
+
+    assert_eq!(
+        results_at_c1.len(),
+        1,
+        "search_vector_visible at C1 must return k=1 result; got {} results",
+        results_at_c1.len()
+    );
+    let (top_id, top_dist) = results_at_c1[0];
+    assert_eq!(
+        top_id, n,
+        "search at C1 must return N (scored by V0, distance ~0); \
+         if this fails, the accessor is using V1 (latest) instead of V0 (as-of-C1)"
+    );
+    assert!(
+        top_dist < 0.01,
+        "distance from V0 to Q must be ~0.0 (identical vectors); got {top_dist} — \
+         if > 0.9, the accessor returned V1 (orthogonal) instead of V0"
+    );
+
+    // Contrast: search at C2 scores N by V1 (far from Q) — N should NOT be top.
+    // N2 = [0.0, 1.0, 0.0] is also far but N's V1 = [0.0, 0.0, 1.0] is equally far.
+    // Whichever comes first, N's distance at C2 must be >> 0 (since V1 ⊥ Q).
+    let results_at_c2 = db
+        .store()
+        .search_vector_visible(index_key, &query, 1, c2, tx_probe);
+    if !results_at_c2.is_empty() {
+        let (_, dist_c2) = results_at_c2[0];
+        assert!(
+            dist_c2 > 0.5,
+            "at C2 the top result must be far from Q (all nodes have dist > 0.5 from Q); \
+             got dist={dist_c2} — if < 0.1, N was scored by V0 at C2 (snapshot not advancing)"
+        );
+    }
+}
+
+// ============================================================================
+// VI8-B. serializable_mmr_search_works
+// ============================================================================
+
+/// Under Serializable isolation `CALL grafeo.search.mmr(...)` must be allowed
+/// (un-guarded) and route through `search_vector_visible`.
+///
+/// ## Shape (mirrors the vector phantom pattern)
+///
+/// 1. `serializable_safe() == true` check — the CALL must not be rejected at
+///    planning time.
+/// 2. Snapshot consistency — a node committed AFTER the snapshot epoch must be
+///    invisible in the MMR result.
+/// 3. Phantom abort — if s1 reads the MMR index and s2 writes to it, the
+///    rw-antidependency cycle aborts s2 (same as `serializable_vector_phantom_aborts`).
+#[cfg(all(feature = "vector-index", feature = "lpg"))]
+#[test]
+fn serializable_mmr_search_works() {
+    let db = grafeo_engine::GrafeoDB::new_in_memory();
+
+    // Seed two nodes with varied vectors.
+    let n1 = db.create_node(&["MMRDoc"]);
+    db.set_node_property(
+        n1,
+        "emb",
+        grafeo_common::types::Value::Vector(vec![1.0_f32, 0.0_f32, 0.0_f32].into()),
+    );
+    let n2 = db.create_node(&["MMRDoc"]);
+    db.set_node_property(
+        n2,
+        "emb",
+        grafeo_common::types::Value::Vector(vec![0.0_f32, 1.0_f32, 0.0_f32].into()),
+    );
+
+    db.create_vector_index("MMRDoc", "emb", Some(3), Some("cosine"), None, None, None)
+        .expect("create MMRDoc:emb vector index");
+
+    // Seed a sentinel for the phantom rw-cycle.
+    let setup = db.session();
+    setup
+        .execute("CREATE (:MMRSentinel {v: 0})")
+        .expect("seed MMRSentinel");
+    drop(setup);
+
+    // ---- Sub-test A: CALL succeeds under Serializable ----
+    {
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(
+            grafeo_engine::transaction::IsolationLevel::Serializable,
+        )
+        .expect("s1: begin Serializable");
+
+        // Under VI7+MMR, CALL grafeo.search.mmr must no longer be rejected.
+        let result = s1.execute("CALL grafeo.search.mmr('MMRDoc', 'emb', [1.0, 0.0, 0.0], 2)");
+        assert!(
+            result.is_ok(),
+            "CALL grafeo.search.mmr under Serializable must succeed after MMR guard removal; \
+             got: {:?}",
+            result.err()
+        );
+        assert!(
+            result.unwrap().row_count() <= 2,
+            "CALL must return at most k=2 rows"
+        );
+
+        s1.commit()
+            .expect("read-only Serializable MMR search must commit");
+    }
+
+    // ---- Sub-test B: snapshot consistency (post-snapshot node invisible) ----
+    {
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(
+            grafeo_engine::transaction::IsolationLevel::Serializable,
+        )
+        .expect("s1: begin Serializable");
+
+        // Post-snapshot: add a third node and commit — must NOT appear in s1's MMR.
+        let writer = db.session();
+        writer
+            .execute("CREATE (:MMRDoc {emb: [0.0, 0.0, 1.0]})")
+            .expect("writer: CREATE MMRDoc node3");
+        drop(writer);
+
+        let r1 = s1
+            .execute("CALL grafeo.search.mmr('MMRDoc', 'emb', [1.0, 0.0, 0.0], 10)")
+            .expect("s1: MMR search under Serializable must not error");
+        assert_eq!(
+            r1.row_count(),
+            2,
+            "Serializable MMR search must see only pre-snapshot nodes (got {} rows); \
+             post-snapshot node leaked through snapshot isolation",
+            r1.row_count()
+        );
+
+        s1.commit()
+            .expect("s1 read-only Serializable MMR commit must succeed");
+    }
+
+    // ---- Sub-test C: phantom abort (rw-antidependency cycle) ----
+    {
+        // Reset sentinel.
+        db.session()
+            .execute("MATCH (n:MMRSentinel) SET n.v = 0")
+            .expect("reset sentinel");
+
+        let mut s1 = db.session();
+        s1.begin_transaction_with_isolation(
+            grafeo_engine::transaction::IsolationLevel::Serializable,
+        )
+        .expect("s1: begin Serializable");
+
+        let mut s2 = db.session();
+        s2.begin_transaction_with_isolation(
+            grafeo_engine::transaction::IsolationLevel::Serializable,
+        )
+        .expect("s2: begin Serializable");
+
+        // s1: MMR search — records IndexId("MMRDoc:emb") in s1's SSI read-set.
+        let r1 = s1
+            .execute("CALL grafeo.search.mmr('MMRDoc', 'emb', [1.0, 0.0, 0.0], 10)")
+            .expect("s1: CALL MMR search under Serializable must not error");
+        let _ = r1.row_count();
+
+        // s1: write sentinel.
+        s1.execute("MATCH (n:MMRSentinel) SET n.v = 99")
+            .expect("s1: SET MMRSentinel.v");
+
+        // s2: read sentinel — records MMRSentinel in s2's SSI read-set.
+        let r2 = s2
+            .execute("MATCH (n:MMRSentinel) RETURN n.v")
+            .expect("s2: MATCH MMRSentinel");
+        assert_eq!(r2.row_count(), 1, "s2: must see the sentinel node");
+
+        // s2: insert a new MMRDoc node — records IndexId("MMRDoc:emb") in s2's write-set.
+        s2.execute("CREATE (:MMRDoc {emb: [0.5, 0.5, 0.0]})")
+            .expect("s2: CREATE MMRDoc node");
+
+        // s1 commits first → must succeed.
+        let c1 = s1.commit();
+        assert!(
+            c1.is_ok(),
+            "s1 (first committer) must succeed; got: {:?}",
+            c1
+        );
+
+        // s2 commits second → MUST abort (rw-antidependency cycle).
+        let c2 = s2.commit();
+        assert_serialization_failure(
+            &c2,
+            "s2 (phantom writer concurrent with MMR search reader) must abort — \
+             if this passes, search.mmr is not routing through search_vector_visible \
+             (IndexId recording is missing from the MMR path)",
+        );
+    }
+}
