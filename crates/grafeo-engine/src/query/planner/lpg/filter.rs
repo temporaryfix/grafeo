@@ -153,8 +153,13 @@ impl super::Planner {
         .with_transaction_context(self.viewing_epoch, self.transaction_id)
         .with_session_context(self.session_context.clone());
 
-        // Create the filter operator
-        let operator = FilterOperator::new(input_op, Box::new(predicate));
+        // Create the filter operator. `mut` is needed under `text-index` (the
+        // block below reassigns `operator` via `with_text_index_reads`); without
+        // that feature the reassignment is cfg'd out, so suppress the otherwise-
+        // spurious unused-mut warning there rather than dropping `mut` (which
+        // breaks the `text-index`/`--all-features` build).
+        #[cfg_attr(not(feature = "text-index"), allow(unused_mut))]
+        let mut operator = FilterOperator::new(input_op, Box::new(predicate));
 
         // Serializable anti-phantom: carry the (label, property) pairs as data
         // on the operator so they are recorded at EXECUTION TIME (first poll),
