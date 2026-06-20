@@ -205,10 +205,10 @@ pub struct TransactionInfo {
     /// Set of `(entity, prop_tag)` pairs written by this transaction.
     /// W-W conflict detection uses the entity component only; the tag
     /// is carried for future property-level rw-antidependency checks.
-    pub write_set: HashSet<(EntityId, PropTag)>,
+    pub write_set: FxHashSet<(EntityId, PropTag)>,
     /// Set of `(entity, prop_tag)` pairs read by this transaction (for
     /// serializable isolation). All callers currently pass `None` as the tag.
-    pub read_set: HashSet<(EntityId, PropTag)>,
+    pub read_set: FxHashSet<(EntityId, PropTag)>,
     /// An rw-antidependency edge points INTO this transaction (this tx is the
     /// writer end of some `reader →rw self`). Used for F2 incremental SSI pivot
     /// detection.
@@ -241,8 +241,8 @@ impl TransactionInfo {
             state: TransactionState::Active,
             isolation_level,
             start_epoch,
-            write_set: HashSet::new(),
-            read_set: HashSet::new(),
+            write_set: FxHashSet::default(),
+            read_set: FxHashSet::default(),
             in_conflict: false,
             out_conflict: false,
             scan_buckets: FxHashMap::default(),
@@ -1383,7 +1383,7 @@ impl TransactionManager {
         self.transactions
             .read()
             .get(&transaction_id)
-            .map(|i| i.read_set.clone())
+            .map(|i| i.read_set.iter().copied().collect())
             .unwrap_or_default()
     }
 

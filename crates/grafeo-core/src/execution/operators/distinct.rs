@@ -3,7 +3,7 @@
 //! This module provides:
 //! - `DistinctOperator`: Removes duplicate rows based on all or specified columns
 
-use std::collections::HashSet;
+use grafeo_common::utils::hash::FxHashSet;
 
 use grafeo_common::types::{LogicalType, Value};
 
@@ -65,7 +65,7 @@ pub struct DistinctOperator {
     /// Output schema.
     output_schema: Vec<LogicalType>,
     /// Set of seen row keys.
-    seen: HashSet<RowKey>,
+    seen: FxHashSet<RowKey>,
 }
 
 impl DistinctOperator {
@@ -75,7 +75,7 @@ impl DistinctOperator {
             child,
             distinct_columns: None,
             output_schema,
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
         }
     }
 
@@ -94,7 +94,7 @@ impl DistinctOperator {
             child,
             distinct_columns: Some(columns),
             output_schema,
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
         }
     }
 }

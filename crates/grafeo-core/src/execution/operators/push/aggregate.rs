@@ -1594,9 +1594,9 @@ mod tests {
     #[cfg(feature = "spill")]
     fn spill_roundtrip_count_distinct() {
         use crate::execution::operators::accumulator::HashableValue;
-        use std::collections::HashSet;
+        use grafeo_common::utils::hash::FxHashSet;
 
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         seen.insert(HashableValue::from(Value::Int64(1)));
         seen.insert(HashableValue::from(Value::Int64(2)));
         seen.insert(HashableValue::from(Value::Int64(3)));
@@ -1615,9 +1615,9 @@ mod tests {
     #[cfg(feature = "spill")]
     fn spill_roundtrip_avg_distinct() {
         use crate::execution::operators::accumulator::HashableValue;
-        use std::collections::HashSet;
+        use grafeo_common::utils::hash::FxHashSet;
 
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         seen.insert(HashableValue::from(Value::Float64(2.0)));
         seen.insert(HashableValue::from(Value::Float64(4.0)));
         let state = GroupState {
@@ -1634,9 +1634,9 @@ mod tests {
     #[cfg(feature = "spill")]
     fn spill_roundtrip_collect_distinct() {
         use crate::execution::operators::accumulator::HashableValue;
-        use std::collections::HashSet;
+        use grafeo_common::utils::hash::FxHashSet;
 
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         seen.insert(HashableValue::from(Value::Int64(10)));
         seen.insert(HashableValue::from(Value::Int64(20)));
         let state = GroupState {
@@ -2062,9 +2062,9 @@ mod tests {
     #[cfg(feature = "spill")]
     fn test_serialize_deserialize_count_distinct() {
         use crate::execution::operators::accumulator::HashableValue;
-        use std::collections::HashSet;
+        use grafeo_common::utils::hash::FxHashSet;
 
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         seen.insert(HashableValue::from(Value::String("Paris".into())));
         seen.insert(HashableValue::from(Value::String("Prague".into())));
         seen.insert(HashableValue::from(Value::String("Barcelona".into())));

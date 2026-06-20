@@ -5,7 +5,8 @@
 //! - `NestedLoopJoinOperator`: General-purpose join for any condition
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+
+use grafeo_common::utils::hash::FxHashMap;
 
 use arcstr::ArcStr;
 use grafeo_common::types::{LogicalType, Value};
@@ -182,7 +183,7 @@ pub struct HashJoinOperator {
     /// Output schema (combined from both sides).
     output_schema: Vec<LogicalType>,
     /// Hash table: key -> list of (chunk_index, row_index).
-    hash_table: HashMap<HashKey, Vec<(usize, usize)>>,
+    hash_table: FxHashMap<HashKey, Vec<(usize, usize)>>,
     /// Materialized build side chunks.
     build_chunks: Vec<DataChunk>,
     /// Whether the build phase is complete.
@@ -232,7 +233,7 @@ impl HashJoinOperator {
             build_keys,
             join_type,
             output_schema,
-            hash_table: HashMap::new(),
+            hash_table: FxHashMap::default(),
             build_chunks: Vec::new(),
             build_complete: false,
             current_probe_chunk: None,

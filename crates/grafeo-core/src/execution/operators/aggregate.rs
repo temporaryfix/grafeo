@@ -8,8 +8,9 @@
 //! the [`super::accumulator`] module.
 
 use indexmap::IndexMap;
-use std::collections::HashSet;
 use std::sync::Arc;
+
+use grafeo_common::utils::hash::FxHashSet;
 
 use arcstr::ArcStr;
 use grafeo_common::types::{LogicalType, PropertyKey, Value};
@@ -32,19 +33,19 @@ pub enum AggregateState {
     /// Count state.
     Count(i64),
     /// Count distinct state (count, seen values).
-    CountDistinct(i64, HashSet<HashableValue>),
+    CountDistinct(i64, FxHashSet<HashableValue>),
     /// Sum state (integer sum, count of values added).
     SumInt(i64, i64),
     /// Sum distinct state (integer sum, count, seen values).
-    SumIntDistinct(i64, i64, HashSet<HashableValue>),
+    SumIntDistinct(i64, i64, FxHashSet<HashableValue>),
     /// Sum state (float sum, count of values added).
     SumFloat(f64, f64, i64),
     /// Sum distinct state (float sum, compensation, count, seen values).
-    SumFloatDistinct(f64, f64, i64, HashSet<HashableValue>),
+    SumFloatDistinct(f64, f64, i64, FxHashSet<HashableValue>),
     /// Average state (sum, count).
     Avg(f64, i64),
     /// Average distinct state (sum, count, seen values).
-    AvgDistinct(f64, i64, HashSet<HashableValue>),
+    AvgDistinct(f64, i64, FxHashSet<HashableValue>),
     /// Min state.
     Min(Option<Value>),
     /// Max state.
@@ -56,7 +57,7 @@ pub enum AggregateState {
     /// Collect state.
     Collect(Vec<Value>),
     /// Collect distinct state (values, seen).
-    CollectDistinct(Vec<Value>, HashSet<HashableValue>),
+    CollectDistinct(Vec<Value>, FxHashSet<HashableValue>),
     /// Sample standard deviation state using Welford's algorithm (count, mean, M2).
     StdDev { count: i64, mean: f64, m2: f64 },
     /// Population standard deviation state using Welford's algorithm (count, mean, M2).
@@ -68,7 +69,7 @@ pub enum AggregateState {
     /// GROUP_CONCAT / LISTAGG state (collected string values, separator).
     GroupConcat(Vec<String>, String),
     /// GROUP_CONCAT / LISTAGG distinct state (collected string values, separator, seen).
-    GroupConcatDistinct(Vec<String>, String, HashSet<HashableValue>),
+    GroupConcatDistinct(Vec<String>, String, FxHashSet<HashableValue>),
     /// SAMPLE state (first non-null value encountered).
     Sample(Option<Value>),
     /// Sample variance state using Welford's algorithm (count, mean, M2).
@@ -105,19 +106,23 @@ impl AggregateState {
                 AggregateState::Count(0)
             }
             (AggregateFunction::Count | AggregateFunction::CountNonNull, true) => {
-                AggregateState::CountDistinct(0, HashSet::new())
+                AggregateState::CountDistinct(0, FxHashSet::default())
             }
             (AggregateFunction::Sum, false) => AggregateState::SumInt(0, 0),
-            (AggregateFunction::Sum, true) => AggregateState::SumIntDistinct(0, 0, HashSet::new()),
+            (AggregateFunction::Sum, true) => {
+                AggregateState::SumIntDistinct(0, 0, FxHashSet::default())
+            }
             (AggregateFunction::Avg, false) => AggregateState::Avg(0.0, 0),
-            (AggregateFunction::Avg, true) => AggregateState::AvgDistinct(0.0, 0, HashSet::new()),
+            (AggregateFunction::Avg, true) => {
+                AggregateState::AvgDistinct(0.0, 0, FxHashSet::default())
+            }
             (AggregateFunction::Min, _) => AggregateState::Min(None), // MIN/MAX don't need distinct
             (AggregateFunction::Max, _) => AggregateState::Max(None),
             (AggregateFunction::First, _) => AggregateState::First(None),
             (AggregateFunction::Last, _) => AggregateState::Last(None),
             (AggregateFunction::Collect, false) => AggregateState::Collect(Vec::new()),
             (AggregateFunction::Collect, true) => {
-                AggregateState::CollectDistinct(Vec::new(), HashSet::new())
+                AggregateState::CollectDistinct(Vec::new(), FxHashSet::default())
             }
             // Statistical functions (Welford's algorithm for online computation)
             (AggregateFunction::StdDev, _) => AggregateState::StdDev {
@@ -144,7 +149,7 @@ impl AggregateState {
             (AggregateFunction::GroupConcat, true) => AggregateState::GroupConcatDistinct(
                 Vec::new(),
                 separator.unwrap_or(" ").to_string(),
-                HashSet::new(),
+                FxHashSet::default(),
             ),
             (AggregateFunction::Sample, _) => AggregateState::Sample(None),
             // Binary set functions (all share the same Bivariate state)
