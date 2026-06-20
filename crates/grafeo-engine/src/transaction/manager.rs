@@ -274,8 +274,8 @@ pub struct TransactionManager {
     /// concurrent writer can then still form the in-edge `reader →rw writer`.
     retired_readers: RwLock<FxHashMap<TransactionId, EpochId>>,
     /// Read-set escalation threshold `T`: once a Serializable transaction has
-    /// recorded more than `T` fine reads under a single label/type predicate,
-    /// the fine `Node`/`Edge` entries are collapsed into the coarse
+    /// recorded more than `T` fine reads under a single `(predicate, coarse_tag)`
+    /// bucket, the fine `Node`/`Edge` entries are collapsed into the coarse
     /// `Label(L)` / `RelType(T)` key (see
     /// [`Self::record_read_in_label`]). Defaults to `256`; GE5 will make this
     /// configurable per-session. `usize::MAX` effectively disables promotion.
@@ -394,8 +394,10 @@ impl TransactionManager {
     /// would) is a `None`-tagged wildcard that destroys Property-granularity
     /// disjointness, so we record the labels alone.
     ///
-    /// The coarse `Label(L)` key is always `None`-tagged (a label scan is a
-    /// structural read), matching the escalated reader's coarse key.
+    /// The coarse `Label(L)` key is `None`-tagged (a structural write / wildcard);
+    /// via `prop_compatible` it conflicts with any escalated reader under `L` —
+    /// both a structural `(Label(L), None)` and a property-tagged
+    /// `(Label(L), Some(t))` coarse read.
     ///
     /// # Errors
     ///
