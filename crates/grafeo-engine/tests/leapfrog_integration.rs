@@ -56,6 +56,11 @@ impl Operator for MockScanOperator {
     }
 }
 
+/// Builds the single-variable alignment for n inputs (each carries gv=0 at col 0).
+fn single_var_alignment(n: usize) -> Vec<Vec<Option<usize>>> {
+    vec![vec![Some(0)]; n]
+}
+
 #[test]
 fn test_leapfrog_three_way_intersection() {
     // Three inputs with partial overlap:
@@ -74,7 +79,7 @@ fn test_leapfrog_three_way_intersection() {
 
     let mut leapfrog = LeapfrogJoinOperator::new(
         vec![op1, op2, op3],
-        vec![vec![0], vec![0], vec![0]], // Join on first column of each
+        single_var_alignment(3),
         vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
         vec![(0, 0), (1, 0), (2, 0)], // Output all three columns
     );
@@ -110,7 +115,7 @@ fn test_leapfrog_with_duplicates() {
 
     let mut leapfrog = LeapfrogJoinOperator::new(
         vec![op1, op2],
-        vec![vec![0], vec![0]],
+        single_var_alignment(2),
         vec![LogicalType::Int64, LogicalType::Int64],
         vec![(0, 0), (1, 0)],
     );
@@ -135,7 +140,7 @@ fn test_leapfrog_single_input() {
 
     let mut leapfrog = LeapfrogJoinOperator::new(
         vec![op],
-        vec![vec![0]],
+        single_var_alignment(1),
         vec![LogicalType::Int64],
         vec![(0, 0)],
     );
@@ -159,7 +164,7 @@ fn test_leapfrog_empty_inputs() {
 
     let mut leapfrog = LeapfrogJoinOperator::new(
         vec![op1, op2],
-        vec![vec![0], vec![0]],
+        single_var_alignment(2),
         vec![LogicalType::Int64, LogicalType::Int64],
         vec![(0, 0), (1, 0)],
     );
@@ -239,7 +244,7 @@ fn test_leapfrog_large_intersection() {
 
     let mut leapfrog = LeapfrogJoinOperator::new(
         vec![op1, op2],
-        vec![vec![0], vec![0]],
+        single_var_alignment(2),
         vec![LogicalType::Int64, LogicalType::Int64],
         vec![(0, 0), (1, 0)],
     );

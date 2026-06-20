@@ -129,16 +129,19 @@ impl super::Planner {
             input_columns.push(cols);
         }
 
-        // For each input, find the column indices of the shared variables (join keys)
-        let mut join_key_indices: Vec<Vec<usize>> = Vec::with_capacity(mwj.inputs.len());
+        // Build the global-variable alignment:
+        // shared_var_cols[input_idx][global_var_idx] = Some(col_in_input) | None
+        // This ensures every input's trie is built in the same global variable order,
+        // enabling the recursive multi-level leapfrog to correctly intersect ragged
+        // variable sets (e.g. triangle R1(a,b), R2(b,c), R3(c,a)).
+        let mut shared_var_cols: Vec<Vec<Option<usize>>> = Vec::with_capacity(mwj.inputs.len());
         for cols in &input_columns {
-            let mut key_indices = Vec::new();
-            for shared_var in &mwj.shared_variables {
-                if let Some(idx) = cols.iter().position(|c| c == shared_var) {
-                    key_indices.push(idx);
-                }
-            }
-            join_key_indices.push(key_indices);
+            let alignment: Vec<Option<usize>> = mwj
+                .shared_variables
+                .iter()
+                .map(|shared_var| cols.iter().position(|c| c == shared_var))
+                .collect();
+            shared_var_cols.push(alignment);
         }
 
         // Build combined output columns: shared variables first (deduplicated),
@@ -178,7 +181,7 @@ impl super::Planner {
 
         let operator: Box<dyn Operator> = Box::new(LeapfrogJoinOperator::new(
             input_ops,
-            join_key_indices,
+            shared_var_cols,
             output_schema,
             output_column_mapping,
         ));
