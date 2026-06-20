@@ -341,6 +341,49 @@ pub trait ReadTracker: Send + Sync {
         self.record_edge_read(transaction_id, edge_id);
     }
 
+    /// Records that `transaction_id` read property `key` of node `node_id`, carrying
+    /// the node's label set for escalation-aware routing.
+    ///
+    /// The engine bridge intersects `labels` with the labels the transaction has
+    /// already scanned (present in the predicate escalation buckets), then routes
+    /// the read under each matched label's predicate bucket so it can escalate to a
+    /// coarse `(Label(L), Some(prop_tag))` key.  Non-matching labels are ignored;
+    /// empty intersection falls back to a plain fine entity read.
+    ///
+    /// Default implementation ignores `labels` and delegates to
+    /// [`record_node_property_read`](Self::record_node_property_read), so
+    /// non-engine trackers remain correct.
+    fn record_node_property_read_in_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        key: &str,
+        _labels: &[LabelId],
+    ) {
+        self.record_node_property_read(transaction_id, node_id, key);
+    }
+
+    /// Records that `transaction_id` read property `key` of edge `edge_id`, carrying
+    /// the edge's relationship type for escalation-aware routing.
+    ///
+    /// The engine bridge checks whether the transaction has already scanned `rel`
+    /// (present in the predicate escalation buckets) and, if so, routes the read
+    /// under the `RelType(rel)` predicate bucket so it can escalate to a coarse
+    /// `(RelType(T), Some(prop_tag))` key.  No match falls back to a plain fine read.
+    ///
+    /// Default implementation ignores `rel` and delegates to
+    /// [`record_edge_property_read`](Self::record_edge_property_read), so
+    /// non-engine trackers remain correct.
+    fn record_edge_property_read_in_rel(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        key: &str,
+        _rel: Option<EdgeTypeId>,
+    ) {
+        self.record_edge_property_read(transaction_id, edge_id, key);
+    }
+
     /// Records that `transaction_id` executed a text search against the
     /// `(label, property)` text index identified by `index_key` (format:
     /// `"label:property"`). Coarse predicate-read recording for anti-phantom SSI.

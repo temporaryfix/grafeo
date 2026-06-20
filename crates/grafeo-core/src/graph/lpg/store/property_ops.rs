@@ -1152,9 +1152,12 @@ impl LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
         if let Some(tx) = transaction_id {
-            // Record the property-level read: the engine bridge records a property
-            // tag under Property granularity, else an entity-level read.
-            self.record_read_node_property(tx, id, key.as_str());
+            // Record the property-level read with escalation: the engine bridge
+            // routes through the node's committed labels so fine Node reads can
+            // escalate to a coarse (Label(L), Some(prop_tag)) key when the tx has
+            // already scanned that label. Falls back to a fine read when no labels
+            // intersect with the transaction's scanned predicates.
+            self.record_read_node_property_escalating(tx, id, key.as_str());
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx)
                 && let Some(op) = delta.node_props.get(&(id, key.clone()))
@@ -1188,9 +1191,11 @@ impl LpgStore {
         transaction_id: Option<TransactionId>,
     ) -> Option<Value> {
         if let Some(tx) = transaction_id {
-            // Record the property-level read: the engine bridge records a property
-            // tag under Property granularity, else an entity-level read.
-            self.record_read_edge_property(tx, id, key.as_str());
+            // Record the property-level read with escalation: symmetric with
+            // record_read_node_property_escalating — routes through the edge's
+            // committed rel-type so fine Edge reads escalate to
+            // (RelType(T), Some(prop_tag)) when the tx has scanned that type.
+            self.record_read_edge_property_escalating(tx, id, key.as_str());
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx)
                 && let Some(op) = delta.edge_props.get(&(id, key.clone()))

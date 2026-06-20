@@ -1265,6 +1265,53 @@ impl LpgStore {
         }
     }
 
+    /// Records that `tx` read property `key` of node `id`, routing through the
+    /// label-set-carrying tracker method for read-set escalation.
+    ///
+    /// Avoids the `committed_node_label_ids` lookup when no tracker is registered
+    /// for `tx` (SI/ReadCommitted pay nothing).  When a tracker is present the
+    /// node's committed labels are fetched without read-recording and forwarded
+    /// to [`ReadTracker::record_node_property_read_in_labels`], which the engine
+    /// bridge uses to route the read under each label the transaction has already
+    /// scanned (intersection).
+    #[inline]
+    pub(crate) fn record_read_node_property_escalating(
+        &self,
+        tx: TransactionId,
+        id: NodeId,
+        key: &str,
+    ) {
+        if !self.read_trackers.read().contains_key(&tx) {
+            return;
+        }
+        let labels = self.committed_node_label_ids(id);
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_node_property_read_in_labels(tx, id, key, &labels);
+        }
+    }
+
+    /// Records that `tx` read property `key` of edge `id`, routing through the
+    /// rel-type-carrying tracker method for read-set escalation.
+    ///
+    /// Mirrors [`record_read_node_property_escalating`](Self::record_read_node_property_escalating)
+    /// for edges: fetches the committed edge type (without read-recording) and
+    /// forwards to [`ReadTracker::record_edge_property_read_in_rel`].
+    #[inline]
+    pub(crate) fn record_read_edge_property_escalating(
+        &self,
+        tx: TransactionId,
+        id: EdgeId,
+        key: &str,
+    ) {
+        if !self.read_trackers.read().contains_key(&tx) {
+            return;
+        }
+        let rel = self.committed_edge_type_id(id);
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_edge_property_read_in_rel(tx, id, key, rel);
+        }
+    }
+
     // ── Write-tracker: per-transaction registration for indexed-SET anti-phantom ──
 
     /// Attaches `tracker` to `tx` so that subsequent buffered indexed-property

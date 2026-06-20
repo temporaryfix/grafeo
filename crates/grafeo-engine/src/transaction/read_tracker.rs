@@ -130,6 +130,64 @@ impl ReadTracker for TransactionReadTracker {
         }
     }
 
+    fn record_node_property_read_in_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        key: &str,
+        labels: &[LabelId],
+    ) {
+        if self.manager.isolation_level(transaction_id) != Some(IsolationLevel::Serializable) {
+            return;
+        }
+        match self.granularity {
+            ConflictGranularity::Property => {
+                let t = Some(prop_tag(key));
+                let _ =
+                    self.manager
+                        .record_read_node_escalating(transaction_id, node_id, t, t, labels);
+            }
+            ConflictGranularity::Entity => {
+                let _ = self.manager.record_read_node_escalating(
+                    transaction_id,
+                    node_id,
+                    None,
+                    None,
+                    labels,
+                );
+            }
+        }
+    }
+
+    fn record_edge_property_read_in_rel(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        key: &str,
+        rel: Option<EdgeTypeId>,
+    ) {
+        if self.manager.isolation_level(transaction_id) != Some(IsolationLevel::Serializable) {
+            return;
+        }
+        match self.granularity {
+            ConflictGranularity::Property => {
+                let t = Some(prop_tag(key));
+                let _ =
+                    self.manager
+                        .record_read_edge_escalating(transaction_id, edge_id, t, t, rel);
+            }
+            ConflictGranularity::Entity => {
+                let _ = self.manager.record_read_edge_escalating(
+                    transaction_id,
+                    edge_id,
+                    None,
+                    None,
+                    rel,
+                );
+            }
+        }
+    }
+
     /// Records a Serializable text search as a coarse **index-level predicate read**.
     ///
     /// A text search reads a *predicate* ("docs matching these terms") over all

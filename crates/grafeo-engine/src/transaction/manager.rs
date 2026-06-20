@@ -1498,6 +1498,120 @@ impl TransactionManager {
             .map_or((false, false), |i| (i.in_conflict, i.out_conflict))
     }
 
+    /// Escalation-aware fine node property read.
+    ///
+    /// Routes the read under each candidate label the transaction has *already
+    /// scanned* (predicates present in `scan_buckets` keys ∪ `escalated`,
+    /// restricted to `Label`).  Empty intersection ⇒ a plain fine read that
+    /// never escalates.
+    ///
+    /// `fine_tag` is the read's own property tag; `coarse_tag` is what the
+    /// matched bucket promotes to (the same property tag for property reads
+    /// under `Property` granularity, `None` for `Entity` granularity).
+    ///
+    /// # Lock discipline
+    ///
+    /// Computes `matched` under a SHORT `transactions.read()`, then drops the
+    /// lock before delegating to `record_read` / `record_read_in_predicate`,
+    /// which each take their own locks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_read_node_escalating(
+        &self,
+        transaction_id: TransactionId,
+        node: NodeId,
+        fine_tag: PropTag,
+        coarse_tag: PropTag,
+        candidate_labels: &[LabelId],
+    ) -> Result<()> {
+        let matched: Vec<LabelId> = {
+            let txns = self.transactions.read();
+            match txns.get(&transaction_id) {
+                None => Vec::new(),
+                Some(info) => candidate_labels
+                    .iter()
+                    .copied()
+                    .filter(|&l| {
+                        let key = EntityId::Label(l);
+                        info.escalated.iter().any(|(p, _)| *p == key)
+                            || info.scan_buckets.keys().any(|(p, _)| *p == key)
+                    })
+                    .collect(),
+            }
+        };
+        if matched.is_empty() {
+            return self.record_read(transaction_id, EntityId::Node(node), fine_tag);
+        }
+        for l in matched {
+            self.record_read_in_predicate(
+                transaction_id,
+                EntityId::Node(node),
+                fine_tag,
+                EntityId::Label(l),
+                coarse_tag,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Escalation-aware fine edge property read.
+    ///
+    /// If `rel` is `Some(t)` AND `(RelType(t), _)` is present in
+    /// `scan_buckets` keys or `escalated`, routes the read under
+    /// `(RelType(t), coarse_tag)`; otherwise falls back to a plain fine
+    /// `record_read(tx, Edge(edge), fine_tag)`.
+    ///
+    /// Symmetric with [`record_read_node_escalating`](Self::record_read_node_escalating).
+    ///
+    /// # Lock discipline
+    ///
+    /// Same as `record_read_node_escalating`: transactions lock is held only
+    /// for the bucket check and released before delegating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_read_edge_escalating(
+        &self,
+        transaction_id: TransactionId,
+        edge: EdgeId,
+        fine_tag: PropTag,
+        coarse_tag: PropTag,
+        rel: Option<EdgeTypeId>,
+    ) -> Result<()> {
+        let matched_rel: Option<EdgeTypeId> = match rel {
+            None => None,
+            Some(t) => {
+                let key = EntityId::RelType(t);
+                let txns = self.transactions.read();
+                match txns.get(&transaction_id) {
+                    None => None,
+                    Some(info) => {
+                        if info.escalated.iter().any(|(p, _)| *p == key)
+                            || info.scan_buckets.keys().any(|(p, _)| *p == key)
+                        {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        match matched_rel {
+            None => self.record_read(transaction_id, EntityId::Edge(edge), fine_tag),
+            Some(t) => self.record_read_in_predicate(
+                transaction_id,
+                EntityId::Edge(edge),
+                fine_tag,
+                EntityId::RelType(t),
+                coarse_tag,
+            ),
+        }
+    }
+
     /// Test-only shim that exposes the private `record_read_in_predicate` with
     /// the `coarse_tag` parameter so that unit tests can exercise property-tagged
     /// escalation paths without going through the public label/rel-type wrappers
@@ -3848,5 +3962,68 @@ mod tests {
                 "Case D: balance edge writer must get in_conflict from balance RelType reader"
             );
         }
+    }
+
+    // --- Task 4: property reads escalate under scanned labels (intersection) ---
+
+    /// A property read escalates only under labels the tx has *already scanned*
+    /// (intersection): a >T scan of :A then x-reads on :A:B nodes promote under
+    /// `(Label(A), Some(x))` and NOT `(Label(B), Some(x))`.
+    #[test]
+    fn property_read_escalates_under_scanned_label_only() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let a = LabelId::new(1);
+        let b = LabelId::new(2);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Tx scanned :A structurally -> Label(A) becomes a scanned predicate.
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, a)
+                .unwrap();
+        }
+
+        // Property x-reads on the same nodes, each carrying labels {A, B}.
+        for i in 0..10u64 {
+            mgr.record_read_node_escalating(tx, NodeId::new(i), xtag, xtag, &[a, b])
+                .unwrap();
+        }
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::Label(a), xtag)),
+            "x-reads promote under scanned Label(A)"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(b), xtag)),
+            "must NOT promote under unscanned Label(B)"
+        );
+    }
+
+    /// Empty intersection (tx scanned NOTHING) falls back to fine reads: the
+    /// read-set contains the fine `(Node(n), xtag)`, no `Label` key.
+    #[test]
+    fn property_read_empty_intersection_falls_back_to_fine() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let a = LabelId::new(10);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // No structural scan of :A, so scan_buckets is empty.
+        mgr.record_read_node_escalating(tx, NodeId::new(7), xtag, xtag, &[a])
+            .unwrap();
+
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::Node(NodeId::new(7)), xtag)),
+            "empty intersection must fall back to fine Node read"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(a), xtag)),
+            "no Label key when intersection is empty"
+        );
     }
 }
