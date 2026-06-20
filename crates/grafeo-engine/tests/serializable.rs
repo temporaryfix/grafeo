@@ -3565,3 +3565,421 @@ fn serializable_escalated_reader_conflicts_with_edge_property_write() {
          RelType(0) write (SSI false negative)",
     );
 }
+
+// ============================================================================
+// SSI escalation: edge + property coverage (2026-06-20)
+// ============================================================================
+
+/// Engine-level: a typed traversal over >T `:LINK` edges escalates to a
+/// single coarse `EntityId::RelType(_)` entry in the read-set and bounds the
+/// number of fine `EntityId::Edge(_)` entries to ≤ T.
+///
+/// This is the engine-level (query-level) counterpart of the unit-test
+/// `escalates_fine_edge_reads_to_rel_type` in manager.rs: it proves that the
+/// full query path (parser → planner → store → SSI recording) correctly
+/// routes typed-traversal edge reads through `record_read_in_rel_type` so the
+/// manager's escalation machinery fires.
+///
+/// Seed: 1 centre node + 10 `:LINK` leaves (10 edges).  After a Serializable
+/// `MATCH (a)-[e:LINK]->(b) RETURN b` with T=4, the read-set must contain at
+/// least one `EntityId::RelType(_)` AND the count of fine
+/// `EntityId::Edge(_)` entries must be ≤ T (≤ 4), NOT 10.
+#[test]
+fn serializable_edge_traversal_escalation_bounds_read_set() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed: one centre node + 10 leaves, all connected by :LINK edges.
+    let setup = db.session();
+    let centre = setup.create_node(&["Centre"]);
+    for _ in 0..10 {
+        let leaf = setup.create_node(&["Leaf"]);
+        setup.create_edge(centre, leaf, "LINK");
+    }
+    drop(setup);
+
+    // Lower threshold to 4 so 10 edges definitely escalate.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin Serializable");
+    let tid = session.active_transaction_id().unwrap();
+
+    // Typed traversal — visits all 10 :LINK edges.
+    let result = session
+        .execute("MATCH (a:Centre)-[e:LINK]->(b:Leaf) RETURN b")
+        .expect("MATCH typed traversal");
+    assert_eq!(result.row_count(), 10, "must see all 10 Leaf nodes");
+
+    session.commit().expect("commit must succeed");
+
+    let rs = session.transaction_manager_ref().read_set(tid);
+
+    // The coarse RelType key must be present — this is the load-bearing
+    // invariant: any writer of a :LINK edge will record the coarse
+    // `EntityId::RelType(T)` write and conflict with this reader.
+    let rel_type_entries: Vec<_> = rs
+        .iter()
+        .filter(|e| matches!(e, EntityId::RelType(_)))
+        .collect();
+    assert!(
+        !rel_type_entries.is_empty(),
+        "read-set must contain EntityId::RelType(_) after escalated :LINK traversal \
+         (threshold=4, 10 edges scanned); got: {rs:?}"
+    );
+
+    // Fine Edge entries must be bounded (≤ T=4), NOT 10.
+    let fine_edge_count = rs.iter().filter(|e| matches!(e, EntityId::Edge(_))).count();
+    assert!(
+        fine_edge_count <= 4,
+        "fine EntityId::Edge(_) count must be ≤ T=4 after escalation (got {fine_edge_count}); \
+         read-set: {rs:?}"
+    );
+}
+
+/// Engine-level: a property scan over >T `:Acct {{balance}}` nodes under
+/// Property granularity escalates to one coarse `(EntityId::Label(L), Some(tag))`
+/// key and the fine `EntityId::Node(_)` count is ≤ T.
+///
+/// Validates that `MATCH (n:Acct) RETURN n.balance` with 10 nodes (T=4)
+/// drives the property read through the label-scan escalation path
+/// (`record_read_node_escalating`) so that the Property-granularity tag
+/// (`Some(prop_tag("balance"))`) is promoted to the coarse label key.
+///
+/// Read-set assertions use `read_set_tagged` to check the `(EntityId, PropTag)` pairs.
+#[test]
+fn serializable_property_scan_escalation_bounds_read_set() {
+    use grafeo_engine::transaction::{PropTag, prop_tag};
+
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 :Acct nodes with a balance property.
+    let setup = db.session();
+    for i in 0..10i64 {
+        let balance = i * 100;
+        setup
+            .execute(&format!("CREATE (:Acct {{id: {i}, balance: {balance}}})"))
+            .expect("create :Acct node");
+    }
+    drop(setup);
+
+    // Lower threshold to 4 so 10 nodes definitely escalate.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    // Resolve the LabelId for :Acct via the existing probe helper.
+    let acct_label = resolve_label_id(&db, "Acct");
+
+    let mut session = db.session();
+    session.set_conflict_granularity(ConflictGranularity::Property);
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin Serializable/Property");
+    let tid = session.active_transaction_id().unwrap();
+
+    // Property-returning label scan — visits all 10 :Acct nodes.
+    let result = session
+        .execute("MATCH (n:Acct) RETURN n.balance")
+        .expect("MATCH :Acct RETURN n.balance");
+    assert_eq!(result.row_count(), 10, "must see all 10 :Acct nodes");
+
+    session.commit().expect("commit must succeed");
+
+    let rs = session.transaction_manager_ref().read_set_tagged(tid);
+
+    let balance_tag: PropTag = Some(prop_tag("balance"));
+    let coarse_key = (EntityId::Label(acct_label), balance_tag);
+
+    // The coarse (Label, Some(balance_tag)) entry must be present.
+    assert!(
+        rs.contains(&coarse_key),
+        "read-set must contain (EntityId::Label(acct_id), Some(prop_tag(\"balance\"))) \
+         after escalated property scan (threshold=4, 10 nodes); got: {rs:?}"
+    );
+
+    // Fine (Node, Some(balance_tag)) entries must be bounded (≤ T=4), NOT 10.
+    let fine_prop_count = rs
+        .iter()
+        .filter(|(e, t)| matches!(e, EntityId::Node(_)) && *t == balance_tag)
+        .count();
+    assert!(
+        fine_prop_count <= 4,
+        "fine (EntityId::Node, Some(balance_tag)) count must be ≤ T=4 after \
+         escalation (got {fine_prop_count}); read-set: {rs:?}"
+    );
+}
+
+/// Part-G knob survives escalation: two Property/Serializable sessions with
+/// T=4, each scanning >T `:Acct` nodes (escalates to coarse Label key), but
+/// reading/writing DISJOINT properties (`balance` vs `amount`).
+///
+/// The escalation coarse-tag for each session is `(Label, Some(balance_tag))`
+/// for s1 and `(Label, Some(amount_tag))` for s2.  The write fan-out tags
+/// `(Label, Some(balance_tag))` for s1's SET and `(Label, Some(amount_tag))`
+/// for s2's SET.  Since `prop_tag("balance") ≠ prop_tag("amount")`, there is
+/// no rw-antidependency at the coarse level — BOTH sessions commit.
+///
+/// This proves the Part-G knob is NOT suppressed by the escalation promotion:
+/// the `(predicate, coarse_tag)` bucket correctly carries the property tag
+/// through promotion so disjoint-property writes remain independently
+/// committable even after read-set escalation.
+#[test]
+fn serializable_escalated_property_knob_disjoint_commits() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 :Acct nodes with both balance and amount properties.
+    let setup = db.session();
+    for i in 0..10i64 {
+        setup
+            .execute(&format!(
+                "CREATE (:Acct2 {{id: {i}, balance: {}, amount: {}}})",
+                i * 100,
+                i * 10
+            ))
+            .expect("create :Acct2 node");
+    }
+    drop(setup);
+
+    // Lower threshold to 4.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    // Both sessions: Property granularity + Serializable.
+    let mut s1 = db.session();
+    s1.set_conflict_granularity(ConflictGranularity::Property);
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable/Property");
+
+    let mut s2 = db.session();
+    s2.set_conflict_granularity(ConflictGranularity::Property);
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable/Property");
+
+    // s1: scan ALL Acct2 nodes returning `balance` — escalates to
+    // (Label(Acct2), Some(balance_tag)).
+    let r1 = s1
+        .execute("MATCH (n:Acct2) RETURN n.balance")
+        .expect("s1: MATCH :Acct2 RETURN n.balance");
+    assert_eq!(r1.row_count(), 10, "s1 must see all 10 :Acct2 nodes");
+
+    // s2: scan ALL Acct2 nodes returning `amount` — escalates to
+    // (Label(Acct2), Some(amount_tag)).
+    let r2 = s2
+        .execute("MATCH (n:Acct2) RETURN n.amount")
+        .expect("s2: MATCH :Acct2 RETURN n.amount");
+    assert_eq!(r2.row_count(), 10, "s2 must see all 10 :Acct2 nodes");
+
+    // s1: write balance on ONE node (fans out coarse Label write tagged balance).
+    s1.execute("MATCH (n:Acct2 {id: 0}) SET n.balance = 9999")
+        .expect("s1: SET balance on node 0");
+
+    // s2: write amount on ONE (different) node (fans out coarse Label write
+    // tagged amount).  Disjoint from s1's balance write.
+    s2.execute("MATCH (n:Acct2 {id: 1}) SET n.amount = 8888")
+        .expect("s2: SET amount on node 1");
+
+    // BOTH must commit: disjoint property tags at the coarse level means no
+    // rw-antidependency even after escalation.
+    let c1 = s1.commit();
+    assert!(
+        c1.is_ok(),
+        "s1 must commit (disjoint property balance vs amount after escalation): {c1:?}"
+    );
+
+    let c2 = s2.commit();
+    assert!(
+        c2.is_ok(),
+        "s2 must commit (disjoint property amount vs balance after escalation): {c2:?}"
+    );
+
+    // Verify both writes persisted.
+    let verifier = db.session();
+    let bal = verifier
+        .execute("MATCH (n:Acct2 {id: 0}) RETURN n.balance")
+        .expect("verify balance");
+    assert_eq!(bal.row_count(), 1, "node 0 must exist");
+
+    let amt = verifier
+        .execute("MATCH (n:Acct2 {id: 1}) RETURN n.amount")
+        .expect("verify amount");
+    assert_eq!(amt.row_count(), 1, "node 1 must exist");
+}
+
+/// Observation test for same-property write-skew at escalation scale.
+///
+/// BACKGROUND — recorded soundness gap (2026-06-20):
+///
+/// When two concurrent Property/Serializable sessions BOTH scan all `:Acct3`
+/// nodes (escalating to `(Label(Acct3), Some(balance_tag))`) and then each
+/// writes `balance` on a DIFFERENT node, there is a write-skew:
+///
+///   s1 reads ALL balance  (sees node 1 incl.)
+///   s2 reads ALL balance  (sees node 0 incl.)
+///   s1 writes node-0.balance  →  node 1's balance is now stale in s1's view
+///   s2 writes node-1.balance  →  node 0's balance is now stale in s2's view
+///
+/// Under a correct SSI implementation this is a write-skew cycle and the
+/// second committer SHOULD abort with SerializationFailure.
+///
+/// CURRENT BEHAVIOUR: both sessions commit.
+///
+/// WHY: The property-write fan-out records `(Label(Acct3), Some(balance_tag))`
+/// in the coarse write-set for s1. When s2 tries to record the same coarse
+/// entry, the first-writer-wins W-W check fires (s1 already has `Label(Acct3)`
+/// in its write_set) and the error is silently dropped by
+/// `record_coarse_node_labels_only` (uses `let _ = ...`). This prevents the
+/// `set_rw_edge(s1_reader, s2_writer)` from firing: s2.in_conflict stays
+/// false, the dangerous-structure cycle is not detected, and s2 commits.
+///
+/// SOUNDNESS NOTE: The W-W check on phantom coarse keys (`Label`, `RelType`)
+/// is overly aggressive for property-write fan-out: two transactions writing
+/// different nodes with the same label/tag are not a real W-W conflict on any
+/// single entity. A future fix would gate the W-W check to real (fine) entity
+/// keys only, and always proceed with the rw-edge formation for coarse
+/// phantom writes. That fix is out of scope for Task 6; this test documents
+/// the observed behaviour and is a regression anchor.
+///
+/// ASSERTION: Both commits succeed (the observed, not the desired, outcome).
+/// If this test STARTS FAILING with a SerializationFailure that means the
+/// soundness gap was fixed — in which case update the assertion and the doc.
+#[test]
+fn serializable_escalated_property_same_prop_both_commit_known_gap() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 :Acct3 nodes with a balance property.
+    let setup = db.session();
+    for i in 0..10i64 {
+        let bal = i * 100;
+        setup
+            .execute(&format!("CREATE (:Acct3 {{id: {i}, balance: {bal}}})"))
+            .expect("create :Acct3 node");
+    }
+    drop(setup);
+
+    // Lower threshold to 4 so 10 nodes escalate.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    // Both sessions: Property granularity + Serializable.
+    let mut s1 = db.session();
+    s1.set_conflict_granularity(ConflictGranularity::Property);
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable/Property");
+
+    let mut s2 = db.session();
+    s2.set_conflict_granularity(ConflictGranularity::Property);
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable/Property");
+
+    // Both sessions scan ALL Acct3 balance values (escalates to
+    // (Label(Acct3), Some(balance_tag))).
+    let r1 = s1
+        .execute("MATCH (n:Acct3) RETURN n.balance")
+        .expect("s1: MATCH :Acct3 RETURN n.balance");
+    assert_eq!(r1.row_count(), 10, "s1 must see all 10 :Acct3 nodes");
+
+    let r2 = s2
+        .execute("MATCH (n:Acct3) RETURN n.balance")
+        .expect("s2: MATCH :Acct3 RETURN n.balance");
+    assert_eq!(r2.row_count(), 10, "s2 must see all 10 :Acct3 nodes");
+
+    // Each writes balance on a DIFFERENT node (disjoint real W-W keys).
+    s1.execute("MATCH (n:Acct3 {id: 0}) SET n.balance = 9999")
+        .expect("s1: SET balance on node 0");
+    s2.execute("MATCH (n:Acct3 {id: 1}) SET n.balance = 8888")
+        .expect("s2: SET balance on node 1");
+
+    // OBSERVED BEHAVIOUR: both commit (the second SHOULD abort but doesn't
+    // due to the phantom-coarse W-W gap documented above).
+    let c1 = s1.commit();
+    assert!(c1.is_ok(), "s1 (first committer) must succeed: {c1:?}");
+
+    let c2 = s2.commit();
+    // NOTE: if this assertion fails with SerializationFailure in the future,
+    // the soundness gap documented above was fixed — update to assert_err.
+    assert!(
+        c2.is_ok(),
+        "s2 must also commit under the current implementation \
+         (both-same-prop write-skew is NOT detected at escalation scale \
+         due to the phantom-coarse W-W gap — see test doc above); got: {c2:?}"
+    );
+}
+
+/// T = usize::MAX reproduces full-precision (no escalation) behaviour.
+///
+/// With `set_escalation_threshold(usize::MAX)` no bucket can ever cross the
+/// threshold, so every read stays as a fine `EntityId::Node(_)` entry.
+/// After scanning 10 `:Acct4` nodes the read-set must contain the N fine Node
+/// entries and NO `EntityId::Label(_)` coarse key.
+///
+/// This proves that T=MAX is a safe identity for the escalation knob: it
+/// exactly reproduces the pre-escalation behaviour.
+#[test]
+fn serializable_escalation_threshold_max_is_full_precision() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 :Acct4 nodes — enough to exceed any threshold ≪ usize::MAX.
+    let setup = db.session();
+    for i in 0..10i64 {
+        setup
+            .execute(&format!("CREATE (:Acct4 {{id: {i}}})"))
+            .expect("create :Acct4 node");
+    }
+    drop(setup);
+
+    // Set threshold to usize::MAX — escalation must never fire.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(usize::MAX);
+    drop(mgr_session);
+
+    let mut session = db.session();
+    session
+        .begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("begin Serializable");
+    let tid = session.active_transaction_id().unwrap();
+
+    // Label scan — visits all 10 :Acct4 nodes.
+    let result = session
+        .execute("MATCH (n:Acct4) RETURN n")
+        .expect("MATCH :Acct4");
+    assert_eq!(result.row_count(), 10, "must see all 10 :Acct4 nodes");
+
+    session.commit().expect("commit must succeed");
+
+    let rs = session.transaction_manager_ref().read_set(tid);
+
+    // Must have fine Node entries (at least for visited nodes).
+    let fine_node_count = rs.iter().filter(|e| matches!(e, EntityId::Node(_))).count();
+    assert!(
+        fine_node_count >= 10,
+        "at T=usize::MAX, all 10 scanned nodes must remain as fine EntityId::Node \
+         entries (no escalation); got fine_node_count={fine_node_count}, read-set: {rs:?}"
+    );
+
+    // Must NOT contain any coarse Label key.
+    let label_entries: Vec<_> = rs
+        .iter()
+        .filter(|e| matches!(e, EntityId::Label(_)))
+        .collect();
+    assert!(
+        label_entries.is_empty(),
+        "at T=usize::MAX no escalation must occur; read-set must NOT contain \
+         EntityId::Label(_); got: {label_entries:?}"
+    );
+}

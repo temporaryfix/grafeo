@@ -1279,9 +1279,10 @@ impl TransactionManager {
 
     /// Returns a copy of the read-set including per-entry [`PropTag`] values.
     ///
-    /// Used by tests (and potentially diagnostics) to verify that property-level
+    /// Used by tests (and diagnostics) to verify that property-level
     /// granularity is emitting `Some(tag)` entries rather than entity-level `None`.
-    #[cfg(test)]
+    /// Also used by integration tests in `tests/serializable.rs` to assert
+    /// tagged read-set contents after escalation.
     pub fn read_set_tagged(&self, transaction_id: TransactionId) -> HashSet<(EntityId, PropTag)> {
         self.transactions
             .read()
