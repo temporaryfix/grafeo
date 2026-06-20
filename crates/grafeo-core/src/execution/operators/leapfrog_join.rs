@@ -193,6 +193,15 @@ impl LeapfrogJoinOperator {
 
         let num_inputs = self.tries.len();
         let num_shared_vars = self.shared_var_cols.first().map_or(0, |v| v.len());
+        // Invariant (guaranteed by the planner): every input's alignment vector
+        // has one slot per global shared variable. The recursion indexes by
+        // global-var position, so a ragged alignment would silently misbind.
+        debug_assert!(
+            self.shared_var_cols
+                .iter()
+                .all(|v| v.len() == num_shared_vars),
+            "shared_var_cols rows must all have length num_shared_vars"
+        );
 
         // Start each input's iterator at the root of its trie
         let initial_iters: Vec<TrieIterator<'_>> = self.tries.iter().map(|t| t.iter()).collect();
@@ -350,13 +359,10 @@ impl LeapfrogJoinOperator {
         }
     }
 
-    /// Collects all EdgeId-encoded row IDs from a TrieIterator's current node
-    /// (the leaf node after all descents). The trie stores row-ids in `node.edges`.
-    ///
-    /// Since `TrieIterator` doesn't expose `node.edges` directly, we use the trie's
-    /// `get` method via the iterator's exposed `collect_edges` helper. We expose
-    /// this by walking the iterator's current node's edges indirectly: we call
-    /// `iter.collect_edges()` which we've added to `TrieIterator`.
+    /// Collects all EdgeId-encoded row IDs from a `TrieIterator`'s current node
+    /// (the leaf node reached after this input's variables are all bound). The
+    /// trie stores row-ids as edges at that node, read via `TrieIterator::edges()`.
+    /// Filters by `input_idx` defensively (a node's edges all belong to one input).
     fn collect_leaf_row_ids(iter: &TrieIterator<'_>, input_idx: usize, row_ids: &mut Vec<RowId>) {
         for &edge_id in iter.edges() {
             let decoded = Self::decode_row_id(edge_id);
@@ -551,6 +557,19 @@ mod tests {
             col1.push_int64(b);
         }
         DataChunk::new(vec![col0, col1])
+    }
+
+    /// Creates a 3-column chunk from triples of i64 values.
+    fn create_three_col_chunk(triples: &[(i64, i64, i64)]) -> DataChunk {
+        let mut col0 = ValueVector::with_type(LogicalType::Int64);
+        let mut col1 = ValueVector::with_type(LogicalType::Int64);
+        let mut col2 = ValueVector::with_type(LogicalType::Int64);
+        for &(a, b, c) in triples {
+            col0.push_int64(a);
+            col1.push_int64(b);
+            col2.push_int64(c);
+        }
+        DataChunk::new(vec![col0, col1, col2])
     }
 
     // ── existing single-variable tests (must keep passing) ───────────────────
@@ -796,6 +815,588 @@ mod tests {
             all_rows[0],
             (1, 2, 3),
             "Triangle values must be (a=1,b=2,c=3)"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SCRATCH REVIEW TESTS (C1–C5 + termination + leaf collection)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// C1 — an input is MISSING A MIDDLE variable.
+    ///
+    /// shared_variables = [a, b, c].
+    ///   R1(a,b):   shared_var_cols[0] = [Some(0), Some(1), None]   (a@0, b@1)
+    ///   R2(b,c):   shared_var_cols[1] = [None,    Some(0), Some(1)] (b@0, c@1)
+    ///   R3(a,c):   shared_var_cols[2] = [Some(0), None,    Some(1)] (a@0, c@1)  ← MISSING b
+    ///
+    /// R3's trie path is [a_val, c_val]. At gv=b (gv=1) R3 must NOT advance its
+    /// iterator (it stays at the c-level), and at gv=c (gv=2) it must intersect
+    /// on c correctly with R2.
+    ///
+    /// Data, with a decoy that ONLY R3's missing-b would let through if buggy:
+    ///   R1: (1,2)            a=1,b=2
+    ///   R2: (2,3), (2,9)     b=2→c=3 ; b=2→c=9 (decoy: c=9 not in R3)
+    ///   R3: (1,3), (1,9)     a=1,c=3 (closes) ; a=1,c=9 (decoy: needs c=9 which only matches R2 decoy, but b for that is 2 = ok... see below)
+    ///
+    /// Trace of the ONLY consistent assignment:
+    ///   a must be 1 (R1, R3 agree).  b must be 2 (R1, R2).  c must satisfy R2(b=2,c) and R3(a=1,c).
+    ///   R2 gives c∈{3,9}; R3 gives c∈{3,9}.  So BOTH c=3 and c=9 close!
+    ///   → expected rows: (1,2,3) and (1,2,9)  → 2 rows.
+    ///
+    /// This is a GOOD discriminator: if R3's iterator wrongly advanced at gv=b,
+    /// the c-level intersection would misalign and drop/!match rows.
+    #[test]
+    fn c1_input_missing_middle_variable() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 2)]);
+        let chunk_r2 = create_two_col_chunk(&[(2, 3), (2, 9)]);
+        let chunk_r3 = create_two_col_chunk(&[(1, 3), (1, 9)]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+        let op3: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r3));
+
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1), None], // R1: a@0, b@1
+            vec![None, Some(0), Some(1)], // R2: b@0, c@1
+            vec![Some(0), None, Some(1)], // R3: a@0, c@1  (no b)
+        ];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2, op3],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1), (1, 1)], // a from R1.col0, b from R1.col1, c from R2.col1
+        );
+
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                let c = chunk.column(2).unwrap().get_int64(row).unwrap();
+                rows.push((a, b, c));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, 2, 3), (1, 2, 9)],
+            "C1: missing-middle-var input must intersect on c correctly"
+        );
+    }
+
+    /// C1b — same shape, but a decoy that WOULD leak if the missing-b input
+    /// over-matched.  R3 has a=1 paired with c=3 only; R2 offers c∈{3,7}.
+    /// Only c=3 should survive (c=7 not in R3).  Expect exactly (1,2,3).
+    #[test]
+    fn c1b_missing_middle_filters_via_c() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 2)]);
+        let chunk_r2 = create_two_col_chunk(&[(2, 3), (2, 7)]); // c=7 decoy
+        let chunk_r3 = create_two_col_chunk(&[(1, 3)]); // only c=3
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+        let op3: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r3));
+
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1), None],
+            vec![None, Some(0), Some(1)],
+            vec![Some(0), None, Some(1)],
+        ];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2, op3],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1), (1, 1)],
+        );
+
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                let c = chunk.column(2).unwrap().get_int64(row).unwrap();
+                rows.push((a, b, c));
+            }
+        }
+        assert_eq!(rows, vec![(1, 2, 3)], "C1b: c=7 decoy must be filtered");
+    }
+
+    /// C2 — multiple rows per leaf (fan-out): an input has several rows with the
+    /// SAME full key; cross-product must include all combinations.
+    ///
+    /// Single shared variable a.  R1 has key a=1 three times; R2 has a=1 twice.
+    /// Expected matches: 3 × 2 = 6.
+    #[test]
+    fn c2_fanout_same_full_key() {
+        // R1: a=1 (x3), a=2 (x1)  ; R2: a=1 (x2), a=3 (x1)
+        let chunk_r1 = create_node_chunk(&[1, 1, 1, 2]);
+        let chunk_r2 = create_node_chunk(&[1, 1, 3]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            single_var_alignment(2),
+            vec![LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (1, 0)],
+        );
+
+        let mut count = 0usize;
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            count += chunk.row_count();
+        }
+        assert_eq!(count, 6, "C2: fan-out cross product must be 3*2 = 6");
+    }
+
+    /// C2b — fan-out on a MULTI-variable (full) key.  Two inputs share (a,b).
+    /// R1 has (1,1) twice; R2 has (1,1) three times.  Expect 2×3 = 6.
+    #[test]
+    fn c2b_fanout_full_multikey() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 1), (1, 1), (1, 2)]);
+        let chunk_r2 = create_two_col_chunk(&[(1, 1), (1, 1), (1, 1), (1, 9)]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        let shared_var_cols = vec![vec![Some(0), Some(1)], vec![Some(0), Some(1)]];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            shared_var_cols,
+            vec![
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+            ],
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+        );
+
+        let mut count = 0usize;
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            count += chunk.row_count();
+        }
+        assert_eq!(count, 6, "C2b: full-key fan-out 2*3 = 6");
+    }
+
+    /// C3 — empty / no-match at a deeper variable ⇒ zero results, no panic/hang.
+    /// Aligned 2-col: a agrees (=1) but b never matches.
+    #[test]
+    fn c3_no_match_deep_variable() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 2), (1, 4)]);
+        let chunk_r2 = create_two_col_chunk(&[(1, 3), (1, 5)]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        let shared_var_cols = vec![vec![Some(0), Some(1)], vec![Some(0), Some(1)]];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            shared_var_cols,
+            vec![
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+            ],
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+        );
+
+        let mut count = 0usize;
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            count += chunk.row_count();
+        }
+        assert_eq!(count, 0, "C3: no common (a,b) ⇒ zero rows");
+    }
+
+    /// C4 — a variable present in only ONE input (single participant).
+    ///
+    /// shared_variables = [a, b].
+    ///   R1(a,b): [Some(0), Some(1)]
+    ///   R2(a):   [Some(0), None]      ← only carries a; b is single-participant (R1 only)
+    ///
+    /// At gv=b only R1 participates. The leapfrog over a single iterator must
+    /// enumerate ALL of R1's b-values for the matched a (not over-constrain).
+    /// Rows still filtered by a (the ≥2-participant variable).
+    ///
+    ///   R1: (1,10), (1,20), (2,30)
+    ///   R2: a=1, a=9
+    ///   a-intersection = {1}. Under a=1, R1 has b∈{10,20}. R2 has no b.
+    ///   Expected: 2 rows (1,10) and (1,20). a=2 dropped (not in R2); a=9 dropped.
+    #[test]
+    fn c4_single_participant_variable() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 10), (1, 20), (2, 30)]);
+        let chunk_r2 = create_node_chunk(&[1, 9]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1)], // R1: a@0, b@1
+            vec![Some(0), None],    // R2: a@0 only
+        ];
+
+        // Output: a, b (from R1)
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1)],
+        );
+
+        let mut rows: Vec<(i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                rows.push((a, b));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, 10), (1, 20)],
+            "C4: single-participant b must enumerate all R1 b-values for a=1"
+        );
+    }
+
+    /// C5 — non-participant iterator state passes UNCHANGED and is later used at
+    /// the correct level. shared_variables = [a, b, c].
+    ///   R1(a,c):  [Some(0), None, Some(1)]  ← skips b at gv=1
+    ///   R2(a,b):  [Some(0), Some(1), None]
+    ///   R3(a,b,c):[Some(0), Some(1), Some(2)]
+    ///
+    /// R1 binds a at gv=0, is idle at gv=1, binds c at gv=2.
+    /// Construct data so R1's c-binding actually filters the result.
+    ///   R1: (1,5), (1,6)        a=1,c=5 ; a=1,c=6
+    ///   R2: (1,2)               a=1,b=2
+    ///   R3: (1,2,5), (1,2,7)    a=1,b=2,c=5 (closes) ; c=7 (decoy, not in R1)
+    ///   a=1,b=2 forced; c must be in R1{5,6} ∩ R3{5,7} = {5}. Expect (1,2,5).
+    #[test]
+    fn c5_nonparticipant_state_threaded() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 5), (1, 6)]); // (a,c)
+        let chunk_r2 = create_two_col_chunk(&[(1, 2)]); // (a,b)
+        let chunk_r3 = create_three_col_chunk(&[(1, 2, 5), (1, 2, 7)]); // (a,b,c)
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+        let op3: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r3));
+
+        let shared_var_cols = vec![
+            vec![Some(0), None, Some(1)],    // R1: a@0, c@1   (no b)
+            vec![Some(0), Some(1), None],    // R2: a@0, b@1
+            vec![Some(0), Some(1), Some(2)], // R3: a@0, b@1, c@2
+        ];
+
+        // Output a (R3.0), b (R3.1), c (R3.2)
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2, op3],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
+            vec![(2, 0), (2, 1), (2, 2)],
+        );
+
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                let c = chunk.column(2).unwrap().get_int64(row).unwrap();
+                rows.push((a, b, c));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![(1, 2, 5)],
+            "C5: R1's idle-at-b iterator must bind c at gv=2 and filter c=7"
+        );
+    }
+
+    /// Termination — duplicate keys at multiple levels must not loop forever.
+    /// Heavy duplication across two aligned 2-col inputs.
+    #[test]
+    fn termination_heavy_duplicates() {
+        let r1: Vec<(i64, i64)> = vec![(1, 1), (1, 1), (1, 2), (2, 2), (2, 2)];
+        let r2: Vec<(i64, i64)> = vec![(1, 1), (1, 1), (2, 2), (2, 2), (2, 3)];
+        let chunk_r1 = create_two_col_chunk(&r1);
+        let chunk_r2 = create_two_col_chunk(&r2);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        let shared_var_cols = vec![vec![Some(0), Some(1)], vec![Some(0), Some(1)]];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            shared_var_cols,
+            vec![
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+            ],
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+        );
+
+        let mut count = 0usize;
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            count += chunk.row_count();
+        }
+        // (1,1): R1 has 2, R2 has 2 → 4 ; (2,2): R1 has 2, R2 has 2 → 4. Total 8.
+        assert_eq!(count, 8, "termination + fan-out across dup full keys");
+    }
+
+    /// Leaf-collection — inputs bottom out at DIFFERENT depths.
+    /// R_long has 3 vars, R_short has 1 var.  R_short's single row must be
+    /// collected at depth-1 while R_long bottoms out at depth-3.
+    ///   shared = [a,b,c]
+    ///   R_long(a,b,c): [Some(0),Some(1),Some(2)] rows (1,2,3)
+    ///   R_short(a):    [Some(0),None,None]        rows a=1
+    ///   Expect 1 row (1,2,3) with R_short contributing a=1.
+    #[test]
+    fn leaf_collection_ragged_depths() {
+        let chunk_long = create_three_col_chunk(&[(1, 2, 3), (1, 2, 4)]);
+        let chunk_short = create_node_chunk(&[1, 5]);
+
+        let op_long: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_long));
+        let op_short: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_short));
+
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1), Some(2)], // R_long
+            vec![Some(0), None, None],       // R_short: only a
+        ];
+
+        // Output a,b,c from R_long
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op_long, op_short],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1), (0, 2)],
+        );
+
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                let c = chunk.column(2).unwrap().get_int64(row).unwrap();
+                rows.push((a, b, c));
+            }
+        }
+        rows.sort();
+        // a=1 matches R_short; R_long has (1,2,3) and (1,2,4) under a=1.
+        // Both should pass (R_short only constrains a). Expect 2 rows.
+        assert_eq!(
+            rows,
+            vec![(1, 2, 3), (1, 2, 4)],
+            "leaf-collection: short input constrains only a; both long rows survive"
+        );
+    }
+
+    /// Leaf-collection sanity: the SHORT input must actually narrow results.
+    /// Same as above but R_short = {7} (no overlap) ⇒ zero rows.
+    #[test]
+    fn leaf_collection_short_input_filters() {
+        let chunk_long = create_three_col_chunk(&[(1, 2, 3)]);
+        let chunk_short = create_node_chunk(&[7]);
+
+        let op_long: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_long));
+        let op_short: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_short));
+
+        let shared_var_cols = vec![vec![Some(0), Some(1), Some(2)], vec![Some(0), None, None]];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op_long, op_short],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1), (0, 2)],
+        );
+
+        let mut count = 0usize;
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            count += chunk.row_count();
+        }
+        assert_eq!(count, 0, "short input with no overlap ⇒ zero rows");
+    }
+
+    /// Multi-result + per-input fan-out across 3 inputs.
+    /// Two distinct closing triangles (1,2,3) and (4,5,6).  Additionally R1 has
+    /// the edge (1,2) twice → triangle (1,2,3) should appear twice (fan-out in R1).
+    /// Total expected = 2 (for triangle1 fan-out) + 1 (triangle2) = 3 rows.
+    #[test]
+    fn multi_result_with_fanout() {
+        // R1(a,b): (1,2) x2 [fan-out], (4,5) x1
+        let chunk_r1 = create_two_col_chunk(&[(1, 2), (1, 2), (4, 5)]);
+        // R2(b,c): (2,3), (5,6)
+        let chunk_r2 = create_two_col_chunk(&[(2, 3), (5, 6)]);
+        // R3(c,a): (3,1), (6,4)
+        let chunk_r3 = create_two_col_chunk(&[(3, 1), (6, 4)]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+        let op3: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r3));
+
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1), None], // R1: a@0, b@1
+            vec![None, Some(0), Some(1)], // R2: b@0, c@1
+            vec![Some(1), None, Some(0)], // R3: a@1, c@0
+        ];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2, op3],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1), (1, 1)],
+        );
+
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                let c = chunk.column(2).unwrap().get_int64(row).unwrap();
+                rows.push((a, b, c));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, 2, 3), (1, 2, 3), (4, 5, 6)],
+            "two triangles, first with R1 fan-out x2"
+        );
+    }
+
+    /// 4-cycle (square): R1(a,b), R2(b,c), R3(c,d), R4(d,a).
+    /// shared = [a,b,c,d].  Exactly one square: a=1,b=2,c=3,d=4, with decoys
+    /// that are guaranteed dead-ends (no accidental second cycle).
+    #[test]
+    fn four_cycle_square() {
+        // Real square: 1→2→3→4→1. Decoys all terminate (b=22 has no R2 partner, etc.)
+        let chunk_r1 = create_two_col_chunk(&[(1, 2), (1, 22)]); // (a,b) decoy b=22 (dead: no R2 b=22)
+        let chunk_r2 = create_two_col_chunk(&[(2, 3), (2, 88)]); // (b,c) decoy c=88 (dead: no R3 c=88)
+        let chunk_r3 = create_two_col_chunk(&[(3, 4), (3, 66)]); // (c,d) decoy d=66 (dead: no R4 d=66)
+        let chunk_r4 = create_two_col_chunk(&[(4, 1), (4, 77)]); // (d,a) decoy a=77 (dead: no R1 a=77)
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+        let op3: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r3));
+        let op4: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r4));
+
+        // gv order [a,b,c,d]
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1), None, None], // R1(a,b)
+            vec![None, Some(0), Some(1), None], // R2(b,c)
+            vec![None, None, Some(0), Some(1)], // R3(c,d)
+            vec![Some(1), None, None, Some(0)], // R4(d,a): a@1, d@0
+        ];
+
+        // Output a,b,c,d : a from R1.0, b from R1.1, c from R2.1, d from R3.1
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2, op3, op4],
+            shared_var_cols,
+            vec![
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+                LogicalType::Int64,
+            ],
+            vec![(0, 0), (0, 1), (1, 1), (2, 1)],
+        );
+
+        let mut rows: Vec<(i64, i64, i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                let c = chunk.column(2).unwrap().get_int64(row).unwrap();
+                let d = chunk.column(3).unwrap().get_int64(row).unwrap();
+                rows.push((a, b, c, d));
+            }
+        }
+        assert_eq!(rows, vec![(1, 2, 3, 4)], "exactly one 4-cycle");
+    }
+
+    /// First global variable present in only ONE input (the others start at gv=1).
+    /// Stresses the "participant at gv=0 is single" + non-participants idle at gv=0.
+    ///   shared=[a,b]; R1(a,b) full; R2(b) only b.
+    ///   At gv=0 only R1 participates (single). At gv=1 both participate.
+    ///   R1: (1,5),(2,5),(2,6) ; R2: b=5 → expect (1,5),(2,5).
+    #[test]
+    fn first_var_single_participant() {
+        let chunk_r1 = create_two_col_chunk(&[(1, 5), (2, 5), (2, 6)]);
+        let chunk_r2 = create_node_chunk(&[5]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        let shared_var_cols = vec![
+            vec![Some(0), Some(1)], // R1: a@0, b@1
+            vec![None, Some(0)],    // R2: b@0  (no a)
+        ];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (0, 1)],
+        );
+
+        let mut rows: Vec<(i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                rows.push((a, b));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, 5), (2, 5)],
+            "b=5 filters; a is single-participant"
+        );
+    }
+
+    /// Defensive: a global variable that NO input carries (all None at that gv).
+    /// The operator's `participant_indices.is_empty()` branch must skip it and
+    /// still join correctly on the real shared variable.
+    ///   shared=[a, GHOST]; both inputs carry a@0, neither carries GHOST.
+    ///   R1 a∈{1,2,3}; R2 a∈{2,3,4} → expect {2,3}.
+    #[test]
+    fn ghost_variable_no_participants() {
+        let chunk_r1 = create_node_chunk(&[1, 2, 3]);
+        let chunk_r2 = create_node_chunk(&[2, 3, 4]);
+
+        let op1: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r1));
+        let op2: Box<dyn Operator> = Box::new(MockScanOperator::new(chunk_r2));
+
+        // gv0 = a (both Some(0)); gv1 = GHOST (both None)
+        let shared_var_cols = vec![vec![Some(0), None], vec![Some(0), None]];
+
+        let mut leapfrog = LeapfrogJoinOperator::new(
+            vec![op1, op2],
+            shared_var_cols,
+            vec![LogicalType::Int64, LogicalType::Int64],
+            vec![(0, 0), (1, 0)],
+        );
+
+        let mut rows: Vec<(i64, i64)> = Vec::new();
+        while let Some(chunk) = leapfrog.next().unwrap() {
+            for row in 0..chunk.row_count() {
+                let a = chunk.column(0).unwrap().get_int64(row).unwrap();
+                let b = chunk.column(1).unwrap().get_int64(row).unwrap();
+                rows.push((a, b));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(2, 2), (3, 3)],
+            "ghost var skipped; join on a only"
         );
     }
 }
