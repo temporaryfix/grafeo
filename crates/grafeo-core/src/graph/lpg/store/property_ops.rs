@@ -1389,8 +1389,11 @@ impl LpgStore {
 
         // Overlay the writing transaction's buffered delta for this node.
         if let Some(tx) = transaction_id {
-            // Record the node read: the whole-entity property read IS the read.
-            self.record_read_node(tx, id);
+            // Record the node read through the escalation-aware materialization
+            // path (symmetric with `read_edge_properties_visible`): a whole-node
+            // `RETURN n` after a label scan escalated must short-circuit on the
+            // coarse `Label(L)` key instead of re-adding a fine `(Node, _)` entry.
+            self.record_read_node_materialized(tx, id);
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx) {
                 for ((node_id, key), op) in &delta.node_props {
