@@ -2908,6 +2908,10 @@ fn edges_from_versioned_records_reads() {
 /// A >T edge traversal of type `R` escalates the edge reads to the coarse
 /// `RelType(R)` predicate via the store chokepoint: the spy sees
 /// `record_read_edge_in_rel_type`, not bare `record_read_edge`.
+/// Covers all three tx-visible edge read paths:
+///   - `is_edge_visible_versioned` (traversal filter)
+///   - `get_edge_versioned` (materialization)
+///   - `edge_type_versioned` (Expand's per-candidate type-filter call)
 #[test]
 fn edge_reads_escalate_by_intrinsic_type_at_chokepoint() {
     use crate::execution::operators::{ReadTracker, SharedReadTracker};
@@ -2938,6 +2942,12 @@ fn edge_reads_escalate_by_intrinsic_type_at_chokepoint() {
     let e1 = store.new_epoch();
     store.finalize_entities_by_id(TransactionId::SYSTEM, e1, &[], &[edge]);
 
+    // Capture the expected EdgeTypeId for "R" — for a fresh store with only "R"
+    // this is EdgeTypeId::from(0), confirmed via committed_edge_type_id.
+    let expected_rel_type = store
+        .committed_edge_type_id(edge)
+        .expect("edge must have a committed type id");
+
     let tx = TransactionId::new(40);
     let spy = Arc::new(Spy::default());
     store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
@@ -2946,15 +2956,26 @@ fn edge_reads_escalate_by_intrinsic_type_at_chokepoint() {
     assert!(store.is_edge_visible_versioned(edge, e1, tx));
     // Materialization path too.
     let _ = store.get_edge_versioned(edge, e1, tx);
+    // Type-resolver path (Expand calls this first for every candidate edge to
+    // filter by relationship type — expand.rs:172).
+    let _ = store.edge_type_versioned(edge, e1, tx);
 
     let coarse = spy.coarse.lock().clone();
+    // Every coarse entry for `edge` must carry the correct RelType id.
     assert!(
         coarse.iter().any(|(id, _)| *id == edge),
         "edge read must route through record_read_edge_in_rel_type, got coarse={coarse:?}"
     );
+    for (id, rt) in coarse.iter().filter(|(id, _)| *id == edge) {
+        assert_eq!(
+            *rt, expected_rel_type,
+            "coarse entry for edge {id:?} must carry RelType {expected_rel_type:?}, got {rt:?}"
+        );
+    }
+    // No path must fall back to bare fine record_read_edge.
     assert!(
         spy.fine.lock().is_empty(),
-        "edge reads must NOT use bare record_read_edge once escalation-aware"
+        "edge reads must NOT use bare record_read_edge on any visibility/type/materialization path"
     );
 }
 

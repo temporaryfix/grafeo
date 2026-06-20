@@ -1020,9 +1020,10 @@ impl LpgStore {
         let edges = self.edges.read();
         let chain = edges.get(&id)?;
         let record = chain.visible_to(epoch, transaction_id)?;
-        // Store-level read recording: a tx-visible edge read (resolved as visible).
-        // Record into the SSI read-set (no-op unless a tracker is registered).
-        self.record_read_edge(transaction_id, id);
+        // Store-level read recording: record under the intrinsic RelType so that
+        // Expand's per-candidate type-filter call participates in coarse escalation
+        // (MATCH ()-[:T]->() avoids O(N) fine Edge entries).
+        self.record_read_edge_in_rel_type(transaction_id, id, EdgeTypeId::from(record.type_id));
         let id_to_type = self.id_to_edge_type.read();
         id_to_type.get(record.type_id as usize).cloned()
     }
@@ -1040,10 +1041,12 @@ impl LpgStore {
         let versions = self.edge_versions.read();
         let index = versions.get(&id)?;
         let vref = index.visible_to(epoch, transaction_id)?;
-        // Store-level read recording: a tx-visible edge read (resolved as visible).
-        // Record into the SSI read-set (no-op unless a tracker is registered).
-        self.record_read_edge(transaction_id, id);
+        // Resolve the record before recording so we know the intrinsic RelType.
         let record = self.read_edge_record(&vref)?;
+        // Store-level read recording: record under the intrinsic RelType so that
+        // Expand's per-candidate type-filter call participates in coarse escalation
+        // (MATCH ()-[:T]->() avoids O(N) fine Edge entries).
+        self.record_read_edge_in_rel_type(transaction_id, id, EdgeTypeId::from(record.type_id));
         let id_to_type = self.id_to_edge_type.read();
         id_to_type.get(record.type_id as usize).cloned()
     }
