@@ -4026,4 +4026,53 @@ mod tests {
             "no Label key when intersection is empty"
         );
     }
+
+    /// Edge mirror of the two node tests: an edge property read escalates only
+    /// under a relationship type the tx has *already scanned* (`Some(t)` that is
+    /// a scanned predicate) and otherwise falls back to a fine `Edge` read
+    /// (unscanned type, or `rel = None`).
+    #[test]
+    fn edge_property_read_escalates_under_scanned_rel_only() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let t = EdgeTypeId::new(1);
+        let other = EdgeTypeId::new(2);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Tx scanned [:T] structurally -> RelType(T) becomes a scanned predicate.
+        for i in 0..10u64 {
+            mgr.record_read_in_rel_type(tx, EdgeId::new(i), None, t)
+                .unwrap();
+        }
+
+        // Edge property x-reads on the same edges (intrinsic type T) -> promote.
+        for i in 0..10u64 {
+            mgr.record_read_edge_escalating(tx, EdgeId::new(i), xtag, xtag, Some(t))
+                .unwrap();
+        }
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::RelType(t), xtag)),
+            "x-reads promote under scanned RelType(T)"
+        );
+
+        // An edge property read of an UNSCANNED type falls back to fine.
+        mgr.record_read_edge_escalating(tx, EdgeId::new(100), xtag, xtag, Some(other))
+            .unwrap();
+        // A property read with no intrinsic type (rel = None) falls back to fine.
+        mgr.record_read_edge_escalating(tx, EdgeId::new(101), xtag, xtag, None)
+            .unwrap();
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            !rs.contains(&(EntityId::RelType(other), xtag)),
+            "must NOT promote under unscanned RelType(other)"
+        );
+        assert!(
+            rs.contains(&(EntityId::Edge(EdgeId::new(100)), xtag))
+                && rs.contains(&(EntityId::Edge(EdgeId::new(101)), xtag)),
+            "unscanned / typeless edge property reads stay fine"
+        );
+    }
 }
