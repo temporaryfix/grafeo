@@ -217,19 +217,21 @@ pub struct TransactionInfo {
     /// the reader end of some `self →rw writer`). Used for F2 incremental SSI
     /// pivot detection.
     pub out_conflict: bool,
-    /// Read-set escalation buckets: maps a coarse predicate key
-    /// (`EntityId::Label(L)` / `EntityId::RelType(T)`) to the fine
-    /// `(EntityId::Node / Edge, PropTag)` reads recorded beneath it during a
-    /// label-/type-scan. When a bucket exceeds the escalation threshold the
-    /// fine entries are collapsed into the single coarse key (see
+    /// Read-set escalation buckets: maps a `(predicate, coarse_tag)` pair
+    /// (e.g. `(EntityId::Label(L), None)` for structural, or
+    /// `(EntityId::Label(L), Some(prop_tag))` for a property-tagged bucket)
+    /// to the fine `(EntityId::Node / Edge, PropTag)` reads accumulated
+    /// beneath it during a label-/type-scan. When a bucket exceeds the
+    /// escalation threshold the fine entries are collapsed into the single
+    /// coarse `(predicate, coarse_tag)` key (see
     /// [`TransactionManager::record_read_in_label`]). Only populated for
     /// Serializable transactions that actually scan by predicate.
-    pub scan_buckets: FxHashMap<EntityId, Vec<(EntityId, PropTag)>>,
-    /// Predicate keys that have already been promoted (escalated). Once a
-    /// predicate is here, further reads under it skip the fine entry entirely
-    /// (the coarse `predicate` key in `read_set` already covers them via GE2's
-    /// write fan-out), so no fine bookkeeping or rw-detection is re-run.
-    pub escalated: FxHashSet<EntityId>,
+    pub scan_buckets: FxHashMap<(EntityId, PropTag), Vec<(EntityId, PropTag)>>,
+    /// `(predicate, coarse_tag)` pairs that have already been promoted
+    /// (escalated). Once a pair is here, further reads under it skip the fine
+    /// entry entirely (the coarse key is in `read_set` and covers them via
+    /// GE2's write fan-out), so no fine bookkeeping or rw-detection is re-run.
+    pub escalated: FxHashSet<(EntityId, PropTag)>,
 }
 
 impl TransactionInfo {
@@ -750,6 +752,7 @@ impl TransactionManager {
             EntityId::Node(node),
             tag,
             EntityId::Label(label),
+            None,
         )
     }
 
@@ -776,14 +779,19 @@ impl TransactionManager {
             EntityId::Edge(edge),
             tag,
             EntityId::RelType(rel),
+            None,
         )
     }
 
     /// Shared implementation for [`record_read_in_label`](Self::record_read_in_label)
     /// and [`record_read_in_rel_type`](Self::record_read_in_rel_type).
     ///
-    /// `fine` is the per-row key (`Node`/`Edge`); `predicate` is the coarse
-    /// scan key (`Label`/`RelType`).
+    /// `fine` / `fine_tag` identify the per-row key (`Node`/`Edge`) and its
+    /// property tag. `predicate` is the coarse scan key (`Label`/`RelType`).
+    /// `coarse_tag` is the tag that will be recorded on the coarse read if this
+    /// bucket promotes; for structural escalation it is always `None`, but
+    /// property-tagged scans may pass `Some(prop_tag)` to promote to a
+    /// `(Label(L), Some(t))` key independently of the structural bucket.
     ///
     /// # Lock discipline
     ///
@@ -796,16 +804,19 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         fine: EntityId,
-        tag: PropTag,
+        fine_tag: PropTag,
         predicate: EntityId,
+        coarse_tag: PropTag,
     ) -> Result<()> {
-        // Already escalated: the coarse `predicate` key is in read_set and the
-        // SIREAD registry; it covers this read. Do NOT add a fine entry and do
-        // NOT re-run rw-detection. (A quick read-lock check.)
+        // Already escalated: the coarse `(predicate, coarse_tag)` key is in
+        // read_set and the SIREAD registry; it covers this read. Do NOT add a
+        // fine entry and do NOT re-run rw-detection. (A quick read-lock check.)
         {
             let txns = self.transactions.read();
             match txns.get(&transaction_id) {
-                Some(info) if info.escalated.contains(&predicate) => return Ok(()),
+                Some(info) if info.escalated.contains(&(predicate, coarse_tag)) => {
+                    return Ok(());
+                }
                 Some(_) => {}
                 // Unknown tx: let the fine record_read below produce the
                 // canonical "not found" error.
@@ -815,42 +826,50 @@ impl TransactionManager {
 
         // Not escalated yet: record the fine read normally (fine entry + its own
         // rw-detection + SIREAD registration). No lock held across this call.
-        self.record_read(transaction_id, fine, tag)?;
+        self.record_read(transaction_id, fine, fine_tag)?;
 
-        // Push the fine entry into this predicate's bucket and decide whether we
-        // crossed the threshold. Lock held only for the push/length check.
+        // Push the fine entry into this (predicate, coarse_tag) bucket and
+        // decide whether we crossed the threshold. Lock held only for the
+        // push/length check.
         let should_promote = {
             let mut txns = self.transactions.write();
             let Some(info) = txns.get_mut(&transaction_id) else {
                 return Ok(());
             };
-            let bucket = info.scan_buckets.entry(predicate).or_default();
-            bucket.push((fine, tag));
+            let bucket = info
+                .scan_buckets
+                .entry((predicate, coarse_tag))
+                .or_default();
+            bucket.push((fine, fine_tag));
             bucket.len() > self.escalation_threshold.load(Ordering::Relaxed)
             // transactions write lock drops here
         };
 
         if should_promote {
-            self.promote_read_bucket(transaction_id, predicate)?;
+            self.promote_read_bucket(transaction_id, predicate, coarse_tag)?;
         }
 
         Ok(())
     }
 
-    /// Promotes a predicate's accumulated fine reads into the coarse key.
+    /// Promotes a `(predicate, coarse_tag)` bucket's accumulated fine reads
+    /// into the coarse key `(predicate, coarse_tag)`.
     ///
     /// Steps (order is load-bearing — see inline notes):
-    /// (a) `record_read(tx, predicate, None)` records the **coarse** read with
-    ///     its own rw-detection. This is what catches a concurrent `Label(L)`
-    ///     writer (incl. a `CREATE (:L)` during the scan) that the fine reads
-    ///     alone could not see — and it is sound to subsequently drop the fine
-    ///     entries because GE2's write fan-out records the coarse key for every
-    ///     structural change to a node/edge under this predicate.
+    /// (a) `record_read(tx, predicate, coarse_tag)` records the **coarse** read
+    ///     with its own rw-detection. This is what catches a concurrent
+    ///     `Label(L)` writer (incl. a `CREATE (:L)` during the scan) that the
+    ///     fine reads alone could not see — and it is sound to subsequently drop
+    ///     the fine entries because GE2's write fan-out records the coarse key
+    ///     for every structural change to a node/edge under this predicate.
+    ///     For structural escalation `coarse_tag` is `None`; property-tagged
+    ///     escalation passes `Some(t)` to record `(Label(L), Some(t))`.
     /// (b) Under the `transactions` lock, drain the bucket, remove every fine
-    ///     `(entity, tag)` from `read_set`, mark `predicate` escalated, and
-    ///     clear the bucket. Release the lock, **then** remove each fine SIREAD
-    ///     entry from the registry via `remove_reader_entity` (registry ops only
-    ///     after the lock is released — the critical deadlock-avoidance rule).
+    ///     `(entity, tag)` from `read_set`, mark `(predicate, coarse_tag)`
+    ///     escalated, and clear the bucket. Release the lock, **then** remove
+    ///     each fine SIREAD entry from the registry via `remove_reader_entity`
+    ///     (registry ops only after the lock is released — the critical
+    ///     deadlock-avoidance rule).
     ///
     /// # Errors
     ///
@@ -859,14 +878,16 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         predicate: EntityId,
+        coarse_tag: PropTag,
     ) -> Result<()> {
         // (a) Coarse read WITH rw-detection (catches concurrent Label/RelType
         //     writers the fine reads missed). No lock held across this call.
-        self.record_read(transaction_id, predicate, None)?;
+        self.record_read(transaction_id, predicate, coarse_tag)?;
 
         // (b) Collapse: take the fine entries and drop them from read_set +
-        //     mark escalated, all under one transactions-lock acquisition.
-        //     Registry removals happen AFTER the lock is released.
+        //     mark (predicate, coarse_tag) escalated, all under one
+        //     transactions-lock acquisition. Registry removals happen AFTER the
+        //     lock is released.
         let fine_entries: Vec<(EntityId, PropTag)> = {
             let mut txns = self.transactions.write();
             let Some(info) = txns.get_mut(&transaction_id) else {
@@ -874,13 +895,13 @@ impl TransactionManager {
             };
             let entries = info
                 .scan_buckets
-                .get_mut(&predicate)
+                .get_mut(&(predicate, coarse_tag))
                 .map(std::mem::take)
                 .unwrap_or_default();
             for entry in &entries {
                 info.read_set.remove(entry);
             }
-            info.escalated.insert(predicate);
+            info.escalated.insert((predicate, coarse_tag));
             entries
             // transactions write lock drops here
         };
@@ -1461,6 +1482,22 @@ impl TransactionManager {
             .get(&tx)
             .map_or((false, false), |i| (i.in_conflict, i.out_conflict))
     }
+
+    /// Test-only shim that exposes the private `record_read_in_predicate` with
+    /// the `coarse_tag` parameter so that unit tests can exercise property-tagged
+    /// escalation paths without going through the public label/rel-type wrappers
+    /// (which always pass `coarse_tag = None`).
+    #[cfg(test)]
+    pub(crate) fn record_read_in_predicate_for_test(
+        &self,
+        tx: TransactionId,
+        fine: EntityId,
+        fine_tag: PropTag,
+        predicate: EntityId,
+        coarse_tag: PropTag,
+    ) -> Result<()> {
+        self.record_read_in_predicate(tx, fine, fine_tag, predicate, coarse_tag)
+    }
 }
 
 impl Default for TransactionManager {
@@ -1472,6 +1509,7 @@ impl Default for TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction::prop_tag;
 
     #[test]
     fn test_begin_commit() {
@@ -3496,6 +3534,43 @@ mod tests {
             "read_set must be bounded after promotion, got {}",
             rs.len()
         );
+    }
+
+    /// Property-tagged reads promote to a coarse `(Label, Some(tag))` key,
+    /// independently of the structural `(Label, None)` bucket.
+    #[test]
+    fn property_tagged_bucket_promotes_independently() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let l = LabelId::new(9);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        for i in 0..10u64 {
+            mgr.record_read_in_predicate_for_test(
+                tx,
+                EntityId::Node(NodeId::new(i)),
+                xtag,
+                EntityId::Label(l),
+                xtag,
+            )
+            .unwrap();
+        }
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::Label(l), xtag)),
+            "coarse (Label(9),Some(x)) present"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(l), None)),
+            "structural None key must NOT appear"
+        );
+        for i in 0..10u64 {
+            assert!(
+                !rs.contains(&(EntityId::Node(NodeId::new(i)), xtag)),
+                "fine x-reads collapsed"
+            );
+        }
     }
 
     /// With `escalation_threshold = usize::MAX`, no bucket can ever cross it, so
