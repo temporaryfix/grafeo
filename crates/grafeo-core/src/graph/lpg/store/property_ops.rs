@@ -1038,9 +1038,10 @@ impl LpgStore {
         // fine Node write here would be a wildcard that defeats Property
         // granularity. Uses the non-recording committed label set (NOT
         // read_node_labels_visible, which would pollute the writer's read-set).
-        // No-op for SI/RC and SYSTEM.
+        // Passes `key` so the tracker can carry Some(prop_tag(key)) on the coarse
+        // write — the Part-G disjoint-property knob. No-op for SI/RC and SYSTEM.
         let label_ids = self.committed_node_label_ids(id);
-        self.record_coarse_node_labels_only(transaction_id, &label_ids);
+        self.record_coarse_node_labels_only(transaction_id, &label_ids, key);
     }
 
     /// Buffers an uncommitted node property removal (tombstone) into the delta.
@@ -1075,9 +1076,9 @@ impl LpgStore {
         // property REMOVE is also a write to `id` and must fan out ONLY the coarse
         // `Label(L)` (fine Node write already recorded under its property tag) so an
         // escalated structural reader (whose fine `Node(n)` entry was dropped) is
-        // caught.
+        // caught. Passes `key` for the Part-G disjoint-property knob.
         let label_ids = self.committed_node_label_ids(id);
-        self.record_coarse_node_labels_only(transaction_id, &label_ids);
+        self.record_coarse_node_labels_only(transaction_id, &label_ids, key);
     }
 
     /// Buffers an uncommitted edge property write into the transaction's delta.
@@ -1103,9 +1104,9 @@ impl LpgStore {
         // the coarse `RelType(T)` write is the only way that reader is caught. Fan
         // out ONLY the coarse RelType(T) key (fine Edge write already recorded
         // under its property tag). `committed_edge_type_id` reads the edge record
-        // with NO read recording.
+        // with NO read recording. Passes `key` for the Part-G disjoint-property knob.
         if let Some(rel_type) = self.committed_edge_type_id(id) {
-            self.record_coarse_edge_type_only(transaction_id, rel_type);
+            self.record_coarse_edge_type_only(transaction_id, rel_type, key);
         }
     }
 
@@ -1128,8 +1129,9 @@ impl LpgStore {
         // property REMOVE on an edge is also a write to `id` and must fan out ONLY
         // the coarse `RelType(T)` (fine Edge write already recorded under its
         // property tag) so an escalated `RelType(T)` reader is caught.
+        // Passes `key` for the Part-G disjoint-property knob.
         if let Some(rel_type) = self.committed_edge_type_id(id) {
-            self.record_coarse_edge_type_only(transaction_id, rel_type);
+            self.record_coarse_edge_type_only(transaction_id, rel_type, key);
         }
     }
 

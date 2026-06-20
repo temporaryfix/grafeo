@@ -240,8 +240,15 @@ pub trait WriteTracker: Send + Sync {
     /// property tag) or is completed at commit time, so re-recording it here as an
     /// entity-level (`None`) write would be a wildcard that defeats Property
     /// granularity. We only need the coarse `Label(L)` guard so an escalated
-    /// structural `Label(L)` reader (whose fine `Node(n)` entry was dropped) still
-    /// forms the rw-antidependency.
+    /// `Label(L)` reader (whose fine `Node(n)` entry was dropped) still forms the
+    /// rw-antidependency.
+    ///
+    /// `key` is the written property name; the engine bridge computes
+    /// `Some(prop_tag(key))` and passes it as the coarse write's tag so that an
+    /// escalated `(Label(L), Some(x))` reader keeps disjoint-property concurrency:
+    /// an `x`-write conflicts, a `y`-write (with `y != x`) does not. A structural
+    /// escalated reader `(Label(L), None)` still catches every coarse write via the
+    /// `None`-wildcard in `prop_compatible`.
     ///
     /// Default implementation is a no-op: non-engine trackers (and SI/RC, where no
     /// tracker is registered) do not track coarse keys.
@@ -253,13 +260,15 @@ pub trait WriteTracker: Send + Sync {
         &self,
         _transaction_id: TransactionId,
         _labels: &[LabelId],
+        _key: &str,
     ) -> Result<(), OperatorError> {
         Ok(())
     }
 
     /// Records **only** the coarse `RelType(T)` phantom write for an edge, WITHOUT
     /// recording the fine `Edge` entity write. Edge mirror of
-    /// [`record_node_labels_write`](Self::record_node_labels_write).
+    /// [`record_node_labels_write`](Self::record_node_labels_write); `key` carries
+    /// the written property name for the same disjoint-property knob.
     ///
     /// Default implementation is a no-op.
     ///
@@ -270,6 +279,7 @@ pub trait WriteTracker: Send + Sync {
         &self,
         _transaction_id: TransactionId,
         _rel_type: EdgeTypeId,
+        _key: &str,
     ) -> Result<(), OperatorError> {
         Ok(())
     }

@@ -394,10 +394,14 @@ impl TransactionManager {
     /// would) is a `None`-tagged wildcard that destroys Property-granularity
     /// disjointness, so we record the labels alone.
     ///
-    /// The coarse `Label(L)` key is `None`-tagged (a structural write / wildcard);
-    /// via `prop_compatible` it conflicts with any escalated reader under `L` —
-    /// both a structural `(Label(L), None)` and a property-tagged
-    /// `(Label(L), Some(t))` coarse read.
+    /// The coarse `Label(L)` key carries `tag` — the written property's tag
+    /// (`Some(prop_tag(key))` from the caller). This means:
+    /// - A structural escalated reader `(Label(L), None)` still conflicts (via
+    ///   `prop_compatible(None, Some(x)) = true` — `None` is the wildcard).
+    /// - A property-escalated reader `(Label(L), Some(x))` conflicts only when
+    ///   `x == tag` (same property) — the Part-G disjoint-property knob.
+    /// - A property-escalated reader `(Label(L), Some(y))` with `y != tag` does
+    ///   NOT conflict (disjoint properties may run concurrently).
     ///
     /// # Errors
     ///
@@ -406,9 +410,10 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         labels: &[LabelId],
+        tag: PropTag,
     ) -> Result<()> {
         for &label in labels {
-            self.record_write(transaction_id, EntityId::Label(label), None)?;
+            self.record_write(transaction_id, EntityId::Label(label), tag)?;
         }
         Ok(())
     }
@@ -416,8 +421,12 @@ impl TransactionManager {
     /// Fans out **only** the coarse `RelType(T)` write for an edge — WITHOUT
     /// recording the fine `Edge(edge)` entity write. Edge mirror of
     /// [`record_node_labels_write`](Self::record_node_labels_write); see there
-    /// for why the fine entity write is intentionally omitted on the
-    /// property-write path.
+    /// for the semantics of `tag` and why the fine entity write is intentionally
+    /// omitted on the property-write path.
+    ///
+    /// The `tag` is the written property's tag (`Some(prop_tag(key))`), enabling
+    /// disjoint-property concurrency for escalated `(RelType(T), Some(y))` readers
+    /// when `y != tag`.
     ///
     /// # Errors
     ///
@@ -426,8 +435,9 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         rel_type: EdgeTypeId,
+        tag: PropTag,
     ) -> Result<()> {
-        self.record_write(transaction_id, EntityId::RelType(rel_type), None)
+        self.record_write(transaction_id, EntityId::RelType(rel_type), tag)
     }
 
     /// Records a write operation for the transaction.
@@ -3732,5 +3742,65 @@ mod tests {
             coarse.contains(&tx),
             "coarse Label(9) reader must be present in the registry after promotion"
         );
+    }
+
+    // --- Part G Task 3: property-write coarse fan-out carries the written prop tag ---
+
+    /// An escalated `(Label(L), Some("balance"))` reader keeps disjoint-property
+    /// concurrency above the escalation threshold: a coarse write for a *different*
+    /// property (`"amount"`) must NOT form an rw-edge, while a write for the *same*
+    /// property (`"balance"`) must.
+    ///
+    /// This is the "Part-G knob": after Task 3 the coarse fan-out carries
+    /// `Some(prop_tag(key))` instead of `None`, so `prop_compatible(Some(x),
+    /// Some(y))` = false when `x != y`.
+    ///
+    /// Case A and Case B use separate managers so transactions from one case
+    /// do not interfere with the W-W check of the other.
+    #[test]
+    fn property_write_fanout_preserves_knob() {
+        let l = LabelId::new(5);
+        let bal = Some(prop_tag("balance"));
+        let amt = Some(prop_tag("amount"));
+
+        // Case A (knob holds): escalated reader of "balance", writer of "amount"
+        // → NO rw-edge (disjoint properties).
+        {
+            let mgr = TransactionManager::new();
+            let r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r, EntityId::Label(l), bal).unwrap();
+            let wy = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_node_labels_write(wy, &[l], amt).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r),
+                (false, false),
+                "Case A: balance reader must NOT get out_conflict from amount write (knob)"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wy),
+                (false, false),
+                "Case A: amount writer must NOT get in_conflict from balance reader (knob)"
+            );
+        }
+
+        // Case B (conflict): escalated reader of "balance", writer of "balance"
+        // → rw-edge r2 → wx exists.
+        {
+            let mgr = TransactionManager::new();
+            let r2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r2, EntityId::Label(l), bal).unwrap();
+            let wx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_node_labels_write(wx, &[l], bal).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r2),
+                (false, true),
+                "Case B: balance reader must get out_conflict from balance write"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wx),
+                (true, false),
+                "Case B: balance writer must get in_conflict from balance reader"
+            );
+        }
     }
 }

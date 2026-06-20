@@ -1377,30 +1377,44 @@ impl LpgStore {
     /// breaks Property-granularity disjointness — see
     /// [`record_node_labels_write`](crate::execution::operators::WriteTracker::record_node_labels_write).
     ///
+    /// `key` is the written property name; forwarded to the tracker so it can
+    /// compute `Some(prop_tag(key))` for the coarse write's tag (Part-G knob).
+    ///
     /// Silent no-op for SYSTEM and when no write tracker is registered (SI/RC).
     #[inline]
-    pub(crate) fn record_coarse_node_labels_only(&self, tx: TransactionId, labels: &[LabelId]) {
+    pub(crate) fn record_coarse_node_labels_only(
+        &self,
+        tx: TransactionId,
+        labels: &[LabelId],
+        key: &str,
+    ) {
         if tx == TransactionId::SYSTEM {
             return;
         }
         if let Some(t) = self.write_trackers.read().get(&tx) {
-            let _ = t.record_node_labels_write(tx, labels);
+            let _ = t.record_node_labels_write(tx, labels, key);
         }
     }
 
     /// Fans out **only** the coarse `RelType(T)` phantom write for an edge — NO
     /// fine `Edge` entity write. Edge mirror of
     /// [`record_coarse_node_labels_only`](Self::record_coarse_node_labels_only),
-    /// used by the edge property-write paths.
+    /// used by the edge property-write paths. `key` is forwarded for the
+    /// Part-G disjoint-property knob.
     ///
     /// Silent no-op for SYSTEM and when no write tracker is registered (SI/RC).
     #[inline]
-    pub(crate) fn record_coarse_edge_type_only(&self, tx: TransactionId, rel_type: EdgeTypeId) {
+    pub(crate) fn record_coarse_edge_type_only(
+        &self,
+        tx: TransactionId,
+        rel_type: EdgeTypeId,
+        key: &str,
+    ) {
         if tx == TransactionId::SYSTEM {
             return;
         }
         if let Some(t) = self.write_trackers.read().get(&tx) {
-            let _ = t.record_edge_type_write(tx, rel_type);
+            let _ = t.record_edge_type_write(tx, rel_type, key);
         }
     }
 }

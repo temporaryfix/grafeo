@@ -94,31 +94,41 @@ impl WriteTracker for TransactionWriteTracker {
 
     /// Fans out only the coarse `Label(L)` phantom writes (no fine `Node` write).
     ///
-    /// Calls [`TransactionManager::record_node_labels_write`]. Used by the store's
-    /// property-write paths so an escalated `Label(L)` reader is caught without
-    /// adding a `None`-tagged fine `Node` write that would defeat Property
-    /// granularity (the fine write is recorded elsewhere under its property tag).
+    /// Calls [`TransactionManager::record_node_labels_write`] with
+    /// `tag = Some(prop_tag(key))`. Used by the store's property-write paths so
+    /// an escalated `(Label(L), Some(x))` reader keeps disjoint-property
+    /// concurrency above the escalation threshold: an `x`-write conflicts, a
+    /// `y`-write (with `y != x`) does not. Structural escalated readers
+    /// `(Label(L), None)` still catch the tagged write via `prop_compatible`'s
+    /// `None`-wildcard. The fine `Node` write is recorded elsewhere under its
+    /// property tag — recording it again here as `None` would defeat Property
+    /// granularity.
     fn record_node_labels_write(
         &self,
         transaction_id: TransactionId,
         labels: &[LabelId],
+        key: &str,
     ) -> Result<(), OperatorError> {
+        let tag = Some(prop_tag(key));
         self.manager
-            .record_node_labels_write(transaction_id, labels)
+            .record_node_labels_write(transaction_id, labels, tag)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 
     /// Fans out only the coarse `RelType(T)` phantom write (no fine `Edge` write).
     ///
-    /// Calls [`TransactionManager::record_edge_type_write`]. Edge mirror of
+    /// Calls [`TransactionManager::record_edge_type_write`] with
+    /// `tag = Some(prop_tag(key))`. Edge mirror of
     /// [`record_node_labels_write`](Self::record_node_labels_write).
     fn record_edge_type_write(
         &self,
         transaction_id: TransactionId,
         rel_type: EdgeTypeId,
+        key: &str,
     ) -> Result<(), OperatorError> {
+        let tag = Some(prop_tag(key));
         self.manager
-            .record_edge_type_write(transaction_id, rel_type)
+            .record_edge_type_write(transaction_id, rel_type, tag)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 
