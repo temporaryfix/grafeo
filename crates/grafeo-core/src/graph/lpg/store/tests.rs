@@ -2979,6 +2979,141 @@ fn edge_reads_escalate_by_intrinsic_type_at_chokepoint() {
     );
 }
 
+/// `get_node_versioned` (node materialization, e.g. `RETURN n`) must route its
+/// read through [`ReadTracker::record_node_read_in_labels`], NOT the bare
+/// [`record_node_read`]. Under an already-escalated label the engine bridge
+/// short-circuits the re-add; here we verify the wiring by asserting the
+/// `labeled` spy path fires and the bare `fine` path is empty.
+#[test]
+fn node_materialization_routes_through_label_carrying_read() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use grafeo_common::types::LabelId;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    struct Spy {
+        fine: Mutex<Vec<NodeId>>,
+        labeled: Mutex<Vec<(NodeId, Vec<LabelId>)>>,
+    }
+    impl ReadTracker for Spy {
+        fn record_node_read(&self, _tx: TransactionId, id: NodeId) {
+            self.fine.lock().push(id);
+        }
+        fn record_edge_read(&self, _tx: TransactionId, _id: EdgeId) {}
+        fn record_node_read_in_labels(&self, _tx: TransactionId, id: NodeId, labels: &[LabelId]) {
+            self.labeled.lock().push((id, labels.to_vec()));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    // Create a committed node with a label.
+    let epoch = store.new_epoch();
+    let node = store.create_node_versioned(&["N"], epoch, TransactionId::SYSTEM);
+    let commit_epoch = store.new_epoch();
+    store.finalize_entities_by_id(TransactionId::SYSTEM, commit_epoch, &[node], &[]);
+
+    let tx = TransactionId::new(55);
+    let spy = Arc::new(Spy {
+        fine: Mutex::new(Vec::new()),
+        labeled: Mutex::new(Vec::new()),
+    });
+    store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+    // Call get_node_versioned (node materialization).
+    let result = store.get_node_versioned(node, commit_epoch, tx);
+    assert!(result.is_some(), "node must be visible");
+
+    // The label-carrying path must have fired.
+    let labeled = spy.labeled.lock().clone();
+    assert!(
+        labeled.iter().any(|(id, _)| *id == node),
+        "get_node_versioned must route through record_node_read_in_labels, got labeled={labeled:?}"
+    );
+    // Labels must be non-empty (the node has label "N").
+    for (id, labels) in labeled.iter().filter(|(id, _)| *id == node) {
+        assert!(
+            !labels.is_empty(),
+            "labels passed to record_node_read_in_labels for node {id:?} must be non-empty"
+        );
+    }
+    // The bare fine path must NOT have fired.
+    assert!(
+        spy.fine.lock().is_empty(),
+        "node materialization must NOT use bare record_node_read, got fine={:?}",
+        spy.fine.lock()
+    );
+}
+
+/// `read_edge_properties_visible` (edge property materialization, e.g. `RETURN e`)
+/// must route its read through the Task 1 intrinsic-RelType chokepoint
+/// ([`ReadTracker::record_read_edge_in_rel_type`]), NOT the bare
+/// [`record_edge_read`]. Under an already-escalated RelType the engine bridge
+/// short-circuits the re-add; here we verify the wiring.
+#[test]
+fn edge_property_materialization_routes_through_rel_type() {
+    use crate::execution::operators::{ReadTracker, SharedReadTracker};
+    use grafeo_common::types::EdgeTypeId;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Spy {
+        fine: Mutex<Vec<EdgeId>>,
+        coarse: Mutex<Vec<(EdgeId, EdgeTypeId)>>,
+    }
+    impl ReadTracker for Spy {
+        fn record_node_read(&self, _tx: TransactionId, _id: NodeId) {}
+        fn record_edge_read(&self, _tx: TransactionId, id: EdgeId) {
+            self.fine.lock().push(id);
+        }
+        fn record_read_edge_in_rel_type(&self, _tx: TransactionId, id: EdgeId, rt: EdgeTypeId) {
+            self.coarse.lock().push((id, rt));
+        }
+    }
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["N"]);
+    let b = store.create_node(&["N"]);
+    let e0 = store.new_epoch();
+    let edge = store.create_edge_versioned(a, b, "R", e0, TransactionId::SYSTEM);
+    let e1 = store.new_epoch();
+    store.finalize_entities_by_id(TransactionId::SYSTEM, e1, &[], &[edge]);
+    // Give the edge a property so the map is non-empty.
+    store.set_edge_property(edge, "weight", Value::from(1i64));
+
+    let expected_rel_type = store
+        .committed_edge_type_id(edge)
+        .expect("edge must have a committed rel type");
+
+    let tx = TransactionId::new(60);
+    let spy = Arc::new(Spy::default());
+    store.register_read_tracker(tx, Arc::clone(&spy) as SharedReadTracker);
+
+    // Call read_edge_properties_visible (edge property materialization).
+    let props = store.read_edge_properties_visible(edge, e1, Some(tx));
+    assert!(!props.is_empty(), "edge properties must be non-empty");
+
+    // The coarse (rel-type) path must have fired.
+    let coarse = spy.coarse.lock().clone();
+    assert!(
+        coarse.iter().any(|(id, _)| *id == edge),
+        "read_edge_properties_visible must route through record_read_edge_in_rel_type, \
+         got coarse={coarse:?}"
+    );
+    for (id, rt) in coarse.iter().filter(|(id, _)| *id == edge) {
+        assert_eq!(
+            *rt, expected_rel_type,
+            "coarse entry for edge {id:?} must carry RelType {expected_rel_type:?}, got {rt:?}"
+        );
+    }
+    // The bare fine path must NOT have fired.
+    assert!(
+        spy.fine.lock().is_empty(),
+        "edge property materialization must NOT use bare record_edge_read, got fine={:?}",
+        spy.fine.lock()
+    );
+}
+
 // ── TI3: per-tx text-index delta ─────────────────────────────────────────────
 
 /// Under a transaction, setting an indexed text property buffers the change into

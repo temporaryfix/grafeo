@@ -130,6 +130,28 @@ impl ReadTracker for TransactionReadTracker {
         }
     }
 
+    fn record_node_read_in_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        labels: &[LabelId],
+    ) {
+        if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
+            let fine_tag = if self.granularity == ConflictGranularity::Property {
+                Some(STRUCT_TAG)
+            } else {
+                None
+            };
+            let _ = self.manager.record_read_node_escalating(
+                transaction_id,
+                node_id,
+                fine_tag,
+                None,
+                labels,
+            );
+        }
+    }
+
     fn record_node_property_read_in_labels(
         &self,
         transaction_id: TransactionId,

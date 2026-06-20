@@ -1432,8 +1432,13 @@ impl LpgStore {
 
         // Overlay the writing transaction's buffered delta for this edge.
         if let Some(tx) = transaction_id {
-            // Record the edge read: the whole-entity property read IS the read.
-            self.record_read_edge(tx, id);
+            // Record the edge read via the intrinsic-type chokepoint (Task 1)
+            // so an already-escalated RelType short-circuits re-adding a fine entry.
+            if let Some(rel_type) = self.committed_edge_type_id(id) {
+                self.record_read_edge_in_rel_type(tx, id, rel_type);
+            } else {
+                self.record_read_edge(tx, id); // typeless fallback (shouldn't happen)
+            }
             let overlay = self.tx_property_overlay.read();
             if let Some(delta) = overlay.get(&tx) {
                 for ((edge_id, key), op) in &delta.edge_props {

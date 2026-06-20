@@ -400,7 +400,7 @@ impl LpgStore {
         }
         drop(nodes);
         let node = self.build_node(id);
-        self.record_read_node(transaction_id, id);
+        self.record_read_node_materialized(transaction_id, id);
         Some(node)
     }
 
@@ -424,7 +424,7 @@ impl LpgStore {
         }
         drop(versions);
         let node = self.build_node(id);
-        self.record_read_node(transaction_id, id);
+        self.record_read_node_materialized(transaction_id, id);
         Some(node)
     }
 

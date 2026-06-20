@@ -427,6 +427,29 @@ pub trait ReadTracker: Send + Sync {
     ) {
         self.record_edge_read(transaction_id, edge_id);
     }
+
+    /// Structural node read carrying the node's intrinsic labels, so a
+    /// materialization (e.g. `RETURN n`) of a node under an already-escalated
+    /// label short-circuits instead of re-adding a fine entry.
+    ///
+    /// The engine bridge intersects `labels` with the label predicates the
+    /// transaction has already escalated; a match routes through
+    /// `record_read_in_predicate` (which short-circuits when the coarse
+    /// `(Label(L), None)` key is already present) rather than re-inserting a
+    /// fine `(Node(n), None)` entry.  Empty intersection falls back to a fine
+    /// structural read via [`record_node_read`](Self::record_node_read).
+    ///
+    /// Default implementation ignores `labels` and delegates to
+    /// [`record_node_read`](Self::record_node_read), so non-engine trackers
+    /// remain correct.
+    fn record_node_read_in_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        _labels: &[LabelId],
+    ) {
+        self.record_node_read(transaction_id, node_id);
+    }
 }
 
 /// Type alias for a shared read tracker.

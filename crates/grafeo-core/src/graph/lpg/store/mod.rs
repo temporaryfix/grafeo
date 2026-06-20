@@ -1265,6 +1265,24 @@ impl LpgStore {
         }
     }
 
+    /// Records that `tx` materialized node `id` (e.g. `RETURN n`), routing
+    /// through the label-carrying tracker method so an already-escalated label
+    /// short-circuits instead of re-adding a fine `(Node(n), None)` entry.
+    ///
+    /// Skips the `committed_node_label_ids` lookup when no tracker is registered
+    /// for `tx` (SI/ReadCommitted pay nothing — mirrors the pattern of
+    /// [`record_read_node_property_escalating`](Self::record_read_node_property_escalating)).
+    #[inline]
+    pub(crate) fn record_read_node_materialized(&self, tx: TransactionId, id: NodeId) {
+        if !self.read_trackers.read().contains_key(&tx) {
+            return;
+        }
+        let labels = self.committed_node_label_ids(id);
+        if let Some(t) = self.read_trackers.read().get(&tx) {
+            t.record_node_read_in_labels(tx, id, &labels);
+        }
+    }
+
     /// Records that `tx` read property `key` of node `id`, routing through the
     /// label-set-carrying tracker method for read-set escalation.
     ///
