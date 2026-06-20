@@ -137,18 +137,22 @@ impl ReadTracker for TransactionReadTracker {
         labels: &[LabelId],
     ) {
         if self.manager.isolation_level(transaction_id) == Some(IsolationLevel::Serializable) {
-            let fine_tag = if self.granularity == ConflictGranularity::Property {
+            // Under Property granularity, structural visits are tagged
+            // `Some(STRUCT_TAG)` so they promote to `(Label(L), Some(STRUCT_TAG))`
+            // rather than `(Label(L), None)`. This preserves the disjoint-property
+            // knob at coarse scale: a property write `(Label(L), Some(x))` with
+            // `x != STRUCT_TAG` is NOT `prop_compatible` with the structural coarse
+            // read, so it doesn't falsely conflict. A structural write `(Label, None)`
+            // still conflicts (`prop_compatible(Some(STRUCT_TAG), None) = true`).
+            // Under Entity granularity both fine_tag and coarse_tag stay `None`.
+            let tag = if self.granularity == ConflictGranularity::Property {
                 Some(STRUCT_TAG)
             } else {
                 None
             };
-            let _ = self.manager.record_read_node_escalating(
-                transaction_id,
-                node_id,
-                fine_tag,
-                None,
-                labels,
-            );
+            let _ =
+                self.manager
+                    .record_read_node_escalating(transaction_id, node_id, tag, tag, labels);
         }
     }
 

@@ -332,10 +332,12 @@ impl TransactionManager {
     /// Records a node write and fans out coarse `Label(L)` writes for each label.
     ///
     /// Calls `record_write(EntityId::Node(node), tag)` **and**, for every
-    /// `label` in `labels`, `record_write(EntityId::Label(label), None)`.
+    /// `label` in `labels`, `record_coarse_write(EntityId::Label(label), None)`.
     ///
-    /// Both the fine node write and the coarse label writes participate in
-    /// first-writer-wins W-W detection and write-time rw-antidependency detection.
+    /// The fine `Node` write participates in first-writer-wins W-W detection.
+    /// The coarse `Label(L)` writes skip W-W (they are phantom guards, not
+    /// exclusive resources — see [`record_coarse_write`](Self::record_coarse_write))
+    /// but still perform write-time rw-antidependency detection.
     /// Any conflict on any entity returns an error immediately.
     ///
     /// This is the load-bearing path for phantom detection: a concurrent
@@ -344,7 +346,7 @@ impl TransactionManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if any `record_write` call detects a conflict.
+    /// Returns an error if any write call detects a conflict.
     pub fn record_node_write(
         &self,
         transaction_id: TransactionId,
@@ -354,7 +356,7 @@ impl TransactionManager {
     ) -> Result<()> {
         self.record_write(transaction_id, EntityId::Node(node), tag)?;
         for &label in labels {
-            self.record_write(transaction_id, EntityId::Label(label), None)?;
+            self.record_coarse_write(transaction_id, EntityId::Label(label), None)?;
         }
         Ok(())
     }
@@ -362,15 +364,18 @@ impl TransactionManager {
     /// Records an edge write and fans out a coarse `RelType(T)` write.
     ///
     /// Calls `record_write(EntityId::Edge(edge), tag)` **and**
-    /// `record_write(EntityId::RelType(rel_type), None)`.
+    /// `record_coarse_write(EntityId::RelType(rel_type), None)`.
     ///
     /// Symmetric with [`record_node_write`](Self::record_node_write): a
     /// concurrent escalated `RelType(T)` reader conflicts with any writer
-    /// that touches an edge of that type.
+    /// that touches an edge of that type. The fine `Edge` write participates in
+    /// W-W; the coarse `RelType` write skips W-W (phantom guard — see
+    /// [`record_coarse_write`](Self::record_coarse_write)) but still performs
+    /// rw-antidependency detection.
     ///
     /// # Errors
     ///
-    /// Returns an error if any `record_write` call detects a conflict.
+    /// Returns an error if any write call detects a conflict.
     pub fn record_edge_write(
         &self,
         transaction_id: TransactionId,
@@ -379,7 +384,7 @@ impl TransactionManager {
         tag: PropTag,
     ) -> Result<()> {
         self.record_write(transaction_id, EntityId::Edge(edge), tag)?;
-        self.record_write(transaction_id, EntityId::RelType(rel_type), None)?;
+        self.record_coarse_write(transaction_id, EntityId::RelType(rel_type), None)?;
         Ok(())
     }
 
@@ -403,9 +408,15 @@ impl TransactionManager {
     /// - A property-escalated reader `(Label(L), Some(y))` with `y != tag` does
     ///   NOT conflict (disjoint properties may run concurrently).
     ///
+    /// Uses [`record_coarse_write`](Self::record_coarse_write) (no W-W check):
+    /// two concurrent transactions that both write a `Label(L)` guard for
+    /// different real nodes are NOT a real write-write conflict, so the W-W
+    /// check is skipped. The rw-antidependency detection still fires normally,
+    /// so escalated readers remain correctly covered.
+    ///
     /// # Errors
     ///
-    /// Returns an error if any `record_write` call detects a conflict.
+    /// Returns an error if any write call detects a conflict.
     pub fn record_node_labels_write(
         &self,
         transaction_id: TransactionId,
@@ -413,7 +424,7 @@ impl TransactionManager {
         tag: PropTag,
     ) -> Result<()> {
         for &label in labels {
-            self.record_write(transaction_id, EntityId::Label(label), tag)?;
+            self.record_coarse_write(transaction_id, EntityId::Label(label), tag)?;
         }
         Ok(())
     }
@@ -431,16 +442,21 @@ impl TransactionManager {
     /// `(RelType(T), Some(x))` with `x == tag` conflicts; a disjoint reader
     /// `(RelType(T), Some(y))` with `y != tag` does not (the knob).
     ///
+    /// Uses [`record_coarse_write`](Self::record_coarse_write) (no W-W check):
+    /// two concurrent transactions writing `RelType(T)` guards for different real
+    /// edges are NOT a real write-write conflict. The rw-antidependency detection
+    /// still fires normally.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the `record_write` call detects a conflict.
+    /// Returns an error if the write call detects a conflict.
     pub fn record_edge_type_write(
         &self,
         transaction_id: TransactionId,
         rel_type: EdgeTypeId,
         tag: PropTag,
     ) -> Result<()> {
-        self.record_write(transaction_id, EntityId::RelType(rel_type), tag)
+        self.record_coarse_write(transaction_id, EntityId::RelType(rel_type), tag)
     }
 
     /// Records a write operation for the transaction.
@@ -473,8 +489,57 @@ impl TransactionManager {
         entity: impl Into<EntityId>,
         tag: PropTag,
     ) -> Result<()> {
-        let entity = entity.into();
+        self.record_write_inner(transaction_id, entity.into(), tag, true)
+    }
 
+    /// Records a write to a COARSE predicate key (`Label(L)` / `RelType(T)`) —
+    /// the phantom guard for escalated predicate readers.
+    ///
+    /// Inserts into the write-set and performs write-time rw-antidependency
+    /// detection, but **deliberately skips first-writer-wins W-W**: a coarse
+    /// predicate key is a guard, not an exclusive resource — two txns that
+    /// structurally touch DIFFERENT entities under the same label/type both
+    /// legitimately write it, and a W-W there is a false conflict. When
+    /// swallowed (e.g. `let _ = record_write(…)`) the false W-W silently drops
+    /// the rw-edge → missed write-skew; when propagated it falsely aborts one
+    /// of the transactions.
+    ///
+    /// The REAL W-W for fine `Node`/`Edge` entity keys is recorded separately
+    /// by [`record_write`](Self::record_write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_coarse_write(
+        &self,
+        transaction_id: TransactionId,
+        entity: impl Into<EntityId>,
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_write_inner(transaction_id, entity.into(), tag, false)
+    }
+
+    /// Shared implementation for [`record_write`](Self::record_write) and
+    /// [`record_coarse_write`](Self::record_coarse_write).
+    ///
+    /// `check_ww` gates the first-writer-wins loop: `true` for fine entity
+    /// writes (`Node`/`Edge`), `false` for coarse predicate phantom guards
+    /// (`Label`/`RelType`). Everything else — state check, `write_set.insert`,
+    /// and Serializable rw-antidependency detection — is identical.
+    ///
+    /// # Lock discipline
+    ///
+    /// The `transactions` write lock is held only for the W-W check (when
+    /// `check_ww`) and `write_set.insert`. It is dropped before consulting the
+    /// `ReadRegistry` and before calling `set_rw_edge` (which also takes
+    /// `transactions.write()`), avoiding re-entrant deadlock.
+    fn record_write_inner(
+        &self,
+        transaction_id: TransactionId,
+        entity: EntityId,
+        tag: PropTag,
+        check_ww: bool,
+    ) -> Result<()> {
         // Perform the W-W check and write_set insert under the transactions lock,
         // then release the lock before any read_registry or set_rw_edge calls.
         // Also capture the writer's start epoch (for the concurrency check
@@ -484,8 +549,11 @@ impl TransactionManager {
 
             // First-writer-wins conflict detection (entity only — W-W is always
             // entity-level regardless of tag). Skip the scan when only one
-            // transaction is active (common case for auto-commit).
-            if self.active_count.load(Ordering::Relaxed) > 1 {
+            // transaction is active (common case for auto-commit) or when the
+            // caller is recording a coarse phantom-guard key (Label/RelType) where
+            // two concurrent txns touching different real entities under the same
+            // predicate both legitimately write it — a W-W there is a false conflict.
+            if check_ww && self.active_count.load(Ordering::Relaxed) > 1 {
                 for (other_tx, other_info) in txns.iter() {
                     if *other_tx != transaction_id
                         && other_info.state == TransactionState::Active
@@ -762,12 +830,21 @@ impl TransactionManager {
         tag: PropTag,
         label: LabelId,
     ) -> Result<()> {
+        // The coarse_tag mirrors the fine tag: for Entity granularity `tag` is
+        // `None` (wildcard) and the bucket promotes to `(Label(L), None)`;
+        // for Property granularity structural reads `tag` is `Some(STRUCT_TAG)`
+        // and the bucket promotes to `(Label(L), Some(STRUCT_TAG))`. Using
+        // `STRUCT_TAG` at the coarse level preserves the disjoint-property knob:
+        // `prop_compatible(Some(STRUCT_TAG), Some(prop_x))` is false, so a
+        // property write does NOT conflict with a structural-only coarse reader.
+        // A structural write (`None` tag) still conflicts:
+        // `prop_compatible(Some(STRUCT_TAG), None) = true`.
         self.record_read_in_predicate(
             transaction_id,
             EntityId::Node(node),
             tag,
             EntityId::Label(label),
-            None,
+            tag,
         )
     }
 
@@ -789,12 +866,16 @@ impl TransactionManager {
         tag: PropTag,
         rel: EdgeTypeId,
     ) -> Result<()> {
+        // Symmetric with `record_read_in_label`: coarse_tag mirrors fine tag so
+        // that structural reads (`None`) promote to `(RelType(T), None)` while
+        // Property-granularity structural reads (`Some(STRUCT_TAG)`) promote to
+        // `(RelType(T), Some(STRUCT_TAG))`, preserving the disjoint-property knob.
         self.record_read_in_predicate(
             transaction_id,
             EntityId::Edge(edge),
             tag,
             EntityId::RelType(rel),
-            None,
+            tag,
         )
     }
 
@@ -804,8 +885,11 @@ impl TransactionManager {
     /// `fine` / `fine_tag` identify the per-row key (`Node`/`Edge`) and its
     /// property tag. `predicate` is the coarse scan key (`Label`/`RelType`).
     /// `coarse_tag` is the tag that will be recorded on the coarse read if this
-    /// bucket promotes; for structural escalation it is always `None`, but
-    /// property-tagged scans may pass `Some(prop_tag)` to promote to a
+    /// bucket promotes. For Entity-granularity structural escalation it is `None`
+    /// (wildcard); for Property-granularity structural escalation it is
+    /// `Some(STRUCT_TAG)` (which is `prop_compatible` with structural writes but
+    /// NOT with property writes, preserving the disjoint-property knob at scale);
+    /// for property-tagged scans it is `Some(prop_tag)` to promote to a
     /// `(Label(L), Some(t))` key independently of the structural bucket.
     ///
     /// # Lock discipline
@@ -1118,11 +1202,23 @@ impl TransactionManager {
         // Transactions committed before our start_epoch are part of our visible
         // snapshot, so overwriting their values is not a conflict.
         // W-W comparison is entity-only (ignores PropTag).
+        //
+        // Coarse predicate-guard keys (Label(L) / RelType(T)) are deliberately
+        // excluded: they are phantom guards used for SSI rw-antidependency
+        // detection, not exclusive resources. Two transactions that each wrote
+        // DIFFERENT real entities under the same predicate both legitimately hold
+        // the coarse key — a W-W on it here would be a false conflict (matching
+        // the write-time behaviour of record_coarse_write).
         for (other_tx, commit_epoch) in committed.iter() {
             if *other_tx != transaction_id && commit_epoch.as_u64() > our_start_epoch.as_u64() {
                 // Check if that transaction wrote to any of our entities
                 if let Some(other_info) = txns.get(other_tx) {
                     for (entity, _) in &our_write_set {
+                        if matches!(entity, EntityId::Label(_) | EntityId::RelType(_)) {
+                            // Coarse phantom guard — skip W-W; the SSI rw-edge
+                            // machinery handles the real conflict.
+                            continue;
+                        }
                         if other_info.write_set.iter().any(|(e, _)| e == entity) {
                             return Err(Error::Transaction(TransactionError::WriteConflict(
                                 format!("Write-write conflict on entity {:?}", entity),
@@ -4075,5 +4171,92 @@ mod tests {
                 && rs.contains(&(EntityId::Edge(EdgeId::new(101)), xtag)),
             "unscanned / typeless edge property reads stay fine"
         );
+    }
+
+    // --- Task 7: record_coarse_write skips first-writer-wins W-W ---
+
+    /// `record_coarse_write` must allow two concurrent Serializable transactions
+    /// to both write the same coarse `Label(L)` guard without a W-W conflict
+    /// (because they are writing DIFFERENT real entities under that label — the
+    /// coarse key is a phantom guard, not an exclusive resource). By contrast,
+    /// `record_write` on the same coarse key from two active transactions DOES
+    /// fire W-W (the flag genuinely gates).
+    ///
+    /// Also verifies that a coarse write still forms the rw-edge against a
+    /// concurrent reader of the same coarse key.
+    #[test]
+    fn coarse_write_skips_first_writer_wins() {
+        let lbl7 = LabelId::new(7);
+
+        // Part 1: two active Serializable txns both call record_coarse_write
+        // on the same Label(7) → BOTH return Ok (no WriteConflict).
+        {
+            let mgr = TransactionManager::new();
+            let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            let r1 = mgr.record_coarse_write(tx1, EntityId::Label(lbl7), None);
+            assert!(
+                r1.is_ok(),
+                "first coarse write of Label(7) must succeed: {r1:?}"
+            );
+
+            let r2 = mgr.record_coarse_write(tx2, EntityId::Label(lbl7), None);
+            assert!(
+                r2.is_ok(),
+                "second coarse write of Label(7) must also succeed — \
+                 coarse key is a phantom guard, not an exclusive resource: {r2:?}"
+            );
+        }
+
+        // Part 2: a coarse write still forms the rw-edge against a concurrent
+        // coarse reader (the rw-detection side is unaffected by the W-W skip).
+        {
+            let mgr = TransactionManager::new();
+            let tx_reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            // Reader records Label(7) read → enters the SIREAD registry.
+            mgr.record_read(tx_reader, EntityId::Label(lbl7), None)
+                .unwrap();
+
+            // Coarse write of Label(7) from a concurrent Serializable writer.
+            mgr.record_coarse_write(tx_writer, EntityId::Label(lbl7), None)
+                .unwrap();
+
+            // The rw-edge reader →rw writer must have formed.
+            assert_eq!(
+                mgr.conflict_flags(tx_reader),
+                (false, true),
+                "coarse write must set reader.out_conflict via rw-detection"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx_writer),
+                (true, false),
+                "coarse write must set writer.in_conflict via rw-detection"
+            );
+        }
+
+        // Part 3 (contrast): record_write on the same coarse key from two active
+        // txns DOES fire W-W — the check_ww flag genuinely gates the behaviour.
+        {
+            let mgr = TransactionManager::new();
+            let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            mgr.record_write(tx1, EntityId::Label(lbl7), None).unwrap();
+
+            let r2 = mgr.record_write(tx2, EntityId::Label(lbl7), None);
+            assert!(
+                r2.is_err(),
+                "record_write (check_ww=true) on the same Label key from a second \
+                 active tx must still return WriteConflict: {r2:?}"
+            );
+            let msg = r2.unwrap_err().to_string();
+            assert!(
+                msg.contains("Write-write conflict"),
+                "expected 'Write-write conflict' in error, got: {msg}"
+            );
+        }
     }
 }

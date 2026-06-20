@@ -3816,45 +3816,32 @@ fn serializable_escalated_property_knob_disjoint_commits() {
     assert_eq!(amt.row_count(), 1, "node 1 must exist");
 }
 
-/// Observation test for same-property write-skew at escalation scale.
+/// Same-property write-skew at escalation scale is now correctly detected.
 ///
-/// BACKGROUND — recorded soundness gap (2026-06-20):
+/// Two concurrent Property/Serializable sessions BOTH scan all `:Acct3` nodes
+/// (escalating to `(Label(Acct3), Some(balance_tag))`) and then each writes
+/// `balance` on a DIFFERENT node:
 ///
-/// When two concurrent Property/Serializable sessions BOTH scan all `:Acct3`
-/// nodes (escalating to `(Label(Acct3), Some(balance_tag))`) and then each
-/// writes `balance` on a DIFFERENT node, there is a write-skew:
+///   s1 reads ALL balance  (sees node 1 incl.)  → escalates to (Label, Some(bal))
+///   s2 reads ALL balance  (sees node 0 incl.)  → escalates to (Label, Some(bal))
+///   s1 writes node-0.balance → coarse write (Label, Some(bal)) → rw-edge: s2→rw→s1
+///   s2 writes node-1.balance → coarse write (Label, Some(bal)) → rw-edge: s1→rw→s2
 ///
-///   s1 reads ALL balance  (sees node 1 incl.)
-///   s2 reads ALL balance  (sees node 0 incl.)
-///   s1 writes node-0.balance  →  node 1's balance is now stale in s1's view
-///   s2 writes node-1.balance  →  node 0's balance is now stale in s2's view
+/// This is a write-skew cycle (s1 and s2 are both pivots). The second
+/// committer must fail with SerializationFailure.
 ///
-/// Under a correct SSI implementation this is a write-skew cycle and the
-/// second committer SHOULD abort with SerializationFailure.
+/// Previously (soundness gap, Task 6): the property-write fan-out called
+/// `record_write(Label, Some(bal))` which triggered a first-writer-wins W-W
+/// when s1 already had that coarse key. That error was swallowed (`let _ =`)
+/// so s2's rw-edge never formed and both sessions committed — a missed
+/// write-skew.
 ///
-/// CURRENT BEHAVIOUR: both sessions commit.
-///
-/// WHY: The property-write fan-out records `(Label(Acct3), Some(balance_tag))`
-/// in the coarse write-set for s1. When s2 tries to record the same coarse
-/// entry, the first-writer-wins W-W check fires (s1 already has `Label(Acct3)`
-/// in its write_set) and the error is silently dropped by
-/// `record_coarse_node_labels_only` (uses `let _ = ...`). This prevents the
-/// `set_rw_edge(s1_reader, s2_writer)` from firing: s2.in_conflict stays
-/// false, the dangerous-structure cycle is not detected, and s2 commits.
-///
-/// SOUNDNESS NOTE: The W-W check on phantom coarse keys (`Label`, `RelType`)
-/// is overly aggressive for property-write fan-out: two transactions writing
-/// different nodes with the same label/tag are not a real W-W conflict on any
-/// single entity. A future fix would gate the W-W check to real (fine) entity
-/// keys only, and always proceed with the rw-edge formation for coarse
-/// phantom writes. That fix is out of scope for Task 6; this test documents
-/// the observed behaviour and is a regression anchor.
-///
-/// ASSERTION: Both commits succeed (the observed, not the desired, outcome).
-/// If this test STARTS FAILING with a SerializationFailure that means the
-/// soundness gap was fixed — in which case update the assertion and the doc.
+/// Fix (Task 7): coarse phantom-guard writes go through `record_coarse_write`
+/// which skips W-W but still runs rw-antidependency detection. Both sessions
+/// now record the coarse guard and both rw-edges form → the second committer
+/// is aborted as the dangerous-structure pivot.
 #[test]
-fn serializable_escalated_property_same_prop_both_commit_known_gap() {
+fn serializable_escalated_property_same_prop_aborts() {
     let db = GrafeoDB::new_in_memory();
 
     // Seed 10 :Acct3 nodes with a balance property.
@@ -3903,24 +3890,97 @@ fn serializable_escalated_property_same_prop_both_commit_known_gap() {
     s2.execute("MATCH (n:Acct3 {id: 1}) SET n.balance = 8888")
         .expect("s2: SET balance on node 1");
 
-    // OBSERVED BEHAVIOUR: both commit (the second SHOULD abort but doesn't
-    // due to the phantom-coarse W-W gap documented above).
+    // First committer succeeds; second committer is the dangerous-structure
+    // pivot and must abort with SerializationFailure.
     let c1 = s1.commit();
     assert!(c1.is_ok(), "s1 (first committer) must succeed: {c1:?}");
 
     let c2 = s2.commit();
-    // NOTE: if this assertion fails with SerializationFailure in the future,
-    // the soundness gap documented above was fixed — update to assert_err.
-    assert!(
-        c2.is_ok(),
-        "s2 must also commit under the current implementation \
-         (both-same-prop write-skew is NOT detected at escalation scale \
-         due to the phantom-coarse W-W gap — see test doc above); got: {c2:?}"
+    assert_serialization_failure(
+        &c2,
+        "s2 (second committer in escalated same-property write-skew)",
     );
 }
 
 /// T = usize::MAX reproduces full-precision (no escalation) behaviour.
 ///
+/// Structural (entity-granularity) write-skew via escalated `Label(L)` reads.
+///
+/// Two Serializable sessions (Entity granularity, the default) each scan ALL
+/// `:Wid` nodes (escalating the structural `Label(Wid)` read to a coarse key)
+/// and then each writes a property on a DIFFERENT `:Wid` node.
+///
+/// The write-skew cycle:
+///   s1 reads ALL :Wid nodes (structural escalation → Label(Wid) in read-set)
+///   s2 reads ALL :Wid nodes (same)
+///   s1 SET n.val on node 0  → coarse structural write Label(Wid) fan-out
+///                            → rw-edge: s2 →rw→ s1
+///   s2 SET n.val on node 1  → coarse structural write Label(Wid) fan-out
+///                            → rw-edge: s1 →rw→ s2
+///
+/// Both sessions are pivots; the second committer must abort.
+///
+/// This test proves the pre-existing structural-fan-out gap is also fixed:
+/// `record_node_write` now uses `record_coarse_write` for the `Label` fan-out,
+/// so both concurrent structural writers record the coarse guard correctly.
+#[test]
+fn serializable_escalated_structural_same_label_write_skew_aborts() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Seed 10 :Wid nodes with a val property.
+    let setup = db.session();
+    for i in 0..10i64 {
+        setup
+            .execute(&format!("CREATE (:Wid {{id: {i}, val: {i}}})"))
+            .expect("create :Wid node");
+    }
+    drop(setup);
+
+    // Lower threshold to 4 so 10 nodes escalate structurally.
+    let mgr_session = db.session();
+    mgr_session
+        .transaction_manager_ref()
+        .set_escalation_threshold(4);
+    drop(mgr_session);
+
+    // Both sessions: Entity granularity (default) + Serializable.
+    let mut s1 = db.session();
+    s1.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s1: begin Serializable");
+
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(IsolationLevel::Serializable)
+        .expect("s2: begin Serializable");
+
+    // Both sessions scan ALL :Wid nodes structurally (escalates to Label(Wid)).
+    let r1 = s1
+        .execute("MATCH (n:Wid) RETURN n")
+        .expect("s1: MATCH :Wid RETURN n");
+    assert_eq!(r1.row_count(), 10, "s1 must see all 10 :Wid nodes");
+
+    let r2 = s2
+        .execute("MATCH (n:Wid) RETURN n")
+        .expect("s2: MATCH :Wid RETURN n");
+    assert_eq!(r2.row_count(), 10, "s2 must see all 10 :Wid nodes");
+
+    // Each writes val on a DIFFERENT :Wid node (disjoint fine entity W-W keys).
+    s1.execute("MATCH (n:Wid {id: 0}) SET n.val = 9999")
+        .expect("s1: SET val on node 0");
+    s2.execute("MATCH (n:Wid {id: 1}) SET n.val = 8888")
+        .expect("s2: SET val on node 1");
+
+    // First committer succeeds; second committer is the dangerous-structure
+    // pivot and must abort with SerializationFailure.
+    let c1 = s1.commit();
+    assert!(c1.is_ok(), "s1 (first committer) must succeed: {c1:?}");
+
+    let c2 = s2.commit();
+    assert_serialization_failure(
+        &c2,
+        "s2 (second committer in escalated structural same-label write-skew)",
+    );
+}
+
 /// With `set_escalation_threshold(usize::MAX)` no bucket can ever cross the
 /// threshold, so every read stays as a fine `EntityId::Node(_)` entry.
 /// After scanning 10 `:Acct4` nodes the read-set must contain the N fine Node
