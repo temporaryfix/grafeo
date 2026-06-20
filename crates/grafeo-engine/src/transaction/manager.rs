@@ -424,9 +424,12 @@ impl TransactionManager {
     /// for the semantics of `tag` and why the fine entity write is intentionally
     /// omitted on the property-write path.
     ///
-    /// The `tag` is the written property's tag (`Some(prop_tag(key))`), enabling
-    /// disjoint-property concurrency for escalated `(RelType(T), Some(y))` readers
-    /// when `y != tag`.
+    /// The `tag` is the written property's tag (`Some(prop_tag(key))`). As with
+    /// [`record_node_labels_write`](Self::record_node_labels_write): a structural
+    /// escalated reader `(RelType(T), None)` still conflicts (the `None` wildcard
+    /// is `prop_compatible` with any write); a same-property reader
+    /// `(RelType(T), Some(x))` with `x == tag` conflicts; a disjoint reader
+    /// `(RelType(T), Some(y))` with `y != tag` does not (the knob).
     ///
     /// # Errors
     ///
@@ -3755,8 +3758,9 @@ mod tests {
     /// `Some(prop_tag(key))` instead of `None`, so `prop_compatible(Some(x),
     /// Some(y))` = false when `x != y`.
     ///
-    /// Case A and Case B use separate managers so transactions from one case
-    /// do not interfere with the W-W check of the other.
+    /// Cases A/B cover the node `Label` path; Cases C/D mirror them for the edge
+    /// `RelType` path. Each case uses a separate manager so transactions from one
+    /// case do not interfere with the W-W check of another.
     #[test]
     fn property_write_fanout_preserves_knob() {
         let l = LabelId::new(5);
@@ -3800,6 +3804,48 @@ mod tests {
                 mgr.conflict_flags(wx),
                 (true, false),
                 "Case B: balance writer must get in_conflict from balance reader"
+            );
+        }
+
+        // Case C (edge, knob holds): escalated RelType reader of "balance",
+        // edge writer of "amount" → NO rw-edge (disjoint properties).
+        {
+            let t = EdgeTypeId::new(5);
+            let mgr = TransactionManager::new();
+            let r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r, EntityId::RelType(t), bal).unwrap();
+            let wy = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_edge_type_write(wy, t, amt).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r),
+                (false, false),
+                "Case C: balance RelType reader must NOT conflict with amount edge write (knob)"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wy),
+                (false, false),
+                "Case C: amount edge writer must NOT conflict with balance RelType reader (knob)"
+            );
+        }
+
+        // Case D (edge, conflict): escalated RelType reader of "balance", edge
+        // writer of "balance" → rw-edge exists.
+        {
+            let t = EdgeTypeId::new(5);
+            let mgr = TransactionManager::new();
+            let r2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r2, EntityId::RelType(t), bal).unwrap();
+            let wx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_edge_type_write(wx, t, bal).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r2),
+                (false, true),
+                "Case D: balance RelType reader must get out_conflict from balance edge write"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wx),
+                (true, false),
+                "Case D: balance edge writer must get in_conflict from balance RelType reader"
             );
         }
     }
