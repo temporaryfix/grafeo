@@ -16,8 +16,9 @@ use super::id::MAX_TABLE_ID;
 use super::node_table::NodeTable;
 use super::rel_table::RelTable;
 use super::schema::{ColumnDef, ColumnType, EdgeSchema, TableSchema};
+use super::temporal_column::TemporalColumn;
 use super::zone_map::ZoneMap;
-use crate::codec::{BitPackedInts, BitVector, DictionaryBuilder};
+use crate::codec::{BitPackedInts, BitVector, DictionaryBuilder, FsstCodec};
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 
 // ---------------------------------------------------------------------------
@@ -476,38 +477,10 @@ impl CompactStoreBuilder {
             fwd_edges.sort_by_key(|&(src, _dst)| src);
             let fwd = CsrAdjacency::from_sorted_edges(src_node_count, &fwd_edges);
 
-            // Optionally build backward CSR + pre-compute bwd-to-fwd position mapping.
-            let bwd =
-                if rtb.backward {
-                    let mut bwd_edges: Vec<(u32, u32)> =
-                        rtb.edges.iter().map(|&(src, dst)| (dst, src)).collect();
-                    bwd_edges.sort_by_key(|&(dst, _src)| dst);
-                    let mut bwd_csr = CsrAdjacency::from_sorted_edges(dst_node_count, &bwd_edges);
-
-                    // For each backward edge (dst -> src), find the forward CSR position
-                    // of the corresponding (src -> dst) edge. This eliminates the O(degree)
-                    // linear scan in edges_to_target at query time.
-                    let mut mapping = Vec::with_capacity(bwd_edges.len());
-                    for &(dst, src) in &bwd_edges {
-                        let fwd_neighbors = fwd.neighbors(src);
-                        let fwd_start = fwd.offset_of(src);
-                        let local_idx = fwd_neighbors.iter().position(|&t| t == dst).ok_or_else(
-                            || {
-                                CompactStoreError::InconsistentEdgeData(format!(
-                                    "backward edge ({dst}->{src}) has no corresponding forward edge"
-                                ))
-                            },
-                        )?;
-                        // reason: local index within CSR neighbors fits u32
-                        #[allow(clippy::cast_possible_truncation)]
-                        mapping.push(fwd_start + local_idx as u32);
-                    }
-                    bwd_csr.set_edge_data(mapping);
-
-                    Some(bwd_csr)
-                } else {
-                    None
-                };
+            // Share exact forward-position mapping with temporal compaction.
+            let bwd = rtb
+                .backward
+                .then(|| super::rel_table::backward_from_fwd(&fwd, dst_node_count));
 
             // Build edge property columns.
             let property_col_defs: Vec<ColumnDef> = rtb
@@ -527,8 +500,13 @@ impl CompactStoreBuilder {
                 property_col_defs,
             );
 
-            let properties: FxHashMap<PropertyKey, ColumnCodec> =
-                rtb.properties.into_iter().collect();
+            // Keep collecting ColumnCodec during build; wrap as all-open
+            // TemporalColumn at RelTable construction (fresh-base identity).
+            let properties: FxHashMap<PropertyKey, TemporalColumn> = rtb
+                .properties
+                .into_iter()
+                .map(|(k, codec)| (k, TemporalColumn::all_open(codec)))
+                .collect();
 
             let table = RelTable::new(schema, fwd, bwd, properties, src_table_id, dst_table_id);
             edge_type_to_rel_id
@@ -597,6 +575,7 @@ fn infer_column_type(codec: &ColumnCodec) -> ColumnType {
             dimensions: *dimensions,
         },
         ColumnCodec::RawI64(_) => ColumnType::Int64,
+        ColumnCodec::Fsst(_) => ColumnType::FsstString,
     }
 }
 
@@ -729,7 +708,9 @@ pub fn from_graph_store(
     // Step 1: Collect all nodes grouped by label, build ID mapping.
     let labels = store.all_labels();
     if labels.is_empty() {
-        return CompactStoreBuilder::new().build();
+        return CompactStoreBuilder::new()
+            .build()
+            .map(|compact| compact.with_property_history_floor(Some(store.current_epoch())));
     }
 
     // old_node_id -> (label_key, offset_within_label)
@@ -900,14 +881,10 @@ pub fn from_graph_store(
                             })
                             .collect();
                         let str_refs: Vec<&str> = str_values.iter().map(String::as_str).collect();
-                        let mut dict_builder = DictionaryBuilder::new();
-                        for s in &str_refs {
-                            dict_builder.add(s);
-                        }
-                        let dict = dict_builder.build();
                         let zone_map = compute_zone_map_strings(&str_refs);
                         t.zone_maps.push((key.clone(), zone_map));
-                        t.columns.push((key.clone(), ColumnCodec::Dict(dict)));
+                        t.columns
+                            .push((key.clone(), encode_string_column(&str_values)));
                         t.record_len(str_values.len());
                     }
                 }
@@ -1056,12 +1033,8 @@ pub fn from_graph_store(
                                         other => format!("{other}"),
                                     })
                                     .collect();
-                                let mut dict_builder = DictionaryBuilder::new();
-                                for s in &str_values {
-                                    dict_builder.add(s);
-                                }
-                                let dict = dict_builder.build();
-                                r.properties.push((key.clone(), ColumnCodec::Dict(dict)));
+                                r.properties
+                                    .push((key.clone(), encode_string_column(&str_values)));
                             }
                         }
                     }
@@ -1072,7 +1045,11 @@ pub fn from_graph_store(
         );
     }
 
-    builder.build()
+    // This conversion copies current values only. A temporal caller that folds
+    // complete source history must explicitly replace this conservative floor.
+    builder
+        .build()
+        .map(|compact| compact.with_property_history_floor(Some(store.current_epoch())))
 }
 
 /// Builds a [`CompactStore`] from any [`GraphStore`](crate::graph::GraphStore) with original ID preservation.
@@ -1224,6 +1201,33 @@ pub fn from_graph_store_preserving_ids(
     Ok(compact)
 }
 
+/// Encodes a string column, choosing the smaller of dictionary and FSST
+/// encoding by in-memory footprint (the dictionary wins ties).
+///
+/// FSST wins on high-cardinality, compressible columns because it compresses
+/// each value. The dictionary wins when values repeat (it deduplicates) or when
+/// the column is small, since FSST carries a fixed symbol table of about
+/// 2.3 KB. Building both and keeping the smaller is regression proof: the result
+/// is never larger than the previous dictionary-always behavior, and it needs no
+/// cardinality threshold. This runs on the batch compaction path, so building
+/// both is acceptable.
+fn encode_string_column(str_values: &[String]) -> ColumnCodec {
+    let mut dict_builder = DictionaryBuilder::new();
+    for s in str_values {
+        dict_builder.add(s.as_str());
+    }
+    let dict = ColumnCodec::Dict(dict_builder.build());
+
+    let byte_refs: Vec<&[u8]> = str_values.iter().map(|s| s.as_bytes()).collect();
+    let fsst = ColumnCodec::Fsst(FsstCodec::build(&byte_refs));
+
+    if fsst.heap_bytes() < dict.heap_bytes() {
+        fsst
+    } else {
+        dict
+    }
+}
+
 /// Infers the columnar encoding type from a slice of [`Value`]s.
 ///
 /// Rules:
@@ -1327,6 +1331,40 @@ mod tests {
     }
 
     #[test]
+    fn encode_string_column_picks_fsst_for_high_cardinality_compressible() {
+        // 500 unique, prefix-sharing, compressible strings: dictionary can't
+        // dedup (all distinct) but FSST compresses each → FSST should win.
+        let values: Vec<String> = (0..500)
+            .map(|i| format!("https://example.com/users/profile/{i:08}/settings"))
+            .collect();
+        let codec = encode_string_column(&values);
+        assert!(
+            matches!(codec, ColumnCodec::Fsst(_)),
+            "high-cardinality compressible column should select FSST"
+        );
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(codec.get(i), Some(Value::String(v.as_str().into())));
+        }
+    }
+
+    #[test]
+    fn encode_string_column_picks_dict_for_low_cardinality() {
+        // 2 distinct values across 500 rows: dictionary dedup beats FSST's
+        // fixed ~2.3 KB symbol-table overhead.
+        let values: Vec<String> = (0..500)
+            .map(|i| if i % 2 == 0 { "active" } else { "inactive" }.to_string())
+            .collect();
+        let codec = encode_string_column(&values);
+        assert!(
+            matches!(codec, ColumnCodec::Dict(_)),
+            "low-cardinality column should select dictionary"
+        );
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(codec.get(i), Some(Value::String(v.as_str().into())));
+        }
+    }
+
+    #[test]
     fn test_builder_with_edges() {
         let store = CompactStoreBuilder::new()
             .node_table("A", |t| t.column_bitpacked("val", &[1, 2, 3], 4))
@@ -1341,6 +1379,88 @@ mod tests {
         assert_eq!(a_ids.len(), 3);
         let b_ids = store.nodes_by_label("B");
         assert_eq!(b_ids.len(), 2);
+    }
+
+    #[test]
+    fn backward_csr_preserves_parallel_edge_identity() {
+        let store = CompactStoreBuilder::new()
+            .node_table("Node", |t| t.column_bitpacked("id", &[0, 1], 1))
+            .rel_table("LINK", "Node", "Node", |r| {
+                r.edges([(0, 1), (0, 1), (0, 1)])
+                    .backward(true)
+                    .column_bitpacked("weight", &[10, 20, 30], 6)
+            })
+            .build()
+            .unwrap();
+        let nodes = store.nodes_by_label("Node");
+        let key = PropertyKey::new("weight");
+        let outgoing = store.edges_from(nodes[0], crate::graph::Direction::Outgoing);
+        let incoming = store.edges_from(nodes[1], crate::graph::Direction::Incoming);
+        let outgoing_weights: Vec<_> = outgoing
+            .iter()
+            .map(|(_, edge)| store.get_edge_property(*edge, &key).unwrap())
+            .collect();
+        let incoming_weights: Vec<_> = incoming
+            .iter()
+            .map(|(_, edge)| store.get_edge_property(*edge, &key).unwrap())
+            .collect();
+        assert_eq!(outgoing.len(), 3);
+        assert_eq!(incoming.len(), 3);
+        assert_eq!(outgoing_weights, incoming_weights);
+        assert_eq!(
+            incoming_weights,
+            vec![Value::Int64(10), Value::Int64(20), Value::Int64(30)]
+        );
+    }
+
+    #[test]
+    fn backward_csr_tracks_interleaved_forward_targets() {
+        let store = CompactStoreBuilder::new()
+            .node_table("Node", |t| t.column_bitpacked("id", &[0, 1], 1))
+            .rel_table("LINK", "Node", "Node", |r| {
+                r.edges([(0, 1), (0, 0), (0, 1), (1, 0)])
+                    .backward(true)
+                    .column_bitpacked("weight", &[10, 20, 30, 40], 6)
+            })
+            .build()
+            .unwrap();
+        let nodes = store.nodes_by_label("Node");
+        let key = PropertyKey::new("weight");
+        let mut forward = nodes
+            .iter()
+            .flat_map(|source| store.edges_from(*source, crate::graph::Direction::Outgoing))
+            .map(|(target, edge)| {
+                (
+                    store.get_edge(edge).unwrap().src,
+                    target,
+                    edge,
+                    store.get_edge_property(edge, &key).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut reverse = nodes
+            .iter()
+            .flat_map(|target| {
+                store
+                    .edges_from(*target, crate::graph::Direction::Incoming)
+                    .into_iter()
+                    .map(move |(source, edge)| (source, *target, edge))
+            })
+            .map(|(source, target, edge)| {
+                (
+                    source,
+                    target,
+                    edge,
+                    store.get_edge_property(edge, &key).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        forward.sort_by_key(|(_, _, edge, _)| *edge);
+        reverse.sort_by_key(|(_, _, edge, _)| *edge);
+        assert_eq!(forward.len(), 4);
+        assert_eq!(reverse.len(), 4);
+        assert_eq!(forward, reverse);
+        assert!(forward.windows(2).all(|rows| rows[0].2 != rows[1].2));
     }
 
     #[test]
@@ -1417,6 +1537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_with_lpg_store() {
         use crate::graph::lpg::LpgStore;
 
@@ -1474,6 +1595,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_edge_properties() {
         use crate::graph::lpg::LpgStore;
 
@@ -1520,6 +1642,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_edge_bool_properties() {
         use crate::graph::lpg::LpgStore;
 
@@ -1545,6 +1668,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_edge_string_properties() {
         use crate::graph::lpg::LpgStore;
 
@@ -1568,6 +1692,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_negative_int_preserves_int64_type() {
         use crate::graph::lpg::LpgStore;
 
@@ -1600,6 +1725,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_float64_column() {
         use crate::graph::lpg::LpgStore;
 
@@ -1621,6 +1747,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_mixed_types_fall_back_to_dict() {
         use crate::graph::lpg::LpgStore;
 
@@ -1652,6 +1779,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_sparse_properties() {
         use crate::graph::lpg::LpgStore;
 
@@ -1697,6 +1825,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_multi_label_nodes() {
         use crate::graph::lpg::LpgStore;
 
@@ -1726,6 +1855,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_all_null_column() {
         use crate::graph::lpg::LpgStore;
 
@@ -1827,6 +1957,7 @@ mod tests {
     /// Same edge type spanning multiple label pairs — normal in LPGs.
     /// Regression test for <https://github.com/GrafeoDB/grafeo/issues/221>.
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_multi_label_edge_type() {
         use crate::graph::lpg::LpgStore;
 
@@ -2044,6 +2175,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_nodes_with_no_properties() {
         use crate::graph::lpg::LpgStore;
 
@@ -2067,6 +2199,7 @@ mod tests {
     /// fallback for "other" values in `infer_type_from_values` and the
     /// per-row Display serialization inside the Dict build path.
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_mixed_vector_dims() {
         use crate::graph::lpg::LpgStore;
         use std::sync::Arc;
@@ -2113,6 +2246,7 @@ mod tests {
     /// through the Float32Vector column codec and comes back as `Value::Vector`
     /// with the original dimensions and values.
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_float32_vector() {
         use crate::graph::lpg::LpgStore;
         use std::sync::Arc;
@@ -2147,6 +2281,7 @@ mod tests {
     /// null-padding path in `from_graph_store`. Covers the `push(Value::Null)`
     /// fill loops that keep column lengths aligned to row count.
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_all_null() {
         use crate::graph::lpg::LpgStore;
 
@@ -2233,6 +2368,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_multi_label_sorted_key() {
         use crate::graph::lpg::LpgStore;
 
@@ -2444,6 +2580,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_preserving_ids_empty() {
         use crate::graph::lpg::LpgStore;
 
@@ -2455,6 +2592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_single_node_no_properties() {
         use crate::graph::lpg::LpgStore;
 
@@ -2467,6 +2605,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_preserving_ids_with_data() {
         use crate::graph::lpg::LpgStore;
 
@@ -2502,6 +2641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_skewed_properties() {
         // One label with 5 nodes, each has only one of three properties.
         // This stresses null-padding in sparse columns.
@@ -2653,6 +2793,36 @@ mod tests {
         assert_eq!(total_edges, 2);
     }
 
+    #[test]
+    fn test_builder_rel_table_property_at_pending() {
+        use grafeo_common::types::EpochId;
+
+        // Fresh-base RelTables wrap edge codecs as all-open TemporalColumns.
+        // The temporal path at PENDING must match the current-value projection.
+        let store = CompactStoreBuilder::new()
+            .node_table("A", |t| t.column_bitpacked("v", &[1, 2], 4))
+            .node_table("B", |t| t.column_bitpacked("v", &[3, 4], 4))
+            .rel_table("LINKS", "A", "B", |r| {
+                r.edges([(0, 0), (1, 1)])
+                    .column_bitpacked("weight", &[100, 200], 8)
+            })
+            .build()
+            .unwrap();
+
+        let rt = store.rel_tables_for_type("LINKS")[0];
+        let key = PropertyKey::new("weight");
+        assert_eq!(
+            rt.get_property_at_epoch(0, &key, EpochId::PENDING),
+            Some(Value::Int64(100))
+        );
+        assert_eq!(
+            rt.get_property_at_epoch(1, &key, EpochId::PENDING),
+            Some(Value::Int64(200))
+        );
+        assert_eq!(rt.get_edge_property(0, &key), Some(Value::Int64(100)));
+        assert_eq!(rt.get_edge_property(1, &key), Some(Value::Int64(200)));
+    }
+
     // -------------------------------------------------------------------
     // from_graph_store_preserving_ids: specialized cases.
     // The basic happy-path is covered by
@@ -2661,6 +2831,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_preserving_ids_multi_label() {
         use crate::graph::lpg::LpgStore;
 
@@ -2679,6 +2850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_from_graph_store_preserving_ids_edges_sorted_by_csr_order() {
         use crate::graph::lpg::LpgStore;
 

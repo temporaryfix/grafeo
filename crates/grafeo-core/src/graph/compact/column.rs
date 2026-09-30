@@ -10,7 +10,7 @@ use arcstr::ArcStr;
 use bytes::{Bytes, BytesMut};
 use grafeo_common::types::Value;
 
-use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding};
+use crate::codec::{BitPackedInts, BitVector, BlockEntry, DictionaryEncoding, FsstCodec};
 
 // ── Phase 3a: Bytes-backed read helpers ──────────────────────────────
 //
@@ -232,6 +232,11 @@ pub enum ColumnCodec {
     BitPacked(BitPackedInts),
     /// Dictionary-encoded strings.
     Dict(DictionaryEncoding),
+    /// FSST-compressed strings with O(1) random-access decode.
+    /// See [`crate::codec::FsstCodec`]. Sits alongside [`Self::Dict`]; pick
+    /// FSST for high-cardinality string columns where dictionary encoding
+    /// loses to per-string compression.
+    Fsst(FsstCodec),
     /// Null/boolean bitmap.
     Bitmap(BitVector),
     /// Int8 quantized vectors (flat array with stride). Bytes-backed
@@ -387,6 +392,15 @@ impl ColumnCodec {
                 val
             }),
             Self::Dict(dict) => dict.get(index).map(|s| Value::String(ArcStr::from(s))),
+            // FSST: `.ok()` maps FsstError (e.g. TruncatedEscape on a
+            // corrupt stream) to None, and `from_utf8(...).ok()` does the
+            // same for non-UTF-8 bytes. Both match the Dict variant's
+            // get-returns-None-on-failure contract.
+            Self::Fsst(fsst) => fsst.get(index).ok().flatten().and_then(|bytes| {
+                std::str::from_utf8(&bytes)
+                    .ok()
+                    .map(|s| Value::String(ArcStr::from(s)))
+            }),
             Self::Bitmap(bv) => bv.get(index).map(Value::Bool),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
@@ -476,6 +490,7 @@ impl ColumnCodec {
         match self {
             Self::BitPacked(bp) => bp.len(),
             Self::Dict(dict) => dict.len(),
+            Self::Fsst(fsst) => fsst.len(),
             Self::Bitmap(bv) => bv.len(),
             Self::Int8Vector { bytes, dimensions } => {
                 let dims = *dimensions as usize;
@@ -888,6 +903,12 @@ impl ColumnCodec {
                 write_usize_as_u32(buf, body.len() / 8);
                 buf.extend_from_slice(&body);
             }
+            Self::Fsst(fsst) => {
+                buf.push(7); // discriminant
+                let body = fsst.to_bytes();
+                write_usize_as_u32(buf, body.len());
+                buf.extend_from_slice(&body);
+            }
         }
     }
 
@@ -965,9 +986,9 @@ impl ColumnCodec {
                 }
                 let storage = data.slice(*pos..*pos + need);
                 *pos += need;
-                Ok(Self::Bitmap(BitVector::from_bytes_storage(
-                    storage, bit_len,
-                )))
+                BitVector::from_bytes_storage(storage, bit_len)
+                    .map(Self::Bitmap)
+                    .map_err(|_| "Bitmap word count does not match bit length")
             }
             3 => {
                 // Int8Vector
@@ -1021,6 +1042,18 @@ impl ColumnCodec {
                 let storage = data.slice(*pos..*pos + byte_need);
                 *pos += byte_need;
                 Ok(Self::RawI64(I64Store::Mapped(storage)))
+            }
+            7 => {
+                // Fsst: length-prefixed FSST blob.
+                let body_len = read_u32_le(bytes, pos)? as usize;
+                if *pos + body_len > bytes.len() {
+                    return Err("truncated Fsst body");
+                }
+                let body = &bytes[*pos..*pos + body_len];
+                let fsst =
+                    crate::codec::FsstCodec::from_bytes(body).map_err(|_| "malformed Fsst blob")?;
+                *pos += body_len;
+                Ok(Self::Fsst(fsst))
             }
             _ => Err("unknown codec discriminant"),
         }
@@ -1268,6 +1301,27 @@ impl ColumnCodec {
                     });
                 }
             }
+            Self::Fsst(fsst) => {
+                // FSST is a monolithic codec: one symbol table shared by all
+                // strings. We serialise the entire codec blob as a single
+                // block body so that the block-index contract (contiguous,
+                // non-overlapping) is satisfied. The `row_count` field of
+                // the single block meta holds the total string count, which
+                // is what `read_from_v2`/`read_from_v3` need to reconstruct
+                // `len()` without re-parsing the FSST blob header.
+                buf.push(7); // discriminant; no global_params beyond this byte
+                let body = fsst.to_bytes();
+                #[allow(clippy::cast_possible_truncation)]
+                let row_count = fsst.len() as u32;
+                #[allow(clippy::cast_possible_truncation)]
+                let byte_len = body.len() as u32;
+                bodies.extend_from_slice(&body);
+                metas.push(BlockMeta {
+                    byte_offset: 0,
+                    byte_len,
+                    row_count,
+                });
+            }
         }
 
         (metas, bodies)
@@ -1374,7 +1428,8 @@ impl ColumnCodec {
                         words.push(read_u64_le(bytes, &mut bp)?);
                     }
                     let block_bv =
-                        crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize);
+                        crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize)
+                            .map_err(|_| "Bitmap block word count does not match row count")?;
                     for j in 0..meta.row_count as usize {
                         all_bits.push(block_bv.get(j).ok_or("Bitmap block index out of range")?);
                     }
@@ -1433,6 +1488,19 @@ impl ColumnCodec {
                 let storage = data.slice(bodies_start..bodies_start + total);
                 *pos = bodies_start + total;
                 Ok(Self::RawI64(I64Store::Mapped(storage)))
+            }
+            7 => {
+                // Fsst: single-block monolithic blob.
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Fsst v2 body out of bounds");
+                }
+                let body = &bytes[bodies_start..bodies_start + total];
+                let fsst = crate::codec::FsstCodec::from_bytes(body)
+                    .map_err(|_| "malformed Fsst v2 blob")?;
+                *pos = bodies_start + total;
+                Ok(Self::Fsst(fsst))
             }
             _ => Err("unknown codec discriminant"),
         }
@@ -1539,7 +1607,8 @@ impl ColumnCodec {
                         words.push(read_u64_le(bytes, &mut bp)?);
                     }
                     let block_bv =
-                        crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize);
+                        crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize)
+                            .map_err(|_| "Bitmap block word count does not match row count")?;
                     for j in 0..meta.row_count as usize {
                         all_bits.push(block_bv.get(j).ok_or("Bitmap block index out of range")?);
                     }
@@ -1604,6 +1673,19 @@ impl ColumnCodec {
                 *pos = bodies_start + total;
                 Ok((Self::RawI64(I64Store::Mapped(storage)), stats))
             }
+            7 => {
+                // Fsst: single-block monolithic blob.
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Fsst v3 body out of bounds");
+                }
+                let body = &bytes[bodies_start..bodies_start + total];
+                let fsst = crate::codec::FsstCodec::from_bytes(body)
+                    .map_err(|_| "malformed Fsst v3 blob")?;
+                *pos = bodies_start + total;
+                Ok((Self::Fsst(fsst), stats))
+            }
             _ => Err("unknown codec discriminant"),
         }
     }
@@ -1617,6 +1699,12 @@ impl ColumnCodec {
                 let codes_bytes = d.code_count() * 4;
                 let dict_bytes: usize = d.dictionary().iter().map(|s| s.len()).sum();
                 codes_bytes + dict_bytes
+            }
+            Self::Fsst(fsst) => {
+                let (_, compressed, offsets) = fsst.parts();
+                // 2304 bytes for the symbol table (256 length bytes + 256×8 body bytes),
+                // plus the compressed bytes and offsets array.
+                2304 + compressed.len() + offsets.len() * 4
             }
             Self::Bitmap(bv) => bv.data_bytes().len(),
             Self::Int8Vector { bytes, .. } => bytes.len(),
@@ -3241,6 +3329,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::large_stack_arrays)] // 3-element fixture array of (large) ColumnCodec variants
     fn butch_block_row_counts_sum_to_column_len() {
         // Phase 2a: trivially true (one block, row_count == len).
         // Phase 2b: this contract is the migration test — multi-block
@@ -3809,5 +3898,86 @@ mod tests {
         let mut sorted = result.clone();
         sorted.sort_unstable();
         assert_eq!(result, sorted, "iterator output must be sorted ascending");
+    }
+
+    #[test]
+    fn column_codec_fsst_round_trip() {
+        use crate::codec::FsstCodec;
+
+        let strings: Vec<&[u8]> = vec![b"Vincent", b"Mia", b"Vincent", b"Butch"];
+        let codec = FsstCodec::build(&strings);
+        let col = ColumnCodec::Fsst(codec);
+
+        assert_eq!(col.len(), 4);
+        assert_eq!(col.get(0), Some(Value::String(ArcStr::from("Vincent"))));
+        assert_eq!(col.get(1), Some(Value::String(ArcStr::from("Mia"))));
+        assert_eq!(col.get(2), Some(Value::String(ArcStr::from("Vincent"))));
+        assert_eq!(col.get(3), Some(Value::String(ArcStr::from("Butch"))));
+        assert_eq!(col.get(4), None);
+
+        // find_eq falls back to scanning via get; verify it still finds duplicates.
+        let hits = col.find_eq(&Value::String("Vincent".into()));
+        assert_eq!(hits, vec![0, 2]);
+    }
+
+    #[test]
+    fn column_codec_fsst_section_round_trip() {
+        use crate::codec::FsstCodec;
+        let strings: Vec<&[u8]> = vec![b"alpha", b"beta", b"alpha"];
+        let codec = FsstCodec::build(&strings);
+        let col = ColumnCodec::Fsst(codec);
+
+        // Serialize via write_to_v3 (the current production path).
+        let mut buf = Vec::new();
+        col.write_to_v3(&mut buf, None);
+
+        // Deserialize via read_from_v3.
+        let mut pos = 0;
+        let bytes = bytes::Bytes::from(buf);
+        let (decoded, _stats) = ColumnCodec::read_from_v3(&bytes, &mut pos).expect("decode");
+
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.get(0), Some(Value::String(ArcStr::from("alpha"))));
+        assert_eq!(decoded.get(1), Some(Value::String(ArcStr::from("beta"))));
+        assert_eq!(decoded.get(2), Some(Value::String(ArcStr::from("alpha"))));
+    }
+
+    #[test]
+    fn column_codec_fsst_v1_round_trip() {
+        use crate::codec::FsstCodec;
+        let strings: Vec<&[u8]> = vec![b"hello", b"world", b"hello"];
+        let codec = FsstCodec::build(&strings);
+        let col = ColumnCodec::Fsst(codec);
+
+        let mut buf = Vec::new();
+        col.write_to(&mut buf);
+
+        let mut pos = 0;
+        let bytes = bytes::Bytes::from(buf);
+        let decoded = ColumnCodec::read_from(&bytes, &mut pos).expect("decode");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.get(0), Some(Value::String(ArcStr::from("hello"))));
+        assert_eq!(decoded.get(1), Some(Value::String(ArcStr::from("world"))));
+        assert_eq!(decoded.get(2), Some(Value::String(ArcStr::from("hello"))));
+    }
+
+    #[test]
+    fn column_codec_fsst_v2_round_trip() {
+        use crate::codec::FsstCodec;
+        let strings: Vec<&[u8]> = vec![b"foo", b"bar", b"baz", b"foo"];
+        let codec = FsstCodec::build(&strings);
+        let col = ColumnCodec::Fsst(codec);
+
+        let mut buf = Vec::new();
+        col.write_to_v2(&mut buf);
+
+        let mut pos = 0;
+        let bytes = bytes::Bytes::from(buf);
+        let decoded = ColumnCodec::read_from_v2(&bytes, &mut pos).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded.get(0), Some(Value::String(ArcStr::from("foo"))));
+        assert_eq!(decoded.get(1), Some(Value::String(ArcStr::from("bar"))));
+        assert_eq!(decoded.get(2), Some(Value::String(ArcStr::from("baz"))));
+        assert_eq!(decoded.get(3), Some(Value::String(ArcStr::from("foo"))));
     }
 }

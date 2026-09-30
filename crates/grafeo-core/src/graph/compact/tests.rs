@@ -429,6 +429,45 @@ fn test_neighbors_incoming() {
 }
 
 #[test]
+fn csr_triangle_count_matches_walk() {
+    // Directed 0→1→2→0 and 0→1→3→0 (6 enumerations).
+    let store = CompactStoreBuilder::new()
+        .node_table("V", |t| t.column_bitpacked("id", &[0, 1, 2, 3, 4], 4))
+        .rel_table("R", "V", "V", |r| {
+            r.edges([(0, 1), (1, 2), (2, 0), (1, 3), (3, 0), (0, 4)])
+                .backward(true)
+        })
+        .build()
+        .unwrap();
+    let starts = store.node_ids();
+    let csr = store
+        .try_count_directed_triangles(&starts, None)
+        .expect("one self-loop CSR table");
+    let mut walk = 0u64;
+    for a in &starts {
+        for (b, _) in store.edges_from(*a, Direction::Outgoing) {
+            for (c, _) in store.edges_from(b, Direction::Outgoing) {
+                if store
+                    .edges_from(c, Direction::Outgoing)
+                    .iter()
+                    .any(|(t, _)| *t == *a)
+                {
+                    walk += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(csr, walk);
+    assert_eq!(csr, 6);
+    assert!(
+        build_test_store()
+            .try_count_directed_triangles(&starts, None)
+            .is_none(),
+        "two rel tables cannot use the single-CSR kernel"
+    );
+}
+
+#[test]
 fn test_neighbors_both() {
     let store = build_test_store();
     let gus = person_at(&store, 1);
@@ -1338,6 +1377,7 @@ fn test_csr_source_for_position_boundary() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_from_graph_store_edges_with_sparse_properties() {
     use crate::graph::compact::builder::from_graph_store;
     use crate::graph::lpg::LpgStore;
@@ -1373,6 +1413,7 @@ fn test_from_graph_store_edges_with_sparse_properties() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_from_graph_store_multiple_edge_types() {
     use crate::graph::compact::builder::from_graph_store;
     use crate::graph::lpg::LpgStore;
@@ -1408,6 +1449,7 @@ fn test_from_graph_store_multiple_edge_types() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_from_graph_store_nodes_without_edges() {
     use crate::graph::compact::builder::from_graph_store;
     use crate::graph::lpg::LpgStore;
@@ -1428,6 +1470,7 @@ fn test_from_graph_store_nodes_without_edges() {
 /// Regression test for GrafeoDB/grafeo#221: `compact()` fails with
 /// "duplicate edge type" when the same edge type spans multiple label pairs.
 #[test]
+#[cfg(feature = "lpg")]
 fn test_from_graph_store_multiple_label_pairs_same_edge_type() {
     use crate::graph::compact::builder::from_graph_store;
     use crate::graph::lpg::LpgStore;
@@ -1458,6 +1501,7 @@ fn test_from_graph_store_multiple_label_pairs_same_edge_type() {
 
 /// Same edge type between different label pairs (e.g. code dependency graph).
 #[test]
+#[cfg(feature = "lpg")]
 fn test_from_graph_store_same_edge_type_different_label_pairs() {
     use crate::graph::compact::builder::from_graph_store;
     use crate::graph::lpg::LpgStore;
@@ -1543,6 +1587,7 @@ fn test_statistics_aggregate_multi_table_edge_type() {
 // ── ID-preserving CompactStore tests ───────────────────────────────
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_get_node() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1589,6 +1634,62 @@ fn test_preserving_ids_get_node() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
+fn edge_scrub_matches_edges_at_epoch_pending() {
+    use crate::graph::compact::from_graph_store_preserving_ids;
+    use crate::graph::lpg::LpgStore;
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["Person"]);
+    let b = store.create_node(&["Person"]);
+    let city = store.create_node(&["City"]);
+    store.create_edge(a, b, "KNOWS");
+    store.create_edge(a, city, "LIVES_IN");
+    let compact = from_graph_store_preserving_ids(&store).unwrap();
+    let edges = compact.edges_at_epoch(EpochId::PENDING);
+    let scrub = compact.edge_scrub_at_epoch(EpochId::PENDING);
+    let mut from_edges: Vec<_> = edges
+        .iter()
+        .map(|e| (e.id, e.src, e.dst, e.edge_type.clone()))
+        .collect();
+    let mut from_scrub = Vec::new();
+    for frame in &scrub {
+        for i in 0..frame.edge_ids.len() {
+            from_scrub.push((
+                frame.edge_ids[i],
+                frame.src_ids[i],
+                frame.dst_ids[i],
+                frame.edge_type.clone(),
+            ));
+        }
+    }
+    from_edges.sort();
+    from_scrub.sort();
+    assert_eq!(from_edges, from_scrub);
+}
+
+#[test]
+#[cfg(feature = "lpg")]
+fn compact_column_is_property_seek() {
+    use crate::graph::compact::from_graph_store_preserving_ids;
+    use crate::graph::lpg::LpgStore;
+
+    let store = LpgStore::new().unwrap();
+    let a = store.create_node(&["Person"]);
+    store.set_node_property(a, "name", Value::from("Alix"));
+    store.create_node(&["City"]);
+    let compact = from_graph_store_preserving_ids(&store).unwrap();
+    assert!(
+        compact.has_property_index("name"),
+        "a node-table column is an equality seek"
+    );
+    assert!(!compact.has_property_index("missing"));
+    let hits = compact.find_nodes_by_property("name", &Value::from("Alix"));
+    assert_eq!(hits, vec![a]);
+}
+
+#[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_node_ids_returns_originals() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1608,6 +1709,7 @@ fn test_preserving_ids_node_ids_returns_originals() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_nodes_by_label() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1630,6 +1732,7 @@ fn test_preserving_ids_nodes_by_label() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_property_access() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1648,6 +1751,7 @@ fn test_preserving_ids_property_access() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_traversal() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1684,6 +1788,7 @@ fn test_preserving_ids_traversal() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_edge_lookup() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1713,6 +1818,7 @@ fn test_preserving_ids_edge_lookup() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_find_nodes_by_property() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1737,6 +1843,7 @@ fn test_preserving_ids_find_nodes_by_property() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_degree() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1756,6 +1863,7 @@ fn test_preserving_ids_degree() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_edge_type() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
@@ -1774,6 +1882,7 @@ fn test_preserving_ids_edge_type() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_preserving_ids_empty_store() {
     use crate::graph::compact::from_graph_store_preserving_ids;
     use crate::graph::lpg::LpgStore;
