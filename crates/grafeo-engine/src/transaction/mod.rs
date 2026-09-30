@@ -56,7 +56,14 @@
 //! ## Epoch-Based Versioning
 //!
 //! Grafeo uses epoch-based MVCC where:
-//! - Each commit advances the global epoch
+//! - Committed transactions and standalone metadata publications reserve from
+//!   one ordered global epoch space
+//! - A failed durable publication may leave an intentional gap; identities are
+//!   never reused or wrapped into the reserved `PENDING` sentinel
+//! - Recovery/import transaction-clock ingress is fallible: `try_sync_epoch`
+//!   rejects `PENDING` before changing the manager counter, while RDF's checked
+//!   commit-epoch APIs reject it before changing the default/named/detached
+//!   graph clocks or consuming a transaction buffer; epoch zero remains valid
 //! - Transactions read data visible at their start epoch
 //! - Version chains store multiple versions for concurrent access
 //! - Garbage collection removes versions no longer needed by active transactions
@@ -190,22 +197,35 @@
 //! # }
 //! ```
 
+mod conflict_key;
 mod manager;
+#[cfg(any(feature = "lpg", feature = "triple-store"))]
+pub(crate) use manager::prepared::TransactionFinalizationWorkspace;
+#[cfg(any(feature = "lpg", feature = "triple-store"))]
+pub(crate) use manager::restore::SnapshotClockWorkspace;
 mod mvcc;
 #[cfg(feature = "parallel")]
 pub mod parallel;
 #[cfg(feature = "lpg")]
 mod prepared;
+mod read_registry;
 
+pub use conflict_key::prop_tag;
+pub use conflict_key::{PropTag, STRUCT_TAG, prop_compatible};
+pub use grafeo_common::types::EdgeTypeId as RelTypeId;
 pub use manager::{
-    EntityId, IsolationLevel, TransactionInfo, TransactionManager, TransactionState,
+    ConflictGranularity, EntityId, IndexId, IsolationLevel, PredicateId, TransactionInfo,
+    TransactionManager, TransactionManagerView, TransactionState,
 };
 #[doc(hidden)]
 pub use mvcc::{VersionChain, VersionInfo};
 #[cfg(feature = "lpg")]
 pub use prepared::{CommitInfo, PreparedCommit};
+pub(crate) use read_registry::ReadRegistry;
+pub use read_tracker::TransactionReadTracker;
 pub use write_tracker::TransactionWriteTracker;
 
+mod read_tracker;
 mod write_tracker;
 
 #[cfg(feature = "parallel")]

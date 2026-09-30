@@ -123,8 +123,7 @@ impl<'a> PreparedCommit<'a> {
     /// Returns an error if the commit fails (write-write conflict, SSI violation, etc.).
     pub fn commit(mut self) -> Result<EpochId> {
         self.finalized = true;
-        self.session.commit()?;
-        Ok(self.session.transaction_manager().current_epoch())
+        self.session.commit()
     }
 
     /// Explicitly aborts the transaction, discarding all changes.
@@ -152,6 +151,7 @@ mod tests {
     use crate::GrafeoDB;
 
     #[test]
+    #[cfg(all(feature = "lpg", feature = "gql"))]
     fn test_prepared_commit_basic() {
         let db = GrafeoDB::new_in_memory();
         let mut session = db.session();
@@ -176,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "lpg", feature = "gql"))]
     fn test_prepared_commit_with_edges() {
         let db = GrafeoDB::new_in_memory();
         let mut session = db.session();
@@ -219,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "lpg", feature = "gql"))]
     fn test_prepared_commit_metadata() {
         let db = GrafeoDB::new_in_memory();
         let mut session = db.session();
@@ -237,6 +239,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "lpg", feature = "gql"))]
     fn test_prepared_commit_abort() {
         let db = GrafeoDB::new_in_memory();
         let mut session = db.session();
@@ -253,6 +256,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "lpg", feature = "gql"))]
     fn test_prepared_commit_drop_rollback() {
         let db = GrafeoDB::new_in_memory();
         let mut session = db.session();

@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use grafeo_common::types::{EdgeId, NodeId, TransactionId};
+use grafeo_common::types::{EdgeId, EdgeTypeId, LabelId, NodeId, TransactionId};
 use grafeo_core::execution::operators::{OperatorError, WriteTracker};
+use grafeo_core::graph::lpg::decode_index_key;
 
-use super::TransactionManager;
+use super::{ConflictGranularity, EntityId, IndexId, PredicateId, TransactionManager, prop_tag};
 
 /// Implements [`WriteTracker`] by forwarding to [`TransactionManager::record_write`].
 ///
@@ -13,12 +14,27 @@ use super::TransactionManager;
 /// mutation operator so it can record writes for conflict detection.
 pub struct TransactionWriteTracker {
     manager: Arc<TransactionManager>,
+    granularity: ConflictGranularity,
 }
 
 impl TransactionWriteTracker {
     /// Creates a new write tracker backed by the given transaction manager.
     pub fn new(manager: Arc<TransactionManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            granularity: ConflictGranularity::Entity,
+        }
+    }
+
+    /// Creates a new write tracker with the specified conflict granularity.
+    pub fn with_granularity(
+        manager: Arc<TransactionManager>,
+        granularity: ConflictGranularity,
+    ) -> Self {
+        Self {
+            manager,
+            granularity,
+        }
     }
 }
 
@@ -29,7 +45,7 @@ impl WriteTracker for TransactionWriteTracker {
         node_id: NodeId,
     ) -> Result<(), OperatorError> {
         self.manager
-            .record_write(transaction_id, node_id)
+            .record_write(transaction_id, node_id, None)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
     }
 
@@ -39,7 +55,177 @@ impl WriteTracker for TransactionWriteTracker {
         edge_id: EdgeId,
     ) -> Result<(), OperatorError> {
         self.manager
-            .record_write(transaction_id, edge_id)
+            .record_write(transaction_id, edge_id, None)
             .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Records a node write with coarse `Label(L)` fan-out for each label.
+    ///
+    /// Calls [`TransactionManager::record_node_write`] which records both
+    /// `EntityId::Node(node_id)` and `EntityId::Label(L)` for every `L`
+    /// in `labels`. Used by `CreateNodeOperator` (which knows its labels)
+    /// and the store's `create_node_versioned` phantom-write path.
+    fn record_node_write_with_labels(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        labels: &[LabelId],
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_node_write(transaction_id, node_id, labels, None)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Records an edge write with coarse `RelType(T)` fan-out.
+    ///
+    /// Calls [`TransactionManager::record_edge_write`] which records both
+    /// `EntityId::Edge(edge_id)` and `EntityId::RelType(rel_type)`.
+    /// Used by `CreateEdgeOperator` and the store's `create_edge_versioned`
+    /// phantom-write path.
+    fn record_edge_write_with_type(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        rel_type: EdgeTypeId,
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_edge_write(transaction_id, edge_id, rel_type, None)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    fn record_label_name_predicate_write(
+        &self,
+        transaction_id: TransactionId,
+        label: &str,
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_coarse_write(
+                transaction_id,
+                EntityId::LabelPredicate(PredicateId::for_label(label)),
+                None,
+            )
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    fn record_rel_type_name_predicate_write(
+        &self,
+        transaction_id: TransactionId,
+        rel_type: &str,
+    ) -> Result<(), OperatorError> {
+        self.manager
+            .record_coarse_write(
+                transaction_id,
+                EntityId::RelTypePredicate(PredicateId::for_rel_type(rel_type)),
+                None,
+            )
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    fn record_lpg_dataset_write(&self, transaction_id: TransactionId) -> Result<(), OperatorError> {
+        self.manager
+            .record_coarse_write(transaction_id, EntityId::LpgDataset, None)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Fans out only the coarse `Label(L)` phantom writes (no fine `Node` write).
+    ///
+    /// Calls [`TransactionManager::record_node_labels_write`] with
+    /// `tag = Some(prop_tag(key))`. Used by the store's property-write paths so
+    /// an escalated `(Label(L), Some(x))` reader keeps disjoint-property
+    /// concurrency above the escalation threshold: an `x`-write conflicts, a
+    /// `y`-write (with `y != x`) does not. Structural escalated readers
+    /// `(Label(L), None)` still catch the tagged write via `prop_compatible`'s
+    /// `None`-wildcard. The fine `Node` write is recorded elsewhere under its
+    /// property tag — recording it again here as `None` would defeat Property
+    /// granularity.
+    fn record_node_labels_write(
+        &self,
+        transaction_id: TransactionId,
+        labels: &[LabelId],
+        key: &str,
+    ) -> Result<(), OperatorError> {
+        let tag = Some(prop_tag(key));
+        self.manager
+            .record_node_labels_write(transaction_id, labels, tag)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Fans out only the coarse `RelType(T)` phantom write (no fine `Edge` write).
+    ///
+    /// Calls [`TransactionManager::record_edge_type_write`] with
+    /// `tag = Some(prop_tag(key))`. Edge mirror of
+    /// [`record_node_labels_write`](Self::record_node_labels_write).
+    fn record_edge_type_write(
+        &self,
+        transaction_id: TransactionId,
+        rel_type: EdgeTypeId,
+        key: &str,
+    ) -> Result<(), OperatorError> {
+        let tag = Some(prop_tag(key));
+        self.manager
+            .record_edge_type_write(transaction_id, rel_type, tag)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    fn record_node_property_write(
+        &self,
+        transaction_id: TransactionId,
+        node_id: NodeId,
+        key: &str,
+    ) -> Result<(), OperatorError> {
+        let tag = if self.granularity == ConflictGranularity::Property {
+            Some(prop_tag(key))
+        } else {
+            None
+        };
+        self.manager
+            .record_write(transaction_id, node_id, tag)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    fn record_edge_property_write(
+        &self,
+        transaction_id: TransactionId,
+        edge_id: EdgeId,
+        key: &str,
+    ) -> Result<(), OperatorError> {
+        let tag = if self.granularity == ConflictGranularity::Property {
+            Some(prop_tag(key))
+        } else {
+            None
+        };
+        self.manager
+            .record_write(transaction_id, edge_id, tag)
+            .map_err(|e| OperatorError::WriteConflict(e.to_string()))
+    }
+
+    /// Records that `transaction_id` wrote to the `(label, property)` text index
+    /// identified by `index_key`. Coarse index-write recording for anti-phantom SSI.
+    ///
+    /// Intentionally infallible: the index-entity write is a coarse SSI signal,
+    /// not a first-writer-wins entity lock (two concurrent indexed SETs to different
+    /// *nodes* in the same index are not a W-W conflict on the index entity itself).
+    fn record_index_write(&self, transaction_id: TransactionId, index_key: &str) {
+        let idx = if let Some((label, property)) = decode_index_key(index_key) {
+            IndexId::for_text_index(label, property)
+        } else {
+            IndexId::for_text_index(index_key, "")
+        };
+        // Index membership is a coarse phantom guard, not a first-writer-wins
+        // resource: independent nodes can update the same index concurrently.
+        // Preserve both writers' guards so an indexed predicate reader cannot
+        // lose the second rw edge to a swallowed W-W error.
+        let _ = self.manager.record_coarse_write(transaction_id, idx, None);
+    }
+
+    fn record_property_index_write(&self, transaction_id: TransactionId, property: &str) {
+        // A predicate is shared by independent node writers. Using the fine
+        // write API here could reject the second writer before registering its
+        // SSI edge, even if the resulting W-W error were ignored.
+        let _ = self.manager.record_coarse_write(
+            transaction_id,
+            IndexId::for_property_index(property),
+            None,
+        );
     }
 }

@@ -1,12 +1,92 @@
 //! Transaction manager.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+pub(crate) mod prepared;
+#[cfg(any(test, feature = "lpg", feature = "triple-store"))]
+pub(crate) mod restore;
 
-use grafeo_common::types::{EdgeId, EpochId, NodeId, TransactionId};
-use grafeo_common::utils::error::{Error, Result, TransactionError};
-use grafeo_common::utils::hash::FxHashMap;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use grafeo_common::types::{EdgeId, EdgeTypeId, EpochId, LabelId, NodeId, TransactionId};
+use grafeo_common::utils::error::{Error, Result, StorageError, TransactionError};
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
+use grafeo_core::graph::lpg::encode_index_key;
 use parking_lot::RwLock;
+
+use super::{PropTag, ReadRegistry, prop_compatible};
+
+/// Stable identifier for a `(label, property)` text index.
+///
+/// Used as the entity key in the SSI read-set / write-set when a Serializable
+/// text search records a predicate read, or a SET/REMOVE on an indexed property
+/// records an index write. Two different `(label, property)` pairs produce
+/// different `IndexId` values; collisions are impossible in practice (probability
+/// ~2^-64) and, like all hash-based conflict keys, produce only false conflicts
+/// (never missed ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IndexId(u64);
+
+impl IndexId {
+    /// Returns a stable `IndexId` for the given label and property.
+    ///
+    /// The hash is computed from the collision-free encoded index key using the
+    /// same stable FNV-1a
+    /// function as [`grafeo_common::utils::hash::stable_hash`], so it survives
+    /// process restarts (though the conflict machinery is in-memory only, so
+    /// stability across restarts is a bonus, not a requirement).
+    ///
+    /// Used for both text and vector indexes — any `(label, property)` index
+    /// pair gets a unique, stable `IndexId` regardless of index kind.
+    #[must_use]
+    pub fn for_index(label: &str, property: &str) -> Self {
+        let key = encode_index_key(label, property);
+        Self(grafeo_common::utils::hash::hash_one(&key))
+    }
+
+    /// Identifies a label-independent node-property predicate. The tuple's
+    /// fixed domain is distinct from the canonical `@idx1` string hashed for
+    /// text/vector indexes; arbitrary property and label spellings cannot
+    /// alias their pre-hash representation. Hash collisions remain conservative.
+    #[must_use]
+    pub fn for_property_index(property: &str) -> Self {
+        Self(grafeo_common::utils::hash::hash_one(&(
+            "grafeo/property-index/v1",
+            property,
+        )))
+    }
+
+    /// Alias for [`for_index`](Self::for_index) — kept for backward compatibility
+    /// with existing text-index call-sites.
+    #[inline]
+    #[must_use]
+    pub fn for_text_index(label: &str, property: &str) -> Self {
+        Self::for_index(label, property)
+    }
+}
+
+/// Stable logical identifier for a named LPG scan predicate.
+///
+/// The enclosing [`EntityId`] variant domain-separates label predicates from
+/// relationship-type predicates. The 64-bit hash is deterministic, so the
+/// same name maps to the same gap key before and after catalog interning.
+/// Hash collisions are conservative only: two distinct names may conflict
+/// spuriously, but a matching read and write can never miss one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PredicateId(u64);
+
+impl PredicateId {
+    /// Returns the stable predicate identifier for a node-label name.
+    #[must_use]
+    pub fn for_label(label: &str) -> Self {
+        Self(grafeo_common::utils::hash::stable_hash(label.as_bytes()))
+    }
+
+    /// Returns the stable predicate identifier for a relationship-type name.
+    #[must_use]
+    pub fn for_rel_type(rel_type: &str) -> Self {
+        Self(grafeo_common::utils::hash::stable_hash(rel_type.as_bytes()))
+    }
+}
 
 /// State of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +143,50 @@ pub enum IsolationLevel {
     Serializable,
 }
 
+/// Conflict-detection granularity for Serializable transactions.
+///
+/// Controls whether rw-antidependency edges (the SSI read-set / write-set
+/// overlap check) are tracked at the entity level or at the individual
+/// property level.
+///
+/// - **`Entity`** (default) — every read or write records the whole entity.
+///   A read of any property on node N and a write to any other property on N
+///   form an rw-antidependency, which may abort transactions that otherwise
+///   have no true data conflict. This is the conservative default.
+///
+/// - **`Property`** — reads and writes record `(entity, property_tag)` pairs.
+///   Two operations on the same entity only conflict if they touch the *same*
+///   property (or one is structural: delete, label-change, whole-entity read).
+///   This allows disjoint-property workloads (e.g. session 1 writes `bal`,
+///   session 2 writes `name` on different nodes) to commit concurrently
+///   instead of aborting with a false serialization failure.
+///
+/// # Safety
+///
+/// Property-level granularity is still sound: hash collisions can only produce
+/// false *conflicts* (two distinct properties map to the same tag → both abort
+/// conservatively), never missed conflicts. The knob cannot introduce anomalies.
+///
+/// # Effect
+///
+/// The granularity is checked only at the next
+/// [`begin_transaction_with_isolation`](crate::Session::begin_transaction_with_isolation)
+/// call; changing it mid-transaction has no effect until the next `BEGIN`.
+///
+/// Only active under `Serializable` isolation; it is ignored for
+/// `SnapshotIsolation` and `ReadCommitted` (which never build read-sets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictGranularity {
+    /// Whole-entity granularity (default). Every property read/write records
+    /// the containing entity, not the individual property.
+    #[default]
+    Entity,
+    /// Per-property granularity. Reads and writes record
+    /// `(entity, prop_tag(key))` so that disjoint-property accesses on the
+    /// same entity do not form rw-antidependencies.
+    Property,
+}
+
 /// Entity identifier for write tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -71,6 +195,43 @@ pub enum EntityId {
     Node(NodeId),
     /// An edge.
     Edge(EdgeId),
+    /// A `(label, property)` text index — used for coarse predicate-read
+    /// recording to prevent phantom reads in Serializable text searches.
+    Index(IndexId),
+    /// A node label — coarse conflict key for label-scan predicate reads
+    /// (e.g. `MATCH (n:Person)`) to prevent phantom reads at Serializable.
+    Label(LabelId),
+    /// A node-label predicate keyed by its stable logical name.
+    ///
+    /// Every qualified label scan records this key, including scans for names
+    /// that have not yet been interned. Structural membership changes fan out
+    /// the same key. [`Label`](Self::Label) remains as the compact numeric key
+    /// used by fine-read escalation and property-granularity tracking.
+    LabelPredicate(PredicateId),
+    /// A relationship type — coarse conflict key for relationship-type-scan
+    /// predicate reads (e.g. `MATCH ()-[:KNOWS]->()`) at Serializable.
+    RelType(EdgeTypeId),
+    /// A relationship-type predicate keyed by its stable logical name.
+    ///
+    /// This is the relationship mirror of [`LabelPredicate`](Self::LabelPredicate)
+    /// and is a distinct enum domain even when the names hash identically.
+    RelTypePredicate(PredicateId),
+    /// The native LPG dataset — a conservative coarse predicate key for
+    /// unlabeled node scans and untyped edge traversals at Serializable.
+    ///
+    /// Structural node/edge writes fan out to this key. Property-only writes
+    /// do not, preserving disjoint-property concurrency while preventing
+    /// phantoms in complete structural scans (including empty scans).
+    LpgDataset,
+    /// The native RDF dataset — a conservative coarse predicate key used by
+    /// Serializable RDF reads and writes.
+    ///
+    /// Every RDF read records this key and every RDF mutation writes it. This
+    /// prevents statement and named-graph phantoms without relying on a lossy
+    /// hash or an incomplete set of SPARQL pattern shapes. Finer graph/predicate
+    /// keys may later improve concurrency, but may not replace this key until
+    /// their coverage is proved complete.
+    RdfDataset,
 }
 
 impl From<NodeId> for EntityId {
@@ -85,6 +246,24 @@ impl From<EdgeId> for EntityId {
     }
 }
 
+impl From<IndexId> for EntityId {
+    fn from(id: IndexId) -> Self {
+        Self::Index(id)
+    }
+}
+
+impl From<LabelId> for EntityId {
+    fn from(id: LabelId) -> Self {
+        Self::Label(id)
+    }
+}
+
+impl From<EdgeTypeId> for EntityId {
+    fn from(id: EdgeTypeId) -> Self {
+        Self::RelType(id)
+    }
+}
+
 /// Information about an active transaction.
 pub struct TransactionInfo {
     /// Transaction state.
@@ -93,10 +272,46 @@ pub struct TransactionInfo {
     pub isolation_level: IsolationLevel,
     /// Start epoch (snapshot epoch for reads).
     pub start_epoch: EpochId,
-    /// Set of entities written by this transaction.
-    pub write_set: HashSet<EntityId>,
-    /// Set of entities read by this transaction (for serializable isolation).
-    pub read_set: HashSet<EntityId>,
+    /// Epoch reserved after validation and before the durable commit marker.
+    reserved_commit_epoch: Option<EpochId>,
+    /// Set of `(entity, prop_tag)` pairs written by this transaction.
+    /// W-W conflict detection uses the entity component only; the tag
+    /// is carried for future property-level rw-antidependency checks.
+    pub write_set: FxHashSet<(EntityId, PropTag)>,
+    /// Set of `(entity, prop_tag)` pairs read by this transaction (for
+    /// serializable isolation). All callers currently pass `None` as the tag.
+    pub read_set: FxHashSet<(EntityId, PropTag)>,
+    /// An rw-antidependency edge points INTO this transaction (this tx is the
+    /// writer end of some `reader →rw self`). Used for F2 incremental SSI pivot
+    /// detection.
+    pub in_conflict: bool,
+    /// An rw-antidependency edge points OUT of this transaction (this tx is
+    /// the reader end of some `self →rw writer`). Used for F2 incremental SSI
+    /// pivot detection.
+    pub out_conflict: bool,
+    /// Read-set escalation buckets: maps a `(predicate, coarse_tag)` pair
+    /// (e.g. `(EntityId::Label(L), None)` for structural, or
+    /// `(EntityId::Label(L), Some(prop_tag))` for a property-tagged bucket)
+    /// to the fine `(EntityId::Node / Edge, PropTag)` reads accumulated
+    /// beneath it during a label-/type-scan. When a bucket exceeds the
+    /// escalation threshold the fine entries are collapsed into the single
+    /// coarse `(predicate, coarse_tag)` key (see
+    /// [`TransactionManager::record_read_in_label`]). Only populated for
+    /// Serializable transactions that actually scan by predicate.
+    pub scan_buckets: FxHashMap<(EntityId, PropTag), Vec<(EntityId, PropTag)>>,
+    /// Membership index for [`Self::scan_buckets`].
+    ///
+    /// The public bucket representation remains a `Vec` for source
+    /// compatibility, while this private set makes the documented escalation
+    /// threshold count distinct fine reads in O(1). Repeated materialization
+    /// of one entity must not manufacture cardinality and promote a predicate
+    /// prematurely.
+    scan_bucket_members: FxHashMap<(EntityId, PropTag), FxHashSet<(EntityId, PropTag)>>,
+    /// `(predicate, coarse_tag)` pairs that have already been promoted
+    /// (escalated). Once a pair is here, further reads under it skip the fine
+    /// entry entirely (the coarse key is in `read_set` and covers them via
+    /// GE2's write fan-out), so no fine bookkeeping or rw-detection is re-run.
+    pub escalated: FxHashSet<(EntityId, PropTag)>,
 }
 
 impl TransactionInfo {
@@ -106,8 +321,14 @@ impl TransactionInfo {
             state: TransactionState::Active,
             isolation_level,
             start_epoch,
-            write_set: HashSet::new(),
-            read_set: HashSet::new(),
+            reserved_commit_epoch: None,
+            write_set: FxHashSet::default(),
+            read_set: FxHashSet::default(),
+            in_conflict: false,
+            out_conflict: false,
+            scan_buckets: FxHashMap::default(),
+            scan_bucket_members: FxHashMap::default(),
+            escalated: FxHashSet::default(),
         }
     }
 }
@@ -116,8 +337,10 @@ impl TransactionInfo {
 pub struct TransactionManager {
     /// Next transaction ID.
     next_transaction_id: AtomicU64,
-    /// Current epoch.
+    /// Latest committed publication visible to new transactions.
     current_epoch: AtomicU64,
+    /// Greatest reserved identity, including rejected publications.
+    reserved_epoch: AtomicU64,
     /// Number of currently active transactions (for fast-path conflict skip).
     active_count: AtomicU64,
     /// Active transactions.
@@ -125,6 +348,171 @@ pub struct TransactionManager {
     /// Committed transaction epochs (for conflict detection).
     /// Maps TransactionId -> commit epoch.
     committed_epochs: RwLock<FxHashMap<TransactionId, EpochId>>,
+    /// Sharded registry of active Serializable readers (SIREAD locks).
+    /// Used for read-time rw-antidependency detection (F2 incremental SSI).
+    read_registry: ReadRegistry,
+    /// Committed Serializable readers whose SIREAD locks (their `read_registry`
+    /// entries) are retained past their own commit until every concurrent
+    /// transaction has finished (the standard Cahill/PostgreSQL SSI rule). Maps
+    /// the committed reader's `TransactionId` -> its commit epoch. A later
+    /// concurrent writer can then still form the in-edge `reader →rw writer`.
+    retired_readers: RwLock<FxHashMap<TransactionId, EpochId>>,
+    /// Read-set escalation threshold `T`: once a Serializable transaction has
+    /// recorded more than `T` fine reads under a single `(predicate, coarse_tag)`
+    /// bucket, the fine `Node`/`Edge` entries are collapsed into the coarse
+    /// `Label(L)` / `RelType(T)` key (see
+    /// [`Self::record_read_in_label`]). Defaults to `256`; GE5 will make this
+    /// configurable per-session. `usize::MAX` effectively disables promotion.
+    ///
+    /// Stored as an atomic so the test setter and the `&self` read path in
+    /// `record_read_in_label` need no extra lock.
+    escalation_threshold: AtomicUsize,
+    /// Write-lock around LPG+RDF apply so concurrent readers see both or neither.
+    publication: std::sync::Arc<parking_lot::RwLock<()>>,
+    /// Database-scoped authority used by framed engine mutation paths.
+    write_authority: grafeo_core::graph::write_permit::WriteAuthority,
+    /// Deterministic unit-test pause after BEGIN publishes its record and
+    /// releases that writer, but before its independent active-count increment.
+    #[cfg(test)]
+    begin_count_pause: RwLock<Option<BeginCountPause>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BeginCountPause {
+    entered: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+/// Read-only observation capability for a database-owned transaction manager.
+///
+/// A [`TransactionManager`] owns commit epochs, transaction identifiers, SSI
+/// metadata, and the mixed-model publication lock. Returning that concrete
+/// manager from a [`Session`](crate::Session) would let downstream code begin,
+/// commit, abort, or forge transaction state outside the Session/WAL protocol.
+/// This view exposes status snapshots only.
+///
+/// Database publication authority is intentionally absent:
+///
+/// ```compile_fail
+/// # use grafeo_engine::GrafeoDB;
+/// let db = GrafeoDB::new_in_memory();
+/// let session = db.session();
+/// let _publication = session.transaction_manager_ref().publication().write();
+/// ```
+///
+/// Epoch mutation is intentionally absent:
+///
+/// ```compile_fail
+/// # use grafeo_common::types::EpochId;
+/// # use grafeo_engine::GrafeoDB;
+/// let db = GrafeoDB::new_in_memory();
+/// db.session()
+///     .transaction_manager_ref()
+///     .sync_epoch(EpochId::new(99));
+/// ```
+///
+/// Transaction-ID allocation and state mutation are intentionally absent:
+///
+/// ```compile_fail
+/// # use grafeo_engine::GrafeoDB;
+/// let db = GrafeoDB::new_in_memory();
+/// let _forged = db.session().transaction_manager_ref().begin();
+/// ```
+///
+/// ```compile_fail
+/// # use grafeo_common::types::TransactionId;
+/// # use grafeo_engine::GrafeoDB;
+/// let db = GrafeoDB::new_in_memory();
+/// db.session()
+///     .transaction_manager_ref()
+///     .advance_next_transaction_id(TransactionId::new(10_000));
+/// ```
+#[derive(Clone, Copy)]
+pub struct TransactionManagerView<'a> {
+    inner: &'a TransactionManager,
+}
+
+impl<'a> TransactionManagerView<'a> {
+    pub(crate) const fn new(inner: &'a TransactionManager) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the isolation level of a retained transaction record.
+    #[must_use]
+    pub fn isolation_level(self, transaction_id: TransactionId) -> Option<IsolationLevel> {
+        self.inner.isolation_level(transaction_id)
+    }
+
+    /// Returns a snapshot of the transaction's entity write set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction is unknown or no longer retained.
+    pub fn get_write_set(self, transaction_id: TransactionId) -> Result<HashSet<EntityId>> {
+        self.inner.get_write_set(transaction_id)
+    }
+
+    /// Returns a snapshot of the transaction's entity read set.
+    #[must_use]
+    pub fn read_set(self, transaction_id: TransactionId) -> HashSet<EntityId> {
+        self.inner.read_set(transaction_id)
+    }
+
+    /// Returns a snapshot of the transaction's property-tagged read set.
+    #[must_use]
+    pub fn read_set_tagged(self, transaction_id: TransactionId) -> HashSet<(EntityId, PropTag)> {
+        self.inner.read_set_tagged(transaction_id)
+    }
+
+    /// Returns the retained state of a transaction.
+    #[must_use]
+    pub fn state(self, transaction_id: TransactionId) -> Option<TransactionState> {
+        self.inner.state(transaction_id)
+    }
+
+    /// Returns the transaction's snapshot epoch.
+    #[must_use]
+    pub fn start_epoch(self, transaction_id: TransactionId) -> Option<EpochId> {
+        self.inner.start_epoch(transaction_id)
+    }
+
+    /// Returns the latest published transaction epoch.
+    #[must_use]
+    pub fn current_epoch(self) -> EpochId {
+        self.inner.current_epoch()
+    }
+
+    /// Returns the oldest epoch needed by an active transaction.
+    #[must_use]
+    pub fn min_active_epoch(self) -> EpochId {
+        self.inner.min_active_epoch()
+    }
+
+    /// Returns the number of active transactions.
+    #[must_use]
+    pub fn active_count(self) -> usize {
+        self.inner.active_count()
+    }
+
+    /// Returns the last transaction identifier assigned by the manager.
+    #[must_use]
+    pub fn last_assigned_transaction_id(self) -> Option<TransactionId> {
+        self.inner.last_assigned_transaction_id()
+    }
+}
+
+impl std::fmt::Debug for TransactionManagerView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionManagerView")
+            .field("current_epoch", &self.current_epoch())
+            .field("active_count", &self.active_count())
+            .field(
+                "last_assigned_transaction_id",
+                &self.last_assigned_transaction_id(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl TransactionManager {
@@ -136,10 +524,45 @@ impl TransactionManager {
             // TransactionId::INVALID = u64::MAX, TransactionId::SYSTEM = 1, user transactions start at 2
             next_transaction_id: AtomicU64::new(2),
             current_epoch: AtomicU64::new(0),
+            reserved_epoch: AtomicU64::new(0),
             active_count: AtomicU64::new(0),
             transactions: RwLock::new(FxHashMap::default()),
             committed_epochs: RwLock::new(FxHashMap::default()),
+            read_registry: ReadRegistry::new(),
+            retired_readers: RwLock::new(FxHashMap::default()),
+            // GE3 default; GE5 will make this session-configurable.
+            escalation_threshold: AtomicUsize::new(256),
+            publication: std::sync::Arc::new(parking_lot::RwLock::new(())),
+            write_authority: grafeo_core::graph::write_permit::WriteAuthority::new(),
+            #[cfg(test)]
+            begin_count_pause: RwLock::new(None),
         }
+    }
+
+    /// Read barrier for committed mixed-model visibility.
+    #[must_use]
+    pub fn publication(&self) -> &parking_lot::RwLock<()> {
+        &self.publication
+    }
+
+    /// Owned handle to the mixed-model publication barrier.
+    ///
+    /// Lazy result streams and thread-bound mixed snapshots share ownership
+    /// of the actual lock independently of the creating read scope.
+    #[must_use]
+    pub(crate) fn publication_arc(&self) -> std::sync::Arc<parking_lot::RwLock<()>> {
+        std::sync::Arc::clone(&self.publication)
+    }
+
+    /// Authority used to seal the stores owned by this transaction manager.
+    #[cfg(any(feature = "lpg", feature = "wal", feature = "grafeo-file"))]
+    pub(crate) fn write_authority(&self) -> &grafeo_core::graph::write_permit::WriteAuthority {
+        &self.write_authority
+    }
+
+    /// Runs one engine-owned mutation against stores sealed by this manager.
+    pub(crate) fn with_write_authority<T>(&self, f: impl FnOnce() -> T) -> T {
+        grafeo_core::graph::write_permit::with_authority(&self.write_authority, f)
     }
 
     /// Begins a new transaction with the default isolation level (Snapshot Isolation).
@@ -151,10 +574,20 @@ impl TransactionManager {
     pub fn begin_with_isolation(&self, isolation_level: IsolationLevel) -> TransactionId {
         let transaction_id =
             TransactionId::new(self.next_transaction_id.fetch_add(1, Ordering::Relaxed));
+        // Snapshot replacement retains this writer while replacing the exact
+        // clock. BEGIN must sample its epoch only after admission, never before
+        // waiting for a replacement to finish.
+        let mut transactions = self.transactions.write();
         let epoch = EpochId::new(self.current_epoch.load(Ordering::Acquire));
 
         let info = TransactionInfo::new(epoch, isolation_level);
-        self.transactions.write().insert(transaction_id, info);
+        transactions.insert(transaction_id, info);
+        drop(transactions);
+        #[cfg(test)]
+        if let Some(pause) = self.begin_count_pause.read().clone() {
+            pause.entered.wait();
+            pause.resume.wait();
+        }
         self.active_count.fetch_add(1, Ordering::Relaxed);
         transaction_id
     }
@@ -167,11 +600,159 @@ impl TransactionManager {
             .map(|info| info.isolation_level)
     }
 
+    /// Records a node write and fans out coarse LPG predicate writes.
+    ///
+    /// Calls `record_write(EntityId::Node(node), tag)`, records the
+    /// `LpgDataset` structural guard, and, for every `label` in `labels`,
+    /// records `EntityId::Label(label)`.
+    ///
+    /// The fine `Node` write participates in first-writer-wins W-W detection.
+    /// The coarse `Label(L)` writes skip W-W (they are phantom guards, not
+    /// exclusive resources — see [`record_coarse_write`](Self::record_coarse_write))
+    /// but still perform write-time rw-antidependency detection.
+    /// Any conflict on any entity returns an error immediately.
+    ///
+    /// This is the load-bearing path for phantom detection: a concurrent
+    /// escalated `Label(L)` reader conflicts with ANY writer that touches a
+    /// node carrying label `L` — including `CREATE (:L)` and `SET n:L`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any write call detects a conflict.
+    pub fn record_node_write(
+        &self,
+        transaction_id: TransactionId,
+        node: NodeId,
+        labels: &[LabelId],
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_write(transaction_id, EntityId::Node(node), tag)?;
+        self.record_coarse_write(transaction_id, EntityId::LpgDataset, None)?;
+        for &label in labels {
+            self.record_coarse_write(transaction_id, EntityId::Label(label), None)?;
+        }
+        Ok(())
+    }
+
+    /// Records an edge write and fans out coarse LPG predicate writes.
+    ///
+    /// Calls `record_write(EntityId::Edge(edge), tag)`, records the
+    /// `LpgDataset` structural guard, and records
+    /// `EntityId::RelType(rel_type)`.
+    ///
+    /// Symmetric with [`record_node_write`](Self::record_node_write): a
+    /// concurrent escalated `RelType(T)` reader conflicts with any writer
+    /// that touches an edge of that type. The fine `Edge` write participates in
+    /// W-W; the coarse `RelType` write skips W-W (phantom guard — see
+    /// [`record_coarse_write`](Self::record_coarse_write)) but still performs
+    /// rw-antidependency detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any write call detects a conflict.
+    pub fn record_edge_write(
+        &self,
+        transaction_id: TransactionId,
+        edge: EdgeId,
+        rel_type: EdgeTypeId,
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_write(transaction_id, EntityId::Edge(edge), tag)?;
+        self.record_coarse_write(transaction_id, EntityId::LpgDataset, None)?;
+        self.record_coarse_write(transaction_id, EntityId::RelType(rel_type), None)?;
+        Ok(())
+    }
+
+    /// Fans out **only** the coarse `Label(L)` writes for a node — WITHOUT
+    /// recording the fine `Node(node)` entity write.
+    ///
+    /// Use this when the fine entity write has already been recorded (with its
+    /// own — possibly property-level — tag) by the operator/commit-completion
+    /// path, and only the coarse phantom guard is still missing. This is the
+    /// property-write case: `SET n.p` already recorded `(Node(n), prop)`; adding
+    /// `(Node(n), None)` here (as the full [`record_node_write`](Self::record_node_write)
+    /// would) is a `None`-tagged wildcard that destroys Property-granularity
+    /// disjointness, so we record the labels alone.
+    ///
+    /// The coarse `Label(L)` key carries `tag` — the written property's tag
+    /// (`Some(prop_tag(key))` from the caller). This means:
+    /// - A structural escalated reader `(Label(L), None)` still conflicts (via
+    ///   `prop_compatible(None, Some(x)) = true` — `None` is the wildcard).
+    /// - A property-escalated reader `(Label(L), Some(x))` conflicts only when
+    ///   `x == tag` (same property) — the Part-G disjoint-property knob.
+    /// - A property-escalated reader `(Label(L), Some(y))` with `y != tag` does
+    ///   NOT conflict (disjoint properties may run concurrently).
+    ///
+    /// Uses [`record_coarse_write`](Self::record_coarse_write) (no W-W check):
+    /// two concurrent transactions that both write a `Label(L)` guard for
+    /// different real nodes are NOT a real write-write conflict, so the W-W
+    /// check is skipped. The rw-antidependency detection still fires normally,
+    /// so escalated readers remain correctly covered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any write call detects a conflict.
+    pub fn record_node_labels_write(
+        &self,
+        transaction_id: TransactionId,
+        labels: &[LabelId],
+        tag: PropTag,
+    ) -> Result<()> {
+        for &label in labels {
+            self.record_coarse_write(transaction_id, EntityId::Label(label), tag)?;
+        }
+        Ok(())
+    }
+
+    /// Fans out **only** the coarse `RelType(T)` write for an edge — WITHOUT
+    /// recording the fine `Edge(edge)` entity write. Edge mirror of
+    /// [`record_node_labels_write`](Self::record_node_labels_write); see there
+    /// for the semantics of `tag` and why the fine entity write is intentionally
+    /// omitted on the property-write path.
+    ///
+    /// The `tag` is the written property's tag (`Some(prop_tag(key))`). As with
+    /// [`record_node_labels_write`](Self::record_node_labels_write): a structural
+    /// escalated reader `(RelType(T), None)` still conflicts (the `None` wildcard
+    /// is `prop_compatible` with any write); a same-property reader
+    /// `(RelType(T), Some(x))` with `x == tag` conflicts; a disjoint reader
+    /// `(RelType(T), Some(y))` with `y != tag` does not (the knob).
+    ///
+    /// Uses [`record_coarse_write`](Self::record_coarse_write) (no W-W check):
+    /// two concurrent transactions writing `RelType(T)` guards for different real
+    /// edges are NOT a real write-write conflict. The rw-antidependency detection
+    /// still fires normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write call detects a conflict.
+    pub fn record_edge_type_write(
+        &self,
+        transaction_id: TransactionId,
+        rel_type: EdgeTypeId,
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_coarse_write(transaction_id, EntityId::RelType(rel_type), tag)
+    }
+
     /// Records a write operation for the transaction.
     ///
     /// Uses first-writer-wins: if another active transaction has already
-    /// written to the same entity, returns a write-write conflict error
-    /// immediately (before the caller mutates the store).
+    /// written to the same **entity** (regardless of tag), returns a write-write
+    /// conflict error immediately (before the caller mutates the store).
+    ///
+    /// For Serializable transactions, also performs write-time
+    /// rw-antidependency detection (the mirror of the read-time detection in
+    /// [`Self::record_read`](Self::record_read)): any concurrent Serializable
+    /// transaction that has read `entity` with a tag compatible with `tag`
+    /// (and is still active) is found via the `ReadRegistry` and a
+    /// `reader →rw tx` edge is recorded for each.
+    ///
+    /// # Lock discipline
+    ///
+    /// The `transactions` write lock is held only for the W-W check and
+    /// `write_set.insert`. It is dropped before consulting the `ReadRegistry`
+    /// and before calling `set_rw_edge` (which also takes `transactions.write()`),
+    /// avoiding re-entrant deadlock.
     ///
     /// # Errors
     ///
@@ -181,26 +762,161 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         entity: impl Into<EntityId>,
+        tag: PropTag,
     ) -> Result<()> {
-        let entity = entity.into();
-        let mut txns = self.transactions.write();
+        self.record_write_inner(transaction_id, entity.into(), tag, true)
+    }
 
-        // First-writer-wins conflict detection. Skip the scan when only one
-        // transaction is active (common case for auto-commit).
-        if self.active_count.load(Ordering::Relaxed) > 1 {
-            for (other_tx, other_info) in txns.iter() {
-                if *other_tx != transaction_id
-                    && other_info.state == TransactionState::Active
-                    && other_info.write_set.contains(&entity)
+    /// Records a write to a COARSE predicate key (`Label(L)`,
+    /// `LabelPredicate(name)`, `RelType(T)`, `RelTypePredicate(name)`,
+    /// `LpgDataset`, or `RdfDataset`) — the phantom guard for predicate readers.
+    ///
+    /// Inserts into the write-set and performs write-time rw-antidependency
+    /// detection, but **deliberately skips first-writer-wins W-W**: a coarse
+    /// predicate key is a guard, not an exclusive resource — two txns that
+    /// structurally touch DIFFERENT entities under the same label/type both
+    /// legitimately write it, and a W-W there is a false conflict. When
+    /// swallowed (e.g. `let _ = record_write(…)`) the false W-W silently drops
+    /// the rw-edge → missed write-skew; when propagated it falsely aborts one
+    /// of the transactions.
+    ///
+    /// The REAL W-W for fine `Node`/`Edge` entity keys is recorded separately
+    /// by [`record_write`](Self::record_write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_coarse_write(
+        &self,
+        transaction_id: TransactionId,
+        entity: impl Into<EntityId>,
+        tag: PropTag,
+    ) -> Result<()> {
+        self.record_write_inner(transaction_id, entity.into(), tag, false)
+    }
+
+    /// Shared implementation for [`record_write`](Self::record_write) and
+    /// [`record_coarse_write`](Self::record_coarse_write).
+    ///
+    /// `check_ww` gates the first-writer-wins loop: `true` for fine entity
+    /// writes (`Node`/`Edge`), `false` for coarse predicate phantom guards
+    /// (`Label`/`LabelPredicate`/`RelType`/`RelTypePredicate`/`LpgDataset`/
+    /// `RdfDataset`). Everything else — state check, `write_set.insert`, and
+    /// Serializable rw-antidependency detection — is identical.
+    ///
+    /// # Lock discipline
+    ///
+    /// The `transactions` write lock is held only for the W-W check (when
+    /// `check_ww`) and `write_set.insert`. It is dropped before consulting the
+    /// `ReadRegistry` and before calling `set_rw_edge` (which also takes
+    /// `transactions.write()`), avoiding re-entrant deadlock.
+    fn record_write_inner(
+        &self,
+        transaction_id: TransactionId,
+        entity: EntityId,
+        tag: PropTag,
+        check_ww: bool,
+    ) -> Result<()> {
+        // Perform the W-W check and write_set insert under the transactions lock,
+        // then release the lock before any read_registry or set_rw_edge calls.
+        // Also capture the writer's start epoch (for the concurrency check
+        // against retired committed readers lingering in the registry).
+        let (is_serializable, our_start): (bool, EpochId) = {
+            let mut txns = self.transactions.write();
+
+            // First-writer-wins conflict detection (entity only — W-W is always
+            // entity-level regardless of tag). Skip the scan when only one
+            // transaction is active (common case for auto-commit) or when the
+            // caller is recording a coarse phantom-guard key (Label/RelType) where
+            // two concurrent txns touching different real entities under the same
+            // predicate both legitimately write it — a W-W there is a false conflict.
+            if check_ww && self.active_count.load(Ordering::Relaxed) > 1 {
+                for (other_tx, other_info) in txns.iter() {
+                    if *other_tx != transaction_id
+                        && other_info.state == TransactionState::Active
+                        && other_info.write_set.iter().any(|(e, _)| *e == entity)
+                    {
+                        return Err(Error::Transaction(TransactionError::WriteConflict(
+                            format!("Write-write conflict on entity {entity:?}"),
+                        )));
+                    }
+                }
+            }
+
+            // Single lookup: get_mut for both state check and write_set insert
+            let info = txns.get_mut(&transaction_id).ok_or_else(|| {
+                Error::Transaction(TransactionError::InvalidState(
+                    "Transaction not found".to_string(),
+                ))
+            })?;
+
+            if info.state != TransactionState::Active {
+                return Err(Error::Transaction(TransactionError::InvalidState(
+                    "Transaction is not active".to_string(),
+                )));
+            }
+            if info.reserved_commit_epoch.is_some() {
+                return Err(Error::Transaction(TransactionError::InvalidState(
+                    "Transaction commit is already prepared".to_string(),
+                )));
+            }
+
+            info.write_set.insert((entity, tag));
+            // Capture isolation level and start epoch while we hold the lock;
+            // drop the lock at the end of this block.
+            (
+                info.isolation_level == IsolationLevel::Serializable,
+                info.start_epoch,
+            )
+            // transactions write lock drops here
+        };
+
+        // Write-time rw-antidependency detection (Serializable writers only).
+        //
+        // An SI writer's overwrite does not participate in SSI cycle detection —
+        // symmetric with the read-time choice in record_read, which only detects
+        // when the READER is Serializable. SSI edges are formed only when the
+        // acting side (reader at read-time, writer at write-time) is Serializable.
+        if is_serializable {
+            // readers_of_compatible uses its own sharded locks, independent of
+            // transactions. Committed readers now linger in the registry (SIREAD
+            // retention), so gate each on the concurrency check: a committed
+            // reader is only a real in-edge source if this writer started before
+            // the reader's commit epoch (so the writer's snapshot couldn't see
+            // that reader).
+            let readers = self.read_registry.readers_of_compatible(entity, tag);
+            for reader in readers {
+                if reader != transaction_id && self.reader_concurrent_with(reader, Some(our_start))
                 {
-                    return Err(Error::Transaction(TransactionError::WriteConflict(
-                        format!("Write-write conflict on entity {entity:?}"),
-                    )));
+                    // reader read a version this writer is now overwriting.
+                    self.set_rw_edge(reader, transaction_id);
                 }
             }
         }
 
-        // Single lookup: get_mut for both state check and write_set insert
+        Ok(())
+    }
+
+    /// Records a touched entity in the transaction's write-set **without**
+    /// conflict detection.
+    ///
+    /// Unlike [`record_write`](Self::record_write), this performs no
+    /// first-writer-wins check: it simply inserts the entity so the write-set is
+    /// a complete record of what the transaction touched (used by
+    /// write-set-scoped commit/rollback). Used by session-direct mutators and for
+    /// newly created entities, which allocate fresh ids and cannot
+    /// write-write-conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_entity(
+        &self,
+        transaction_id: TransactionId,
+        entity: impl Into<EntityId>,
+    ) -> Result<()> {
+        let entity = entity.into();
+        let mut txns = self.transactions.write();
         let info = txns.get_mut(&transaction_id).ok_or_else(|| {
             Error::Transaction(TransactionError::InvalidState(
                 "Transaction not found".to_string(),
@@ -213,11 +929,65 @@ impl TransactionManager {
             )));
         }
 
-        info.write_set.insert(entity);
+        info.write_set.insert((entity, None));
         Ok(())
     }
 
+    /// Adds entities to the transaction's write-set without conflict detection
+    /// (used to complete the set from store chokepoints before validation).
+    ///
+    /// Unlike [`record_write`](Self::record_write), this performs no
+    /// first-writer-wins check — it simply bulk-inserts entities so the
+    /// write-set is a complete record of what the transaction touched.
+    /// Silently no-ops if the transaction is not active (to keep commit
+    /// on the hot path allocation-free on failure).
+    pub fn extend_write_set(
+        &self,
+        transaction_id: TransactionId,
+        entities: impl IntoIterator<Item = EntityId>,
+    ) {
+        if let Some(info) = self.transactions.write().get_mut(&transaction_id)
+            && info.state == TransactionState::Active
+        {
+            info.write_set
+                .extend(entities.into_iter().map(|e| (e, None)));
+        }
+    }
+
+    /// Tagged variant of [`extend_write_set`](Self::extend_write_set) used
+    /// under `ConflictGranularity::Property`.
+    ///
+    /// Accepts `(EntityId, PropTag)` pairs directly, so the commit path can
+    /// supply per-property tags from the store overlay instead of collapsing
+    /// every write to entity-level (`None`). Entity-level structural writes
+    /// (creates, deletes, label changes) still carry `None` even under
+    /// `Property` granularity.
+    pub fn extend_write_set_tagged(
+        &self,
+        transaction_id: TransactionId,
+        tagged: impl IntoIterator<Item = (EntityId, super::PropTag)>,
+    ) {
+        if let Some(info) = self.transactions.write().get_mut(&transaction_id)
+            && info.state == TransactionState::Active
+        {
+            info.write_set.extend(tagged);
+        }
+    }
+
     /// Records a read operation for the transaction (for serializable isolation).
+    ///
+    /// For Serializable transactions, also registers the reader in the
+    /// `ReadRegistry` and performs read-time rw-antidependency detection:
+    /// any concurrent transaction (active or committed-after-our-start) that
+    /// has written `entity` with a tag compatible with `tag` is recorded as
+    /// a writer end of a `tx →rw T_w` edge.
+    ///
+    /// # Lock discipline
+    ///
+    /// This method holds `transactions.write()` only long enough to (a) validate
+    /// state, (b) insert into `read_set`, and (c) collect concurrent-writer IDs
+    /// into a local `Vec`. It releases the lock before calling `set_rw_edge` (which
+    /// also takes `transactions.write()`), avoiding re-entrant deadlock.
     ///
     /// # Errors
     ///
@@ -226,52 +996,15 @@ impl TransactionManager {
         &self,
         transaction_id: TransactionId,
         entity: impl Into<EntityId>,
+        tag: PropTag,
     ) -> Result<()> {
-        let mut txns = self.transactions.write();
-        let info = txns.get_mut(&transaction_id).ok_or_else(|| {
-            Error::Transaction(TransactionError::InvalidState(
-                "Transaction not found".to_string(),
-            ))
-        })?;
+        let entity = entity.into();
 
-        if info.state != TransactionState::Active {
-            return Err(Error::Transaction(TransactionError::InvalidState(
-                "Transaction is not active".to_string(),
-            )));
-        }
-
-        info.read_set.insert(entity.into());
-        Ok(())
-    }
-
-    /// Commits a transaction with conflict detection.
-    ///
-    /// # Conflict Detection
-    ///
-    /// - **All isolation levels**: Write-write conflicts (two transactions writing
-    ///   to the same entity) are always detected and cause the second committer to abort.
-    ///
-    /// - **Serializable only**: Read-write conflicts (SSI validation) are additionally
-    ///   checked. If transaction T1 read an entity that another transaction T2 wrote,
-    ///   and T2 committed after T1 started, T1 will abort. This prevents write skew.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The transaction is not active
-    /// - There's a write-write conflict with another committed transaction
-    /// - (Serializable only) There's a read-write conflict (SSI violation)
-    pub fn commit(&self, transaction_id: TransactionId) -> Result<EpochId> {
-        // Lock ordering: transactions first, then committed_epochs (matches gc()).
-        // Both held as write locks to ensure state and epoch are updated atomically,
-        // preventing a race where another thread sees state == Committed but the
-        // epoch is not yet in committed_epochs.
-        let mut txns = self.transactions.write();
-        let mut committed = self.committed_epochs.write();
-
-        // First, validate the transaction exists and is active
-        let (our_isolation, our_start_epoch, our_write_set, our_read_set) = {
-            let info = txns.get(&transaction_id).ok_or_else(|| {
+        // Collect concurrent writers while holding the transactions lock, then
+        // release it before calling set_rw_edge (which also takes the lock).
+        let concurrent_writers: Vec<TransactionId> = {
+            let mut txns = self.transactions.write();
+            let info = txns.get_mut(&transaction_id).ok_or_else(|| {
                 Error::Transaction(TransactionError::InvalidState(
                     "Transaction not found".to_string(),
                 ))
@@ -283,11 +1016,500 @@ impl TransactionManager {
                 )));
             }
 
+            info.read_set.insert((entity, tag));
+
+            // Only gather concurrent writers for Serializable transactions.
+            if info.isolation_level != IsolationLevel::Serializable {
+                return Ok(());
+            }
+
+            let our_start = info.start_epoch;
+
+            // Collect active writers whose write_set contains `(entity, write_tag)`
+            // with `prop_compatible(tag, write_tag)`.
+            let mut writers: Vec<TransactionId> = txns
+                .iter()
+                .filter(|(other_tx, other_info)| {
+                    **other_tx != transaction_id
+                        && other_info.state == TransactionState::Active
+                        && other_info
+                            .write_set
+                            .iter()
+                            .any(|(e, wt)| *e == entity && prop_compatible(tag, *wt))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+
+            // Collect committed-after-our-start writers (they committed a newer
+            // version that our snapshot doesn't see).
+            //
+            // We take committed_epochs as a *read* lock here. Lock ordering
+            // is: transactions first, then committed_epochs — which we respect
+            // (transactions write lock is already held above).
+            let committed = self.committed_epochs.read();
+            for (other_tx, commit_epoch) in committed.iter() {
+                if *other_tx != transaction_id
+                    && commit_epoch.as_u64() > our_start.as_u64()
+                    && txns.get(other_tx).is_some_and(|i| {
+                        i.write_set
+                            .iter()
+                            .any(|(e, wt)| *e == entity && prop_compatible(tag, *wt))
+                    })
+                {
+                    writers.push(*other_tx);
+                }
+            }
+
+            writers
+            // transactions write lock and committed_epochs read lock drop here
+        };
+
+        // Register this reader in the SIREAD registry (uses its own sharded locks).
+        self.read_registry
+            .record_reader(entity, transaction_id, tag);
+
+        // Apply rw-antidependency edges now that the transactions lock is released.
+        for writer in concurrent_writers {
+            self.set_rw_edge(transaction_id, writer);
+        }
+
+        Ok(())
+    }
+
+    /// Sets the read-set escalation threshold `T` (test/diagnostics hook).
+    ///
+    /// A value of `usize::MAX` effectively disables promotion (no bucket can
+    /// exceed it). GE5 will route session configuration through here.
+    pub fn set_escalation_threshold(&self, threshold: usize) {
+        self.escalation_threshold
+            .store(threshold, Ordering::Relaxed);
+    }
+
+    /// Records a fine node read that occurred *while scanning label `label`*
+    /// (e.g. a `MATCH (n:L)` visit), with read-set escalation.
+    ///
+    /// While the predicate `Label(L)` has not yet escalated, each visited node
+    /// is recorded as a normal fine `Node(n)` read (full rw-antidependency
+    /// detection + SIREAD registration, identical to [`Self::record_read`]). Once
+    /// more than `escalation_threshold` distinct fine reads have accumulated
+    /// under `Label(L)`, the fine entries are **promoted**: collapsed into the
+    /// single coarse `Label(L)` key (see `Self::promote_read_bucket`). After
+    /// promotion, subsequent reads under `Label(L)` are no-ops at the fine
+    /// level — the coarse key already covers them, and GE2's write fan-out
+    /// (`record_node_write` → coarse `Label(L)` write) guarantees any writer of
+    /// a node carrying `L` still forms the rw-edge against this reader.
+    ///
+    /// Symmetric with [`Self::record_read_in_rel_type`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active (propagated from the
+    /// underlying [`Self::record_read`] calls).
+    pub fn record_read_in_label(
+        &self,
+        transaction_id: TransactionId,
+        node: NodeId,
+        tag: PropTag,
+        label: LabelId,
+    ) -> Result<()> {
+        // The coarse_tag mirrors the fine tag: for Entity granularity `tag` is
+        // `None` (wildcard) and the bucket promotes to `(Label(L), None)`;
+        // for Property granularity structural reads `tag` is `Some(STRUCT_TAG)`
+        // and the bucket promotes to `(Label(L), Some(STRUCT_TAG))`. Using
+        // `STRUCT_TAG` at the coarse level preserves the disjoint-property knob:
+        // `prop_compatible(Some(STRUCT_TAG), Some(prop_x))` is false, so a
+        // property write does NOT conflict with a structural-only coarse reader.
+        // A structural write (`None` tag) still conflicts:
+        // `prop_compatible(Some(STRUCT_TAG), None) = true`.
+        self.record_read_in_predicate(
+            transaction_id,
+            EntityId::Node(node),
+            tag,
+            EntityId::Label(label),
+            tag,
+        )
+    }
+
+    /// Records a fine edge read that occurred *while scanning relationship type
+    /// `rel`* (e.g. a `MATCH ()-[:T]->()` visit), with read-set escalation.
+    ///
+    /// Symmetric with [`Self::record_read_in_label`]: collapses fine `Edge(e)`
+    /// reads into the coarse `RelType(T)` key once the threshold is exceeded.
+    /// Drop-safety relies on GE2's edge write fan-out (`record_edge_write` →
+    /// coarse `RelType(T)` write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_read_in_rel_type(
+        &self,
+        transaction_id: TransactionId,
+        edge: EdgeId,
+        tag: PropTag,
+        rel: EdgeTypeId,
+    ) -> Result<()> {
+        // Symmetric with `record_read_in_label`: coarse_tag mirrors fine tag so
+        // that structural reads (`None`) promote to `(RelType(T), None)` while
+        // Property-granularity structural reads (`Some(STRUCT_TAG)`) promote to
+        // `(RelType(T), Some(STRUCT_TAG))`, preserving the disjoint-property knob.
+        self.record_read_in_predicate(
+            transaction_id,
+            EntityId::Edge(edge),
+            tag,
+            EntityId::RelType(rel),
+            tag,
+        )
+    }
+
+    /// Shared implementation for [`record_read_in_label`](Self::record_read_in_label)
+    /// and [`record_read_in_rel_type`](Self::record_read_in_rel_type).
+    ///
+    /// `fine` / `fine_tag` identify the per-row key (`Node`/`Edge`) and its
+    /// property tag. `predicate` is the coarse scan key (`Label`/`RelType`).
+    /// `coarse_tag` is the tag that will be recorded on the coarse read if this
+    /// bucket promotes. For Entity-granularity structural escalation it is `None`
+    /// (wildcard); for Property-granularity structural escalation it is
+    /// `Some(STRUCT_TAG)` (which is `prop_compatible` with structural writes but
+    /// NOT with property writes, preserving the disjoint-property knob at scale);
+    /// for property-tagged scans it is `Some(prop_tag)` to promote to a
+    /// `(Label(L), Some(t))` key independently of the structural bucket.
+    ///
+    /// # Lock discipline
+    ///
+    /// Never holds the `transactions` write lock across a `read_registry` call.
+    /// The fine `record_read` (and the coarse one inside `promote_read_bucket`)
+    /// each acquire and release the lock internally; the bucket bookkeeping
+    /// here takes the lock only to insert/inspect and releases it before any
+    /// registry op.
+    fn record_read_in_predicate(
+        &self,
+        transaction_id: TransactionId,
+        fine: EntityId,
+        fine_tag: PropTag,
+        predicate: EntityId,
+        coarse_tag: PropTag,
+    ) -> Result<()> {
+        // Already escalated: the coarse `(predicate, coarse_tag)` key is in
+        // read_set and the SIREAD registry; it covers this read. Do NOT add a
+        // fine entry and do NOT re-run rw-detection. (A quick read-lock check.)
+        {
+            let txns = self.transactions.read();
+            match txns.get(&transaction_id) {
+                Some(info) if info.escalated.contains(&(predicate, coarse_tag)) => {
+                    return Ok(());
+                }
+                Some(_) => {}
+                // Unknown tx: let the fine record_read below produce the
+                // canonical "not found" error.
+                None => {}
+            }
+        }
+
+        // Not escalated yet: record the fine read normally (fine entry + its own
+        // rw-detection + SIREAD registration). No lock held across this call.
+        self.record_read(transaction_id, fine, fine_tag)?;
+
+        // Insert the fine entry into this (predicate, coarse_tag) bucket and
+        // decide whether the number of DISTINCT reads crossed the threshold.
+        // `record_read` and the registry are already set-like, so repeating an
+        // entity here must likewise be idempotent. The companion membership
+        // set avoids turning a large non-promoting scan into O(n²) work while
+        // preserving the public Vec bucket representation.
+        let should_promote = {
+            let mut txns = self.transactions.write();
+            let Some(info) = txns.get_mut(&transaction_id) else {
+                return Ok(());
+            };
+            let key = (predicate, coarse_tag);
+            let inserted = info
+                .scan_bucket_members
+                .entry(key)
+                .or_default()
+                .insert((fine, fine_tag));
+            let bucket = info.scan_buckets.entry(key).or_default();
+            if inserted {
+                bucket.push((fine, fine_tag));
+            }
+            inserted && bucket.len() > self.escalation_threshold.load(Ordering::Relaxed)
+            // transactions write lock drops here
+        };
+
+        if should_promote {
+            self.promote_read_bucket(transaction_id, predicate, coarse_tag)?;
+        }
+
+        Ok(())
+    }
+
+    /// Promotes a `(predicate, coarse_tag)` bucket's accumulated fine reads
+    /// into the coarse key `(predicate, coarse_tag)`.
+    ///
+    /// Steps (order is load-bearing — see inline notes):
+    /// (a) `record_read(tx, predicate, coarse_tag)` records the **coarse** read
+    ///     with its own rw-detection. This is what catches a concurrent
+    ///     `Label(L)` writer (incl. a `CREATE (:L)` during the scan) that the
+    ///     fine reads alone could not see — and it is sound to subsequently drop
+    ///     the fine entries because GE2's write fan-out records the coarse key
+    ///     for every structural change to a node/edge under this predicate.
+    ///     For structural escalation `coarse_tag` is `None`; property-tagged
+    ///     escalation passes `Some(t)` to record `(Label(L), Some(t))`.
+    /// (b) Under the `transactions` lock, drain the bucket, remove every fine
+    ///     `(entity, tag)` from `read_set`, mark `(predicate, coarse_tag)`
+    ///     escalated, and clear the bucket. Release the lock, **then** remove
+    ///     each fine SIREAD entry from the registry via `remove_reader_entity`
+    ///     (registry ops only after the lock is released — the critical
+    ///     deadlock-avoidance rule).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the coarse `record_read` fails (tx not active).
+    fn promote_read_bucket(
+        &self,
+        transaction_id: TransactionId,
+        predicate: EntityId,
+        coarse_tag: PropTag,
+    ) -> Result<()> {
+        // (a) Coarse read WITH rw-detection (catches concurrent Label/RelType
+        //     writers the fine reads missed). No lock held across this call.
+        self.record_read(transaction_id, predicate, coarse_tag)?;
+
+        // (b) Collapse: take the fine entries and drop them from read_set +
+        //     mark (predicate, coarse_tag) escalated, all under one
+        //     transactions-lock acquisition. Registry removals happen AFTER the
+        //     lock is released.
+        let fine_entries: Vec<(EntityId, PropTag)> = {
+            let mut txns = self.transactions.write();
+            let Some(info) = txns.get_mut(&transaction_id) else {
+                return Ok(());
+            };
+            let entries = info
+                .scan_buckets
+                .get_mut(&(predicate, coarse_tag))
+                .map(std::mem::take)
+                .unwrap_or_default();
+            info.scan_bucket_members.remove(&(predicate, coarse_tag));
+            for entry in &entries {
+                info.read_set.remove(entry);
+            }
+            info.escalated.insert((predicate, coarse_tag));
+            entries
+            // transactions write lock drops here
+        };
+
+        // Release the per-row SIREAD locks now that the coarse key covers them.
+        // (registry has its own sharded locks; never call this under the
+        // transactions write lock.)
+        for (entity, tag) in fine_entries {
+            self.read_registry
+                .remove_reader_entity(entity, transaction_id, tag);
+        }
+
+        Ok(())
+    }
+
+    /// For each entity this tx wrote (including store-derived completions that
+    /// bypassed `record_write`), record the write-time rw-edge against any
+    /// concurrent reader.
+    ///
+    /// Idempotent (`set_rw_edge` just re-sets bools); safe to run at commit
+    /// even if `record_write` already detected some edges.
+    ///
+    /// Must be called **before** taking the `transactions`/`committed_epochs`
+    /// locks so that `set_rw_edge`'s own `transactions.write()` does not
+    /// re-enter.
+    fn detect_writeset_conflicts(&self, tx: TransactionId) {
+        let write_set = self
+            .transactions
+            .read()
+            .get(&tx)
+            .map(|i| (i.isolation_level, i.write_set.clone()));
+        if let Some((IsolationLevel::Serializable, ws)) = write_set {
+            // Capture the writer's start epoch for the concurrency check against
+            // retired (committed) readers lingering in the registry.
+            let writer_start = self.start_epoch(tx);
+            for (entity, write_tag) in ws {
+                for reader in self.read_registry.readers_of_compatible(entity, write_tag) {
+                    if reader != tx && self.reader_concurrent_with(reader, writer_start) {
+                        self.set_rw_edge(reader, tx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decides whether a reader found via `read_registry.readers_of_compatible`
+    /// is concurrent with a writer that started at `writer_start`.
+    ///
+    /// Committed readers now linger in the registry (their SIREAD locks are
+    /// retained until all concurrent txns finish), so `readers_of_compatible`
+    /// can return a reader that already committed at epoch `C_r`. Such a reader
+    /// is concurrent with the writer only if the writer started before `C_r`
+    /// (i.e. the writer could not see the reader's commit). A reader that is
+    /// still active (not in `retired_readers`) is always concurrent (both
+    /// started at or before now and neither has finished).
+    ///
+    /// `writer_start` is `None` only if the writer is already gone from
+    /// `transactions`; in that case there is no live edge to form, so return
+    /// `false`.
+    fn reader_concurrent_with(&self, reader: TransactionId, writer_start: Option<EpochId>) -> bool {
+        let retired = self.retired_readers.read();
+        match retired.get(&reader) {
+            // Committed reader: concurrent iff the writer started before the
+            // reader's commit epoch.
+            Some(commit_epoch) => {
+                writer_start.is_some_and(|ws| ws.as_u64() < commit_epoch.as_u64())
+            }
+            // Still active → concurrent.
+            None => true,
+        }
+    }
+
+    /// Garbage-collect retained SIREAD locks (the `retired_readers` set).
+    ///
+    /// A committed reader's SIREAD lock must persist until every transaction
+    /// concurrent with it has finished. A retired reader (commit epoch `C_r`) is
+    /// releasable once no currently-Active Serializable transaction could be
+    /// concurrent with it — i.e. once `C_r <= min_active_start`, where
+    /// `min_active_start` is the minimum start epoch over all Active Serializable
+    /// transactions. If there are no Active Serializable transactions, every
+    /// retired reader is releasable.
+    ///
+    /// # Lock discipline
+    ///
+    /// Collects the releasable ids first (a short read over `transactions` to
+    /// compute `min_active_start`, then a read over `retired_readers`), releasing
+    /// both before calling `read_registry.remove_reader` (independent sharded
+    /// locks) and before taking the `retired_readers` write lock to prune. Never
+    /// holds `transactions` while calling into the registry.
+    fn gc_retired_readers(&self) {
+        // min_active_start over Active + Serializable transactions; None ⇒ none
+        // active ⇒ release everything.
+        let min_active_start: Option<u64> = {
+            let txns = self.transactions.read();
+            txns.values()
+                .filter(|info| {
+                    info.state == TransactionState::Active
+                        && info.isolation_level == IsolationLevel::Serializable
+                })
+                .map(|info| info.start_epoch.as_u64())
+                .min()
+            // transactions read lock drops here
+        };
+
+        // Collect releasable ids under the retired_readers read lock.
+        let releasable: Vec<TransactionId> = {
+            let retired = self.retired_readers.read();
+            retired
+                .iter()
+                .filter(|(_, commit_epoch)| match min_active_start {
+                    Some(min_start) => commit_epoch.as_u64() <= min_start,
+                    None => true,
+                })
+                .map(|(tx, _)| *tx)
+                .collect()
+            // retired_readers read lock drops here
+        };
+
+        if releasable.is_empty() {
+            return;
+        }
+
+        // Release SIREAD locks (registry uses independent sharded locks) and
+        // prune retired_readers.
+        let mut retired = self.retired_readers.write();
+        for tx in releasable {
+            self.read_registry.remove_reader(tx);
+            retired.remove(&tx);
+        }
+    }
+
+    /// Commits a transaction with conflict detection.
+    ///
+    /// # Conflict Detection
+    ///
+    /// - **All isolation levels**: Write-write conflicts (two transactions writing
+    ///   to the same entity) are always detected and cause the second committer to abort.
+    ///
+    /// - **Serializable only**: Incremental SSI (F2 dangerous-structure pivot
+    ///   detection). A transaction that is the pivot of a rw-antidependency cycle
+    ///   — it has both an inbound rw-edge (`in_conflict`) and an outbound rw-edge
+    ///   (`out_conflict`), and the outbound edge is confirmed by a committed writer
+    ///   — is aborted. Read-only transactions (never wrote anything) and
+    ///   single-edge transactions (only one flag set) are not aborted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The transaction is not active
+    /// - There's a write-write conflict with another committed transaction
+    /// - (Serializable only) This transaction is a dangerous-structure pivot
+    pub fn commit(&self, transaction_id: TransactionId) -> Result<EpochId> {
+        // Keep the public in-memory path atomic too. Durable Session commits
+        // hold this lock themselves and use prepare/finalize directly around
+        // the WAL marker.
+        let _publication = self.publication.write();
+        let epoch = self.prepare_commit_epoch(transaction_id)?;
+        self.finalize_durable_commit(transaction_id, epoch)?;
+        Ok(epoch)
+    }
+
+    /// Validates a transaction and reserves its commit epoch without marking
+    /// it committed.
+    ///
+    /// The caller must hold the database publication write lock until it either
+    /// calls [`finalize_durable_commit`](Self::finalize_durable_commit) after
+    /// durably recording the commit marker, or aborts the transaction. Epoch
+    /// gaps after a failed durable write are intentional and harmless.
+    pub(crate) fn prepare_durable_commit(&self, transaction_id: TransactionId) -> Result<EpochId> {
+        self.prepare_commit_epoch(transaction_id)
+    }
+
+    fn prepare_commit_epoch(&self, transaction_id: TransactionId) -> Result<EpochId> {
+        // Safety-net write-time detection: covers store-derived writes that
+        // bypassed record_write (e.g. extend_write_set / record_entity).
+        // Must run BEFORE taking transactions/committed_epochs locks to avoid
+        // re-entrant deadlock (set_rw_edge also takes transactions.write()).
+        self.detect_writeset_conflicts(transaction_id);
+
+        // Lock ordering: transactions first, then committed_epochs (matches gc()).
+        // Preparation only reads the committed map; finalization later takes
+        // both write locks and publishes state + epoch atomically.
+        let mut txns = self.transactions.write();
+        let committed = self.committed_epochs.read();
+
+        // First, validate the transaction exists and is active
+        let (
+            our_isolation,
+            our_start_epoch,
+            our_write_set,
+            our_read_set,
+            our_in_conflict,
+            our_out_conflict,
+        ) = {
+            let info = txns.get(&transaction_id).ok_or_else(|| {
+                Error::Transaction(TransactionError::InvalidState(
+                    "Transaction not found".to_string(),
+                ))
+            })?;
+
+            if info.state != TransactionState::Active {
+                return Err(Error::Transaction(TransactionError::InvalidState(
+                    "Transaction is not active".to_string(),
+                )));
+            }
+            if info.reserved_commit_epoch.is_some() {
+                return Err(Error::Transaction(TransactionError::InvalidState(
+                    "Transaction commit is already prepared".to_string(),
+                )));
+            }
+
             (
                 info.isolation_level,
                 info.start_epoch,
                 info.write_set.clone(),
                 info.read_set.clone(),
+                info.in_conflict,
+                info.out_conflict,
             )
         };
 
@@ -295,12 +1517,35 @@ impl TransactionManager {
         // after our snapshot (i.e., concurrent writers to the same entities).
         // Transactions committed before our start_epoch are part of our visible
         // snapshot, so overwriting their values is not a conflict.
+        // W-W comparison is entity-only (ignores PropTag).
+        //
+        // Coarse predicate-guard keys (numeric and named Label/RelType keys plus
+        // Index/LpgDataset/RdfDataset) are deliberately excluded: they are phantom
+        // guards used for SSI rw-antidependency detection, not exclusive
+        // resources. Two transactions that each wrote DIFFERENT real entities
+        // under the same predicate both legitimately hold the coarse key — a W-W
+        // on it here would be a false conflict (matching the write-time behaviour
+        // of record_coarse_write).
         for (other_tx, commit_epoch) in committed.iter() {
             if *other_tx != transaction_id && commit_epoch.as_u64() > our_start_epoch.as_u64() {
                 // Check if that transaction wrote to any of our entities
                 if let Some(other_info) = txns.get(other_tx) {
-                    for entity in &our_write_set {
-                        if other_info.write_set.contains(entity) {
+                    for (entity, _) in &our_write_set {
+                        if matches!(
+                            entity,
+                            EntityId::Index(_)
+                                | EntityId::Label(_)
+                                | EntityId::LabelPredicate(_)
+                                | EntityId::RelType(_)
+                                | EntityId::RelTypePredicate(_)
+                                | EntityId::LpgDataset
+                                | EntityId::RdfDataset
+                        ) {
+                            // Coarse phantom guard — skip W-W; the SSI rw-edge
+                            // machinery handles the real conflict.
+                            continue;
+                        }
+                        if other_info.write_set.iter().any(|(e, _)| e == entity) {
                             return Err(Error::Transaction(TransactionError::WriteConflict(
                                 format!("Write-write conflict on entity {:?}", entity),
                             )));
@@ -310,48 +1555,98 @@ impl TransactionManager {
             }
         }
 
-        // SSI validation for Serializable isolation level.
-        // Check for read-write conflicts: if we read an entity that another
-        // transaction (that committed after we started) wrote, we have a
-        // "rw-antidependency" which can cause write skew.
+        // F2 incremental SSI: a transaction with BOTH an inbound and an outbound
+        // rw-antidependency is a pivot that can anchor a non-serializable cycle.
+        // Abort it — but only when the outbound edge is confirmed by a committed
+        // writer (i.e., the cycle is actually closed). This prevents over-aborting
+        // the first committer in a write-skew scenario where neither side has
+        // committed yet.
         //
-        // With both transactions.write() and committed_epochs.write() held,
-        // no concurrent commit can insert into committed_epochs or change
-        // transaction state during our validation window. A single pass over
-        // committed_epochs is sufficient.
-        if our_isolation == IsolationLevel::Serializable && !our_read_set.is_empty() {
-            for (other_tx, commit_epoch) in committed.iter() {
-                if *other_tx != transaction_id && commit_epoch.as_u64() > our_start_epoch.as_u64() {
-                    // Check if that transaction wrote to any entity we read
-                    if let Some(other_info) = txns.get(other_tx) {
-                        for entity in &our_read_set {
-                            if other_info.write_set.contains(entity) {
-                                return Err(Error::Transaction(
-                                    TransactionError::SerializationFailure(format!(
-                                        "Read-write conflict on entity {:?}: \
-                                         another transaction modified data we read",
-                                        entity
-                                    )),
-                                ));
-                            }
-                        }
-                    }
-                }
+        // Read-only txns never set in_conflict (they write nothing, so no reader
+        // can form an inbound edge against them); benign single-edge txns have
+        // only one flag — neither aborts.
+        //
+        // The cycle-closed check: a committed tx wrote some (entity, write_tag)
+        // and our read_set contains some (entity, read_tag) with
+        // prop_compatible(read_tag, write_tag). Under all-None this is identical
+        // to the old "entity in read_set" check.
+        if our_isolation == IsolationLevel::Serializable
+            && our_in_conflict
+            && our_out_conflict
+            && !our_read_set.is_empty()
+        {
+            let cycle_closed = committed.iter().any(|(other_tx, commit_epoch)| {
+                *other_tx != transaction_id
+                    && commit_epoch.as_u64() > our_start_epoch.as_u64()
+                    && txns.get(other_tx).is_some_and(|i| {
+                        i.write_set.iter().any(|(wentity, wtag)| {
+                            our_read_set.iter().any(|(rentity, rtag)| {
+                                wentity == rentity && prop_compatible(*rtag, *wtag)
+                            })
+                        })
+                    })
+            });
+            if cycle_closed {
+                return Err(Error::Transaction(TransactionError::SerializationFailure(
+                    "Serialization failure: transaction is a dangerous-structure pivot (incremental SSI)".to_string(),
+                )));
             }
         }
 
-        // Commit successful: advance epoch atomically.
-        // SeqCst ensures all threads see commits in a consistent total order.
-        let commit_epoch = EpochId::new(self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1);
-
-        // Update state and record commit epoch atomically (both write locks held).
-        if let Some(info) = txns.get_mut(&transaction_id) {
-            info.state = TransactionState::Committed;
-        }
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
-        committed.insert(transaction_id, commit_epoch);
+        // Validation succeeded: reserve the next epoch, but deliberately keep
+        // the transaction Active until its durable commit marker is written.
+        // SeqCst gives reservations a single total order. A failed WAL write
+        // may leave an epoch gap; reusing that epoch would be less safe.
+        let commit_epoch = self.reserve_publication_epoch()?;
+        txns.get_mut(&transaction_id)
+            .expect("validated transaction must still exist")
+            .reserved_commit_epoch = Some(commit_epoch);
+        drop(txns);
+        drop(committed);
 
         Ok(commit_epoch)
+    }
+
+    /// Marks a validated transaction committed at its reserved durable epoch.
+    ///
+    /// This must be called only after the commit marker has been force-synced
+    /// (or immediately after preparation for an in-memory transaction).
+    pub(crate) fn finalize_durable_commit(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+    ) -> Result<()> {
+        let mut txns = self.transactions.write();
+        let mut committed = self.committed_epochs.write();
+        let info = txns.get_mut(&transaction_id).ok_or_else(|| {
+            Error::Transaction(TransactionError::InvalidState(
+                "Transaction not found".to_string(),
+            ))
+        })?;
+        if info.state != TransactionState::Active
+            || info.reserved_commit_epoch != Some(commit_epoch)
+        {
+            return Err(Error::Transaction(TransactionError::InvalidState(
+                "Transaction has no matching prepared commit".to_string(),
+            )));
+        }
+
+        info.reserved_commit_epoch = None;
+        info.state = TransactionState::Committed;
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
+        committed.insert(transaction_id, commit_epoch);
+        self.publish_reserved_epoch(commit_epoch);
+
+        // Retain SIREAD locks until every transaction concurrent with this
+        // commit has finished (Cahill/PostgreSQL SSI rule).
+        self.retired_readers
+            .write()
+            .insert(transaction_id, commit_epoch);
+
+        drop(txns);
+        drop(committed);
+        self.gc_retired_readers();
+        Ok(())
     }
 
     /// Aborts a transaction.
@@ -374,12 +1669,27 @@ impl TransactionManager {
             )));
         }
 
+        info.reserved_commit_epoch = None;
         info.state = TransactionState::Aborted;
         self.active_count.fetch_sub(1, Ordering::Relaxed);
+
+        // Release lock before GC (remove_reader uses its own sharded locks).
+        drop(txns);
+
+        // An aborted tx's reads never participated in any committed schedule, so
+        // its SIREAD locks release at once (no retention). Also defensively drop
+        // it from retired_readers (it should not be there — abort only fires on
+        // an Active tx).
+        self.read_registry.remove_reader(transaction_id);
+        self.retired_readers.write().remove(&transaction_id);
+        // Sweep: aborting shrinks the active set, which may now let earlier
+        // retired readers be released.
+        self.gc_retired_readers();
+
         Ok(())
     }
 
-    /// Returns the write set of a transaction.
+    /// Returns the write set of a transaction as a set of `EntityId` values.
     ///
     /// This returns a copy of the entities written by this transaction,
     /// used for rollback to discard uncommitted versions.
@@ -394,7 +1704,31 @@ impl TransactionManager {
                 "Transaction not found".to_string(),
             ))
         })?;
-        Ok(info.write_set.clone())
+        Ok(info.write_set.iter().map(|(e, _)| *e).collect())
+    }
+
+    /// Returns a copy of the read-set of a transaction as a set of `EntityId`
+    /// values (serializable read tracking).
+    pub fn read_set(&self, transaction_id: TransactionId) -> HashSet<EntityId> {
+        self.transactions
+            .read()
+            .get(&transaction_id)
+            .map(|i| i.read_set.iter().map(|(e, _)| *e).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns a copy of the read-set including per-entry [`PropTag`] values.
+    ///
+    /// Used by tests (and diagnostics) to verify that property-level
+    /// granularity is emitting `Some(tag)` entries rather than entity-level `None`.
+    /// Also used by integration tests in `tests/serializable.rs` to assert
+    /// tagged read-set contents after escalation.
+    pub fn read_set_tagged(&self, transaction_id: TransactionId) -> HashSet<(EntityId, PropTag)> {
+        self.transactions
+            .read()
+            .get(&transaction_id)
+            .map(|i| i.read_set.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Replaces the write set of a transaction (used for savepoint rollback).
@@ -413,7 +1747,12 @@ impl TransactionManager {
                 "Transaction not found".to_string(),
             ))
         })?;
-        info.write_set = write_set;
+        if info.state != TransactionState::Active || info.reserved_commit_epoch.is_some() {
+            return Err(Error::Transaction(TransactionError::InvalidState(
+                "Cannot reset the write set after commit preparation".to_string(),
+            )));
+        }
+        info.write_set = write_set.into_iter().map(|e| (e, None)).collect();
         Ok(())
     }
 
@@ -424,6 +1763,7 @@ impl TransactionManager {
         let mut txns = self.transactions.write();
         for info in txns.values_mut() {
             if info.state == TransactionState::Active {
+                info.reserved_commit_epoch = None;
                 info.state = TransactionState::Aborted;
                 self.active_count.fetch_sub(1, Ordering::Relaxed);
             }
@@ -446,19 +1786,72 @@ impl TransactionManager {
             .map(|info| info.start_epoch)
     }
 
-    /// Returns the current epoch.
+    /// Returns the latest committed epoch, excluding uncommitted reservations.
     #[must_use]
     pub fn current_epoch(&self) -> EpochId {
         EpochId::new(self.current_epoch.load(Ordering::Acquire))
     }
 
-    /// Synchronizes the epoch counter to at least the given value.
+    /// Reserves the next epoch in the shared publication identity space.
     ///
-    /// Used after snapshot import and WAL recovery to align the
-    /// TransactionManager epoch with the store epoch.
-    pub fn sync_epoch(&self, epoch: EpochId) {
+    /// Reservations share the same sequentially consistent counter for
+    /// transaction commits and standalone metadata publications, so every
+    /// publication has one total order. Callers must retain the publication
+    /// write lock through durable acknowledgement and live-state publication;
+    /// standalone store mutations must also retain database write authority.
+    /// A failed durable publication may leave an epoch gap; reserved epochs are
+    /// never reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured storage-capacity exhaustion after the final real
+    /// epoch has already been reserved. The counter is left unchanged.
+    pub(crate) fn reserve_publication_epoch(&self) -> Result<EpochId> {
+        let previous = self
+            .reserved_epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next < EpochId::PENDING.as_u64())
+            })
+            .map_err(|_| {
+                Error::Storage(StorageError::Full)
+                    .with_context("publication epoch identity space is exhausted")
+            })?;
+        Ok(EpochId::new(previous + 1))
+    }
+
+    /// Publishes a successfully installed, previously reserved real epoch.
+    ///
+    /// The caller retains publication authority through all model installers.
+    /// This infallible step performs no allocation and never exposes a failed
+    /// reservation as committed. Recovery uses `try_sync_epoch` instead.
+    pub(crate) fn publish_reserved_epoch(&self, epoch: EpochId) {
         self.current_epoch
             .fetch_max(epoch.as_u64(), Ordering::SeqCst);
+    }
+
+    /// Synchronizes both clocks to at least the given real committed epoch.
+    ///
+    /// Used after snapshot import and WAL recovery to align the
+    /// `TransactionManager` epoch with the store epoch. Epoch zero is a valid
+    /// empty-store/recovery frontier; [`EpochId::PENDING`] is an uncommitted
+    /// interval sentinel and can never become the durable publication clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidValue`] if `epoch` is [`EpochId::PENDING`]. The
+    /// counter is not modified on error.
+    pub fn try_sync_epoch(&self, epoch: EpochId) -> Result<()> {
+        if epoch == EpochId::PENDING {
+            return Err(Error::InvalidValue(
+                "transaction manager epoch cannot be PENDING".to_string(),
+            ));
+        }
+        self.reserved_epoch
+            .fetch_max(epoch.as_u64(), Ordering::SeqCst);
+        self.publish_reserved_epoch(epoch);
+        Ok(())
     }
 
     /// Returns the minimum epoch that must be preserved for active transactions.
@@ -541,11 +1934,28 @@ impl TransactionManager {
         initial_count - txns.len()
     }
 
-    /// Marks a transaction as committed at a specific epoch.
+    /// Marks a valid transaction as committed at a specific real epoch.
     ///
-    /// Used during recovery to restore transaction state.
-    pub fn mark_committed(&self, transaction_id: TransactionId, epoch: EpochId) {
+    /// Used during recovery to restore transaction state. Epoch zero remains a
+    /// valid synthetic recovery cut; [`EpochId::PENDING`] is never committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidValue`] before changing committed metadata when
+    /// either coordinate is a reserved sentinel.
+    pub fn try_mark_committed(&self, transaction_id: TransactionId, epoch: EpochId) -> Result<()> {
+        if !transaction_id.is_valid() {
+            return Err(Error::InvalidValue(
+                "committed transaction ID cannot be INVALID".to_string(),
+            ));
+        }
+        if epoch == EpochId::PENDING {
+            return Err(Error::InvalidValue(
+                "committed transaction epoch cannot be PENDING".to_string(),
+            ));
+        }
         self.committed_epochs.write().insert(transaction_id, epoch);
+        Ok(())
     }
 
     /// Returns the last assigned transaction ID.
@@ -561,10 +1971,193 @@ impl TransactionManager {
         }
     }
 
+    /// Ensures the next allocated id is strictly greater than `seen`.
+    ///
+    /// Recovery uses this so a crash-orphaned WAL transaction can never be
+    /// authenticated by a later process that would otherwise restart at 2.
+    pub fn advance_next_transaction_id(&self, seen: TransactionId) {
+        if !seen.is_valid() {
+            return;
+        }
+        let next = seen.as_u64().saturating_add(1);
+        if next <= 1 {
+            return;
+        }
+        self.next_transaction_id.fetch_max(next, Ordering::Release);
+    }
+
     /// Returns the commit epoch of a transaction, if committed.
     #[cfg(test)]
     pub fn committed_epoch(&self, transaction_id: TransactionId) -> Option<EpochId> {
         self.committed_epochs.read().get(&transaction_id).copied()
+    }
+
+    /// Record a read-write antidependency edge `reader →rw writer` (the reader read a
+    /// version the writer overwrites). Sets each flag independently:
+    ///
+    /// - `reader.out_conflict` is set iff `reader` is Active + Serializable.
+    /// - `writer.in_conflict` is set iff `writer` is Active + Serializable.
+    ///
+    /// This means a committed writer's flag is never set (it is done), but an
+    /// active reader's `out_conflict` is still set even when writing to a
+    /// committed writer — which is the correct pivot-detection signal.
+    pub(crate) fn set_rw_edge(&self, reader: TransactionId, writer: TransactionId) {
+        if reader == writer {
+            return;
+        }
+        let mut txns = self.transactions.write();
+        if let Some(i) = txns.get_mut(&reader)
+            && i.state == TransactionState::Active
+            && i.isolation_level == IsolationLevel::Serializable
+        {
+            i.out_conflict = true;
+        }
+        if let Some(i) = txns.get_mut(&writer)
+            && i.state == TransactionState::Active
+            && i.isolation_level == IsolationLevel::Serializable
+        {
+            i.in_conflict = true;
+        }
+    }
+
+    /// Returns the `(in_conflict, out_conflict)` flags for a transaction.
+    /// Returns `(false, false)` if the transaction is not found.
+    #[cfg(test)]
+    pub(crate) fn conflict_flags(&self, tx: TransactionId) -> (bool, bool) {
+        self.transactions
+            .read()
+            .get(&tx)
+            .map_or((false, false), |i| (i.in_conflict, i.out_conflict))
+    }
+
+    /// Escalation-aware fine node property read.
+    ///
+    /// Routes the read under each candidate label the transaction has *already
+    /// scanned* (predicates present in `scan_buckets` keys ∪ `escalated`,
+    /// restricted to `Label`).  Empty intersection ⇒ a plain fine read that
+    /// never escalates.
+    ///
+    /// `fine_tag` is the read's own property tag; `coarse_tag` is what the
+    /// matched bucket promotes to (the same property tag for property reads
+    /// under `Property` granularity, `None` for `Entity` granularity).
+    ///
+    /// # Lock discipline
+    ///
+    /// Computes `matched` under a SHORT `transactions.read()`, then drops the
+    /// lock before delegating to `record_read` / `record_read_in_predicate`,
+    /// which each take their own locks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_read_node_escalating(
+        &self,
+        transaction_id: TransactionId,
+        node: NodeId,
+        fine_tag: PropTag,
+        coarse_tag: PropTag,
+        candidate_labels: &[LabelId],
+    ) -> Result<()> {
+        let matched: Vec<LabelId> = {
+            let txns = self.transactions.read();
+            match txns.get(&transaction_id) {
+                None => Vec::new(),
+                Some(info) => candidate_labels
+                    .iter()
+                    .copied()
+                    .filter(|&l| {
+                        let key = EntityId::Label(l);
+                        info.escalated.iter().any(|(p, _)| *p == key)
+                            || info.scan_buckets.keys().any(|(p, _)| *p == key)
+                    })
+                    .collect(),
+            }
+        };
+        if matched.is_empty() {
+            return self.record_read(transaction_id, EntityId::Node(node), fine_tag);
+        }
+        for l in matched {
+            self.record_read_in_predicate(
+                transaction_id,
+                EntityId::Node(node),
+                fine_tag,
+                EntityId::Label(l),
+                coarse_tag,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Escalation-aware fine edge property read.
+    ///
+    /// If `rel` is `Some(t)` AND `(RelType(t), _)` is present in
+    /// `scan_buckets` keys or `escalated`, routes the read under
+    /// `(RelType(t), coarse_tag)`; otherwise falls back to a plain fine
+    /// `record_read(tx, Edge(edge), fine_tag)`.
+    ///
+    /// Symmetric with [`record_read_node_escalating`](Self::record_read_node_escalating).
+    ///
+    /// # Lock discipline
+    ///
+    /// Same as `record_read_node_escalating`: transactions lock is held only
+    /// for the bucket check and released before delegating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction is not active.
+    pub fn record_read_edge_escalating(
+        &self,
+        transaction_id: TransactionId,
+        edge: EdgeId,
+        fine_tag: PropTag,
+        coarse_tag: PropTag,
+        rel: Option<EdgeTypeId>,
+    ) -> Result<()> {
+        let matched_rel: Option<EdgeTypeId> = match rel {
+            None => None,
+            Some(t) => {
+                let key = EntityId::RelType(t);
+                let txns = self.transactions.read();
+                match txns.get(&transaction_id) {
+                    None => None,
+                    Some(info) => {
+                        if info.escalated.iter().any(|(p, _)| *p == key)
+                            || info.scan_buckets.keys().any(|(p, _)| *p == key)
+                        {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        match matched_rel {
+            None => self.record_read(transaction_id, EntityId::Edge(edge), fine_tag),
+            Some(t) => self.record_read_in_predicate(
+                transaction_id,
+                EntityId::Edge(edge),
+                fine_tag,
+                EntityId::RelType(t),
+                coarse_tag,
+            ),
+        }
+    }
+
+    /// Test-only shim that exposes the private `record_read_in_predicate` with
+    /// the `coarse_tag` parameter so that unit tests can exercise property-tagged
+    /// escalation paths without going through the public label/rel-type wrappers
+    /// (which always pass `coarse_tag = None`).
+    #[cfg(test)]
+    pub(crate) fn record_read_in_predicate_for_test(
+        &self,
+        tx: TransactionId,
+        fine: EntityId,
+        fine_tag: PropTag,
+        predicate: EntityId,
+        coarse_tag: PropTag,
+    ) -> Result<()> {
+        self.record_read_in_predicate(tx, fine, fine_tag, predicate, coarse_tag)
     }
 }
 
@@ -577,6 +2170,19 @@ impl Default for TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction::prop_tag;
+
+    #[test]
+    fn advance_next_skips_orphaned_id() {
+        let mgr = TransactionManager::new();
+        mgr.advance_next_transaction_id(TransactionId::new(2));
+        let tx = mgr.begin();
+        assert_eq!(
+            tx,
+            TransactionId::new(3),
+            "reopen must not reissue a tid still in retained WAL history"
+        );
+    }
 
     #[test]
     fn test_begin_commit() {
@@ -689,9 +2295,9 @@ mod tests {
         let tx = mgr.begin();
 
         // Record writes
-        mgr.record_write(tx, NodeId::new(1)).unwrap();
-        mgr.record_write(tx, NodeId::new(2)).unwrap();
-        mgr.record_write(tx, EdgeId::new(100)).unwrap();
+        mgr.record_write(tx, NodeId::new(1), None).unwrap();
+        mgr.record_write(tx, NodeId::new(2), None).unwrap();
+        mgr.record_write(tx, EdgeId::new(100), None).unwrap();
 
         // Should commit successfully (no conflicts)
         assert!(mgr.commit(tx).is_ok());
@@ -756,6 +2362,31 @@ mod tests {
     }
 
     #[test]
+    fn test_record_entity_no_conflict_and_in_write_set() {
+        let mgr = TransactionManager::new();
+        let tx1 = mgr.begin();
+        let tx2 = mgr.begin();
+        let entity = NodeId::new(7);
+
+        // record_entity adds to the write-set WITHOUT conflict detection: both
+        // transactions can record the same entity (record_write would reject the
+        // second). This keeps the write-set a complete scoping record.
+        mgr.record_entity(tx1, entity).unwrap();
+        mgr.record_entity(tx2, entity).unwrap();
+
+        assert!(
+            mgr.get_write_set(tx1)
+                .unwrap()
+                .contains(&EntityId::Node(entity))
+        );
+        assert!(
+            mgr.get_write_set(tx2)
+                .unwrap()
+                .contains(&EntityId::Node(entity))
+        );
+    }
+
+    #[test]
     fn test_write_write_conflict_detection() {
         let mgr = TransactionManager::new();
 
@@ -765,10 +2396,10 @@ mod tests {
 
         // First writer succeeds
         let entity = NodeId::new(42);
-        mgr.record_write(tx1, entity).unwrap();
+        mgr.record_write(tx1, entity, None).unwrap();
 
         // Second writer is rejected immediately (first-writer-wins)
-        let result = mgr.record_write(tx2, entity);
+        let result = mgr.record_write(tx2, entity, None);
         assert!(result.is_err());
         assert!(
             result
@@ -807,6 +2438,202 @@ mod tests {
                 epochs[i - 1]
             );
         }
+    }
+
+    #[test]
+    fn publication_epoch_reservations_are_monotonic_with_commit_epochs() {
+        let mgr = TransactionManager::new();
+
+        let first_transaction = mgr.begin();
+        let committed_before = mgr.commit(first_transaction).unwrap();
+
+        let (first_catalog, second_catalog) = mgr.with_write_authority(|| {
+            let _publication = mgr.publication().write();
+            (
+                mgr.reserve_publication_epoch().unwrap(),
+                mgr.reserve_publication_epoch().unwrap(),
+            )
+        });
+
+        assert_eq!(mgr.current_epoch(), committed_before);
+        let second_transaction = mgr.begin();
+        let committed_after = mgr.commit(second_transaction).unwrap();
+
+        assert_eq!(committed_before.as_u64(), 1);
+        assert_eq!(first_catalog.as_u64(), 2);
+        assert_eq!(second_catalog.as_u64(), 3);
+        assert_eq!(committed_after.as_u64(), 4);
+        assert_eq!(mgr.current_epoch(), committed_after);
+    }
+
+    #[test]
+    fn aborted_preparation_preserves_visible_cut_and_never_reuses_identity() {
+        let mgr = TransactionManager::new();
+        let first = mgr.begin();
+        let initial = mgr.commit(first).unwrap();
+        let failed = mgr.begin();
+        let publication = mgr.publication().write();
+        let rejected_epoch = mgr.prepare_durable_commit(failed).unwrap();
+        assert!(rejected_epoch > initial);
+        assert_eq!(mgr.current_epoch(), initial);
+        let reader = mgr.begin();
+        assert_eq!(mgr.start_epoch(reader), Some(initial));
+        mgr.abort(failed).unwrap();
+        assert_eq!(mgr.current_epoch(), initial);
+        mgr.abort(reader).unwrap();
+        drop(publication);
+        let next = mgr.begin();
+        let committed = mgr.commit(next).unwrap();
+        assert!(committed > rejected_epoch);
+        assert_eq!(mgr.current_epoch(), committed);
+    }
+
+    #[test]
+    fn sync_epoch_rejects_pending_without_poisoning_the_clock() {
+        let mgr = TransactionManager::new();
+
+        let error = mgr.try_sync_epoch(EpochId::PENDING).unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            grafeo_common::utils::error::ErrorCode::InvalidInput
+        );
+        assert_eq!(mgr.current_epoch(), EpochId::new(0));
+
+        mgr.try_sync_epoch(EpochId::new(7)).unwrap();
+        mgr.try_sync_epoch(EpochId::new(0)).unwrap();
+        assert_eq!(
+            mgr.current_epoch(),
+            EpochId::new(7),
+            "real epoch synchronization remains monotonic and epoch zero remains valid"
+        );
+    }
+
+    #[test]
+    fn mark_committed_rejects_reserved_coordinates_without_mutating_metadata() {
+        let mgr = TransactionManager::new();
+        let transaction_id = TransactionId::new(81);
+
+        let error = mgr
+            .try_mark_committed(transaction_id, EpochId::PENDING)
+            .unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            grafeo_common::utils::error::ErrorCode::InvalidInput
+        );
+        assert_eq!(mgr.committed_epoch(transaction_id), None);
+
+        let error = mgr
+            .try_mark_committed(TransactionId::INVALID, EpochId::new(3))
+            .unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            grafeo_common::utils::error::ErrorCode::InvalidInput
+        );
+        assert_eq!(mgr.committed_epoch(TransactionId::INVALID), None);
+
+        mgr.try_mark_committed(transaction_id, EpochId::INITIAL)
+            .unwrap();
+        assert_eq!(
+            mgr.committed_epoch(transaction_id),
+            Some(EpochId::INITIAL),
+            "epoch zero remains a valid recovery coordinate"
+        );
+        mgr.try_mark_committed(transaction_id, EpochId::new(9))
+            .unwrap();
+        assert_eq!(mgr.committed_epoch(transaction_id), Some(EpochId::new(9)));
+    }
+
+    #[test]
+    fn publication_epoch_issues_final_real_identity_once_without_wrapping() {
+        let mgr = TransactionManager::new();
+        let final_real = EpochId::PENDING.as_u64() - 1;
+        mgr.try_sync_epoch(EpochId::new(final_real - 1)).unwrap();
+
+        assert_eq!(
+            mgr.reserve_publication_epoch().unwrap(),
+            EpochId::new(final_real)
+        );
+        assert_eq!(mgr.current_epoch().as_u64(), final_real - 1);
+        assert_eq!(mgr.reserved_epoch.load(Ordering::SeqCst), final_real);
+
+        for _ in 0..2 {
+            let error = mgr.reserve_publication_epoch().unwrap_err();
+            assert_eq!(
+                error.error_code(),
+                grafeo_common::utils::error::ErrorCode::StorageFull
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("publication epoch identity space is exhausted"),
+                "{message}"
+            );
+            assert_eq!(mgr.current_epoch().as_u64(), final_real - 1);
+            assert_eq!(mgr.reserved_epoch.load(Ordering::SeqCst), final_real);
+        }
+    }
+
+    #[test]
+    fn exhausted_commit_remains_active_unprepared_and_abortable() {
+        let mgr = TransactionManager::new();
+        let final_real = EpochId::PENDING.as_u64() - 1;
+        mgr.try_sync_epoch(EpochId::new(final_real)).unwrap();
+        let transaction_id = mgr.begin();
+
+        let error = mgr.commit(transaction_id).unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            grafeo_common::utils::error::ErrorCode::StorageFull
+        );
+        let transactions = mgr.transactions.read();
+        let info = transactions.get(&transaction_id).unwrap();
+        assert_eq!(info.state, TransactionState::Active);
+        assert_eq!(info.reserved_commit_epoch, None);
+        drop(transactions);
+        assert_eq!(mgr.current_epoch().as_u64(), final_real);
+
+        mgr.abort(transaction_id).unwrap();
+        assert_eq!(mgr.state(transaction_id), Some(TransactionState::Aborted));
+    }
+
+    #[test]
+    fn concurrent_boundary_reservation_is_unique_and_does_not_wrap() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let mgr = Arc::new(TransactionManager::new());
+        let final_real = EpochId::PENDING.as_u64() - 1;
+        mgr.try_sync_epoch(EpochId::new(final_real - 1)).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let mgr = Arc::clone(&mgr);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    mgr.reserve_publication_epoch()
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result
+                        .as_ref()
+                        .is_ok_and(|epoch| *epoch == EpochId::new(final_real))
+                })
+                .count(),
+            1
+        );
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(mgr.current_epoch().as_u64(), final_real - 1);
+        assert_eq!(mgr.reserved_epoch.load(Ordering::SeqCst), final_real);
     }
 
     #[test]
@@ -894,32 +2721,30 @@ mod tests {
     }
 
     #[test]
-    fn test_ssi_read_write_conflict_detected() {
+    fn test_ssi_read_write_conflict_single_edge_does_not_abort() {
+        // F2 incremental SSI: a single rw-antidependency (out_conflict only,
+        // no in_conflict) is NOT a dangerous-structure pivot and must not abort.
+        //
+        // tx1 (Serializable) reads entity 42; tx2 (SI) writes and commits it.
+        // tx1 has out_conflict=true but in_conflict=false → not a pivot → Ok.
         let mgr = TransactionManager::new();
 
-        // tx1 starts with Serializable isolation
         let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin(); // SI — write-time detection skipped for SI writers
 
-        // tx2 starts and will modify an entity
-        let tx2 = mgr.begin();
-
-        // tx1 reads entity 42
         let entity = NodeId::new(42);
-        mgr.record_read(tx1, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
 
-        // tx2 writes to the same entity and commits
-        mgr.record_write(tx2, entity).unwrap();
+        mgr.record_write(tx2, entity, None).unwrap();
         mgr.commit(tx2).unwrap();
 
-        // tx1 tries to commit - should fail due to SSI read-write conflict
+        // tx1 has out_conflict from a committed SI writer, but no in_conflict.
+        // Under F2 this is only half a dangerous structure — tx1 must commit Ok.
         let result = mgr.commit(tx1);
-        assert!(result.is_err());
         assert!(
+            result.is_ok(),
+            "F2: single rw-edge (out_conflict only) must not abort; got: {:?}",
             result
-                .unwrap_err()
-                .to_string()
-                .contains("Serialization failure"),
-            "Expected serialization failure error"
         );
     }
 
@@ -935,10 +2760,10 @@ mod tests {
 
         // tx1 reads entity 42
         let entity = NodeId::new(42);
-        mgr.record_read(tx1, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
 
         // tx2 writes to the same entity and commits
-        mgr.record_write(tx2, entity).unwrap();
+        mgr.record_write(tx2, entity, None).unwrap();
         mgr.commit(tx2).unwrap();
 
         // tx1 should commit successfully (SI doesn't check read-write conflicts)
@@ -956,12 +2781,12 @@ mod tests {
         // tx1 writes and commits first
         let tx1 = mgr.begin();
         let entity = NodeId::new(42);
-        mgr.record_write(tx1, entity).unwrap();
+        mgr.record_write(tx1, entity, None).unwrap();
         mgr.commit(tx1).unwrap();
 
         // tx2 starts AFTER tx1 committed and reads the entity
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
-        mgr.record_read(tx2, entity).unwrap();
+        mgr.record_read(tx2, entity, None).unwrap();
 
         // tx2 should commit successfully (tx1 committed before tx2 started)
         let result = mgr.commit(tx2);
@@ -989,14 +2814,14 @@ mod tests {
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // Both read both accounts
-        mgr.record_read(tx1, account_a).unwrap();
-        mgr.record_read(tx1, account_b).unwrap();
-        mgr.record_read(tx2, account_a).unwrap();
-        mgr.record_read(tx2, account_b).unwrap();
+        mgr.record_read(tx1, account_a, None).unwrap();
+        mgr.record_read(tx1, account_b, None).unwrap();
+        mgr.record_read(tx2, account_a, None).unwrap();
+        mgr.record_read(tx2, account_b, None).unwrap();
 
         // T1 writes to A, T2 writes to B (no write-write conflict)
-        mgr.record_write(tx1, account_a).unwrap();
-        mgr.record_write(tx2, account_b).unwrap();
+        mgr.record_write(tx1, account_a, None).unwrap();
+        mgr.record_write(tx2, account_b, None).unwrap();
 
         // T1 commits first
         let result1 = mgr.commit(tx1);
@@ -1023,11 +2848,11 @@ mod tests {
         let entity = NodeId::new(42);
 
         // tx1 reads entity
-        mgr.record_read(tx1, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
 
         // tx2 writes and commits
         let tx2 = mgr.begin();
-        mgr.record_write(tx2, entity).unwrap();
+        mgr.record_write(tx2, entity, None).unwrap();
         mgr.commit(tx2).unwrap();
 
         // tx1 can still commit (ReadCommitted allows non-repeatable reads)
@@ -1070,8 +2895,8 @@ mod tests {
         let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-        mgr.record_read(tx1, entity).unwrap();
-        mgr.record_read(tx2, entity).unwrap();
+        mgr.record_read(tx1, entity, None).unwrap();
+        mgr.record_read(tx2, entity, None).unwrap();
 
         // Both should commit successfully (read-read is not a conflict)
         assert!(mgr.commit(tx1).is_ok());
@@ -1089,10 +2914,10 @@ mod tests {
         let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
         // First writer succeeds
-        mgr.record_write(tx1, entity).unwrap();
+        mgr.record_write(tx1, entity, None).unwrap();
 
         // Second writer is rejected immediately (first-writer-wins)
-        let result = mgr.record_write(tx2, entity);
+        let result = mgr.record_write(tx2, entity, None);
         assert!(
             result.is_err(),
             "Second record_write should fail with write-write conflict"
@@ -1121,13 +2946,13 @@ mod tests {
             let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
             let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-            mgr.record_read(tx1, entity_a).unwrap();
-            mgr.record_read(tx1, entity_b).unwrap();
-            mgr.record_read(tx2, entity_a).unwrap();
-            mgr.record_read(tx2, entity_b).unwrap();
+            mgr.record_read(tx1, entity_a, None).unwrap();
+            mgr.record_read(tx1, entity_b, None).unwrap();
+            mgr.record_read(tx2, entity_a, None).unwrap();
+            mgr.record_read(tx2, entity_b, None).unwrap();
 
-            mgr.record_write(tx1, entity_a).unwrap();
-            mgr.record_write(tx2, entity_b).unwrap();
+            mgr.record_write(tx1, entity_a, None).unwrap();
+            mgr.record_write(tx2, entity_b, None).unwrap();
 
             // Commit tx1 first so it's in committed_epochs
             mgr.commit(tx1).unwrap();
@@ -1163,13 +2988,13 @@ mod tests {
             let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
             let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
 
-            mgr.record_read(tx1, entity_a).unwrap();
-            mgr.record_read(tx1, entity_b).unwrap();
-            mgr.record_read(tx2, entity_a).unwrap();
-            mgr.record_read(tx2, entity_b).unwrap();
+            mgr.record_read(tx1, entity_a, None).unwrap();
+            mgr.record_read(tx1, entity_b, None).unwrap();
+            mgr.record_read(tx2, entity_a, None).unwrap();
+            mgr.record_read(tx2, entity_b, None).unwrap();
 
-            mgr.record_write(tx1, entity_a).unwrap();
-            mgr.record_write(tx2, entity_b).unwrap();
+            mgr.record_write(tx1, entity_a, None).unwrap();
+            mgr.record_write(tx2, entity_b, None).unwrap();
 
             let mgr1 = Arc::clone(&mgr);
             let mgr2 = Arc::clone(&mgr);
@@ -1218,7 +3043,7 @@ mod tests {
         let mgr = TransactionManager::new();
 
         let tx = mgr.begin();
-        mgr.record_write(tx, NodeId::new(1)).unwrap();
+        mgr.record_write(tx, NodeId::new(1), None).unwrap();
         let epoch = mgr.commit(tx).unwrap();
 
         // committed_epoch must be available immediately after commit returns
@@ -1227,5 +3052,2026 @@ mod tests {
             Some(epoch),
             "committed_epochs must contain tx immediately after commit()"
         );
+    }
+
+    // --- F2 incremental SSI: rw-conflict flags ---
+
+    #[test]
+    fn test_rw_conflict_flags_initial_false() {
+        // Both flags start as false for any new Serializable transaction.
+        let mgr = TransactionManager::new();
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        assert_eq!(mgr.conflict_flags(t1), (false, false));
+        assert_eq!(mgr.conflict_flags(t2), (false, false));
+    }
+
+    #[test]
+    fn test_set_rw_edge_sets_reader_out_and_writer_in() {
+        // set_rw_edge(t1, t2): t1 is the reader, t2 is the writer.
+        // t1.out_conflict must become true; t2.in_conflict must become true.
+        let mgr = TransactionManager::new();
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.set_rw_edge(t1, t2);
+
+        // t1 is the reader end: out_conflict = true, in_conflict unchanged (false)
+        assert_eq!(
+            mgr.conflict_flags(t1),
+            (false, true),
+            "reader t1 must have out_conflict=true"
+        );
+        // t2 is the writer end: in_conflict = true, out_conflict unchanged (false)
+        assert_eq!(
+            mgr.conflict_flags(t2),
+            (true, false),
+            "writer t2 must have in_conflict=true"
+        );
+    }
+
+    #[test]
+    fn test_set_rw_edge_noop_for_non_serializable() {
+        // Flags are set independently per transaction: an SI transaction never gets
+        // a flag, but the Serializable peer's flag IS set if it is Active+Ser.
+        let mgr = TransactionManager::new();
+        let t_ser = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
+
+        // t_ser reads, t_si writes:
+        //   t_ser is Active+Ser → out_conflict set.
+        //   t_si is SI → no in_conflict.
+        mgr.set_rw_edge(t_ser, t_si);
+        assert_eq!(
+            mgr.conflict_flags(t_ser),
+            (false, true),
+            "Serializable reader gets out_conflict even when writer is SI"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "SI writer never gets a flag"
+        );
+
+        // t_si reads, t_ser writes:
+        //   t_si is SI → no out_conflict.
+        //   t_ser is Active+Ser → in_conflict set (it was already out=true above).
+        mgr.set_rw_edge(t_si, t_ser);
+        assert_eq!(
+            mgr.conflict_flags(t_ser),
+            (true, true),
+            "Serializable writer gets in_conflict; out_conflict already set above"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "SI reader never gets a flag"
+        );
+    }
+
+    #[test]
+    fn test_set_rw_edge_self_loop_is_noop() {
+        // set_rw_edge(t, t) must be silently ignored.
+        let mgr = TransactionManager::new();
+        let t = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.set_rw_edge(t, t);
+        assert_eq!(mgr.conflict_flags(t), (false, false));
+    }
+
+    #[test]
+    fn test_set_rw_edge_committed_reader_no_flag() {
+        // set_rw_edge(committed_reader, active_writer): the committed reader
+        // cannot receive out_conflict (it is done); the active+Ser writer gets
+        // in_conflict independently.
+        let mgr = TransactionManager::new();
+        let t_reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Commit the reader before recording the edge
+        mgr.commit(t_reader).unwrap();
+
+        // t_reader is committed → no out_conflict; t_writer is Active+Ser → in_conflict.
+        mgr.set_rw_edge(t_reader, t_writer);
+        assert_eq!(
+            mgr.conflict_flags(t_reader),
+            (false, false),
+            "committed reader must never get out_conflict"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_writer),
+            (true, false),
+            "active Serializable writer gets in_conflict independently"
+        );
+    }
+
+    #[test]
+    fn test_set_rw_edge_reader_active_writer_committed() {
+        // The key case for read-time detection: T_reader is active+Ser and
+        // T_writer already committed.  reader.out_conflict must be set; the
+        // committed writer's in_conflict is moot and must stay false.
+        let mgr = TransactionManager::new();
+        let t_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.commit(t_writer).unwrap();
+
+        // Edge: t_reader →rw t_writer (t_reader read something t_writer already wrote)
+        mgr.set_rw_edge(t_reader, t_writer);
+        assert_eq!(
+            mgr.conflict_flags(t_reader),
+            (false, true),
+            "active Serializable reader gets out_conflict even for a committed writer"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_writer),
+            (false, false),
+            "committed writer in_conflict stays false"
+        );
+    }
+
+    // --- F2 Task 3: read-registry feed + read-time rw-edge detection ---
+
+    #[test]
+    fn test_read_after_concurrent_committed_write_sets_reader_out() {
+        // t_w (Serializable) writes E and commits; t_r (Serializable) began BEFORE
+        // t_w committed (lower start_epoch) then reads E → t_r.out_conflict=true,
+        // t_w is done so its in_conflict stays false.
+        let mgr = TransactionManager::new();
+
+        // t_r begins first (start_epoch = 0)
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // t_w begins, writes E, commits (commit_epoch > t_r.start_epoch = 0)
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let entity = NodeId::new(1);
+        mgr.record_write(t_w, entity, None).unwrap();
+        mgr.commit(t_w).unwrap();
+
+        // t_r now reads E; t_w committed after t_r started → concurrent writer
+        mgr.record_read(t_r, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, true),
+            "t_r must have out_conflict: it read a version t_w (concurrent committed) overwrote"
+        );
+        // t_w committed; its in_conflict was never set (and is moot)
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (false, false),
+            "committed t_w in_conflict stays false"
+        );
+    }
+
+    #[test]
+    fn test_read_after_concurrent_active_write_sets_both() {
+        // t_w (Serializable, active) record_write(E); t_r (Serializable, active)
+        // record_read(E) → t_r.out_conflict=true AND t_w.in_conflict=true.
+        let mgr = TransactionManager::new();
+
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let entity = NodeId::new(2);
+
+        mgr.record_write(t_w, entity, None).unwrap();
+        mgr.record_read(t_r, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, true),
+            "t_r (reader) must have out_conflict"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (true, false),
+            "t_w (active writer) must have in_conflict"
+        );
+    }
+
+    #[test]
+    fn test_read_of_unwritten_entity_no_edge() {
+        // t_r reads E that nobody has written → no flags; t_r IS registered in
+        // read_registry.
+        let mgr = TransactionManager::new();
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let entity = EntityId::Node(NodeId::new(42));
+
+        mgr.record_read(t_r, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, false),
+            "no rw edge when nobody wrote the entity"
+        );
+
+        // The reader must be registered in the read_registry.
+        let readers = mgr.read_registry.readers_of_compatible(entity, None);
+        assert!(
+            readers.contains(&t_r),
+            "t_r must be registered in read_registry after record_read"
+        );
+    }
+
+    #[test]
+    fn test_non_serializable_read_no_registry_no_edges() {
+        // An SI transaction reads E that a Serializable writer wrote → no flags,
+        // not in registry.
+        let mgr = TransactionManager::new();
+
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let entity = NodeId::new(7);
+        mgr.record_write(t_w, entity, None).unwrap();
+
+        let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
+        mgr.record_read(t_si, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "SI reader must not get any conflict flags"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (false, false),
+            "writer must not get in_conflict from a non-Serializable reader"
+        );
+
+        // SI reader must NOT be in the read_registry.
+        let readers = mgr
+            .read_registry
+            .readers_of_compatible(EntityId::Node(entity), None);
+        assert!(
+            !readers.contains(&t_si),
+            "SI reader must not be registered in read_registry"
+        );
+    }
+
+    // --- F2 Task 4: write-time rw-edge detection via read-registry (mirror direction) ---
+
+    #[test]
+    fn test_write_after_concurrent_read_sets_reader_out_writer_in() {
+        // t_r (Serializable, active) record_read(E) registers it in the
+        // read_registry; t_w (Serializable, active) record_write(E) must detect
+        // t_r as a concurrent reader and set the rw-edge: reader.out_conflict=true,
+        // writer.in_conflict=true.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(10);
+
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // t_r reads E first → registered in read_registry
+        mgr.record_read(t_r, entity, None).unwrap();
+        // t_w writes E → discovers t_r as concurrent reader → sets rw-edge
+        mgr.record_write(t_w, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, true),
+            "t_r (reader) must have out_conflict after write-time detection"
+        );
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (true, false),
+            "t_w (writer) must have in_conflict after write-time detection"
+        );
+    }
+
+    #[test]
+    fn test_write_with_no_concurrent_readers_no_edge() {
+        // t_w writes E that nobody has read → no flags set.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(20);
+
+        let t_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_write(t_w, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(t_w),
+            (false, false),
+            "no rw edge when nobody read the entity"
+        );
+    }
+
+    #[test]
+    fn test_non_serializable_write_no_edges() {
+        // An SI writer does not participate in SSI cycle detection; detection
+        // fires only for Serializable actors on the acting side.
+        //
+        // Choice: we skip write-time detection when the WRITER is not Serializable
+        // (symmetric with Task 3's choice to skip when the READER is not
+        // Serializable). An SI writer's overwrite does not form an SSI rw-edge.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(30);
+
+        // t_r is Serializable and reads E → registered in read_registry
+        let t_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(t_r, entity, None).unwrap();
+
+        // t_si is SI and writes E → does NOT trigger write-time detection
+        let t_si = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
+        mgr.record_write(t_si, entity, None).unwrap();
+
+        // The SI writer gets no flag
+        assert_eq!(
+            mgr.conflict_flags(t_si),
+            (false, false),
+            "SI writer must not get any conflict flags"
+        );
+        // The Serializable reader's flags are unchanged by the SI write
+        assert_eq!(
+            mgr.conflict_flags(t_r),
+            (false, false),
+            "Serializable reader must not get out_conflict from a non-Serializable writer"
+        );
+    }
+
+    #[test]
+    fn test_write_does_not_self_edge() {
+        // A transaction that reads E then writes E is in the read_registry for E,
+        // but the `reader != tx` guard must skip itself → no self-edge.
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(40);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        // Read first (registers in read_registry)
+        mgr.record_read(tx, entity, None).unwrap();
+        // Write same entity → readers_of_compatible returns `tx` itself, but guard skips it
+        mgr.record_write(tx, entity, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx),
+            (false, false),
+            "a tx that reads then writes the same entity must not self-edge"
+        );
+    }
+
+    // --- F2 Task 5: dangerous-structure pivot abort + registry GC ---
+
+    /// A Serializable tx with both in_conflict and out_conflict where the cycle
+    /// is confirmed by a committed writer must return SerializationFailure.
+    ///
+    /// Interleave (classic write-skew, second committer):
+    ///   tx1 (Ser): read A, read B, write A → commits
+    ///   tx2 (Ser): read A, read B, write B → tries to commit → ABORT
+    ///
+    /// At tx2 commit: tx2.in_conflict=true (tx1 read B, tx2 wrote B, via write-time
+    /// detection); tx2.out_conflict=true (tx2 read A, tx1 wrote A, via read-time
+    /// detection). tx1 committed after tx2 started and A ∈ tx2.read_set → cycle
+    /// closed → SerializationFailure.
+    #[test]
+    fn pivot_with_both_flags_aborts() {
+        let mgr = TransactionManager::new();
+
+        let account_a = NodeId::new(1);
+        let account_b = NodeId::new(2);
+
+        // Both start Serializable.
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Both read both accounts.
+        mgr.record_read(tx1, account_a, None).unwrap();
+        mgr.record_read(tx1, account_b, None).unwrap();
+        mgr.record_read(tx2, account_a, None).unwrap();
+        mgr.record_read(tx2, account_b, None).unwrap();
+
+        // tx1 writes A; tx2 writes B (disjoint — no W-W conflict).
+        mgr.record_write(tx1, account_a, None).unwrap();
+        mgr.record_write(tx2, account_b, None).unwrap();
+
+        // tx1 commits first → must succeed (cycle not yet closed for tx1).
+        let r1 = mgr.commit(tx1);
+        assert!(r1.is_ok(), "first committer must succeed: {:?}", r1);
+
+        // tx2 commits: both flags set AND tx1 (committed) wrote A ∈ tx2.read_set
+        // → dangerous-structure pivot → SerializationFailure.
+        let r2 = mgr.commit(tx2);
+        assert!(r2.is_err(), "second committer must fail as pivot");
+        assert!(
+            r2.unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "expected SerializationFailure"
+        );
+    }
+
+    /// A Serializable tx that only reads (no writes) never gets in_conflict.
+    /// With only out_conflict (at most), it is NOT a pivot and must commit Ok.
+    ///
+    /// Interleave:
+    ///   writer (SI): writes E, commits.
+    ///   reader (Ser): read E before writer started → out_conflict may be set.
+    ///   reader.commit() → Ok (no in_conflict → not a pivot).
+    #[test]
+    fn read_only_does_not_abort() {
+        let mgr = TransactionManager::new();
+
+        let entity = NodeId::new(50);
+
+        // Reader starts first (lower start_epoch).
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Writer (SI, so write-time detection does not fire) writes E and commits.
+        let writer = mgr.begin_with_isolation(IsolationLevel::SnapshotIsolation);
+        mgr.record_write(writer, entity, None).unwrap();
+        mgr.commit(writer).unwrap();
+
+        // Reader reads E: committed-after-start writer detected via read-time
+        // scan in record_read (but writer is SI, so no edge is formed).
+        mgr.record_read(reader, entity, None).unwrap();
+
+        // Reader has no in_conflict (it wrote nothing) → not a pivot → Ok.
+        let result = mgr.commit(reader);
+        assert!(
+            result.is_ok(),
+            "read-only Serializable tx must commit Ok: {:?}",
+            result
+        );
+    }
+
+    /// A Serializable writer with only in_conflict (no out_conflict) is not a
+    /// pivot and must commit Ok.
+    ///
+    /// Interleave:
+    ///   reader (Ser, active): reads E.
+    ///   writer (Ser): writes E → write-time detection → writer.in_conflict=true.
+    ///   writer.commit() → Ok (out_conflict=false → not a pivot).
+    #[test]
+    fn single_in_edge_does_not_abort() {
+        let mgr = TransactionManager::new();
+
+        let entity = NodeId::new(60);
+
+        // reader registers in read_registry.
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(reader, entity, None).unwrap();
+
+        // writer: write E → write-time detection finds reader → writer.in_conflict=true.
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_write(writer, entity, None).unwrap();
+
+        // writer has in_conflict=true, out_conflict=false → not a pivot → Ok.
+        assert_eq!(
+            mgr.conflict_flags(writer),
+            (true, false),
+            "writer must have only in_conflict"
+        );
+        let result = mgr.commit(writer);
+        assert!(
+            result.is_ok(),
+            "single in_conflict must not abort writer: {:?}",
+            result
+        );
+    }
+
+    /// After a Serializable reader commits, it must be removed from the
+    /// read_registry so future writers of the same entity do not falsely see
+    /// it as a concurrent reader.
+    #[test]
+    fn gc_removes_reader_on_commit() {
+        let mgr = TransactionManager::new();
+
+        let entity = NodeId::new(70);
+
+        // Reader registers in read_registry.
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(reader, entity, None).unwrap();
+
+        // Confirm it is registered.
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader must be in registry before commit"
+        );
+
+        // Commit the reader.
+        mgr.commit(reader).unwrap();
+
+        // After commit, the reader must be gone from the registry.
+        assert!(
+            !mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader must be removed from registry after commit"
+        );
+    }
+
+    /// After a Serializable reader aborts, it must be removed from the
+    /// read_registry so future writers of the same entity do not falsely see
+    /// it as a concurrent reader.
+    #[test]
+    fn gc_removes_reader_on_abort() {
+        let mgr = TransactionManager::new();
+
+        let entity = NodeId::new(80);
+
+        // Reader registers in read_registry.
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(reader, entity, None).unwrap();
+
+        // Confirm it is registered.
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader must be in registry before abort"
+        );
+
+        // Abort the reader.
+        mgr.abort(reader).unwrap();
+
+        // After abort, the reader must be gone from the registry.
+        assert!(
+            !mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader must be removed from registry after abort"
+        );
+    }
+
+    // --- F2 SIREAD lock lifecycle: retain reader entries until concurrent
+    //     transactions finish (sound 3-tx SSI cycles) ---
+
+    /// THE regression test. A genuinely non-serializable 3-transaction
+    /// rw-antidependency cycle (all Serializable, all snapshot epoch 0 — none
+    /// sees another's writes) must abort EXACTLY ONE transaction.
+    ///
+    /// Interleave:
+    ///   T1: read(p), write(q), commit
+    ///   T3: read(r), write(p), commit
+    ///   T2: read(q), read(r), write(r), commit
+    ///
+    /// Edges: T2 →rw T1 (T2 read q, T1 wrote q), T3 →rw T2 (T3 read r, T2 wrote r),
+    /// T1 →rw T3 (T1 read p, T3 wrote p) → cycle T1 → T3 → T2 → T1.
+    ///
+    /// The hole this guards: when T2 writes r, its in-neighbor T3 has already
+    /// committed. If T3's SIREAD lock on r were discarded at its own commit, the
+    /// in-edge `T3 →rw T2` would never form and all three would commit. With
+    /// SIREAD retention (T3 is still concurrent with T2 at epoch 0), the edge
+    /// forms, T2 becomes a pivot (in+out), and aborts.
+    #[test]
+    fn three_tx_rw_cycle_aborts_one() {
+        let mgr = TransactionManager::new();
+
+        let p = NodeId::new(1);
+        let q = NodeId::new(2);
+        let r = NodeId::new(3);
+
+        // All three begin at snapshot epoch 0 (none sees another's writes).
+        let t1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let t3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // T1: read p, write q, commit.
+        mgr.record_read(t1, p, None).unwrap();
+        mgr.record_write(t1, q, None).unwrap();
+        let r1 = mgr.commit(t1);
+
+        // T3: read r, write p, commit.
+        mgr.record_read(t3, r, None).unwrap();
+        mgr.record_write(t3, p, None).unwrap();
+        let r3 = mgr.commit(t3);
+
+        // T2: read q, read r, write r, commit.
+        mgr.record_read(t2, q, None).unwrap();
+        mgr.record_read(t2, r, None).unwrap();
+        mgr.record_write(t2, r, None).unwrap();
+        let r2 = mgr.commit(t2);
+
+        // Exactly one of the three must fail with SerializationFailure.
+        let results = [&r1, &r2, &r3];
+        let failures = results.iter().filter(|res| res.is_err()).count();
+        assert_eq!(
+            failures, 1,
+            "exactly one of the 3-tx cycle must abort; got r1={r1:?} r2={r2:?} r3={r3:?}"
+        );
+
+        // The single failure must be a SerializationFailure (not a W-W conflict).
+        let failing = results.into_iter().find(|res| res.is_err()).unwrap();
+        assert!(
+            failing
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "the abort must be a SerializationFailure; got {failing:?}"
+        );
+    }
+
+    /// A committed Serializable reader's SIREAD lock must persist while a
+    /// concurrent transaction is still active, so that a later write by that
+    /// concurrent tx still forms the in-edge.
+    #[test]
+    fn committed_reader_siread_retained_until_concurrent_finishes() {
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(90);
+
+        // reader and writer both begin at epoch 0 (concurrent).
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // reader reads E, then commits — but writer is still active, so the
+        // SIREAD lock must be retained.
+        mgr.record_read(reader, entity, None).unwrap();
+        mgr.commit(reader).unwrap();
+
+        // The reader's SIREAD entry must still be present (concurrent writer alive).
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "committed reader's SIREAD lock must persist while concurrent writer is active"
+        );
+
+        // writer now writes E → must discover the retained reader as a concurrent
+        // reader and form the in-edge → writer.in_conflict = true.
+        mgr.record_write(writer, entity, None).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(writer),
+            (true, false),
+            "writer must get in_conflict from the retained committed reader"
+        );
+    }
+
+    /// After all transactions concurrent with a committed reader finish, the
+    /// reader's SIREAD lock is garbage-collected (no leak).
+    #[test]
+    fn siread_released_after_no_concurrent() {
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(100);
+
+        // reader and writer both begin at epoch 0 (concurrent).
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(reader, entity, None).unwrap();
+        mgr.commit(reader).unwrap();
+
+        // Still retained while writer is active.
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader retained while concurrent writer active"
+        );
+
+        // writer commits → no transaction concurrent with reader remains → GC.
+        mgr.commit(writer).unwrap();
+
+        assert!(
+            !mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader's SIREAD lock must be released once no concurrent txn remains"
+        );
+    }
+
+    /// A writer that STARTED AFTER a committed reader's commit epoch is NOT
+    /// concurrent with it and must not receive a false in-edge from its lingering
+    /// SIREAD lock.
+    #[test]
+    fn non_concurrent_committed_reader_no_false_edge() {
+        let mgr = TransactionManager::new();
+        let entity = NodeId::new(110);
+
+        // keep_alive holds the active set non-empty so the reader's SIREAD lock
+        // is not GC'd before the (non-concurrent) writer can observe it.
+        let keep_alive = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // reader reads E and commits at some epoch C_r.
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_read(reader, entity, None).unwrap();
+        mgr.commit(reader).unwrap();
+
+        // writer begins AFTER reader committed → writer.start_epoch >= C_r →
+        // NOT concurrent with reader. The lingering SIREAD lock must not form an
+        // edge.
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let c_r = mgr.committed_epoch(reader).unwrap();
+        assert!(
+            mgr.start_epoch(writer).unwrap().as_u64() >= c_r.as_u64(),
+            "writer must start at/after reader's commit epoch for this test"
+        );
+
+        // The reader's SIREAD lock should still be present (keep_alive is active
+        // and concurrent with reader, so GC has not released it).
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Node(entity), None)
+                .contains(&reader),
+            "reader's SIREAD lock retained by keep_alive being concurrent"
+        );
+
+        mgr.record_write(writer, entity, None).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(writer),
+            (false, false),
+            "non-concurrent committed reader must not form a false in-edge"
+        );
+
+        // And the writer must commit Ok (no spurious abort).
+        assert!(
+            mgr.commit(writer).is_ok(),
+            "writer must not be spuriously aborted by a non-concurrent committed reader"
+        );
+
+        let _ = mgr.commit(keep_alive);
+    }
+
+    // --- Task 7: IndexId + EntityId::Index predicate-read recording ---
+
+    #[test]
+    fn index_id_stable_and_distinguishing() {
+        // IndexId::for_text_index must be stable (same input → same id) and
+        // distinguish different (label, property) pairs.
+        let id1 = IndexId::for_text_index("Doc", "body");
+        let id2 = IndexId::for_text_index("Doc", "body");
+        let id3 = IndexId::for_text_index("Doc", "title");
+        let id4 = IndexId::for_text_index("Article", "body");
+
+        assert_eq!(id1, id2, "same inputs must produce equal IndexId");
+        assert_ne!(id1, id3, "(Doc,body) must differ from (Doc,title)");
+        assert_ne!(id1, id4, "(Doc,body) must differ from (Article,body)");
+        assert_ne!(id3, id4, "(Doc,title) must differ from (Article,body)");
+    }
+
+    // --- Task 5: for_index generalization + for_text_index alias ---
+
+    #[test]
+    fn property_index_ids_keep_arbitrary_names_in_their_own_domain() {
+        let names = [
+            "",
+            "k",
+            "a:b",
+            "@idx1:0:k",
+            "grafeo/property-index/v1",
+            "\0λ",
+        ];
+        for property in names {
+            let id = IndexId::for_property_index(property);
+            assert_eq!(id, IndexId::for_property_index(property));
+            for other in names {
+                if property != other {
+                    assert_ne!(id, IndexId::for_property_index(other));
+                }
+                assert_ne!(id, IndexId::for_index(other, property));
+                assert_ne!(id, IndexId::for_index(property, other));
+            }
+        }
+    }
+
+    #[test]
+    fn for_index_stable_and_distinguishing() {
+        // IndexId::for_index must be stable (same input → same id) and
+        // distinguish different (label, property) pairs — covers the vector index path.
+        let id1 = IndexId::for_index("Doc", "embedding");
+        let id2 = IndexId::for_index("Doc", "embedding");
+        let id3 = IndexId::for_index("Doc", "title");
+        let id4 = IndexId::for_index("Article", "embedding");
+
+        assert_eq!(id1, id2, "same inputs must produce equal IndexId");
+        assert_ne!(id1, id3, "(Doc,embedding) must differ from (Doc,title)");
+        assert_ne!(
+            id1, id4,
+            "(Doc,embedding) must differ from (Article,embedding)"
+        );
+        assert_ne!(id3, id4, "(Doc,title) must differ from (Article,embedding)");
+    }
+
+    #[test]
+    fn for_text_index_is_alias_for_for_index() {
+        // for_text_index must return the same value as for_index for the same pair,
+        // guaranteeing that existing text call-sites and new vector call-sites
+        // produce the same IndexId for the same (label, property).
+        let via_generic = IndexId::for_index("Doc", "body");
+        let via_alias = IndexId::for_text_index("Doc", "body");
+        assert_eq!(
+            via_generic, via_alias,
+            "for_text_index must be an alias for for_index"
+        );
+    }
+
+    #[test]
+    fn index_rw_edge_vector_index_id() {
+        // tx1 (Serializable) records a vector-index read; tx2 (Serializable) records
+        // a vector-index write on the same IndexId::for_index pair → rw-edge:
+        // tx1.out_conflict, tx2.in_conflict. Mirrors the text cycle test shape.
+        let mgr = TransactionManager::new();
+        let idx = IndexId::for_index("Doc", "embedding");
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx1, EntityId::Index(idx), None).unwrap();
+        mgr.record_write(tx2, EntityId::Index(idx), None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "tx1 (reader) must have out_conflict after vector index write by tx2"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "tx2 (writer) must have in_conflict after vector index read by tx1"
+        );
+    }
+
+    #[test]
+    fn entity_id_index_variant_from_index_id() {
+        let idx = IndexId::for_text_index("Doc", "body");
+        let eid: EntityId = idx.into();
+        assert!(matches!(eid, EntityId::Index(_)));
+        // Must be usable as a HashSet key.
+        let mut set = std::collections::HashSet::new();
+        set.insert(eid);
+        assert!(set.contains(&EntityId::Index(idx)));
+    }
+
+    #[test]
+    fn index_rw_edge_formed_between_read_and_write() {
+        // tx1 (Serializable) records an index read; tx2 (Serializable) records an
+        // index write on the same IndexId → rw-edge: tx1.out_conflict, tx2.in_conflict.
+        let mgr = TransactionManager::new();
+        let idx = IndexId::for_text_index("Doc", "body");
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx1, EntityId::Index(idx), None).unwrap();
+        mgr.record_write(tx2, EntityId::Index(idx), None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "tx1 (reader) must have out_conflict after index write by tx2"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "tx2 (writer) must have in_conflict after index read by tx1"
+        );
+    }
+
+    #[test]
+    fn different_index_ids_do_not_conflict() {
+        // tx1 reads (Doc, body); tx2 writes (Doc, title) — different indexes.
+        // No rw-edge must be formed.
+        let mgr = TransactionManager::new();
+        let idx_body = IndexId::for_text_index("Doc", "body");
+        let idx_title = IndexId::for_text_index("Doc", "title");
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx1, EntityId::Index(idx_body), None)
+            .unwrap();
+        mgr.record_write(tx2, EntityId::Index(idx_title), None)
+            .unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, false),
+            "different index ids must not form an rw-edge"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (false, false),
+            "different index ids must not form an rw-edge on the writer side"
+        );
+    }
+
+    #[test]
+    fn index_rw_write_before_read_sets_reader_out() {
+        // tx_w (Serializable) writes index and commits; tx_r (Serializable) began
+        // BEFORE tx_w committed, then reads the same index → tx_r.out_conflict.
+        let mgr = TransactionManager::new();
+        let idx = IndexId::for_text_index("Post", "content");
+
+        // tx_r begins first (start_epoch = 0)
+        let tx_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx_w writes index and commits (commit_epoch > tx_r.start_epoch)
+        let tx_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_write(tx_w, EntityId::Index(idx), None).unwrap();
+        mgr.commit(tx_w).unwrap();
+
+        // tx_r now reads the index; tx_w committed after tx_r started → out_conflict
+        mgr.record_read(tx_r, EntityId::Index(idx), None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx_r),
+            (false, true),
+            "tx_r must have out_conflict: index read after concurrent committed index write"
+        );
+    }
+
+    // --- Task 1: EntityId::Label + EntityId::RelType coarse conflict keys ---
+
+    #[test]
+    fn entity_id_label_reltype_hash_eq() {
+        // The two new variants are distinct HashSet keys; From works.
+        use std::collections::HashSet;
+
+        let l7 = LabelId::new(7);
+        let l8 = LabelId::new(8);
+        let rt1 = EdgeTypeId::new(1);
+        let rt2 = EdgeTypeId::new(2);
+
+        // From impls
+        let eid_l7: EntityId = l7.into();
+        let eid_l8: EntityId = l8.into();
+        let eid_rt1: EntityId = rt1.into();
+        let eid_rt2: EntityId = rt2.into();
+
+        assert!(matches!(eid_l7, EntityId::Label(_)));
+        assert!(matches!(eid_l8, EntityId::Label(_)));
+        assert!(matches!(eid_rt1, EntityId::RelType(_)));
+        assert!(matches!(eid_rt2, EntityId::RelType(_)));
+
+        // Equality
+        assert_eq!(eid_l7, EntityId::Label(l7));
+        assert_ne!(eid_l7, eid_l8);
+        assert_ne!(eid_l7, eid_rt1);
+
+        // HashSet keys are distinct
+        let mut set: HashSet<EntityId> = HashSet::new();
+        set.insert(eid_l7);
+        set.insert(eid_l8);
+        set.insert(eid_rt1);
+        set.insert(eid_rt2);
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(&EntityId::Label(l7)));
+        assert!(set.contains(&EntityId::Label(l8)));
+        assert!(set.contains(&EntityId::RelType(rt1)));
+        assert!(set.contains(&EntityId::RelType(rt2)));
+
+        // Label and RelType with same inner value are distinct
+        let l0 = LabelId::new(0);
+        let rt0 = EdgeTypeId::new(0);
+        assert_ne!(EntityId::Label(l0), EntityId::RelType(rt0));
+    }
+
+    #[test]
+    fn named_label_predicate_same_name_conflicts_but_different_name_does_not() {
+        let mgr = TransactionManager::new();
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let same_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let other_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        let absent = PredicateId::for_label("Absent");
+        let other = PredicateId::for_label("Other");
+        mgr.record_read(reader, EntityId::LabelPredicate(absent), None)
+            .unwrap();
+        mgr.record_coarse_write(same_writer, EntityId::LabelPredicate(absent), None)
+            .unwrap();
+        mgr.record_coarse_write(other_writer, EntityId::LabelPredicate(other), None)
+            .unwrap();
+
+        assert_eq!(mgr.conflict_flags(reader), (false, true));
+        assert_eq!(mgr.conflict_flags(same_writer), (true, false));
+        assert_eq!(
+            mgr.conflict_flags(other_writer),
+            (false, false),
+            "a different label name must not conflict with the absent-label gap"
+        );
+    }
+
+    #[test]
+    fn named_relationship_predicate_same_name_conflicts_but_different_name_does_not() {
+        let mgr = TransactionManager::new();
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let same_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let other_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        let absent = PredicateId::for_rel_type("ABSENT_REL");
+        let other = PredicateId::for_rel_type("OTHER_REL");
+        mgr.record_read(reader, EntityId::RelTypePredicate(absent), None)
+            .unwrap();
+        mgr.record_coarse_write(same_writer, EntityId::RelTypePredicate(absent), None)
+            .unwrap();
+        mgr.record_coarse_write(other_writer, EntityId::RelTypePredicate(other), None)
+            .unwrap();
+
+        assert_eq!(mgr.conflict_flags(reader), (false, true));
+        assert_eq!(mgr.conflict_flags(same_writer), (true, false));
+        assert_eq!(
+            mgr.conflict_flags(other_writer),
+            (false, false),
+            "a different relationship type must not conflict with the absent-type gap"
+        );
+        assert_ne!(
+            EntityId::LabelPredicate(PredicateId::for_label("SAME")),
+            EntityId::RelTypePredicate(PredicateId::for_rel_type("SAME")),
+            "label and relationship predicate domains must remain distinct"
+        );
+    }
+
+    #[test]
+    fn unqualified_lpg_dataset_predicate_conflicts_with_structural_write() {
+        let mgr = TransactionManager::new();
+        let reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(reader, EntityId::LpgDataset, None).unwrap();
+        mgr.record_coarse_write(writer, EntityId::LpgDataset, None)
+            .unwrap();
+
+        assert_eq!(mgr.conflict_flags(reader), (false, true));
+        assert_eq!(mgr.conflict_flags(writer), (true, false));
+    }
+
+    #[test]
+    fn label_rw_edge() {
+        // Mirrors the write-skew / index_rw_edge pattern:
+        // tx1 and tx2 both read Label(7); tx1 writes Label(7), tx2 writes a node.
+        // tx1 commits first; tx2 has out_conflict (read Label(7) which tx1 wrote)
+        // AND in_conflict (tx1 read Label(7) which tx2... wait — only tx1 wrote Label).
+        //
+        // Correct dangerous-structure:
+        //   tx1 reads Label(7) AND writes NodeId(1)
+        //   tx2 reads NodeId(1) AND writes Label(7)
+        //   → tx1 →rw tx2  (tx1 read Label(7), tx2 wrote Label(7))
+        //   → tx2 →rw tx1  (tx2 read NodeId(1), tx1 wrote NodeId(1))
+        //   Both flags set on tx1 and tx2; first committer succeeds,
+        //   second committer is aborted as pivot.
+        //
+        // This also covers: same label → conflict; different label → no conflict.
+        // EntityId::RelType symmetric section follows.
+
+        let lbl7 = LabelId::new(7);
+        let lbl8 = LabelId::new(8);
+
+        // --- Label rw-edge: same label id forms a dangerous-structure pivot ---
+        {
+            let mgr = TransactionManager::new();
+            let node1 = NodeId::new(1);
+
+            let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            // tx1 reads Label(7), writes NodeId(1)
+            mgr.record_read(tx1, EntityId::Label(lbl7), None).unwrap();
+            mgr.record_write(tx1, node1, None).unwrap();
+
+            // tx2 reads NodeId(1), writes Label(7)
+            // record_write(tx2, node1) would fail W-W — use record_read for node1 only
+            mgr.record_read(tx2, node1, None).unwrap();
+            mgr.record_write(tx2, EntityId::Label(lbl7), None).unwrap();
+
+            // tx1 →rw tx2: tx1 read Label(7), tx2 wrote Label(7)
+            // tx2 →rw tx1: tx2 read NodeId(1), tx1 wrote NodeId(1)
+            assert_eq!(
+                mgr.conflict_flags(tx1),
+                (true, true),
+                "tx1 must have both flags: in_conflict (tx2→rw→tx1) and out_conflict (tx1→rw→tx2)"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx2),
+                (true, true),
+                "tx2 must have both flags: in_conflict (tx1→rw→tx2) and out_conflict (tx2→rw→tx1)"
+            );
+
+            // tx1 commits first → succeeds (no prior committed writer yet)
+            mgr.commit(tx1).unwrap();
+
+            // tx2 tries to commit → must be aborted (pivot closed)
+            let r2 = mgr.commit(tx2);
+            assert!(
+                r2.is_err(),
+                "tx2 must be aborted: label rw-edge closes a dangerous-structure pivot; got: {r2:?}"
+            );
+            assert!(
+                r2.unwrap_err()
+                    .to_string()
+                    .contains("Serialization failure"),
+                "expected SerializationFailure"
+            );
+        }
+
+        // --- Label rw-edge: different label ids must NOT conflict ---
+        {
+            let mgr = TransactionManager::new();
+            let tx3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx4 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            mgr.record_read(tx3, EntityId::Label(lbl8), None).unwrap();
+            mgr.record_write(tx4, EntityId::Label(lbl7), None).unwrap();
+
+            assert_eq!(
+                mgr.conflict_flags(tx3),
+                (false, false),
+                "different label ids must not form an rw-edge"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx4),
+                (false, false),
+                "different label ids must not form an rw-edge on writer side"
+            );
+        }
+
+        // --- RelType rw-edge: same rel type id forms a dangerous-structure pivot ---
+        {
+            let mgr = TransactionManager::new();
+            let rt5 = EdgeTypeId::new(5);
+            let node2 = NodeId::new(2);
+
+            let tx5 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx6 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            // tx5 reads RelType(5), writes NodeId(2)
+            mgr.record_read(tx5, EntityId::RelType(rt5), None).unwrap();
+            mgr.record_write(tx5, node2, None).unwrap();
+
+            // tx6 reads NodeId(2), writes RelType(5)
+            mgr.record_read(tx6, node2, None).unwrap();
+            mgr.record_write(tx6, EntityId::RelType(rt5), None).unwrap();
+
+            assert_eq!(
+                mgr.conflict_flags(tx5),
+                (true, true),
+                "tx5 must have both flags for reltype pivot"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx6),
+                (true, true),
+                "tx6 must have both flags for reltype pivot"
+            );
+
+            mgr.commit(tx5).unwrap();
+            let r6 = mgr.commit(tx6);
+            assert!(
+                r6.is_err(),
+                "tx6 must be aborted: reltype rw-edge closes pivot; got: {r6:?}"
+            );
+            assert!(
+                r6.unwrap_err()
+                    .to_string()
+                    .contains("Serialization failure"),
+                "expected SerializationFailure for reltype pivot"
+            );
+        }
+
+        // --- RelType: different rel type ids must NOT conflict ---
+        {
+            let mgr = TransactionManager::new();
+            let rt5 = EdgeTypeId::new(5);
+            let rt6 = EdgeTypeId::new(6);
+
+            let tx7 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx8 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            mgr.record_read(tx7, EntityId::RelType(rt6), None).unwrap();
+            mgr.record_write(tx8, EntityId::RelType(rt5), None).unwrap();
+
+            assert_eq!(
+                mgr.conflict_flags(tx7),
+                (false, false),
+                "different rel type ids must not form an rw-edge"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx8),
+                (false, false),
+                "different rel type ids must not form an rw-edge on writer side"
+            );
+        }
+    }
+
+    // --- Part G Task 2: all-None tags reproduce existing write-skew abort ---
+
+    /// Regression: with all PropTag=None, the tag-threaded read/write-set must
+    /// detect write-skew exactly as F2 did. Any deviation means a stray non-None
+    /// was introduced or a compatibility check is backwards.
+    #[test]
+    fn all_none_tags_write_skew_aborts_second_committer() {
+        let mgr = TransactionManager::new();
+
+        let a = NodeId::new(1);
+        let b = NodeId::new(2);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Both read both accounts with None tag.
+        mgr.record_read(tx1, a, None).unwrap();
+        mgr.record_read(tx1, b, None).unwrap();
+        mgr.record_read(tx2, a, None).unwrap();
+        mgr.record_read(tx2, b, None).unwrap();
+
+        // Disjoint writes with None tag.
+        mgr.record_write(tx1, a, None).unwrap();
+        mgr.record_write(tx2, b, None).unwrap();
+
+        // tx1 commits first.
+        assert!(mgr.commit(tx1).is_ok(), "first committer must succeed");
+
+        // tx2 must be aborted: it read a (which tx1 wrote) → pivot.
+        let r2 = mgr.commit(tx2);
+        assert!(
+            r2.is_err(),
+            "second committer must be aborted under all-None tags"
+        );
+        assert!(
+            r2.unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "expected SerializationFailure"
+        );
+    }
+
+    // --- GE2: record_node_write fan-out to Label coarse conflict keys ---
+
+    /// A Serializable reader of Label(5) conflicts with a node write that
+    /// fans out to Label(5) via `record_node_write`.
+    ///
+    /// Interleave:
+    ///   tx1 (Ser): record_read(Label(5)) → registered in read_registry.
+    ///   tx2 (Ser): record_node_write(node, &[LabelId(5)], None) → fans out
+    ///              to Label(5) → write-time detection: tx1.out_conflict=true,
+    ///              tx2.in_conflict=true.
+    ///   A second call with labels=[LabelId(6)] must produce NO conflict with tx1.
+    #[test]
+    fn node_write_fans_out_to_label() {
+        let mgr = TransactionManager::new();
+        let lbl5 = LabelId::new(5);
+        let lbl6 = LabelId::new(6);
+        let node = NodeId::new(1);
+        let node2 = NodeId::new(2);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx1 records a Label(5) read (simulates escalated scan of :Label5)
+        mgr.record_read(tx1, EntityId::Label(lbl5), None).unwrap();
+
+        // tx2 writes a node with label LabelId(5)
+        // → record_write(Node(node), None) + record_write(Label(5), None)
+        mgr.record_node_write(tx2, node, &[lbl5], None).unwrap();
+
+        // tx1 must have out_conflict (it read Label(5), tx2 wrote Label(5))
+        // tx2 must have in_conflict (tx1 was a concurrent Label(5) reader)
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "tx1 (Label reader) must get out_conflict from node write fanning to Label(5)"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "tx2 (node writer) must get in_conflict from Label(5) reader"
+        );
+
+        // A node write with a DIFFERENT label must NOT conflict with the Label(5) reader.
+        let tx3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_node_write(tx3, node2, &[lbl6], None).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(tx3),
+            (false, false),
+            "node write with Label(6) must not conflict with Label(5) reader"
+        );
+    }
+
+    /// `record_node_write` with multiple labels fans out to all of them.
+    /// A reader of any matching label detects the conflict.
+    #[test]
+    fn node_write_fans_out_to_all_labels() {
+        let mgr = TransactionManager::new();
+        let lbl_a = LabelId::new(10);
+        let lbl_b = LabelId::new(11);
+        let node = NodeId::new(42);
+
+        let tx_r_a = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx_r_b = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx_r_a, EntityId::Label(lbl_a), None)
+            .unwrap();
+        mgr.record_read(tx_r_b, EntityId::Label(lbl_b), None)
+            .unwrap();
+
+        // Write a node with BOTH labels → fans out to both Label(10) and Label(11)
+        mgr.record_node_write(tx_w, node, &[lbl_a, lbl_b], None)
+            .unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx_r_a),
+            (false, true),
+            "Label(10) reader must get out_conflict"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx_r_b),
+            (false, true),
+            "Label(11) reader must get out_conflict"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx_w),
+            (true, false),
+            "node writer must have in_conflict from both readers"
+        );
+    }
+
+    /// `record_edge_write` fans out to RelType coarse write.
+    /// A RelType(T) reader conflicts; a different-type reader does not.
+    #[test]
+    fn edge_write_fans_out_to_rel_type() {
+        let mgr = TransactionManager::new();
+        let rt5 = EdgeTypeId::new(5);
+        let rt6 = EdgeTypeId::new(6);
+        let edge = EdgeId::new(100);
+        let edge2 = EdgeId::new(101);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx1 records a RelType(5) read
+        mgr.record_read(tx1, EntityId::RelType(rt5), None).unwrap();
+
+        // tx2 writes an edge of type rt5 → fans out to RelType(5)
+        mgr.record_edge_write(tx2, edge, rt5, None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (false, true),
+            "RelType reader must get out_conflict from edge write fanning to RelType(5)"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, false),
+            "edge writer must get in_conflict from RelType(5) reader"
+        );
+
+        // An edge write of a DIFFERENT type must NOT conflict with RelType(5) reader.
+        let tx3 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        mgr.record_edge_write(tx3, edge2, rt6, None).unwrap();
+        assert_eq!(
+            mgr.conflict_flags(tx3),
+            (false, false),
+            "edge write with RelType(6) must not conflict with RelType(5) reader"
+        );
+    }
+
+    /// `record_node_write` with no labels only records the node entity —
+    /// no coarse Label writes, no spurious conflicts with Label readers.
+    #[test]
+    fn node_write_no_labels_no_label_conflict() {
+        let mgr = TransactionManager::new();
+        let lbl = LabelId::new(99);
+        let node = NodeId::new(7);
+
+        let tx_r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx_w = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        mgr.record_read(tx_r, EntityId::Label(lbl), None).unwrap();
+
+        // Write a node with NO labels → no fan-out to any Label
+        mgr.record_node_write(tx_w, node, &[], None).unwrap();
+
+        assert_eq!(
+            mgr.conflict_flags(tx_r),
+            (false, false),
+            "Label reader must not conflict with node write that has no labels"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx_w),
+            (false, false),
+            "node writer with no labels must have no conflict flags"
+        );
+    }
+
+    // --- GE3: read-set Node->Label / Edge->RelType escalation at threshold T ---
+
+    /// Crossing the threshold collapses the fine `Node` reads under a predicate
+    /// into the single coarse `Label(L)` key: after promotion the read-set holds
+    /// `Label(L)` and ZERO `Node(_)` for the promoted rows; a read under a
+    /// *different* label stays fine.
+    #[test]
+    fn escalation_promotes_at_threshold() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let lbl9 = LabelId::new(9);
+        let lbl8 = LabelId::new(8);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // 10 fine reads under Label(9) → bucket exceeds 4 → promotes.
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, lbl9)
+                .unwrap();
+        }
+        // One read under a different label (8) — must stay fine.
+        mgr.record_read_in_label(tx, NodeId::new(100), None, lbl8)
+            .unwrap();
+
+        let rs = mgr.read_set_tagged(tx);
+
+        // Coarse Label(9) key present.
+        assert!(
+            rs.contains(&(EntityId::Label(lbl9), None)),
+            "Label(9) coarse key must be in read_set after promotion"
+        );
+        // ZERO fine Node entries for the promoted (Label(9)) rows 0..10.
+        for i in 0..10u64 {
+            assert!(
+                !rs.contains(&(EntityId::Node(NodeId::new(i)), None)),
+                "fine Node({i}) must have been collapsed away after promotion"
+            );
+        }
+        // The Label(8) read stayed fine (its bucket never crossed the threshold).
+        assert!(
+            rs.contains(&(EntityId::Node(NodeId::new(100)), None)),
+            "read under non-escalated Label(8) must remain a fine Node entry"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(lbl8), None)),
+            "Label(8) must NOT be promoted (under threshold)"
+        );
+
+        // Size is bounded: not ~10 fine entries, just the coarse key + the one
+        // fine Label(8) read.
+        assert!(
+            rs.len() <= 3,
+            "read_set must be bounded after promotion, got {}",
+            rs.len()
+        );
+    }
+
+    /// Escalation cardinality is the number of distinct fine reads, not the
+    /// number of times a materialization pipeline revisits one entity.
+    #[test]
+    fn escalation_deduplicates_repeated_fine_reads() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(1);
+        let label = LabelId::new(9);
+        let first = NodeId::new(7);
+        let second = NodeId::new(8);
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        for _ in 0..16 {
+            mgr.record_read_in_label(tx, first, None, label).unwrap();
+        }
+        let repeated = mgr.read_set_tagged(tx);
+        assert!(repeated.contains(&(EntityId::Node(first), None)));
+        assert!(
+            !repeated.contains(&(EntityId::Label(label), None)),
+            "revisiting one fine entity must not promote a predicate"
+        );
+
+        mgr.record_read_in_label(tx, second, None, label).unwrap();
+        let promoted = mgr.read_set_tagged(tx);
+        assert!(promoted.contains(&(EntityId::Label(label), None)));
+        assert!(!promoted.contains(&(EntityId::Node(first), None)));
+        assert!(!promoted.contains(&(EntityId::Node(second), None)));
+    }
+
+    /// Property-tagged reads promote to a coarse `(Label, Some(tag))` key,
+    /// independently of the structural `(Label, None)` bucket.
+    #[test]
+    fn property_tagged_bucket_promotes_independently() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let l = LabelId::new(9);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        for i in 0..10u64 {
+            mgr.record_read_in_predicate_for_test(
+                tx,
+                EntityId::Node(NodeId::new(i)),
+                xtag,
+                EntityId::Label(l),
+                xtag,
+            )
+            .unwrap();
+        }
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::Label(l), xtag)),
+            "coarse (Label(9),Some(x)) present"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(l), None)),
+            "structural None key must NOT appear"
+        );
+        for i in 0..10u64 {
+            assert!(
+                !rs.contains(&(EntityId::Node(NodeId::new(i)), xtag)),
+                "fine x-reads collapsed"
+            );
+        }
+    }
+
+    /// With `escalation_threshold = usize::MAX`, no bucket can ever cross it, so
+    /// every read stays fine: 10 `Node` entries, no `Label` key.
+    #[test]
+    fn escalation_threshold_max_no_promote() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(usize::MAX);
+        let lbl9 = LabelId::new(9);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, lbl9)
+                .unwrap();
+        }
+
+        let rs = mgr.read_set_tagged(tx);
+        for i in 0..10u64 {
+            assert!(
+                rs.contains(&(EntityId::Node(NodeId::new(i)), None)),
+                "fine Node({i}) must remain (no promotion at usize::MAX)"
+            );
+        }
+        assert!(
+            !rs.contains(&(EntityId::Label(lbl9), None)),
+            "Label(9) must NOT appear when promotion is disabled"
+        );
+    }
+
+    /// LOAD-BEARING: dropping the fine entries on promotion must NOT lose a
+    /// conflict. It is only safe because GE2's write fan-out records the coarse
+    /// `Label(L)` key for every structural change to a node carrying `L`.
+    ///
+    /// We build a genuine two-transaction write-skew whose cycle can ONLY close
+    /// through coarse keys (two distinct labels, so the writes don't W-W collide
+    /// on the same `Label` key):
+    ///   tx1: escalated scan of Label(5)  + writes node W1 carrying Label(6)
+    ///   tx2: coarse read of Label(6)     + writes node 0 carrying Label(5)
+    ///
+    /// Node 0 is one tx1 *scanned and then dropped* from the registry. tx2's
+    /// `record_node_write(node0, [L5])` fans out to a coarse `Label(5)` write
+    /// that must still find tx1 — whose `Label(5)` read survives ONLY as the
+    /// coarse key (its fine `Node(_)` SIREAD entries were collapsed). That edge
+    /// (tx1 →rw tx2) is what gives tx2 its `in_conflict`; without the coarse
+    /// recording the drop would silently lose it and tx2 would NOT be a pivot.
+    /// The symmetric `Label(6)` edge closes the cycle, aborting the second
+    /// committer (tx2).
+    #[test]
+    fn escalated_reader_still_conflicts_via_label() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let lbl5 = LabelId::new(5);
+        let lbl6 = LabelId::new(6);
+
+        let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // tx1 scans > T nodes of Label(5) → escalates → coarse Label(5);
+        // its fine Node(0..10) reads are dropped from the registry.
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx1, NodeId::new(i), None, lbl5)
+                .unwrap();
+        }
+        // Sanity: tx1 escalated — coarse Label(5) present, fine Node(0) dropped
+        // from BOTH the read_set and the SIREAD registry.
+        let rs1 = mgr.read_set_tagged(tx1);
+        assert!(rs1.contains(&(EntityId::Label(lbl5), None)));
+        assert!(!rs1.contains(&(EntityId::Node(NodeId::new(0)), None)));
+        assert!(
+            !mgr.read_registry
+                .readers_of_compatible(EntityId::Node(NodeId::new(0)), None)
+                .contains(&tx1),
+            "tx1's fine Node(0) reader must be dropped from the registry"
+        );
+        assert!(
+            mgr.read_registry
+                .readers_of_compatible(EntityId::Label(lbl5), None)
+                .contains(&tx1),
+            "tx1's coarse Label(5) reader must remain in the registry"
+        );
+
+        // tx2 reads Label(6) (coarse).
+        mgr.record_read(tx2, EntityId::Label(lbl6), None).unwrap();
+
+        // Writes (disjoint coarse keys → no W-W collision):
+        // tx1 writes node W1 carrying Label(6) → Label(6) fan-out finds tx2.
+        mgr.record_node_write(tx1, NodeId::new(900), &[lbl6], None)
+            .unwrap();
+        // tx2 writes node 0 carrying Label(5) → Label(5) fan-out must find tx1
+        // via the COARSE key (fine Node(0) was dropped). THIS is the drop-safety.
+        mgr.record_node_write(tx2, NodeId::new(0), &[lbl5], None)
+            .unwrap();
+
+        // Both txs are pivots: each has an inbound and an outbound rw-edge.
+        // tx2.in_conflict in particular was set via the coarse Label(5) key
+        // after its fine Node(0) reader had been dropped — the load-bearing bit.
+        assert_eq!(
+            mgr.conflict_flags(tx1),
+            (true, true),
+            "tx1 must have both edges (in via Label(5) write-target reader, out via Label(6))"
+        );
+        assert_eq!(
+            mgr.conflict_flags(tx2),
+            (true, true),
+            "tx2 must have both edges — in via the coarse Label(5) key (post-drop)"
+        );
+
+        // tx1 commits first (no committed concurrent writer yet → not a pivot).
+        assert!(
+            mgr.commit(tx1).is_ok(),
+            "first committer (tx1) must succeed"
+        );
+        // tx2 is now the dangerous-structure pivot: in+out, and tx1 (committed
+        // after tx2's start) wrote Label(6) which is in tx2's read_set.
+        let r2 = mgr.commit(tx2);
+        assert!(
+            r2.is_err(),
+            "tx2 must fail to serialize — the fine-entry drop did not lose the conflict (coarse Label(5) carried it)"
+        );
+        assert!(
+            r2.unwrap_err()
+                .to_string()
+                .contains("Serialization failure"),
+            "expected SerializationFailure for the escalated-reader conflict"
+        );
+    }
+
+    /// After promotion the fine SIREAD entries are gone from the registry but the
+    /// coarse key is present: `readers_of_compatible(Node(0))` is empty for the
+    /// tx, while `readers_of_compatible(Label(9))` returns it.
+    #[test]
+    fn promotion_drops_from_registry() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let lbl9 = LabelId::new(9);
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, lbl9)
+                .unwrap();
+        }
+
+        // Fine reader removed from the registry for a promoted row.
+        let fine = mgr
+            .read_registry
+            .readers_of_compatible(EntityId::Node(NodeId::new(0)), None);
+        assert!(
+            !fine.contains(&tx),
+            "fine Node(0) reader must be removed from the registry after promotion"
+        );
+
+        // Coarse key reader present.
+        let coarse = mgr
+            .read_registry
+            .readers_of_compatible(EntityId::Label(lbl9), None);
+        assert!(
+            coarse.contains(&tx),
+            "coarse Label(9) reader must be present in the registry after promotion"
+        );
+    }
+
+    // --- Part G Task 3: property-write coarse fan-out carries the written prop tag ---
+
+    /// An escalated `(Label(L), Some("balance"))` reader keeps disjoint-property
+    /// concurrency above the escalation threshold: a coarse write for a *different*
+    /// property (`"amount"`) must NOT form an rw-edge, while a write for the *same*
+    /// property (`"balance"`) must.
+    ///
+    /// This is the "Part-G knob": after Task 3 the coarse fan-out carries
+    /// `Some(prop_tag(key))` instead of `None`, so `prop_compatible(Some(x),
+    /// Some(y))` = false when `x != y`.
+    ///
+    /// Cases A/B cover the node `Label` path; Cases C/D mirror them for the edge
+    /// `RelType` path. Each case uses a separate manager so transactions from one
+    /// case do not interfere with the W-W check of another.
+    #[test]
+    fn property_write_fanout_preserves_knob() {
+        let l = LabelId::new(5);
+        let bal = Some(prop_tag("balance"));
+        let amt = Some(prop_tag("amount"));
+
+        // Case A (knob holds): escalated reader of "balance", writer of "amount"
+        // → NO rw-edge (disjoint properties).
+        {
+            let mgr = TransactionManager::new();
+            let r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r, EntityId::Label(l), bal).unwrap();
+            let wy = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_node_labels_write(wy, &[l], amt).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r),
+                (false, false),
+                "Case A: balance reader must NOT get out_conflict from amount write (knob)"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wy),
+                (false, false),
+                "Case A: amount writer must NOT get in_conflict from balance reader (knob)"
+            );
+        }
+
+        // Case B (conflict): escalated reader of "balance", writer of "balance"
+        // → rw-edge r2 → wx exists.
+        {
+            let mgr = TransactionManager::new();
+            let r2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r2, EntityId::Label(l), bal).unwrap();
+            let wx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_node_labels_write(wx, &[l], bal).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r2),
+                (false, true),
+                "Case B: balance reader must get out_conflict from balance write"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wx),
+                (true, false),
+                "Case B: balance writer must get in_conflict from balance reader"
+            );
+        }
+
+        // Case C (edge, knob holds): escalated RelType reader of "balance",
+        // edge writer of "amount" → NO rw-edge (disjoint properties).
+        {
+            let t = EdgeTypeId::new(5);
+            let mgr = TransactionManager::new();
+            let r = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r, EntityId::RelType(t), bal).unwrap();
+            let wy = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_edge_type_write(wy, t, amt).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r),
+                (false, false),
+                "Case C: balance RelType reader must NOT conflict with amount edge write (knob)"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wy),
+                (false, false),
+                "Case C: amount edge writer must NOT conflict with balance RelType reader (knob)"
+            );
+        }
+
+        // Case D (edge, conflict): escalated RelType reader of "balance", edge
+        // writer of "balance" → rw-edge exists.
+        {
+            let t = EdgeTypeId::new(5);
+            let mgr = TransactionManager::new();
+            let r2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_read(r2, EntityId::RelType(t), bal).unwrap();
+            let wx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            mgr.record_edge_type_write(wx, t, bal).unwrap();
+            assert_eq!(
+                mgr.conflict_flags(r2),
+                (false, true),
+                "Case D: balance RelType reader must get out_conflict from balance edge write"
+            );
+            assert_eq!(
+                mgr.conflict_flags(wx),
+                (true, false),
+                "Case D: balance edge writer must get in_conflict from balance RelType reader"
+            );
+        }
+    }
+
+    // --- Task 4: property reads escalate under scanned labels (intersection) ---
+
+    /// A property read escalates only under labels the tx has *already scanned*
+    /// (intersection): a >T scan of :A then x-reads on :A:B nodes promote under
+    /// `(Label(A), Some(x))` and NOT `(Label(B), Some(x))`.
+    #[test]
+    fn property_read_escalates_under_scanned_label_only() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let a = LabelId::new(1);
+        let b = LabelId::new(2);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Tx scanned :A structurally -> Label(A) becomes a scanned predicate.
+        for i in 0..10u64 {
+            mgr.record_read_in_label(tx, NodeId::new(i), None, a)
+                .unwrap();
+        }
+
+        // Property x-reads on the same nodes, each carrying labels {A, B}.
+        for i in 0..10u64 {
+            mgr.record_read_node_escalating(tx, NodeId::new(i), xtag, xtag, &[a, b])
+                .unwrap();
+        }
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::Label(a), xtag)),
+            "x-reads promote under scanned Label(A)"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(b), xtag)),
+            "must NOT promote under unscanned Label(B)"
+        );
+    }
+
+    /// Empty intersection (tx scanned NOTHING) falls back to fine reads: the
+    /// read-set contains the fine `(Node(n), xtag)`, no `Label` key.
+    #[test]
+    fn property_read_empty_intersection_falls_back_to_fine() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let a = LabelId::new(10);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // No structural scan of :A, so scan_buckets is empty.
+        mgr.record_read_node_escalating(tx, NodeId::new(7), xtag, xtag, &[a])
+            .unwrap();
+
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::Node(NodeId::new(7)), xtag)),
+            "empty intersection must fall back to fine Node read"
+        );
+        assert!(
+            !rs.contains(&(EntityId::Label(a), xtag)),
+            "no Label key when intersection is empty"
+        );
+    }
+
+    /// Edge mirror of the two node tests: an edge property read escalates only
+    /// under a relationship type the tx has *already scanned* (`Some(t)` that is
+    /// a scanned predicate) and otherwise falls back to a fine `Edge` read
+    /// (unscanned type, or `rel = None`).
+    #[test]
+    fn edge_property_read_escalates_under_scanned_rel_only() {
+        let mgr = TransactionManager::new();
+        mgr.set_escalation_threshold(4);
+        let t = EdgeTypeId::new(1);
+        let other = EdgeTypeId::new(2);
+        let xtag = Some(prop_tag("x"));
+
+        let tx = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+        // Tx scanned [:T] structurally -> RelType(T) becomes a scanned predicate.
+        for i in 0..10u64 {
+            mgr.record_read_in_rel_type(tx, EdgeId::new(i), None, t)
+                .unwrap();
+        }
+
+        // Edge property x-reads on the same edges (intrinsic type T) -> promote.
+        for i in 0..10u64 {
+            mgr.record_read_edge_escalating(tx, EdgeId::new(i), xtag, xtag, Some(t))
+                .unwrap();
+        }
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            rs.contains(&(EntityId::RelType(t), xtag)),
+            "x-reads promote under scanned RelType(T)"
+        );
+
+        // An edge property read of an UNSCANNED type falls back to fine.
+        mgr.record_read_edge_escalating(tx, EdgeId::new(100), xtag, xtag, Some(other))
+            .unwrap();
+        // A property read with no intrinsic type (rel = None) falls back to fine.
+        mgr.record_read_edge_escalating(tx, EdgeId::new(101), xtag, xtag, None)
+            .unwrap();
+        let rs = mgr.read_set_tagged(tx);
+        assert!(
+            !rs.contains(&(EntityId::RelType(other), xtag)),
+            "must NOT promote under unscanned RelType(other)"
+        );
+        assert!(
+            rs.contains(&(EntityId::Edge(EdgeId::new(100)), xtag))
+                && rs.contains(&(EntityId::Edge(EdgeId::new(101)), xtag)),
+            "unscanned / typeless edge property reads stay fine"
+        );
+    }
+
+    // --- Task 7: record_coarse_write skips first-writer-wins W-W ---
+
+    /// `record_coarse_write` must allow two concurrent Serializable transactions
+    /// to both write the same coarse `Label(L)` guard without a W-W conflict
+    /// (because they are writing DIFFERENT real entities under that label — the
+    /// coarse key is a phantom guard, not an exclusive resource). By contrast,
+    /// `record_write` on the same coarse key from two active transactions DOES
+    /// fire W-W (the flag genuinely gates).
+    ///
+    /// Also verifies that a coarse write still forms the rw-edge against a
+    /// concurrent reader of the same coarse key.
+    #[test]
+    fn coarse_write_skips_first_writer_wins() {
+        let lbl7 = LabelId::new(7);
+
+        // Part 1: two active Serializable txns both call record_coarse_write
+        // on the same Label(7) → BOTH return Ok (no WriteConflict).
+        {
+            let mgr = TransactionManager::new();
+            let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            let r1 = mgr.record_coarse_write(tx1, EntityId::Label(lbl7), None);
+            assert!(
+                r1.is_ok(),
+                "first coarse write of Label(7) must succeed: {r1:?}"
+            );
+
+            let r2 = mgr.record_coarse_write(tx2, EntityId::Label(lbl7), None);
+            assert!(
+                r2.is_ok(),
+                "second coarse write of Label(7) must also succeed — \
+                 coarse key is a phantom guard, not an exclusive resource: {r2:?}"
+            );
+        }
+
+        // Part 2: a coarse write still forms the rw-edge against a concurrent
+        // coarse reader (the rw-detection side is unaffected by the W-W skip).
+        {
+            let mgr = TransactionManager::new();
+            let tx_reader = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx_writer = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            // Reader records Label(7) read → enters the SIREAD registry.
+            mgr.record_read(tx_reader, EntityId::Label(lbl7), None)
+                .unwrap();
+
+            // Coarse write of Label(7) from a concurrent Serializable writer.
+            mgr.record_coarse_write(tx_writer, EntityId::Label(lbl7), None)
+                .unwrap();
+
+            // The rw-edge reader →rw writer must have formed.
+            assert_eq!(
+                mgr.conflict_flags(tx_reader),
+                (false, true),
+                "coarse write must set reader.out_conflict via rw-detection"
+            );
+            assert_eq!(
+                mgr.conflict_flags(tx_writer),
+                (true, false),
+                "coarse write must set writer.in_conflict via rw-detection"
+            );
+        }
+
+        // Part 3 (contrast): record_write on the same coarse key from two active
+        // txns DOES fire W-W — the check_ww flag genuinely gates the behaviour.
+        {
+            let mgr = TransactionManager::new();
+            let tx1 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+            let tx2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+
+            mgr.record_write(tx1, EntityId::Label(lbl7), None).unwrap();
+
+            let r2 = mgr.record_write(tx2, EntityId::Label(lbl7), None);
+            assert!(
+                r2.is_err(),
+                "record_write (check_ww=true) on the same Label key from a second \
+                 active tx must still return WriteConflict: {r2:?}"
+            );
+            let msg = r2.unwrap_err().to_string();
+            assert!(
+                msg.contains("Write-write conflict"),
+                "expected 'Write-write conflict' in error, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_commit_is_not_visible_until_finalized() {
+        let manager = TransactionManager::new();
+        let transaction_id = manager.begin();
+
+        let epoch = manager.prepare_durable_commit(transaction_id).unwrap();
+        assert_eq!(
+            manager.state(transaction_id),
+            Some(TransactionState::Active)
+        );
+        assert_eq!(manager.active_count(), 1);
+        assert_eq!(manager.committed_epoch(transaction_id), None);
+        assert!(manager.prepare_durable_commit(transaction_id).is_err());
+        assert!(
+            manager
+                .record_write(transaction_id, EntityId::Node(NodeId::new(7)), None)
+                .is_err(),
+            "a prepared transaction must be immutable"
+        );
+
+        manager
+            .finalize_durable_commit(transaction_id, epoch)
+            .unwrap();
+        assert_eq!(
+            manager.state(transaction_id),
+            Some(TransactionState::Committed)
+        );
+        assert_eq!(manager.active_count(), 0);
+        assert_eq!(manager.committed_epoch(transaction_id), Some(epoch));
+    }
+
+    #[test]
+    fn prepared_commit_can_abort_after_durable_write_failure() {
+        let manager = TransactionManager::new();
+        let transaction_id = manager.begin();
+        let reserved = manager.prepare_durable_commit(transaction_id).unwrap();
+
+        assert!(
+            manager
+                .finalize_durable_commit(transaction_id, EpochId::new(reserved.as_u64() + 1),)
+                .is_err(),
+            "finalization must match the exact reserved epoch"
+        );
+        manager.abort(transaction_id).unwrap();
+        assert_eq!(
+            manager.state(transaction_id),
+            Some(TransactionState::Aborted)
+        );
+        assert_eq!(manager.active_count(), 0);
+        assert_eq!(manager.committed_epoch(transaction_id), None);
     }
 }
