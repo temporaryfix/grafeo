@@ -9,3 +9,9 @@ rustflags = [
     '--cfg', 'getrandom_backend="wasm_js"',
     '-C', 'target-feature=+simd128',
 ]
+
+# Use Apple's system linker explicitly for native (Apple Silicon) builds, for
+# consistent native linking. ld-1167+ is Apple's fast
+# "new" linker; scoped to aarch64-apple-darwin so the wasm config above is untouched.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=/usr/bin/ld"]

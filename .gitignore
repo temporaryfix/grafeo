@@ -89,6 +89,7 @@ cargo-timing*.html
 # we want to guard against; otherwise local artefacts.
 *.proptest-regressions
 
+
 # ── Documentation (auto-generated) ───────────────────────────────────
 docs/changelog.md
 site/
