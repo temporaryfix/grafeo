@@ -141,6 +141,47 @@ where
 ///
 /// A vector of vectors, where `result[i]` contains all nodes at distance `i` from start.
 pub fn bfs_layers(store: &dyn GraphStore, start: NodeId) -> Vec<Vec<NodeId>> {
+    bfs_layers_filtered(store, start, None, None)
+}
+
+/// BFS layers restricted to one edge type and/or bounded in depth.
+///
+/// Traverses outgoing edges, as [`bfs_layers`] does. A caller that needs an edge-type filter or a
+/// depth bound gets it here instead of re-running a traversal of its own.
+///
+/// # Arguments
+///
+/// * `store` - The graph store to traverse
+/// * `start` - The starting node ID
+/// * `edge_type` - When given, only edges of this type are followed, matched
+///   case-insensitively as elsewhere in the engine
+/// * `max_depth` - When given, the largest distance from `start` that is returned: `Some(0)` yields
+///   the start node alone, `Some(2)` yields at most three layers
+///
+/// # Returns
+///
+/// A vector of vectors, where `result[i]` contains all nodes at distance `i` from start.
+pub fn bfs_layers_filtered(
+    store: &dyn GraphStore,
+    start: NodeId,
+    edge_type: Option<&str>,
+    max_depth: Option<usize>,
+) -> Vec<Vec<NodeId>> {
+    bfs_layers_with_direction(store, start, edge_type, max_depth, Direction::Outgoing)
+}
+
+/// BFS layers restricted by edge type, depth, and traversal direction.
+///
+/// The start node is always returned at distance zero when it exists. Parallel
+/// edges and cycles do not duplicate a node because discovery is tracked by
+/// node identity.
+pub fn bfs_layers_with_direction(
+    store: &dyn GraphStore,
+    start: NodeId,
+    edge_type: Option<&str>,
+    max_depth: Option<usize>,
+    direction: Direction,
+) -> Vec<Vec<NodeId>> {
     let mut layers: Vec<Vec<NodeId>> = Vec::new();
     let mut discovered: FxHashSet<NodeId> = FxHashSet::default();
     let mut current_layer: Vec<NodeId> = Vec::new();
@@ -156,8 +197,20 @@ pub fn bfs_layers(store: &dyn GraphStore, start: NodeId) -> Vec<Vec<NodeId>> {
     while !current_layer.is_empty() {
         layers.push(current_layer.clone());
 
+        // The layer just pushed sits at depth `layers.len() - 1`; stop once that is the bound.
+        if max_depth.is_some_and(|bound| layers.len() > bound) {
+            break;
+        }
+
         for &node in &current_layer {
-            for (neighbor, _) in store.edges_from(node, Direction::Outgoing) {
+            for (neighbor, edge_id) in store.edges_from(node, direction) {
+                if let Some(wanted) = edge_type
+                    && !store
+                        .edge_type(edge_id)
+                        .is_some_and(|actual| actual.as_str().eq_ignore_ascii_case(wanted))
+                {
+                    continue;
+                }
                 if discovered.insert(neighbor) {
                     next_layer.push(neighbor);
                 }
@@ -370,13 +423,40 @@ static BFS_PARAMS: OnceLock<Vec<ParameterDef>> = OnceLock::new();
 
 fn bfs_params() -> &'static [ParameterDef] {
     BFS_PARAMS.get_or_init(|| {
-        vec![ParameterDef {
-            name: "start".to_string(),
-            description: "Starting node ID".to_string(),
-            param_type: ParameterType::NodeId,
-            required: true,
-            default: None,
-        }]
+        vec![
+            ParameterDef {
+                name: "start".to_string(),
+                description: "Starting node ID".to_string(),
+                param_type: ParameterType::NodeId,
+                required: true,
+                default: None,
+            },
+            // Optional parameters are appended, never inserted: positional arguments map by index.
+            ParameterDef {
+                name: "edge_type".to_string(),
+                description: "Follow only edges of this type (default: every type)".to_string(),
+                param_type: ParameterType::String,
+                required: false,
+                default: None,
+            },
+            ParameterDef {
+                name: "max_depth".to_string(),
+                description: "Largest distance from `start` to return; 0 yields the start node \
+                              alone (default: unbounded)"
+                    .to_string(),
+                param_type: ParameterType::Integer,
+                required: false,
+                default: None,
+            },
+            ParameterDef {
+                name: "direction".to_string(),
+                description: "Traversal direction: outgoing, incoming, or both (default: outgoing)"
+                    .to_string(),
+                param_type: ParameterType::String,
+                required: false,
+                default: Some("outgoing".to_string()),
+            },
+        ]
     })
 }
 
@@ -394,7 +474,70 @@ impl_algorithm! {
         })?;
 
         let start = node_id_from_param(start_id, "start")?;
-        let layers = bfs_layers(store, start);
+        let edge_type = match params.get_string("edge_type") {
+            Some(value) => Some(value),
+            None
+                if params.get_int("edge_type").is_some()
+                    || params.get_float("edge_type").is_some()
+                    || params.get_bool("edge_type").is_some()
+                    || params.get_list("edge_type").is_some() =>
+            {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    "edge_type must be a string".to_string(),
+                ));
+            }
+            None => None,
+        };
+        let max_depth = match params.get_int("max_depth") {
+            Some(v) if v < 0 => {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    format!("max_depth must be non-negative, got {v}"),
+                ));
+            }
+            Some(v) => Some(usize::try_from(v).map_err(|_| {
+                grafeo_common::utils::error::Error::InvalidValue(
+                    format!("max_depth value {v} exceeds maximum supported size"),
+                )
+            })?),
+            None
+                if params.get_float("max_depth").is_some()
+                    || params.get_string("max_depth").is_some()
+                    || params.get_bool("max_depth").is_some()
+                    || params.get_list("max_depth").is_some() =>
+            {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    "max_depth must be an integer".to_string(),
+                ));
+            }
+            None => None,
+        };
+        let direction_value = match params.get_string("direction") {
+            Some(value) => value,
+            None
+                if params.get_int("direction").is_some()
+                    || params.get_float("direction").is_some()
+                    || params.get_bool("direction").is_some()
+                    || params.get_list("direction").is_some() =>
+            {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    "direction must be a string".to_string(),
+                ));
+            }
+            None => "outgoing",
+        };
+        let direction = match direction_value.to_ascii_lowercase().as_str() {
+            "outgoing" => Direction::Outgoing,
+            "incoming" => Direction::Incoming,
+            "both" => Direction::Both,
+            value => {
+                return Err(grafeo_common::utils::error::Error::InvalidValue(
+                    format!(
+                        "direction must be one of outgoing, incoming, or both, got '{value}'"
+                    ),
+                ));
+            }
+        };
+        let layers = bfs_layers_with_direction(store, start, edge_type, max_depth, direction);
 
         let mut result = AlgorithmResult::new(vec!["node_id".to_string(), "distance".to_string()]);
 
@@ -500,6 +643,206 @@ mod tests {
         assert!(!layers.is_empty());
         assert_eq!(layers[0], vec![NodeId::new(0)]);
         // Distance 0: just the start node
+    }
+
+    /// A chain of two edge types: `a -KNOWS-> b -KNOWS-> c` and `a -LIKES-> d -LIKES-> e`.
+    ///
+    /// Unfiltered BFS reaches both branches; filtering on one type must reach only it, and a depth
+    /// bound must cut the layers it returns.
+    fn create_two_edge_type_graph() -> (LpgStore, Vec<NodeId>) {
+        let store = LpgStore::new().unwrap();
+        let nodes: Vec<NodeId> = (0..5).map(|_| store.create_node(&["Node"])).collect();
+        store.create_edge(nodes[0], nodes[1], "KNOWS");
+        store.create_edge(nodes[1], nodes[2], "KNOWS");
+        store.create_edge(nodes[0], nodes[3], "LIKES");
+        store.create_edge(nodes[3], nodes[4], "LIKES");
+        (store, nodes)
+    }
+
+    #[test]
+    fn bfs_layers_filtered_restricts_to_one_edge_type() {
+        let (store, nodes) = create_two_edge_type_graph();
+
+        let all = bfs_layers(&store, nodes[0]);
+        assert_eq!(all.len(), 3, "both branches are two hops deep: {all:?}");
+        assert_eq!(
+            all[1].len(),
+            2,
+            "unfiltered, layer 1 holds b and d: {all:?}"
+        );
+
+        let knows = bfs_layers_filtered(&store, nodes[0], Some("KNOWS"), None);
+        assert_eq!(
+            knows,
+            vec![vec![nodes[0]], vec![nodes[1]], vec![nodes[2]]],
+            "KNOWS must not reach the LIKES branch"
+        );
+
+        let likes = bfs_layers_filtered(&store, nodes[0], Some("LIKES"), None);
+        assert_eq!(
+            likes,
+            vec![vec![nodes[0]], vec![nodes[3]], vec![nodes[4]]],
+            "LIKES must not reach the KNOWS branch"
+        );
+
+        // Edge types match case-insensitively, as they do everywhere else in the engine.
+        assert_eq!(
+            bfs_layers_filtered(&store, nodes[0], Some("knows"), None),
+            knows
+        );
+
+        assert_eq!(
+            bfs_layers_filtered(&store, nodes[0], Some("NOPE"), None),
+            vec![vec![nodes[0]]],
+            "an unused edge type leaves the start node alone"
+        );
+    }
+
+    #[test]
+    fn bfs_layers_filtered_truncates_at_max_depth() {
+        let (store, nodes) = create_two_edge_type_graph();
+
+        assert_eq!(
+            bfs_layers_filtered(&store, nodes[0], None, Some(0)),
+            vec![vec![nodes[0]]],
+            "depth 0 is the start node alone"
+        );
+        let depth_one = bfs_layers_filtered(&store, nodes[0], None, Some(1));
+        assert_eq!(depth_one.len(), 2, "depth 1 returns two layers");
+        assert_eq!(depth_one[1].len(), 2);
+
+        assert_eq!(
+            bfs_layers_filtered(&store, nodes[0], Some("KNOWS"), Some(1)),
+            vec![vec![nodes[0]], vec![nodes[1]]],
+            "the filter and the bound compose"
+        );
+        assert_eq!(
+            bfs_layers_filtered(&store, nodes[0], None, Some(9)),
+            bfs_layers(&store, nodes[0]),
+            "a bound past the graph's depth changes nothing"
+        );
+    }
+
+    #[test]
+    fn bfs_algorithm_accepts_the_edge_type_and_depth_parameters() {
+        use super::super::traits::GraphAlgorithm;
+
+        let (store, nodes) = create_two_edge_type_graph();
+        let parameters = BfsAlgorithm.parameters();
+        assert_eq!(parameters.len(), 4);
+        assert_eq!(parameters[0].name, "start");
+        assert_eq!(parameters[1].name, "edge_type");
+        assert_eq!(parameters[2].name, "max_depth");
+        assert_eq!(parameters[3].name, "direction");
+        assert_eq!(parameters[3].default.as_deref(), Some("outgoing"));
+        assert!(!parameters[1].required && !parameters[2].required && !parameters[3].required);
+
+        let mut params = super::super::super::Parameters::new();
+        // reason: node IDs are sequential counters, well within i64::MAX
+        #[allow(clippy::cast_possible_wrap)]
+        params.set_int("start", nodes[0].0 as i64);
+        assert_eq!(
+            BfsAlgorithm.execute(&store, &params).unwrap().row_count(),
+            5,
+            "unfiltered BFS reaches every node"
+        );
+
+        params.set_string("edge_type", "KNOWS");
+        assert_eq!(
+            BfsAlgorithm.execute(&store, &params).unwrap().row_count(),
+            3,
+            "the KNOWS branch is three nodes"
+        );
+
+        params.set_int("max_depth", 1);
+        assert_eq!(
+            BfsAlgorithm.execute(&store, &params).unwrap().row_count(),
+            2,
+            "depth 1 on the KNOWS branch is two nodes"
+        );
+
+        params.set_int("max_depth", -1);
+        assert!(
+            BfsAlgorithm.execute(&store, &params).is_err(),
+            "a negative depth is rejected, not silently treated as unbounded"
+        );
+    }
+
+    #[test]
+    fn bfs_layers_direction_handles_cycles_parallel_edges_and_disconnected_start() {
+        let store = LpgStore::new().unwrap();
+        let a = store.create_node(&["Node"]);
+        let b = store.create_node(&["Node"]);
+        let c = store.create_node(&["Node"]);
+        let d = store.create_node(&["Node"]);
+        let isolated = store.create_node(&["Node"]);
+        store.create_edge(a, b, "KNOWS");
+        store.create_edge(a, b, "KNOWS");
+        store.create_edge(b, c, "KNOWS");
+        store.create_edge(c, a, "KNOWS");
+        store.create_edge(d, b, "LIKES");
+
+        assert_eq!(
+            bfs_layers_with_direction(&store, c, Some("KNOWS"), Some(2), Direction::Incoming),
+            vec![vec![c], vec![b], vec![a]]
+        );
+        assert_eq!(
+            bfs_layers_with_direction(&store, b, None, Some(1), Direction::Both),
+            vec![vec![b], vec![c, a, d]]
+        );
+        assert_eq!(
+            bfs_layers_with_direction(&store, isolated, None, None, Direction::Both),
+            vec![vec![isolated]]
+        );
+    }
+
+    #[test]
+    fn bfs_algorithm_direction_parameter_is_positional_and_validated() {
+        use super::super::traits::GraphAlgorithm;
+
+        let store = LpgStore::new().unwrap();
+        let a = store.create_node(&["Node"]);
+        let b = store.create_node(&["Node"]);
+        store.create_edge(a, b, "R");
+
+        let mut params = super::super::super::Parameters::new();
+        #[allow(clippy::cast_possible_wrap)]
+        params.set_int("start", b.0 as i64);
+        params.set_string("direction", "incoming");
+        assert_eq!(
+            BfsAlgorithm.execute(&store, &params).unwrap().row_count(),
+            2
+        );
+
+        params.set_string("direction", "sideways");
+        assert!(BfsAlgorithm.execute(&store, &params).is_err());
+
+        let mut wrong_type = super::super::super::Parameters::new();
+        #[allow(clippy::cast_possible_wrap)]
+        wrong_type.set_int("start", a.0 as i64);
+        wrong_type.set_float("max_depth", 1.5);
+        assert!(
+            BfsAlgorithm.execute(&store, &wrong_type).is_err(),
+            "a fractional max_depth must not silently become unbounded"
+        );
+
+        let mut wrong_type = super::super::super::Parameters::new();
+        #[allow(clippy::cast_possible_wrap)]
+        wrong_type.set_int("start", a.0 as i64);
+        wrong_type.set_list("edge_type", vec![Value::Int64(1)]);
+        assert!(
+            BfsAlgorithm.execute(&store, &wrong_type).is_err(),
+            "a non-string edge_type must not silently remove the filter"
+        );
+
+        let mut wrong_type = super::super::super::Parameters::new();
+        #[allow(clippy::cast_possible_wrap)]
+        wrong_type.set_int("start", a.0 as i64);
+        wrong_type.set_bool("direction", true);
+        assert!(
+            BfsAlgorithm.execute(&store, &wrong_type).is_err(),
+            "a non-string direction must not silently use outgoing"
+        );
     }
 
     #[test]

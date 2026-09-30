@@ -748,8 +748,44 @@ mod tests {
     #[test]
     fn sec17_is_iri() {
         let query = "SELECT ?s WHERE { ?s ?p ?o FILTER(isIRI(?o)) }";
-        let result = sparql::parse(query);
-        assert!(result.is_ok(), "isIRI(): {result:?}");
+        let result = sparql::parse(query).expect("isIRI() parses");
+        let ast::QueryForm::Select(select) = &result.query_form else {
+            panic!("expected SELECT")
+        };
+        let ast::GraphPattern::Group(patterns) = &select.where_clause else {
+            panic!("expected WHERE group")
+        };
+        let function = patterns.iter().find_map(|pattern| {
+            let ast::GraphPattern::Filter(ast::Expression::FunctionCall { function, .. }) = pattern
+            else {
+                return None;
+            };
+            Some(function)
+        });
+        assert!(matches!(
+            function,
+            Some(ast::FunctionName::BuiltIn(ast::BuiltInFunction::IsIri))
+        ));
+    }
+
+    #[test]
+    fn sec17_relative_custom_function_is_not_a_bare_builtin() {
+        let query = "BASE <http://example/> SELECT ?s WHERE { ?s ?p ?o FILTER(<isIRI>(?o)) }";
+        let result = sparql::parse(query).expect("relative custom function parses");
+        let ast::QueryForm::Select(select) = &result.query_form else {
+            panic!("expected SELECT")
+        };
+        let ast::GraphPattern::Group(patterns) = &select.where_clause else {
+            panic!("expected WHERE group")
+        };
+        let function = patterns.iter().find_map(|pattern| {
+            let ast::GraphPattern::Filter(ast::Expression::FunctionCall { function, .. }) = pattern
+            else {
+                return None;
+            };
+            Some(function)
+        });
+        assert!(matches!(function, Some(ast::FunctionName::Custom(_))));
     }
 
     #[test]

@@ -11,6 +11,15 @@ use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
 /// expressions, EXISTS subqueries, function calls).
 const MAX_NESTING_DEPTH: u32 = 128;
 
+/// Longest left-associative operator chain one expression may contain.
+const MAX_CHAIN_LENGTH: u32 = 512;
+
+/// Most chain links one statement may contain. Chains nested inside each other
+/// each stay under [`MAX_CHAIN_LENGTH`] but deepen the tree together, and a
+/// syntax tree tens of thousands of levels deep overflows the stack when it is
+/// dropped, so the statement total is bounded as well.
+const MAX_STATEMENT_LINKS: u32 = 16_384;
+
 /// SPARQL Parser.
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -23,6 +32,8 @@ pub struct Parser<'a> {
     anon_blank_counter: u32,
     /// Current nesting depth for recursive parsing constructs.
     nesting_depth: u32,
+    /// Chain links in this statement; see [`MAX_STATEMENT_LINKS`].
+    statement_links: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -37,6 +48,7 @@ impl<'a> Parser<'a> {
             collection_counter: 0,
             anon_blank_counter: 0,
             nesting_depth: 0,
+            statement_links: 0,
         }
     }
 
@@ -519,7 +531,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Named => {
                 self.advance();
-                Ok(GraphTarget::Named(Iri::new(""))) // All named graphs
+                Ok(GraphTarget::NamedAll)
             }
             TokenKind::All => {
                 self.advance();
@@ -1349,7 +1361,11 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::By)?;
 
         let mut conditions = Vec::new();
-        while self.current.kind == TokenKind::Variable || self.current.kind == TokenKind::LeftParen
+        while self.current.kind == TokenKind::Variable
+            || self.current.kind == TokenKind::LeftParen
+            || self.current.kind == TokenKind::Iri
+            || self.current.kind == TokenKind::PrefixedName
+            || self.is_built_in_function()
         {
             conditions.push(self.parse_group_condition()?);
         }
@@ -1379,7 +1395,12 @@ impl<'a> Parser<'a> {
             let name = self.expect_variable_name()?;
             Ok(GroupCondition::Variable(name))
         } else {
-            let expr = self.parse_built_in_call()?;
+            let expr = if self.is_built_in_function() {
+                self.parse_built_in_call()?
+            } else {
+                let iri = self.expect_iri()?;
+                self.parse_function_call_with_iri(iri)?
+            };
             Ok(GroupCondition::BuiltInCall(expr))
         }
     }
@@ -1467,9 +1488,11 @@ impl<'a> Parser<'a> {
 
     fn parse_conditional_or_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_conditional_and_expression()?;
+        let mut links = 0;
 
         while self.current.kind == TokenKind::OrOp {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_conditional_and_expression()?;
             expr = Expression::Binary {
                 left: Box::new(expr),
@@ -1483,9 +1506,11 @@ impl<'a> Parser<'a> {
 
     fn parse_conditional_and_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_value_logical()?;
+        let mut links = 0;
 
         while self.current.kind == TokenKind::AndOp {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_value_logical()?;
             expr = Expression::Binary {
                 left: Box::new(expr),
@@ -1550,8 +1575,10 @@ impl<'a> Parser<'a> {
 
     fn parse_additive_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_multiplicative_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             let operator = match self.current.kind {
                 TokenKind::Plus => BinaryOperator::Add,
                 TokenKind::MinusOp => BinaryOperator::Subtract,
@@ -1571,8 +1598,10 @@ impl<'a> Parser<'a> {
 
     fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_unary_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             let operator = match self.current.kind {
                 TokenKind::Star => BinaryOperator::Multiply,
                 TokenKind::Slash => BinaryOperator::Divide,
@@ -1640,6 +1669,12 @@ impl<'a> Parser<'a> {
                 } else {
                     Ok(Expression::Iri(iri))
                 }
+            }
+            // The lexer represents bare built-in names as PrefixedName tokens.
+            // Recognize them before treating the token as a custom IRI; an
+            // explicit `<isIRI>` remains a custom function as required.
+            TokenKind::PrefixedName if self.is_built_in_function() => {
+                self.parse_built_in_function()
             }
             TokenKind::PrefixedName => {
                 let iri = self.parse_prefixed_iri()?;
@@ -2083,6 +2118,8 @@ impl<'a> Parser<'a> {
                 if let Some(&next) = chars.peek() {
                     chars.next();
                     match next {
+                        'b' => result.push('\u{0008}'),
+                        'f' => result.push('\u{000C}'),
                         'n' => result.push('\n'),
                         'r' => result.push('\r'),
                         't' => result.push('\t'),
@@ -2244,6 +2281,29 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.error(&format!("invalid integer: {}", text)))
     }
 
+    /// Counts one more link in a left-associative chain such as `a || b || …`.
+    ///
+    /// The loops build the chain without recursing, but every later pass
+    /// recurses once per link, and dropping the tree does too. A chain longer
+    /// than the engine's statement depth limit is rejected there anyway, so
+    /// stopping here keeps an oversized statement from building a tree too deep
+    /// to drop.
+    fn extend_chain(&mut self, links: &mut u32) -> Result<()> {
+        *links += 1;
+        self.statement_links += 1;
+        if *links > MAX_CHAIN_LENGTH {
+            return Err(self.error(&format!(
+                "Expression chain longer than {MAX_CHAIN_LENGTH} operators"
+            )));
+        }
+        if self.statement_links > MAX_STATEMENT_LINKS {
+            return Err(self.error(&format!(
+                "Statement has more than {MAX_STATEMENT_LINKS} chained operators"
+            )));
+        }
+        Ok(())
+    }
+
     /// Increments the nesting depth and returns an error if the limit is exceeded.
     fn enter_nesting(&mut self) -> Result<()> {
         self.nesting_depth += 1;
@@ -2276,6 +2336,15 @@ mod tests {
     fn parse(query: &str) -> Result<Query> {
         let mut parser = Parser::new(query);
         parser.parse()
+    }
+
+    #[test]
+    fn unescapes_all_sparql_echar_controls() {
+        let parser = Parser::new("");
+        assert_eq!(
+            parser.unescape_string(r"\b\f\n\r\t", '"'),
+            "\u{0008}\u{000C}\n\r\t"
+        );
     }
 
     #[test]
@@ -2377,6 +2446,91 @@ mod tests {
         } else {
             panic!("expected SELECT query");
         }
+    }
+
+    #[test]
+    fn test_group_by_unparenthesized_built_in_call() {
+        let query = parse(
+            "SELECT (STR(?x) AS ?key) (COUNT(*) AS ?count) \
+             WHERE { ?x ?p ?y } GROUP BY STR(?x) ?y ORDER BY ?key",
+        )
+        .expect("SPARQL permits a built-in call as an unparenthesized GROUP BY condition");
+        let QueryForm::Select(select) = query.query_form else {
+            panic!("expected SELECT query");
+        };
+        let group_by = select
+            .solution_modifiers
+            .group_by
+            .expect("GROUP BY conditions");
+
+        assert_eq!(group_by.len(), 2);
+        assert!(matches!(
+            &group_by[0],
+            GroupCondition::BuiltInCall(Expression::FunctionCall {
+                function: FunctionName::BuiltIn(BuiltInFunction::Str),
+                arguments,
+            }) if matches!(arguments.as_slice(), [Expression::Variable(variable)] if variable == "x")
+        ));
+        assert!(matches!(&group_by[1], GroupCondition::Variable(variable) if variable == "y"));
+        assert!(select.solution_modifiers.order_by.is_some());
+    }
+
+    #[test]
+    fn test_group_by_unparenthesized_prefixed_function_call_stops_at_having() {
+        let query = parse(
+            "PREFIX ex: <https://example.com/function/> \
+             SELECT (COUNT(*) AS ?count) WHERE { ?x ?p ?y } \
+             GROUP BY ex:key(?x) HAVING (COUNT(*) > 0)",
+        )
+        .expect("SPARQL permits a prefixed function call as a GROUP BY condition");
+        let QueryForm::Select(select) = query.query_form else {
+            panic!("expected SELECT query");
+        };
+        let group_by = select
+            .solution_modifiers
+            .group_by
+            .expect("GROUP BY conditions");
+
+        assert!(matches!(
+            group_by.as_slice(),
+            [GroupCondition::BuiltInCall(Expression::FunctionCall {
+                function: FunctionName::Custom(iri),
+                arguments,
+            })] if iri.as_str() == "ex:key"
+                && matches!(arguments.as_slice(), [Expression::Variable(variable)] if variable == "x")
+        ));
+        assert!(select.solution_modifiers.having.is_some());
+    }
+
+    #[test]
+    fn test_group_by_unparenthesized_iri_function_call_stops_at_order_and_limit() {
+        let query = parse(
+            "SELECT (COUNT(*) AS ?count) WHERE { ?x ?p ?y } \
+             GROUP BY <https://example.com/function/key>(?x) \
+             ORDER BY ?count LIMIT 7",
+        )
+        .expect("SPARQL permits an IRI function call as a GROUP BY condition");
+        let QueryForm::Select(select) = query.query_form else {
+            panic!("expected SELECT query");
+        };
+        let group_by = select
+            .solution_modifiers
+            .group_by
+            .expect("GROUP BY conditions");
+
+        assert!(matches!(
+            group_by.as_slice(),
+            [GroupCondition::BuiltInCall(Expression::FunctionCall {
+                function: FunctionName::Custom(iri),
+                arguments,
+            })] if iri.as_str() == "https://example.com/function/key"
+                && matches!(arguments.as_slice(), [Expression::Variable(variable)] if variable == "x")
+        ));
+        assert_eq!(
+            select.solution_modifiers.order_by.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(select.solution_modifiers.limit, Some(7));
     }
 
     #[test]

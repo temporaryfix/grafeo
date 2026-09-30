@@ -10,6 +10,15 @@ use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result, Sou
 /// expressions, CASE, EXISTS subqueries, list literals, function calls).
 const MAX_NESTING_DEPTH: u32 = 128;
 
+/// Longest left-associative operator chain one expression may contain.
+const MAX_CHAIN_LENGTH: u32 = 512;
+
+/// Most chain links one statement may contain. Chains nested inside each other
+/// each stay under [`MAX_CHAIN_LENGTH`] but deepen the tree together, and a
+/// syntax tree tens of thousands of levels deep overflows the stack when it is
+/// dropped, so the statement total is bounded as well.
+const MAX_STATEMENT_LINKS: u32 = 16_384;
+
 /// GQL Parser.
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -19,6 +28,8 @@ pub struct Parser<'a> {
     source: &'a str,
     /// Current nesting depth for recursive parsing constructs.
     nesting_depth: u32,
+    /// Chain links in this statement; see [`MAX_STATEMENT_LINKS`].
+    statement_links: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -33,7 +44,31 @@ impl<'a> Parser<'a> {
             peeked_second: None,
             source: input,
             nesting_depth: 0,
+            statement_links: 0,
         }
+    }
+
+    /// Counts one more link in a left-associative chain such as `a OR b OR …`.
+    ///
+    /// The loops build the chain without recursing, but every later pass
+    /// recurses once per link, and dropping the tree does too. A chain longer
+    /// than the engine's statement depth limit is rejected there anyway, so
+    /// stopping here keeps an oversized statement from building a tree too deep
+    /// to drop.
+    fn extend_chain(&mut self, links: &mut u32) -> Result<()> {
+        *links += 1;
+        self.statement_links += 1;
+        if *links > MAX_CHAIN_LENGTH {
+            return Err(self.error(&format!(
+                "Expression chain longer than {MAX_CHAIN_LENGTH} operators"
+            )));
+        }
+        if self.statement_links > MAX_STATEMENT_LINKS {
+            return Err(self.error(&format!(
+                "Statement has more than {MAX_STATEMENT_LINKS} chained operators"
+            )));
+        }
+        Ok(())
     }
 
     /// Increments the nesting depth and returns an error if the limit is exceeded.
@@ -305,6 +340,16 @@ impl<'a> Parser<'a> {
             };
         }
 
+        // Statement terminators are transport syntax, not part of the parsed
+        // statement. Accept the established one-or-more terminal form while
+        // still rejecting any non-terminator suffix.
+        while self.current.kind == TokenKind::Semicolon {
+            self.advance();
+        }
+        if self.current.kind != TokenKind::Eof {
+            return Err(self.error("Unexpected trailing input after complete statement"));
+        }
+
         Ok(left)
     }
 
@@ -316,9 +361,7 @@ impl<'a> Parser<'a> {
             | TokenKind::Merge
             | TokenKind::For
             | TokenKind::Return => self.parse_query().map(Statement::Query),
-            TokenKind::Insert => self
-                .parse_insert()
-                .map(|s| Statement::DataModification(DataModificationStatement::Insert(s))),
+            TokenKind::Insert => self.parse_leading_insert_or_create(),
             TokenKind::Delete | TokenKind::Detach | TokenKind::Nodetach => self
                 .parse_delete()
                 .map(|s| Statement::DataModification(DataModificationStatement::Delete(s))),
@@ -326,9 +369,7 @@ impl<'a> Parser<'a> {
                 // Check if CREATE is followed by a pattern (Cypher-style) or a DDL keyword
                 let next = self.peek_kind();
                 if next == TokenKind::LParen {
-                    // Cypher-style: CREATE (n:Label {...}) - treat as INSERT
-                    self.parse_create_as_insert()
-                        .map(|s| Statement::DataModification(DataModificationStatement::Insert(s)))
+                    self.parse_leading_insert_or_create()
                 } else {
                     // GQL schema/session: dispatches between DDL (NODE TYPE, EDGE TYPE,
                     // GRAPH TYPE, INDEX, CONSTRAINT, SCHEMA) and session (GRAPH instance)
@@ -3035,9 +3076,11 @@ impl<'a> Parser<'a> {
 
     fn parse_or_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_xor_expression()?;
+        let mut links = 0;
 
         while self.current.kind == TokenKind::Or {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_xor_expression()?;
             left = Expression::Binary {
                 left: Box::new(left),
@@ -3051,9 +3094,11 @@ impl<'a> Parser<'a> {
 
     fn parse_xor_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_and_expression()?;
+        let mut links = 0;
 
         while self.current.kind == TokenKind::Xor {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_and_expression()?;
             left = Expression::Binary {
                 left: Box::new(left),
@@ -3067,9 +3112,11 @@ impl<'a> Parser<'a> {
 
     fn parse_and_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_not_expression()?;
+        let mut links = 0;
 
         while self.current.kind == TokenKind::And {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_not_expression()?;
             left = Expression::Binary {
                 left: Box::new(left),
@@ -3084,7 +3131,10 @@ impl<'a> Parser<'a> {
     fn parse_not_expression(&mut self) -> Result<Expression> {
         if self.current.kind == TokenKind::Not {
             self.advance();
-            let operand = self.parse_not_expression()?;
+            self.enter_nesting()?;
+            let operand = self.parse_not_expression();
+            self.exit_nesting();
+            let operand = operand?;
             return Ok(Expression::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
@@ -3393,8 +3443,10 @@ impl<'a> Parser<'a> {
 
     fn parse_additive_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_multiplicative_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             let op = match self.current.kind {
                 TokenKind::Plus => BinaryOp::Add,
                 TokenKind::Minus => BinaryOp::Sub,
@@ -3415,8 +3467,10 @@ impl<'a> Parser<'a> {
 
     fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_unary_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             let op = match self.current.kind {
                 TokenKind::Star => BinaryOp::Mul,
                 TokenKind::Slash => BinaryOp::Div,
@@ -3455,7 +3509,10 @@ impl<'a> Parser<'a> {
                         return Ok(Expression::Literal(Literal::Float(val)));
                     }
                 }
-                let operand = self.parse_unary_expression()?;
+                self.enter_nesting()?;
+                let operand = self.parse_unary_expression();
+                self.exit_nesting();
+                let operand = operand?;
                 Ok(Expression::Unary {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
@@ -3463,7 +3520,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Plus => {
                 self.advance();
-                let operand = self.parse_unary_expression()?;
+                self.enter_nesting()?;
+                let operand = self.parse_unary_expression();
+                self.exit_nesting();
+                let operand = operand?;
                 Ok(Expression::Unary {
                     op: UnaryOp::Pos,
                     operand: Box::new(operand),
@@ -3475,8 +3535,10 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_primary_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             match self.current.kind {
                 TokenKind::LBracket => {
                     self.advance();
@@ -4357,26 +4419,51 @@ impl<'a> Parser<'a> {
         Ok(properties)
     }
 
-    fn parse_insert(&mut self) -> Result<InsertStatement> {
-        self.expect(TokenKind::Insert)?;
+    /// Parses a leading INSERT or pattern-style CREATE without changing the
+    /// established mutation-only result contract.
+    ///
+    /// Explicit RETURN/SELECT/FINISH and compound queries stay in the full
+    /// query AST. The exact legacy single-create shape is converted back to a
+    /// data-modification statement, whose translator returns the final created
+    /// entity as before.
+    fn parse_leading_insert_or_create(&mut self) -> Result<Statement> {
+        let query = self.parse_query()?;
+        let legacy_single_create = query.match_clauses.is_empty()
+            && query.where_clause.is_none()
+            && query.set_clauses.is_empty()
+            && query.remove_clauses.is_empty()
+            && query.with_clauses.is_empty()
+            && query.unwind_clauses.is_empty()
+            && query.merge_clauses.is_empty()
+            && query.create_clauses.len() == 1
+            && query.delete_clauses.is_empty()
+            && query.having_clause.is_none()
+            && query.ordered_clauses.len() == 1
+            && matches!(query.ordered_clauses.first(), Some(QueryClause::Create(_)))
+            && query.return_clause.items.is_empty()
+            && !query.return_clause.is_wildcard
+            && !query.return_clause.is_finish
+            && query.return_clause.group_by.is_empty()
+            && query.return_clause.order_by.is_none()
+            && query.return_clause.skip.is_none()
+            && query.return_clause.limit.is_none();
 
-        let mut patterns = Vec::new();
-        patterns.push(self.parse_pattern()?);
-
-        while self.current.kind == TokenKind::Comma {
-            self.advance();
-            patterns.push(self.parse_pattern()?);
+        if legacy_single_create {
+            let insert = query
+                .create_clauses
+                .into_iter()
+                .next()
+                .expect("single-create shape checked above");
+            Ok(Statement::DataModification(
+                DataModificationStatement::Insert(insert),
+            ))
+        } else {
+            Ok(Statement::Query(query))
         }
-
-        Ok(InsertStatement {
-            patterns,
-            span: None,
-        })
     }
 
-    /// Parses CREATE as INSERT (Cypher-style data modification).
-    fn parse_create_as_insert(&mut self) -> Result<InsertStatement> {
-        self.expect(TokenKind::Create)?;
+    fn parse_insert(&mut self) -> Result<InsertStatement> {
+        self.expect(TokenKind::Insert)?;
 
         let mut patterns = Vec::new();
         patterns.push(self.parse_pattern()?);
@@ -4894,62 +4981,99 @@ impl<'a> Parser<'a> {
             self.advance();
             match kind_text.to_uppercase().as_str() {
                 "TEXT" => index_kind = IndexKind::Text,
-                "VECTOR" => {
-                    index_kind = IndexKind::Vector;
-                    // Parse optional {dimensions: N, metric: 'name'}
-                    if self.current.kind == TokenKind::LBrace {
-                        self.advance();
-                        while self.current.kind != TokenKind::RBrace {
-                            if !self.is_identifier() {
-                                return Err(self.error("Expected option name"));
-                            }
-                            let opt_name = self.get_identifier_name();
-                            self.advance();
-                            self.expect(TokenKind::Colon)?;
-                            match opt_name.to_uppercase().as_str() {
-                                "DIMENSIONS" | "DIMENSION" => {
-                                    if self.current.kind != TokenKind::Integer {
-                                        return Err(self.error("Expected integer for dimensions"));
-                                    }
-                                    let dim: usize = self
-                                        .current
-                                        .text
-                                        .parse()
-                                        .map_err(|_| self.error("Invalid dimension value"))?;
-                                    self.advance();
-                                    options.dimensions = Some(dim);
-                                }
-                                "METRIC" => {
-                                    if self.current.kind != TokenKind::String {
-                                        return Err(self.error("Expected string for metric"));
-                                    }
-                                    let metric = self
-                                        .current
-                                        .text
-                                        .trim_matches('\'')
-                                        .trim_matches('"')
-                                        .to_string();
-                                    self.advance();
-                                    options.metric = Some(metric);
-                                }
-                                _ => {
-                                    return Err(
-                                        self.error(&format!("Unknown index option '{opt_name}'"))
-                                    );
-                                }
-                            }
-                            if self.current.kind == TokenKind::Comma {
-                                self.advance();
-                            }
-                        }
-                        self.expect(TokenKind::RBrace)?;
-                    }
-                }
+                "VECTOR" => index_kind = IndexKind::Vector,
                 "BTREE" => index_kind = IndexKind::BTree,
                 _ => {
                     return Err(self.error(&format!("Unknown index type '{kind_text}'")));
                 }
             }
+        }
+
+        // Parse kind-qualified options. In particular, a Text tokenizer option
+        // must never be accepted and silently discarded by another index kind.
+        if self.current.kind == TokenKind::LBrace {
+            self.advance();
+            while self.current.kind != TokenKind::RBrace {
+                if !self.is_identifier() {
+                    return Err(self.error("Expected option name"));
+                }
+                let opt_name = self.get_identifier_name();
+                self.advance();
+                self.expect(TokenKind::Colon)?;
+                match opt_name.to_uppercase().as_str() {
+                    "MIN_TOKEN_LENGTH" => {
+                        if index_kind != IndexKind::Text {
+                            return Err(self.error("min_token_length requires USING TEXT"));
+                        }
+                        if self.current.kind != TokenKind::Integer {
+                            return Err(
+                                self.error("Expected nonnegative integer for min_token_length")
+                            );
+                        }
+                        let length: usize = self
+                            .current
+                            .text
+                            .parse()
+                            .map_err(|_| self.error("Invalid min_token_length value"))?;
+                        self.advance();
+                        options.min_token_length = Some(length);
+                    }
+                    "DIMENSIONS" | "DIMENSION" => {
+                        if index_kind != IndexKind::Vector {
+                            return Err(self.error("dimensions requires USING VECTOR"));
+                        }
+                        if self.current.kind != TokenKind::Integer {
+                            return Err(self.error("Expected integer for dimensions"));
+                        }
+                        let dim: usize = self
+                            .current
+                            .text
+                            .parse()
+                            .map_err(|_| self.error("Invalid dimension value"))?;
+                        self.advance();
+                        options.dimensions = Some(dim);
+                    }
+                    "EF" => {
+                        if index_kind != IndexKind::Vector {
+                            return Err(self.error("ef requires USING VECTOR"));
+                        }
+                        if self.current.kind != TokenKind::Integer {
+                            return Err(self.error("Expected positive integer for ef"));
+                        }
+                        let ef: usize = self
+                            .current
+                            .text
+                            .parse()
+                            .map_err(|_| self.error("Invalid ef value"))?;
+                        if ef == 0 {
+                            return Err(self.error("ef must be positive"));
+                        }
+                        self.advance();
+                        options.ef = Some(ef);
+                    }
+                    "METRIC" => {
+                        if index_kind != IndexKind::Vector {
+                            return Err(self.error("metric requires USING VECTOR"));
+                        }
+                        if self.current.kind != TokenKind::String {
+                            return Err(self.error("Expected string for metric"));
+                        }
+                        let metric = self
+                            .current
+                            .text
+                            .trim_matches('\'')
+                            .trim_matches('"')
+                            .to_string();
+                        self.advance();
+                        options.metric = Some(metric);
+                    }
+                    _ => return Err(self.error(&format!("Unknown index option '{opt_name}'"))),
+                }
+                if self.current.kind == TokenKind::Comma {
+                    self.advance();
+                }
+            }
+            self.expect(TokenKind::RBrace)?;
         }
 
         Ok(SchemaStatement::CreateIndex(CreateIndexStatement {
@@ -6106,6 +6230,7 @@ impl<'a> Parser<'a> {
     /// SHOW EDGE TYPES
     /// SHOW GRAPH TYPES
     /// SHOW GRAPH TYPE <name>
+    /// SHOW CURRENT GRAPH TYPE
     /// ```
     fn parse_show(&mut self) -> Result<SchemaStatement> {
         self.advance(); // consume SHOW
@@ -6171,6 +6296,23 @@ impl<'a> Parser<'a> {
                         self.advance();
                         Ok(SchemaStatement::ShowSchemas)
                     }
+                    "CURRENT" => {
+                        self.advance();
+                        if !self.is_identifier()
+                            || !self.get_identifier_name().eq_ignore_ascii_case("GRAPH")
+                        {
+                            return Err(self.error("Expected GRAPH after SHOW CURRENT"));
+                        }
+                        self.advance();
+                        if self.current.kind != TokenKind::Type
+                            && !(self.is_identifier()
+                                && self.get_identifier_name().eq_ignore_ascii_case("TYPE"))
+                        {
+                            return Err(self.error("Expected TYPE after SHOW CURRENT GRAPH"));
+                        }
+                        self.advance();
+                        Ok(SchemaStatement::ShowCurrentGraphType)
+                    }
                     "GRAPH" => {
                         self.advance();
                         // SHOW GRAPH TYPES or SHOW GRAPH TYPE <name>
@@ -6194,7 +6336,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     _ => Err(self.error(
-                        "Expected CONSTRAINTS, INDEXES, NODE TYPES, EDGE TYPES, GRAPHS, GRAPH TYPES, or GRAPH TYPE <name> after SHOW",
+                        "Expected CONSTRAINTS, INDEXES, NODE TYPES, EDGE TYPES, GRAPHS, GRAPH TYPES, GRAPH TYPE <name>, or CURRENT GRAPH TYPE after SHOW",
                     )),
                 }
             }
@@ -7020,6 +7162,43 @@ mod tests {
         } else {
             panic!("Expected Insert statement");
         }
+    }
+
+    #[test]
+    fn test_parse_insert_with_explicit_return_consumes_return_clause() {
+        let mut parser = Parser::new("INSERT (n:Person {name: 'Alix'}) RETURN n.name AS name");
+        let Statement::Query(query) = parser.parse().unwrap() else {
+            panic!("Expected mutation Query statement");
+        };
+        assert_eq!(query.create_clauses.len(), 1);
+        assert_eq!(query.return_clause.items.len(), 1);
+        assert_eq!(query.return_clause.items[0].alias.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn test_parse_rejects_trailing_unconsumed_input() {
+        let mut parser = Parser::new("INSERT (n:Person) definitely_not_a_clause");
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_parse_accepts_terminal_semicolons_only() {
+        assert!(Parser::new("RETURN 1;").parse().is_ok());
+        assert!(Parser::new("RETURN 1;;;").parse().is_ok());
+        assert!(Parser::new("INSERT (n:Person);").parse().is_ok());
+        assert!(Parser::new("RETURN 1; RETURN 2").parse().is_err());
+    }
+
+    #[test]
+    fn test_parse_create_preserves_legacy_shape_unless_returning() {
+        assert!(matches!(
+            Parser::new("CREATE (n:Person)").parse().unwrap(),
+            Statement::DataModification(DataModificationStatement::Insert(_))
+        ));
+        assert!(matches!(
+            Parser::new("CREATE (n:Person) RETURN n").parse().unwrap(),
+            Statement::Query(_)
+        ));
     }
 
     #[test]
@@ -10076,6 +10255,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_show_current_graph_type() {
+        let mut parser = Parser::new("SHOW CURRENT GRAPH TYPE");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "SHOW CURRENT GRAPH TYPE should parse: {result:?}"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            Statement::Schema(SchemaStatement::ShowCurrentGraphType)
+        ));
+    }
+
+    #[test]
     fn test_parse_show_graph_type_named() {
         let mut parser = Parser::new("SHOW GRAPH TYPE social");
         let result = parser.parse();
@@ -10792,6 +10985,133 @@ mod tests {
             "CREATE INDEX ... FOR must parse: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_create_index_min_token_length_valid()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        for length in [0, 3, usize::MAX] {
+            let query = format!(
+                "CREATE INDEX docs FOR (n:Doc) ON (n.text) USING TEXT {{min_token_length: {length}}}"
+            );
+            let mut parser = Parser::new(&query);
+            let Statement::Schema(SchemaStatement::CreateIndex(statement)) = parser.parse()? else {
+                return Err("expected CREATE INDEX".into());
+            };
+            assert_eq!(statement.index_kind, IndexKind::Text);
+            assert_eq!(statement.options.min_token_length, Some(length));
+            assert!(statement.options.dimensions.is_none());
+            assert!(statement.options.metric.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_index_min_token_length_rejects_invalid_values() {
+        for value in ["-1", "'3'", "3.5", "true", "null", "18446744073709551616"] {
+            let query = format!(
+                "CREATE INDEX docs FOR (n:Doc) ON (n.text) USING TEXT {{min_token_length: {value}}}"
+            );
+            let mut parser = Parser::new(&query);
+            let result = parser.parse();
+            assert!(
+                result.is_err(),
+                "invalid tokenizer value {value} was accepted"
+            );
+            if let Err(error) = result {
+                assert!(error.to_string().contains("min_token_length"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_index_min_token_length_rejects_non_text_kinds() {
+        for kind in ["USING VECTOR", "USING BTREE", ""] {
+            let query =
+                format!("CREATE INDEX docs FOR (n:Doc) ON (n.text) {kind} {{min_token_length: 3}}");
+            let mut parser = Parser::new(&query);
+            let result = parser.parse();
+            assert!(
+                result.is_err(),
+                "non-Text tokenizer option was accepted: {kind}"
+            );
+            if let Err(error) = result {
+                assert!(error.to_string().contains("requires USING TEXT"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_index_min_token_length_preserves_defaults_and_vector_options()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        for kind in ["", "USING TEXT", "USING VECTOR", "USING BTREE"] {
+            let query = format!("CREATE INDEX docs FOR (n:Doc) ON (n.text) {kind}");
+            let mut parser = Parser::new(&query);
+            let Statement::Schema(SchemaStatement::CreateIndex(statement)) = parser.parse()? else {
+                return Err("expected CREATE INDEX".into());
+            };
+            assert!(statement.options.min_token_length.is_none());
+            assert!(statement.options.dimensions.is_none());
+            assert!(statement.options.metric.is_none());
+        }
+        let mut parser = Parser::new(
+            "CREATE INDEX vectors FOR (n:Doc) ON (n.embedding) USING VECTOR {dimensions: 3, metric: 'cosine'}",
+        );
+        let Statement::Schema(SchemaStatement::CreateIndex(statement)) = parser.parse()? else {
+            return Err("expected CREATE INDEX".into());
+        };
+        assert_eq!(statement.index_kind, IndexKind::Vector);
+        assert_eq!(statement.options.dimensions, Some(3));
+        assert_eq!(statement.options.metric.as_deref(), Some("cosine"));
+        assert!(statement.options.ef.is_none());
+        assert!(statement.options.min_token_length.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_vector_index_ef_options() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let mut parser = Parser::new(
+            "CREATE INDEX vectors FOR (n:Doc) ON (n.embedding) USING VECTOR {dimensions: 8, ef: 128}",
+        );
+        let Statement::Schema(SchemaStatement::CreateIndex(statement)) = parser.parse()? else {
+            return Err("expected CREATE INDEX".into());
+        };
+        assert_eq!(statement.options.dimensions, Some(8));
+        assert_eq!(statement.options.ef, Some(128));
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_index_ef_rejects_invalid_values() {
+        for value in ["0", "-1", "1.5", "true", "null", "18446744073709551616"] {
+            let query = format!(
+                "CREATE INDEX vectors FOR (n:Doc) ON (n.embedding) USING VECTOR {{ef: {value}}}"
+            );
+            let mut parser = Parser::new(&query);
+            let result = parser.parse();
+            assert!(result.is_err(), "invalid ef value {value} was accepted");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("ef"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_index_ef_rejects_non_vector_kinds() {
+        for kind in ["", "USING TEXT", "USING BTREE"] {
+            let query =
+                format!("CREATE INDEX docs FOR (n:Doc) ON (n.embedding) {kind} {{ef: 128}}");
+            let mut parser = Parser::new(&query);
+            let result = parser.parse();
+            assert!(result.is_err(), "non-Vector ef option was accepted: {kind}");
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("requires USING VECTOR"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]

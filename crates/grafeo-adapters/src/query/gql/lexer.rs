@@ -237,6 +237,8 @@ pub enum TokenKind {
     Colon,
     /// , punctuation.
     Comma,
+    /// ; statement terminator.
+    Semicolon,
     /// . punctuation.
     Dot,
     /// .. range operator (for list slicing).
@@ -279,7 +281,13 @@ impl<'a> Lexer<'a> {
 
     /// Returns the next token.
     pub fn next_token(&mut self) -> Token {
-        self.skip_whitespace();
+        if let Some((start, line, column)) = self.skip_whitespace() {
+            return Token {
+                kind: TokenKind::Error,
+                text: self.input[start..self.position].to_string(),
+                span: SourceSpan::new(start, self.position, line, column),
+            };
+        }
 
         let start = self.position;
         let start_line = self.line;
@@ -327,6 +335,10 @@ impl<'a> Lexer<'a> {
             ',' => {
                 self.advance();
                 TokenKind::Comma
+            }
+            ';' => {
+                self.advance();
+                TokenKind::Semicolon
             }
             '.' => {
                 self.advance();
@@ -446,7 +458,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn skip_whitespace(&mut self) {
+    /// Skips whitespace and complete comments, returning the start coordinate
+    /// of an unterminated block comment so it cannot masquerade as EOF.
+    fn skip_whitespace(&mut self) -> Option<(usize, u32, u32)> {
         while self.position < self.input.len() {
             let ch = self.current_char();
             if ch.is_whitespace() {
@@ -459,12 +473,15 @@ impl<'a> Lexer<'a> {
                 self.position += ch.len_utf8();
             } else if self.rest().starts_with("/*") {
                 // Block comment: skip to */
+                let comment_start = (self.position, self.line, self.column);
                 self.position += 2;
                 self.column += 2;
+                let mut closed = false;
                 while self.position < self.input.len() {
                     if self.rest().starts_with("*/") {
                         self.position += 2;
                         self.column += 2;
+                        closed = true;
                         break;
                     }
                     let c = self.current_char();
@@ -475,6 +492,9 @@ impl<'a> Lexer<'a> {
                         self.column += 1;
                     }
                     self.position += c.len_utf8();
+                }
+                if !closed {
+                    return Some(comment_start);
                 }
             } else {
                 // Line comment: "-- " (with space/tab) to disambiguate from undirected edge "--"
@@ -492,6 +512,7 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+        None
     }
 
     /// Returns the remaining input from the current position.
@@ -917,6 +938,24 @@ mod tests {
         assert_eq!(lexer.next_token().kind, TokenKind::RParen);
         assert_eq!(lexer.next_token().kind, TokenKind::Return);
         assert_eq!(lexer.next_token().kind, TokenKind::Identifier); // n
+        assert_eq!(lexer.next_token().kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_unterminated_block_comment_is_error_not_eof() {
+        let mut lexer = Lexer::new("RETURN 1 /* unterminated");
+        assert_eq!(lexer.next_token().kind, TokenKind::Return);
+        assert_eq!(lexer.next_token().kind, TokenKind::Integer);
+        let error = lexer.next_token();
+        assert_eq!(error.kind, TokenKind::Error);
+        assert_eq!(error.text, "/* unterminated");
+    }
+
+    #[test]
+    fn test_semicolon_token() {
+        let mut lexer = Lexer::new(";;");
+        assert_eq!(lexer.next_token().kind, TokenKind::Semicolon);
+        assert_eq!(lexer.next_token().kind, TokenKind::Semicolon);
         assert_eq!(lexer.next_token().kind, TokenKind::Eof);
     }
 

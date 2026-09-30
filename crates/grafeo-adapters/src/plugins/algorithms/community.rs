@@ -19,11 +19,20 @@ use super::traits::{ComponentResultBuilder, impl_algorithm};
 // Label Propagation
 // ============================================================================
 
-/// Detects communities using the Label Propagation Algorithm.
+/// Detects communities with LDBC Graphalytics CDLP (synchronous label propagation).
 ///
-/// Each node is initially assigned a unique label. Then, iteratively,
-/// each node adopts the most frequent label among its neighbors until
-/// the labels stabilize.
+/// Each node starts in its own community. In every iteration each node adopts the label that
+/// occurs most often among its neighbours **as of the previous iteration**, ties broken by the
+/// smallest label.
+///
+/// The update is *synchronous*, which is what LDBC Graphalytics CDLP specifies: an iteration
+/// reads a snapshot of the labels and writes a fresh map, so no node can observe a label another
+/// node adopted in the same iteration. An in-place (asynchronous) sweep is a different algorithm
+/// and gives different answers — on a bipartite cycle it collapses every node into one community,
+/// while synchronous CDLP keeps the two sides of the bipartition apart.
+///
+/// The neighbourhood is undirected: outgoing and incoming edges both contribute, and a neighbour
+/// reached by several edges votes once per edge.
 ///
 /// # Arguments
 ///
@@ -61,26 +70,36 @@ pub fn label_propagation(store: &dyn GraphStore, max_iterations: usize) -> FxHas
         max_iterations
     };
 
+    // Read the undirected neighbourhood once: the graph does not change between iterations.
+    // Both directions are collected, so a reciprocal pair votes twice, as LDBC counts edges.
+    let neighbors: Vec<Vec<NodeId>> = nodes
+        .iter()
+        .map(|&node| {
+            let mut list: Vec<NodeId> = store
+                .edges_from(node, Direction::Outgoing)
+                .into_iter()
+                .map(|(neighbor, _)| neighbor)
+                .collect();
+            list.extend(
+                store
+                    .edges_from(node, Direction::Incoming)
+                    .into_iter()
+                    .map(|(neighbor, _)| neighbor),
+            );
+            list
+        })
+        .collect();
+
     for _ in 0..max_iter {
+        // Synchronous update: every node reads `labels` (the previous iteration's state) and the
+        // winners are written into `next`, which nothing reads until the iteration is over.
+        let mut next = labels.clone();
         let mut changed = false;
 
-        // Update labels in random order (here we use insertion order)
-        for &node in &nodes {
-            // Get neighbor labels and their frequencies
+        for (idx, &node) in nodes.iter().enumerate() {
             let mut label_counts: FxHashMap<u64, usize> = FxHashMap::default();
-
-            // Consider both outgoing and incoming edges (undirected community detection)
-            // Outgoing edges: node -> neighbor
-            for (neighbor, _) in store.edges_from(node, Direction::Outgoing) {
+            for &neighbor in &neighbors[idx] {
                 if let Some(&label) = labels.get(&neighbor) {
-                    *label_counts.entry(label).or_insert(0) += 1;
-                }
-            }
-
-            // Incoming edges: neighbor -> node
-            // Uses backward adjacency index for O(degree) instead of O(V*E)
-            for (incoming_neighbor, _) in store.edges_from(node, Direction::Incoming) {
-                if let Some(&label) = labels.get(&incoming_neighbor) {
                     *label_counts.entry(label).or_insert(0) += 1;
                 }
             }
@@ -89,34 +108,35 @@ pub fn label_propagation(store: &dyn GraphStore, max_iterations: usize) -> FxHas
                 continue;
             }
 
-            // Find the most frequent label
-            let max_count = *label_counts.values().max().unwrap_or(&0);
-            let max_labels: Vec<u64> = label_counts
-                .into_iter()
-                .filter(|&(_, count)| count == max_count)
-                .map(|(label, _)| label)
-                .collect();
+            // Most frequent label, smallest label on a tie (deterministic).
+            let mut best_label = u64::MAX;
+            let mut best_count = 0usize;
+            for (&label, &count) in &label_counts {
+                if count > best_count || (count == best_count && label < best_label) {
+                    best_count = count;
+                    best_label = label;
+                }
+            }
 
-            // Choose the smallest label in case of tie (deterministic)
-            let new_label = *max_labels
-                .iter()
-                .min()
-                .expect("max_labels non-empty: filtered from non-empty label_counts");
             let current_label = *labels.get(&node).expect("node initialized with label");
-
-            if new_label != current_label {
-                labels.insert(node, new_label);
+            if best_label != current_label {
+                next.insert(node, best_label);
                 changed = true;
             }
         }
+
+        labels = next;
 
         if !changed {
             break;
         }
     }
 
-    // Normalize labels to be contiguous starting from 0
-    let unique_labels: FxHashSet<u64> = labels.values().copied().collect();
+    // Normalize labels to be contiguous starting from 0, in ascending label order so the
+    // community ids do not depend on hash iteration order.
+    let mut unique_labels: Vec<u64> = labels.values().copied().collect();
+    unique_labels.sort_unstable();
+    unique_labels.dedup();
     let mut label_map: FxHashMap<u64, u64> = FxHashMap::default();
     for (idx, label) in unique_labels.into_iter().enumerate() {
         label_map.insert(label, idx as u64);
@@ -143,30 +163,51 @@ pub struct LouvainResult {
     pub num_communities: usize,
 }
 
-/// Detects communities using the Louvain algorithm.
+/// Smallest modularity gain that counts as an improvement (guards float wobble).
+const MODULARITY_EPSILON: f64 = 1e-12;
+
+/// Hard cap on local-moving sweeps per level, so a float plateau cannot spin forever.
+const MAX_LOCAL_MOVING_SWEEPS: usize = 100;
+
+/// Detects communities using the Louvain method (Blondel, Guillaume, Lambiotte & Lefebvre,
+/// "Fast unfolding of communities in large networks", J. Stat. Mech. P10008, 2008).
 ///
-/// The Louvain algorithm optimizes modularity through a greedy approach,
-/// consisting of two phases that are repeated iteratively:
-/// 1. Local optimization: Move nodes to neighboring communities if it increases modularity
-/// 2. Aggregation: Build a new graph where communities become super-nodes
+/// Both published phases run, the pair repeated until modularity stops improving:
+///
+/// 1. **Local moving** — every node is moved into the neighbouring community that gains the most
+///    modularity, swept until no single move gains anything.
+/// 2. **Community aggregation** — every community collapses into one super-node whose self-loop
+///    carries the community's internal weight and whose edges carry the weight between
+///    communities. Local moving then runs again on that graph, and so on.
+///
+/// The second phase reaches partitions that no single-node move can. In a ring of `m` triangles,
+/// merging two adjacent triangles raises modularity once `m > 8` (the resolution limit of
+/// Fortunato & Barthélemy, PNAS 104(1):36-41, 2007), yet moving any single node out of its
+/// triangle loses modularity — so local moving alone stops at the triangles.
+///
+/// A level is kept only if the partition it induces on the original graph has strictly higher
+/// modularity than the level before it, so the returned partition is never worse than the first
+/// level's.
 ///
 /// # Arguments
 ///
-/// * `store` - The graph store
-/// * `resolution` - Resolution parameter (higher = smaller communities, default 1.0)
+/// * `store` - The graph store, read as undirected: every stored edge contributes weight 1 to
+///   both endpoints, and a reciprocal pair therefore weighs 2.
+/// * `resolution` - Resolution parameter γ (higher = smaller communities, default 1.0). It scales
+///   the null-model term of modularity, in both the move gain and the reported score.
 ///
 /// # Returns
 ///
-/// Community assignments and modularity score.
+/// Community assignments and the standard modularity
+/// `Q = Σ_c [ in_c/2m - γ (tot_c/2m)² ]` of the partition returned.
 ///
 /// # Panics
 ///
-/// Panics if the internal community-to-index mapping is inconsistent
-/// (internal invariant).
+/// Panics if the internal community-to-index mapping is inconsistent (internal invariant).
 ///
 /// # Complexity
 ///
-/// O(V log V) on average for sparse graphs
+/// O(levels × sweeps × E)
 pub fn louvain(store: &dyn GraphStore, resolution: f64) -> LouvainResult {
     let nodes = store.node_ids();
     let n = nodes.len();
@@ -186,7 +227,8 @@ pub fn louvain(store: &dyn GraphStore, resolution: f64) -> LouvainResult {
     }
 
     // Build adjacency with weights (for undirected graph)
-    // weights[i][j] = weight of edge between nodes i and j
+    // weights[i][j] = weight of edge between nodes i and j; weights[i][i] is twice the self-loop
+    // weight, the adjacency-matrix convention that makes degrees[i] the plain row sum.
     let mut weights: Vec<FxHashMap<usize, f64>> = vec![FxHashMap::default(); n];
     let mut total_weight = 0.0;
 
@@ -216,113 +258,189 @@ pub fn louvain(store: &dyn GraphStore, resolution: f64) -> LouvainResult {
         };
     }
 
-    // Compute node degrees (sum of incident edge weights)
-    let degrees: Vec<f64> = (0..n).map(|i| weights[i].values().sum()).collect();
+    let m2 = 2.0 * total_weight;
 
-    // Initialize: each node in its own community
-    let mut community: Vec<usize> = (0..n).collect();
+    // `assignment[i]` is the community of original node `i` in the best partition so far, and
+    // doubles as the map from an original node to the node index of the current level.
+    let mut assignment: Vec<usize> = (0..n).collect();
+    let mut best_modularity = compute_modularity(&weights, &assignment, total_weight, resolution);
+    let mut num_communities = n;
 
-    // Community internal weights and total weights
-    let mut community_internal: FxHashMap<usize, f64> = FxHashMap::default();
-    let mut community_total: FxHashMap<usize, f64> = FxHashMap::default();
+    let mut level_weights = weights.clone();
+    // Node degrees (sum of incident edge weights) of the current level.
+    let mut level_degrees: Vec<f64> = (0..n).map(|i| weights[i].values().sum()).collect();
 
-    for i in 0..n {
-        community_total.insert(i, degrees[i]);
-        community_internal.insert(i, weights[i].get(&i).copied().unwrap_or(0.0));
-    }
+    // Each level can only shrink the graph, so `n` levels is a hard upper bound.
+    for _ in 0..n {
+        // Phase 1: local moving on the current level.
+        let moved = local_moving(&level_weights, &level_degrees, m2, resolution);
+        let (level_community, level_count) = renumber_communities(&moved);
 
-    // Phase 1: Local optimization
-    let mut improved = true;
-    while improved {
-        improved = false;
+        // Phase 2 candidate: the partition this level induces on the original graph.
+        let candidate: Vec<usize> = assignment
+            .iter()
+            .map(|&level_node| level_community[level_node])
+            .collect();
+        let candidate_modularity =
+            compute_modularity(&weights, &candidate, total_weight, resolution);
 
-        for i in 0..n {
-            let current_comm = community[i];
-
-            // Compute links to each neighboring community
-            let mut comm_links: FxHashMap<usize, f64> = FxHashMap::default();
-            for (&j, &w) in &weights[i] {
-                let c = community[j];
-                *comm_links.entry(c).or_insert(0.0) += w;
-            }
-
-            // Try moving to each neighboring community
-            let mut best_delta = 0.0;
-            let mut best_comm = current_comm;
-
-            // Remove node from current community for delta calculation
-            let ki = degrees[i];
-            let ki_in = comm_links.get(&current_comm).copied().unwrap_or(0.0);
-
-            for (&target_comm, &k_i_to_comm) in &comm_links {
-                if target_comm == current_comm {
-                    continue;
-                }
-
-                let sigma_tot = *community_total.get(&target_comm).unwrap_or(&0.0);
-
-                // Modularity delta for moving to target_comm
-                let delta = resolution
-                    * (k_i_to_comm
-                        - ki_in
-                        - ki * (sigma_tot - community_total.get(&current_comm).unwrap_or(&0.0)
-                            + ki)
-                            / (2.0 * total_weight));
-
-                if delta > best_delta {
-                    best_delta = delta;
-                    best_comm = target_comm;
-                }
-            }
-
-            if best_comm != current_comm {
-                // Move node to best community
-                // Update community statistics
-                *community_total.entry(current_comm).or_insert(0.0) -= ki;
-                *community_internal.entry(current_comm).or_insert(0.0) -=
-                    2.0 * ki_in + weights[i].get(&i).copied().unwrap_or(0.0);
-
-                community[i] = best_comm;
-
-                *community_total.entry(best_comm).or_insert(0.0) += ki;
-                let k_i_best = comm_links.get(&best_comm).copied().unwrap_or(0.0);
-                *community_internal.entry(best_comm).or_insert(0.0) +=
-                    2.0 * k_i_best + weights[i].get(&i).copied().unwrap_or(0.0);
-
-                improved = true;
-            }
+        if candidate_modularity <= best_modularity + MODULARITY_EPSILON {
+            // Modularity stopped improving: keep the previous level's partition.
+            break;
         }
-    }
 
-    // Normalize community IDs
-    let unique_comms: FxHashSet<usize> = community.iter().copied().collect();
-    let mut comm_map: FxHashMap<usize, u64> = FxHashMap::default();
-    for (idx, c) in unique_comms.iter().enumerate() {
-        comm_map.insert(*c, idx as u64);
+        best_modularity = candidate_modularity;
+        assignment = candidate;
+        num_communities = level_count;
+
+        if level_count == level_weights.len() {
+            // Local moving changed nothing structurally; aggregation would rebuild the same graph.
+            break;
+        }
+
+        // Phase 2: aggregate communities into super-nodes and repeat.
+        let (next_weights, next_degrees) =
+            aggregate_communities(&level_weights, &level_community, level_count);
+        level_weights = next_weights;
+        level_degrees = next_degrees;
     }
 
     let communities: FxHashMap<NodeId, u64> = nodes
         .iter()
         .enumerate()
-        .map(|(i, &node)| {
-            (
-                node,
-                *comm_map.get(&community[i]).expect("community in map"),
-            )
-        })
+        .map(|(i, &node)| (node, assignment[i] as u64))
         .collect();
-
-    // Compute final modularity
-    let modularity = compute_modularity(&weights, &community, total_weight, resolution);
 
     LouvainResult {
         communities,
-        modularity,
-        num_communities: unique_comms.len(),
+        modularity: best_modularity,
+        num_communities,
     }
 }
 
-/// Computes the modularity of a community assignment.
+/// Runs the local-moving phase: sweeps every node into the neighbouring community with the
+/// largest modularity gain until a whole sweep moves nothing.
+///
+/// `weights` is the symmetric adjacency of the current level (diagonal = twice the self-loop
+/// weight), `degrees` its row sums, and `m2` twice the total edge weight of the *original* graph,
+/// which aggregation preserves.
+///
+/// Returns the community index of each node; the indices are arbitrary but deterministic.
+fn local_moving(
+    weights: &[FxHashMap<usize, f64>],
+    degrees: &[f64],
+    m2: f64,
+    resolution: f64,
+) -> Vec<usize> {
+    let n = weights.len();
+    let mut community: Vec<usize> = (0..n).collect();
+    // community_total[c] = sum of the degrees of the nodes currently in community c.
+    let mut community_total: Vec<f64> = degrees.to_vec();
+
+    for _ in 0..MAX_LOCAL_MOVING_SWEEPS {
+        let mut moved = false;
+
+        for i in 0..n {
+            let current = community[i];
+            let ki = degrees[i];
+
+            // Weight from i into each neighbouring community (self-loops excluded: they stay with
+            // i wherever it goes and cannot change the gain).
+            let mut comm_links: FxHashMap<usize, f64> = FxHashMap::default();
+            for (&j, &w) in &weights[i] {
+                if j != i {
+                    *comm_links.entry(community[j]).or_insert(0.0) += w;
+                }
+            }
+
+            // Take i out of its community, so every candidate is scored against the same baseline.
+            community_total[current] -= ki;
+
+            // Gain of placing i in community c, dropping the terms common to every candidate:
+            //   k_{i,c} - γ k_i Σtot_c / 2m
+            let mut candidates: Vec<(usize, f64)> =
+                comm_links.iter().map(|(&c, &w)| (c, w)).collect();
+            candidates.sort_unstable_by_key(|&(c, _)| c);
+
+            let mut best = current;
+            let mut best_gain = comm_links.get(&current).copied().unwrap_or(0.0)
+                - resolution * ki * community_total[current] / m2;
+
+            for (c, w) in candidates {
+                if c == current {
+                    continue;
+                }
+                let gain = w - resolution * ki * community_total[c] / m2;
+                if gain > best_gain + MODULARITY_EPSILON {
+                    best_gain = gain;
+                    best = c;
+                }
+            }
+
+            community_total[best] += ki;
+            community[i] = best;
+
+            if best != current {
+                moved = true;
+            }
+        }
+
+        if !moved {
+            break;
+        }
+    }
+
+    community
+}
+
+/// Renumbers community indices to a contiguous `0..count` range, ordered by first appearance.
+///
+/// Returns the renumbered assignment and the number of communities.
+fn renumber_communities(community: &[usize]) -> (Vec<usize>, usize) {
+    let mut mapping: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut renumbered = Vec::with_capacity(community.len());
+    for &c in community {
+        let next = mapping.len();
+        let id = *mapping.entry(c).or_insert(next);
+        renumbered.push(id);
+    }
+    let count = mapping.len();
+    (renumbered, count)
+}
+
+/// Builds the aggregated graph of the community-aggregation phase: one super-node per community,
+/// whose self-loop carries the community's internal weight and whose edges carry the weight
+/// between communities.
+///
+/// `community` must be contiguous (`0..count`). The returned adjacency keeps the same convention
+/// as its input (diagonal = twice the self-loop weight) and the same total weight, so modularity
+/// is comparable across levels.
+fn aggregate_communities(
+    weights: &[FxHashMap<usize, f64>],
+    community: &[usize],
+    count: usize,
+) -> (Vec<FxHashMap<usize, f64>>, Vec<f64>) {
+    let mut aggregated: Vec<FxHashMap<usize, f64>> = vec![FxHashMap::default(); count];
+    for (i, row) in weights.iter().enumerate() {
+        let ci = community[i];
+        for (&j, &w) in row {
+            let cj = community[j];
+            *aggregated[ci].entry(cj).or_insert(0.0) += w;
+        }
+    }
+    let degrees: Vec<f64> = aggregated.iter().map(|row| row.values().sum()).collect();
+    (aggregated, degrees)
+}
+
+/// Computes the standard modularity of a community assignment:
+///
+/// `Q = Σ_c [ in_c / 2m - γ (tot_c / 2m)² ]`
+///
+/// where `in_c` is the total weight of the edges with both endpoints in `c` (counted in both
+/// directions, so a single internal edge of weight 1 contributes 2) and `tot_c` is the sum of the
+/// degrees of its nodes. This is Newman-Girvan modularity with a resolution parameter: the
+/// null-model term covers **every** pair of nodes in the community, not only the adjacent ones,
+/// and it is what makes `Q = 0` for the partition that puts the whole graph in one community.
 fn compute_modularity(
     weights: &[FxHashMap<usize, f64>],
     community: &[usize],
@@ -336,19 +454,30 @@ fn compute_modularity(
         return 0.0;
     }
 
-    let degrees: Vec<f64> = (0..n).map(|i| weights[i].values().sum()).collect();
-
-    let mut modularity = 0.0;
+    let mut internal: FxHashMap<usize, f64> = FxHashMap::default();
+    let mut total: FxHashMap<usize, f64> = FxHashMap::default();
 
     for i in 0..n {
+        let ci = community[i];
+        let mut degree = 0.0;
         for (&j, &a_ij) in &weights[i] {
-            if community[i] == community[j] {
-                modularity += a_ij - resolution * degrees[i] * degrees[j] / m2;
+            degree += a_ij;
+            if community[j] == ci {
+                *internal.entry(ci).or_insert(0.0) += a_ij;
             }
         }
+        *total.entry(ci).or_insert(0.0) += degree;
     }
 
-    modularity / m2
+    // Every community appears in `total`; one with no internal edge still carries its
+    // null-model penalty.
+    let mut modularity = 0.0;
+    for (community_id, &tot_c) in &total {
+        let in_c = internal.get(community_id).copied().unwrap_or(0.0);
+        modularity += in_c / m2 - resolution * (tot_c / m2) * (tot_c / m2);
+    }
+
+    modularity
 }
 
 // ============================================================================
@@ -887,6 +1016,195 @@ impl_algorithm! {
 #[cfg(all(test, feature = "lpg"))]
 mod tests {
     use super::*;
+
+    /// Ring of `triangles` K3s, each closed into the next by one bridge edge.
+    ///
+    /// `triangles * 3` nodes and `triangles * 4` edges. Used for the two-level fixture of
+    /// Fortunato & Barthélemy (2007): the modularity optimum merges adjacent triangles, which no
+    /// single-node move can reach.
+    fn create_ring_of_triangles(triangles: usize) -> (LpgStore, Vec<NodeId>) {
+        let store = LpgStore::new().unwrap();
+        let nodes: Vec<NodeId> = (0..triangles * 3)
+            .map(|_| store.create_node(&["Node"]))
+            .collect();
+        for t in 0..triangles {
+            let (a, b, c) = (nodes[t * 3], nodes[t * 3 + 1], nodes[t * 3 + 2]);
+            store.create_edge(a, b, "EDGE");
+            store.create_edge(b, c, "EDGE");
+            store.create_edge(c, a, "EDGE");
+            store.create_edge(c, nodes[((t + 1) % triangles) * 3], "EDGE");
+        }
+        (store, nodes)
+    }
+
+    /// Standard modularity is 0 when the whole graph is one community, for every graph: the
+    /// observed term and the null-model term are both 1. The formula that sums the null-model term
+    /// over adjacent pairs only reported 0.5 for this path.
+    #[test]
+    fn modularity_of_the_single_community_partition_is_zero() {
+        // Path 0-1-2: weights symmetric, one unit per edge, m = 2.
+        let mut weights: Vec<FxHashMap<usize, f64>> = vec![FxHashMap::default(); 3];
+        weights[0].insert(1, 1.0);
+        weights[1].insert(0, 1.0);
+        weights[1].insert(2, 1.0);
+        weights[2].insert(1, 1.0);
+
+        let q = compute_modularity(&weights, &[0, 0, 0], 2.0, 1.0);
+        assert!(
+            q.abs() < 1e-12,
+            "one community covering the whole graph scores Q = 0, got {q}"
+        );
+    }
+
+    /// The per-triangle partition of the ring of ten triangles scores exactly 0.650:
+    /// `10 * (3/40 - (8/80)^2)`. The adjacent-pairs-only formula reported 0.684375.
+    #[test]
+    fn modularity_of_the_ring_of_triangles_is_hand_derivable() {
+        let (store, nodes) = create_ring_of_triangles(10);
+        let mut weights: Vec<FxHashMap<usize, f64>> = vec![FxHashMap::default(); nodes.len()];
+        let index: FxHashMap<NodeId, usize> =
+            nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+        let mut total_weight = 0.0;
+        for (i, &node) in nodes.iter().enumerate() {
+            for (neighbor, _) in store.edges_from(node, Direction::Outgoing) {
+                let j = index[&neighbor];
+                *weights[i].entry(j).or_insert(0.0) += 1.0;
+                *weights[j].entry(i).or_insert(0.0) += 1.0;
+                total_weight += 1.0;
+            }
+        }
+        assert_eq!(total_weight, 40.0, "30 clique edges + 10 bridges");
+
+        let per_triangle: Vec<usize> = (0..nodes.len()).map(|i| i / 3).collect();
+        let q = compute_modularity(&weights, &per_triangle, total_weight, 1.0);
+        assert!(
+            (q - 0.650).abs() < 1e-12,
+            "the per-triangle partition scores Q = 0.650, got {q}"
+        );
+
+        let per_pair: Vec<usize> = (0..nodes.len()).map(|i| i / 6).collect();
+        let q_pair = compute_modularity(&weights, &per_pair, total_weight, 1.0);
+        assert!(
+            (q_pair - 0.675).abs() < 1e-12,
+            "the paired-triangle partition scores Q = 0.675, got {q_pair}"
+        );
+
+        // Pin the actual phase boundary: a supplied good partition alone cannot
+        // prove that local moving and aggregation reach it.
+        let degrees: Vec<f64> = weights.iter().map(|row| row.values().sum()).collect();
+        assert_eq!(degrees.iter().sum::<f64>(), 80.0);
+        let (first, first_count) =
+            renumber_communities(&local_moving(&weights, &degrees, 80.0, 1.0));
+        assert_eq!(first_count, 10);
+        assert_eq!(first, per_triangle, "phase one stops at whole triangles");
+        assert!((compute_modularity(&weights, &first, 40.0, 1.0) - 13.0 / 20.0).abs() < 1e-12);
+
+        let (aggregated, super_degrees) = aggregate_communities(&weights, &first, first_count);
+        assert_eq!(super_degrees, vec![8.0; 10]);
+        assert_eq!(super_degrees.iter().sum::<f64>(), 80.0);
+        for (triangle, row) in aggregated.iter().enumerate() {
+            assert_eq!(row.len(), 3);
+            assert_eq!(row.get(&triangle), Some(&6.0), "internal edges count twice");
+            assert_eq!(row.get(&((triangle + 1) % 10)), Some(&1.0));
+            assert_eq!(row.get(&((triangle + 9) % 10)), Some(&1.0));
+        }
+        let (second, second_count) =
+            renumber_communities(&local_moving(&aggregated, &super_degrees, 80.0, 1.0));
+        assert_eq!(second_count, 5);
+        for community in 0..second_count {
+            let members: Vec<_> = second
+                .iter()
+                .enumerate()
+                .filter_map(|(triangle, &assigned)| (assigned == community).then_some(triangle))
+                .collect();
+            assert_eq!(members.len(), 2);
+            assert!((members[0] + 1) % 10 == members[1] || (members[1] + 1) % 10 == members[0]);
+        }
+        let lifted: Vec<_> = first.iter().map(|&triangle| second[triangle]).collect();
+        let expected = 27.0 / 40.0;
+        assert!((compute_modularity(&weights, &lifted, 40.0, 1.0) - expected).abs() < 1e-12);
+        assert!((compute_modularity(&aggregated, &second, 40.0, 1.0) - expected).abs() < 1e-12);
+        let (pairs, pair_degrees) = aggregate_communities(&aggregated, &second, second_count);
+        assert_eq!(pair_degrees, vec![16.0; 5]);
+        assert_eq!(pair_degrees.iter().sum::<f64>(), 80.0);
+        for (pair, row) in pairs.iter().enumerate() {
+            assert_eq!(row.get(&pair), Some(&14.0));
+        }
+    }
+
+    /// Full Louvain must reach the second level of the ring of ten triangles: five communities of
+    /// two triangles each, Q = 0.675. Local moving alone stops at the ten triangles (Q = 0.650).
+    #[test]
+    fn louvain_reaches_the_second_level_of_the_ring_of_triangles() {
+        let (store, nodes) = create_ring_of_triangles(10);
+        let result = louvain(&store, 1.0);
+
+        assert_eq!(result.communities.len(), nodes.len());
+        assert_eq!(
+            result.num_communities, 5,
+            "aggregation must merge adjacent triangles, got {} communities with Q = {}",
+            result.num_communities, result.modularity
+        );
+        assert!(
+            (result.modularity - 0.675).abs() < 1e-9,
+            "the paired partition scores Q = 0.675, got {}",
+            result.modularity
+        );
+
+        let mut sizes: FxHashMap<u64, usize> = FxHashMap::default();
+        for community in result.communities.values() {
+            *sizes.entry(*community).or_insert(0) += 1;
+        }
+        for (community, size) in &sizes {
+            assert_eq!(
+                *size, 6,
+                "community {community} must be two whole triangles, got {size} nodes"
+            );
+        }
+        let mut paired_triangles: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for (triangle, members) in nodes.chunks_exact(3).enumerate() {
+            let community = result.communities[&members[0]];
+            assert!(
+                members
+                    .iter()
+                    .all(|node| result.communities[node] == community)
+            );
+            paired_triangles
+                .entry(community)
+                .or_default()
+                .push(triangle);
+        }
+        for pair in paired_triangles.values() {
+            assert_eq!(pair.len(), 2);
+            assert!((pair[0] + 1) % 10 == pair[1] || (pair[1] + 1) % 10 == pair[0]);
+        }
+    }
+
+    /// LDBC CDLP is synchronous: on the 4-cycle `a->b->c->d->a` the two sides of the bipartition
+    /// stay apart. An in-place sweep collapses the cycle into one community.
+    #[test]
+    fn label_propagation_keeps_the_bipartition_of_a_four_cycle() {
+        let store = LpgStore::new().unwrap();
+        let nodes: Vec<NodeId> = (0..4).map(|_| store.create_node(&["Node"])).collect();
+        for i in 0..4 {
+            store.create_edge(nodes[i], nodes[(i + 1) % 4], "EDGE");
+        }
+
+        let communities = label_propagation(&store, 2);
+        assert_eq!(communities.len(), 4);
+        assert_eq!(
+            communities[&nodes[0]], communities[&nodes[2]],
+            "synchronous CDLP keeps the two even nodes together: {communities:?}"
+        );
+        assert_eq!(
+            communities[&nodes[1]], communities[&nodes[3]],
+            "synchronous CDLP keeps the two odd nodes together: {communities:?}"
+        );
+        assert_ne!(
+            communities[&nodes[0]], communities[&nodes[1]],
+            "synchronous CDLP never merges the sides of a bipartite cycle: {communities:?}"
+        );
+    }
 
     fn create_two_cliques_graph() -> LpgStore {
         // Two cliques connected by one edge

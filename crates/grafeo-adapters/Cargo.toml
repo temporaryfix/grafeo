@@ -44,7 +44,6 @@ gremlin = []                  # Gremlin parser (Apache TinkerPop)
 graphql = []                  # GraphQL parser (spec-compliant)
 sql-pgq = ["gql"]             # SQL/PGQ parser (SQL:2023 GRAPH_TABLE)
 triple-store = ["grafeo-core/triple-store"]  # RDF triple store model
-rdf = ["triple-store"]                      # Deprecated: use triple-store
 parallel = ["rayon", "grafeo-core/parallel"]  # Parallel algorithms (rayon)
 algos = []  # Graph algorithm plugin (SSSP, PageRank, centrality, community detection, etc.)
 # Convenience groups

@@ -269,7 +269,7 @@ pub struct CreateIndexStatement {
     pub label: String,
     /// Properties to index.
     pub properties: Vec<String>,
-    /// Additional options (dimensions, metric for vector indexes).
+    /// Additional options (vector configuration or Text tokenizer length).
     pub options: IndexOptions,
     /// IF NOT EXISTS flag.
     pub if_not_exists: bool,
@@ -295,8 +295,12 @@ pub enum IndexKind {
 pub struct IndexOptions {
     /// Vector dimensions (for vector indexes).
     pub dimensions: Option<usize>,
+    /// HNSW search breadth (for vector indexes).
+    pub ef: Option<usize>,
     /// Distance metric (for vector indexes).
     pub metric: Option<String>,
+    /// Minimum lowercased UTF-8 token byte length (Text only; default 2).
+    pub min_token_length: Option<usize>,
 }
 
 /// A CREATE CONSTRAINT statement.

@@ -187,7 +187,9 @@ pub enum GraphTarget {
     Default,
     /// NAMED graph by IRI.
     Named(Iri),
-    /// ALL graphs.
+    /// All named graphs (not DEFAULT).
+    NamedAll,
+    /// ALL graphs (DEFAULT + named).
     All,
 }
 

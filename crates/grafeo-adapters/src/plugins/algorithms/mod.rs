@@ -53,7 +53,10 @@ pub use traits::{
 };
 
 // Traversal algorithms
-pub use traversal::{bfs, bfs_layers, bfs_with_visitor, dfs, dfs_all, dfs_with_visitor};
+pub use traversal::{
+    bfs, bfs_layers, bfs_layers_filtered, bfs_layers_with_direction, bfs_with_visitor, dfs,
+    dfs_all, dfs_with_visitor,
+};
 
 // Component algorithms
 pub use components::{
@@ -75,11 +78,14 @@ pub use centrality::{
 
 // Clustering algorithms
 pub use clustering::{
-    ClusteringCoefficientResult, clustering_coefficient, global_clustering_coefficient,
-    local_clustering_coefficient, total_triangles, triangle_count,
+    ClusteringCoefficientResult, clustering_coefficient, clustering_coefficient_directed,
+    global_clustering_coefficient, local_clustering_coefficient, total_triangles, triangle_count,
 };
 #[cfg(feature = "parallel")]
-pub use clustering::{clustering_coefficient_parallel, total_triangles_parallel};
+pub use clustering::{
+    clustering_coefficient_directed_parallel, clustering_coefficient_parallel,
+    total_triangles_parallel,
+};
 
 // Community detection algorithms
 pub use community::{

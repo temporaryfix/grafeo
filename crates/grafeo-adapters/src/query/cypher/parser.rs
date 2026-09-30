@@ -12,6 +12,15 @@ use grafeo_common::utils::error::{QueryError, QueryErrorKind, Result};
 /// expressions, CASE, EXISTS subqueries, list literals, function calls).
 const MAX_NESTING_DEPTH: u32 = 128;
 
+/// Longest left-associative operator chain one expression may contain.
+const MAX_CHAIN_LENGTH: u32 = 512;
+
+/// Most chain links one statement may contain. Chains nested inside each other
+/// each stay under [`MAX_CHAIN_LENGTH`] but deepen the tree together, and a
+/// syntax tree tens of thousands of levels deep overflows the stack when it is
+/// dropped, so the statement total is bounded as well.
+const MAX_STATEMENT_LINKS: u32 = 16_384;
+
 /// Cypher query parser.
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -20,6 +29,8 @@ pub struct Parser<'a> {
     source: &'a str,
     /// Current nesting depth for recursive parsing constructs.
     nesting_depth: u32,
+    /// Chain links in this statement; see [`MAX_STATEMENT_LINKS`].
+    statement_links: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -38,7 +49,31 @@ impl<'a> Parser<'a> {
             previous,
             source: query,
             nesting_depth: 0,
+            statement_links: 0,
         }
+    }
+
+    /// Counts one more link in a left-associative chain such as `a OR b OR …`.
+    ///
+    /// The loops build the chain without recursing, but every later pass
+    /// recurses once per link, and dropping the tree does too. A chain longer
+    /// than the engine's statement depth limit is rejected there anyway, so
+    /// stopping here keeps an oversized statement from building a tree too deep
+    /// to drop.
+    fn extend_chain(&mut self, links: &mut u32) -> Result<()> {
+        *links += 1;
+        self.statement_links += 1;
+        if *links > MAX_CHAIN_LENGTH {
+            return Err(self.error(&format!(
+                "Expression chain longer than {MAX_CHAIN_LENGTH} operators"
+            )));
+        }
+        if self.statement_links > MAX_STATEMENT_LINKS {
+            return Err(self.error(&format!(
+                "Statement has more than {MAX_STATEMENT_LINKS} chained operators"
+            )));
+        }
+        Ok(())
     }
 
     /// Increments the nesting depth and returns an error if the limit is exceeded.
@@ -1135,8 +1170,10 @@ impl<'a> Parser<'a> {
 
     fn parse_or_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_xor_expression()?;
+        let mut links = 0;
         while self.current.kind == TokenKind::Or {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_xor_expression()?;
             left = Expression::Binary {
                 left: Box::new(left),
@@ -1149,8 +1186,10 @@ impl<'a> Parser<'a> {
 
     fn parse_xor_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_and_expression()?;
+        let mut links = 0;
         while self.current.kind == TokenKind::Xor {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_and_expression()?;
             left = Expression::Binary {
                 left: Box::new(left),
@@ -1163,8 +1202,10 @@ impl<'a> Parser<'a> {
 
     fn parse_and_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_not_expression()?;
+        let mut links = 0;
         while self.current.kind == TokenKind::And {
             self.advance();
+            self.extend_chain(&mut links)?;
             let right = self.parse_not_expression()?;
             left = Expression::Binary {
                 left: Box::new(left),
@@ -1178,7 +1219,10 @@ impl<'a> Parser<'a> {
     fn parse_not_expression(&mut self) -> Result<Expression> {
         if self.current.kind == TokenKind::Not {
             self.advance();
-            let operand = self.parse_not_expression()?;
+            self.enter_nesting()?;
+            let operand = self.parse_not_expression();
+            self.exit_nesting();
+            let operand = operand?;
             Ok(Expression::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
@@ -1267,8 +1311,10 @@ impl<'a> Parser<'a> {
 
     fn parse_additive_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_multiplicative_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             let op = match self.current.kind {
                 TokenKind::Plus => BinaryOp::Add,
                 TokenKind::Minus => BinaryOp::Sub,
@@ -1289,8 +1335,10 @@ impl<'a> Parser<'a> {
 
     fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
         let mut left = self.parse_power_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             let op = match self.current.kind {
                 TokenKind::Star => BinaryOp::Mul,
                 TokenKind::Slash => BinaryOp::Div,
@@ -1315,7 +1363,10 @@ impl<'a> Parser<'a> {
 
         if self.current.kind == TokenKind::Caret {
             self.advance();
-            let right = self.parse_power_expression()?; // Right associative
+            self.enter_nesting()?;
+            let right = self.parse_power_expression(); // Right associative
+            self.exit_nesting();
+            let right = right?;
             left = Expression::Binary {
                 left: Box::new(left),
                 op: BinaryOp::Pow,
@@ -1345,7 +1396,10 @@ impl<'a> Parser<'a> {
                         return Ok(Expression::Literal(Literal::Float(val)));
                     }
                 }
-                let operand = self.parse_unary_expression()?;
+                self.enter_nesting()?;
+                let operand = self.parse_unary_expression();
+                self.exit_nesting();
+                let operand = operand?;
                 Ok(Expression::Unary {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
@@ -1353,7 +1407,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Plus => {
                 self.advance();
-                let operand = self.parse_unary_expression()?;
+                self.enter_nesting()?;
+                let operand = self.parse_unary_expression();
+                self.exit_nesting();
+                let operand = operand?;
                 Ok(Expression::Unary {
                     op: UnaryOp::Pos,
                     operand: Box::new(operand),
@@ -1365,8 +1422,10 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_primary_expression()?;
+        let mut links = 0;
 
         loop {
+            self.extend_chain(&mut links)?;
             match self.current.kind {
                 TokenKind::Dot => {
                     self.advance();

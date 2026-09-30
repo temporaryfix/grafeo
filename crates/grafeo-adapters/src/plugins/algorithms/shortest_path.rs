@@ -694,7 +694,9 @@ fn sssp_params() -> &'static [ParameterDef] {
         vec![
             ParameterDef {
                 name: "source".to_string(),
-                description: "Source node name (string) or ID (integer as string)".to_string(),
+                description: "Source node: internal node ID, or a property value when `key` names \
+                              the property to resolve it against"
+                    .to_string(),
                 param_type: ParameterType::String,
                 required: true,
                 default: None,
@@ -706,15 +708,72 @@ fn sssp_params() -> &'static [ParameterDef] {
                 required: false,
                 default: None,
             },
+            // Appended last on purpose: positional arguments map by index, so a new parameter
+            // goes after the existing ones or it changes what `(x, y)` means.
+            ParameterDef {
+                name: "key".to_string(),
+                description: "Node property to resolve a non-numeric `source` against".to_string(),
+                param_type: ParameterType::String,
+                required: false,
+                default: None,
+            },
         ]
     })
 }
 
+/// Resolves the `source` argument of [`SsspAlgorithm`] to a node.
+///
+/// * `key` given — `source` is a value of that node property. This is the route for a graph keyed
+///   by anything other than `name`, which is most of them. String values are tried first, then the
+///   integer reading of `source` when it parses as one.
+/// * no `key`, numeric `source` — the node's internal ID (which must exist).
+/// * no `key`, non-numeric `source` — rejected; callers must name the property with `key`.
+fn resolve_sssp_source(store: &dyn GraphStore, source: &str, key: Option<&str>) -> Result<NodeId> {
+    let Some(key) = key else {
+        if let Ok(id) = source.parse::<u64>() {
+            let node = NodeId::new(id);
+            return if store.get_node(node).is_some() {
+                Ok(node)
+            } else {
+                Err(Error::InvalidValue(format!(
+                    "No node found with internal ID '{source}'"
+                )))
+            };
+        }
+        return Err(Error::InvalidValue(format!(
+            "Non-numeric source '{source}' requires `key` naming the node property to resolve it"
+        )));
+    };
+
+    resolve_by_property(store, key, source)
+        .ok_or_else(|| Error::InvalidValue(format!("No node found with {key} '{source}'")))?
+}
+
+/// Looks a node up by a property value, trying the string reading then the integer one.
+///
+/// `None` means no node carries the value; `Some(Err(..))` that several do.
+fn resolve_by_property(store: &dyn GraphStore, key: &str, value: &str) -> Option<Result<NodeId>> {
+    let mut candidates = store.find_nodes_by_property(key, &Value::from(value));
+    if candidates.is_empty()
+        && let Ok(number) = value.parse::<i64>()
+    {
+        candidates = store.find_nodes_by_property(key, &Value::Int64(number));
+    }
+    match candidates.len() {
+        0 => None,
+        1 => Some(Ok(candidates[0])),
+        _ => Some(Err(Error::InvalidValue(format!(
+            "Multiple nodes found with {key} '{value}', use the internal node ID instead"
+        )))),
+    }
+}
+
 /// SSSP (Single-Source Shortest Paths) algorithm for LDBC Graphanalytics compatibility.
 ///
-/// Wraps Dijkstra's algorithm with string-based node name resolution.
-/// The source parameter is a string node name (looked up via "name" property)
-/// or falls back to integer ID parsing.
+/// Wraps Dijkstra's algorithm. The source is keyed on the node's **internal ID**: `source` is
+/// parsed as an integer first, so a graph that carries no naming property at all is usable. An
+/// optional `key` parameter names a node property to resolve `source` against instead, for graphs
+/// keyed by `id`, `iri`, or anything else. Non-numeric sources require that explicit property key.
 pub struct SsspAlgorithm;
 
 impl GraphAlgorithm for SsspAlgorithm {
@@ -731,29 +790,38 @@ impl GraphAlgorithm for SsspAlgorithm {
     }
 
     fn execute(&self, store: &dyn GraphStore, params: &Parameters) -> Result<AlgorithmResult> {
+        if params.get_string("source").is_none()
+            && params.get_int("source").is_none()
+            && (params.get_float("source").is_some()
+                || params.get_bool("source").is_some()
+                || params.get_list("source").is_some())
+        {
+            return Err(Error::InvalidValue(
+                "source parameter must be a string or integer".to_string(),
+            ));
+        }
+        for name in ["key", "weight"] {
+            if params.get_string(name).is_none()
+                && (params.get_int(name).is_some()
+                    || params.get_float(name).is_some()
+                    || params.get_bool(name).is_some()
+                    || params.get_list(name).is_some())
+            {
+                return Err(Error::InvalidValue(format!(
+                    "{name} parameter must be a string"
+                )));
+            }
+        }
+
+        // `source` arrives as a string from the CALL surface and as an integer from a caller that
+        // already holds the internal ID.
+        let source_owned = params.get_int("source").map(|id| id.to_string());
         let source_str = params
             .get_string("source")
+            .or(source_owned.as_deref())
             .ok_or_else(|| Error::InvalidValue("source parameter required".to_string()))?;
 
-        // Resolve source: try integer parse first, then name property lookup
-        let source = if let Ok(id) = source_str.parse::<u64>() {
-            NodeId::new(id)
-        } else {
-            let candidates = store.find_nodes_by_property("name", &Value::from(source_str));
-            match candidates.len() {
-                0 => {
-                    return Err(Error::InvalidValue(format!(
-                        "No node found with name '{source_str}'"
-                    )));
-                }
-                1 => candidates[0],
-                _ => {
-                    return Err(Error::InvalidValue(format!(
-                        "Multiple nodes found with name '{source_str}', use node ID instead"
-                    )));
-                }
-            }
-        };
+        let source = resolve_sssp_source(store, source_str, params.get_string("key"))?;
 
         let weight_prop = params.get_string("weight");
         let dijkstra_result = dijkstra(store, source, weight_prop);
@@ -1144,6 +1212,7 @@ mod tests {
 
         let mut params = Parameters::new();
         params.set_string("source", "alix");
+        params.set_string("key", "name");
         params.set_string("weight", "weight");
 
         let result = SsspAlgorithm.execute(&store, &params).unwrap();
@@ -1175,5 +1244,128 @@ mod tests {
 
         let result = SsspAlgorithm.execute(&store, &params);
         assert!(result.is_err());
+    }
+
+    /// A graph keyed by `id` instead of `name` must still be usable: `key` names the property the
+    /// source is resolved against.
+    #[test]
+    fn sssp_resolves_a_source_through_the_key_override() {
+        let store = LpgStore::new().unwrap();
+        let nodes: Vec<NodeId> = (0..3)
+            .map(|i| {
+                let node = store.create_node(&["Vertex"]);
+                store.set_node_property(node, "id", Value::from(format!("v_{i}").as_str()));
+                node
+            })
+            .collect();
+        store.create_edge(nodes[0], nodes[1], "LINK");
+        store.create_edge(nodes[1], nodes[2], "LINK");
+
+        let mut params = Parameters::new();
+        params.set_string("source", "v_0");
+        params.set_string("key", "id");
+
+        let result = SsspAlgorithm.execute(&store, &params).unwrap();
+        assert_eq!(result.columns, vec!["node_id", "distance"]);
+        assert_eq!(result.row_count(), 3);
+    }
+
+    /// An integer `source` is the node's internal ID, with no property lookup at all — the graph
+    /// here carries no properties.
+    #[test]
+    fn sssp_keys_an_integer_source_on_the_internal_id() {
+        let store = LpgStore::new().unwrap();
+        let n0 = store.create_node(&["Node"]);
+        let n1 = store.create_node(&["Node"]);
+        store.create_edge(n0, n1, "EDGE");
+
+        let mut params = Parameters::new();
+        // reason: node IDs are sequential counters, well within i64::MAX
+        #[allow(clippy::cast_possible_wrap)]
+        params.set_int("source", n0.0 as i64);
+
+        let result = SsspAlgorithm.execute(&store, &params).unwrap();
+        assert_eq!(result.row_count(), 2);
+    }
+
+    /// A `key` that resolves nothing names the key in the error, rather than reporting `name`.
+    #[test]
+    fn sssp_reports_the_key_it_could_not_resolve() {
+        let store = LpgStore::new().unwrap();
+        store.create_node(&["Node"]);
+
+        let mut params = Parameters::new();
+        params.set_string("source", "v_0");
+        params.set_string("key", "id");
+
+        let error = match SsspAlgorithm.execute(&store, &params) {
+            Err(error) => error,
+            Ok(result) => panic!("expected an error, got {} rows", result.row_count()),
+        };
+        assert!(
+            error.to_string().contains("No node found with id 'v_0'"),
+            "error should name the key: {error}"
+        );
+    }
+
+    /// With no `key`, an unresolvable non-numeric source says how to resolve it.
+    #[test]
+    fn sssp_without_a_key_points_at_the_override() {
+        let store = LpgStore::new().unwrap();
+        store.create_node(&["Node"]);
+
+        let mut params = Parameters::new();
+        params.set_string("source", "v_0");
+
+        let error = match SsspAlgorithm.execute(&store, &params) {
+            Err(error) => error,
+            Ok(result) => panic!("expected an error, got {} rows", result.row_count()),
+        };
+        assert!(
+            error.to_string().contains("`key`"),
+            "error should point at the key override: {error}"
+        );
+    }
+
+    #[test]
+    fn sssp_rejects_a_nonexistent_internal_source() {
+        let store = LpgStore::new().unwrap();
+        store.create_node(&["Node"]);
+
+        let mut params = Parameters::new();
+        params.set_string("source", "999");
+
+        let error = SsspAlgorithm
+            .execute(&store, &params)
+            .err()
+            .expect("invalid algorithm arguments must fail");
+        assert!(error.to_string().contains("internal ID '999'"));
+    }
+
+    #[test]
+    fn sssp_rejects_wrong_types_for_source_key_and_weight() {
+        let store = LpgStore::new().unwrap();
+        let node = store.create_node(&["Node"]);
+        for (name, message) in [
+            ("source", "string or integer"),
+            ("key", "string"),
+            ("weight", "string"),
+        ] {
+            let mut params = Parameters::new();
+            if name == "source" {
+                params.set_bool(name, true);
+            } else if name == "key" {
+                params.set_string("source", node.0.to_string());
+                params.set_int(name, 1);
+            } else {
+                params.set_string("source", node.0.to_string());
+                params.set_bool(name, true);
+            }
+            let error = SsspAlgorithm
+                .execute(&store, &params)
+                .err()
+                .expect("invalid algorithm arguments must fail");
+            assert!(error.to_string().contains(message), "{name}: {error}");
+        }
     }
 }
