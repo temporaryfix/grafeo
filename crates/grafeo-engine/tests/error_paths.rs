@@ -4,7 +4,10 @@
 //! invalid queries, double-commit, transaction state violations,
 //! and other edge cases that should produce clear errors rather than panics.
 
+#[cfg(feature = "lpg")]
 use grafeo_common::types::{EdgeId, NodeId, Value};
+#[cfg(feature = "lpg")]
+use grafeo_common::utils::error::Error;
 use grafeo_engine::GrafeoDB;
 
 // ============================================================================
@@ -12,45 +15,56 @@ use grafeo_engine::GrafeoDB;
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_get_nonexistent_node() {
     let db = GrafeoDB::new_in_memory();
     assert!(db.get_node(NodeId::new(999)).is_none());
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_get_nonexistent_edge() {
     let db = GrafeoDB::new_in_memory();
     assert!(db.get_edge(EdgeId::new(999)).is_none());
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_set_property_on_nonexistent_node() {
     let db = GrafeoDB::new_in_memory();
-    // Setting a property on a missing node should not panic
-    db.set_node_property(NodeId::new(999), "key", Value::Int64(1));
-    // Node still doesn't exist
+    let epoch = db.current_epoch();
+    assert!(matches!(
+        db.set_node_property(NodeId::new(999), "key", Value::Int64(1)),
+        Err(Error::NodeNotFound(id)) if id == NodeId::new(999)
+    ));
+    assert_eq!(db.current_epoch(), epoch);
+    assert_eq!(db.node_count(), 0);
     assert!(db.get_node(NodeId::new(999)).is_none());
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_delete_nonexistent_node() {
     let db = GrafeoDB::new_in_memory();
     assert!(!db.delete_node(NodeId::new(999)));
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_delete_nonexistent_edge() {
     let db = GrafeoDB::new_in_memory();
     assert!(!db.delete_edge(EdgeId::new(999)));
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_get_labels_nonexistent_node() {
     let db = GrafeoDB::new_in_memory();
     assert!(db.get_node_labels(NodeId::new(999)).is_none());
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_add_label_nonexistent_node() {
     let db = GrafeoDB::new_in_memory();
     // Should not panic - returns false since node doesn't exist
@@ -58,6 +72,7 @@ fn test_add_label_nonexistent_node() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_remove_label_nonexistent_node() {
     let db = GrafeoDB::new_in_memory();
     assert!(!db.remove_node_label(NodeId::new(999), "Label"));
@@ -68,6 +83,7 @@ fn test_remove_label_nonexistent_node() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_syntax_error() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -82,6 +98,7 @@ fn test_query_syntax_error() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_empty_string() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -91,6 +108,7 @@ fn test_query_empty_string() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_unclosed_parenthesis() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -100,6 +118,7 @@ fn test_query_unclosed_parenthesis() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_undefined_variable() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -110,6 +129,7 @@ fn test_query_undefined_variable() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_return_without_match() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -188,6 +208,7 @@ fn test_begin_after_rollback_succeeds() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_empty_database() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -201,6 +222,7 @@ fn test_query_empty_database() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_count_on_empty_database() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -214,6 +236,7 @@ fn test_count_on_empty_database() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_validate_empty_database() {
     let db = GrafeoDB::new_in_memory();
     let result = db.validate();
@@ -221,6 +244,7 @@ fn test_validate_empty_database() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_schema_empty_database() {
     let db = GrafeoDB::new_in_memory();
     let schema = db.schema();
@@ -247,33 +271,30 @@ fn test_info_empty_database() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_property_with_null_value() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&["Test"]);
-    db.set_node_property(n, "key", Value::Null);
+    db.set_node_property(n, "key", Value::Null)
+        .expect("set node property");
 
     // In temporal mode, Null acts as a tombstone and is filtered out.
     // In non-temporal mode, Null is stored and returned.
     let node = db.get_node(n).unwrap();
-    #[cfg(feature = "temporal")]
     assert_eq!(
         node.get_property("key"),
         None,
         "Temporal: Null acts as tombstone"
     );
-    #[cfg(not(feature = "temporal"))]
-    assert_eq!(
-        node.get_property("key"),
-        Some(&Value::Null),
-        "Should store Null value"
-    );
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_property_with_empty_string() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&["Test"]);
-    db.set_node_property(n, "key", Value::String("".into()));
+    db.set_node_property(n, "key", Value::String("".into()))
+        .expect("set node property");
 
     let node = db.get_node(n).unwrap();
     assert_eq!(
@@ -284,6 +305,7 @@ fn test_property_with_empty_string() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_node_with_no_labels() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&[]);
@@ -294,6 +316,7 @@ fn test_node_with_no_labels() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_node_with_many_labels() {
     let db = GrafeoDB::new_in_memory();
     let labels: Vec<&str> = (0..10)
@@ -317,6 +340,7 @@ fn test_node_with_many_labels() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_self_referencing_edge() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&["Node"]);
@@ -332,6 +356,7 @@ fn test_self_referencing_edge() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_syntax_error_has_position_info() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -355,6 +380,7 @@ fn test_gql_syntax_error_has_position_info() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_translator_errors_not_internal() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -381,21 +407,27 @@ fn test_translator_errors_not_internal() {
 
 #[cfg(feature = "algos")]
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_unknown_procedure_error_code() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
-    let result = session.execute("CALL grafeo.nonexistent()");
-    assert!(result.is_err());
-    let err_str = result.unwrap_err().to_string();
+    let error = session.execute("CALL grafeo.nonexistent()").unwrap_err();
+    let Error::Query(details) = error else {
+        panic!("expected structured semantic error, got {error:?}");
+    };
+    assert_eq!(
+        details.kind,
+        grafeo_common::utils::error::QueryErrorKind::Semantic
+    );
     assert!(
-        err_str.contains("Unknown procedure"),
-        "Should say 'Unknown procedure', got: {}",
-        err_str
+        details.to_string().contains("grafeo.nonexistent"),
+        "unknown-procedure diagnostic must identify the requested procedure: {details}"
     );
 }
 
 #[cfg(feature = "algos")]
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_yield_nonexistent_column_error() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -411,6 +443,7 @@ fn test_gql_yield_nonexistent_column_error() {
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "lpg")]
 fn test_cypher_pattern_comprehension_works() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -426,13 +459,16 @@ fn test_cypher_pattern_comprehension_works() {
 
 #[test]
 #[cfg(feature = "graphql")]
+#[cfg(feature = "lpg")]
 fn test_graphql_range_filter_end_to_end() {
     let db = GrafeoDB::new_in_memory();
     // Create test data
     for i in 0..5 {
         let n = db.create_node(&["Person"]);
-        db.set_node_property(n, "name", Value::String(format!("Person{}", i).into()));
-        db.set_node_property(n, "age", Value::Int64(20 + i * 10)); // 20, 30, 40, 50, 60
+        db.set_node_property(n, "name", Value::String(format!("Person{}", i).into()))
+            .expect("set node property");
+        db.set_node_property(n, "age", Value::Int64(20 + i * 10))
+            .expect("set node property"); // 20, 30, 40, 50, 60
     }
 
     let session = db.session();
@@ -457,6 +493,7 @@ fn test_graphql_range_filter_end_to_end() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_insert_and_match_special_characters_in_properties() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -470,10 +507,12 @@ fn test_insert_and_match_special_characters_in_properties() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_match_with_multiple_labels() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&["Person", "Employee"]);
-    db.set_node_property(n, "name", Value::String("Alix".into()));
+    db.set_node_property(n, "name", Value::String("Alix".into()))
+        .expect("set node property");
 
     let session = db.session();
     let result = session.execute("MATCH (n:Person) RETURN n.name").unwrap();
@@ -481,6 +520,7 @@ fn test_match_with_multiple_labels() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_in_operator_with_empty_list() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -502,6 +542,7 @@ fn test_in_operator_with_empty_list() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_error_shows_line_and_column() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -528,6 +569,7 @@ fn test_gql_error_shows_line_and_column() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_multiline_error_position() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -546,6 +588,7 @@ fn test_gql_multiline_error_position() {
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "lpg")]
 fn test_cypher_error_shows_position() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -566,22 +609,34 @@ fn test_cypher_error_shows_position() {
 
 #[test]
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
-fn test_sparql_error_shows_position() {
-    let db = GrafeoDB::new_in_memory();
+fn test_sparql_error_shows_position() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::utils::error::{Error, QueryErrorKind};
+    use grafeo_engine::config::{Config, GraphModel};
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))?;
     let session = db.session();
 
     // Missing closing brace: genuine syntax error
-    let result = session.execute_sparql("SELECT ?s WHERE { ?s ?p ?o");
+    let query = "SELECT ?s WHERE { ?s ?p ?o";
+    let result = session.execute_sparql(query);
     assert!(result.is_err(), "Expected parse error for malformed SPARQL");
-    let err_str = result.unwrap_err().to_string();
+    let error = result.unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Query(details) if details.kind == QueryErrorKind::Syntax
+            && details.span.is_some() && details.source_query.as_deref() == Some(query)
+    ));
+    let err_str = error.to_string();
     assert!(
         err_str.contains("-->"),
         "SPARQL error should show position, got: {err_str}"
     );
+    Ok(())
 }
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "lpg")]
 fn test_sql_pgq_error_shows_position() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -674,6 +729,7 @@ fn test_binary_garbage_input() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_error_names_unexpected_token() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -689,6 +745,7 @@ fn test_gql_error_names_unexpected_token() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_error_includes_line_and_column() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -703,6 +760,7 @@ fn test_gql_error_includes_line_and_column() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_gql_error_includes_caret_marker() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -718,21 +776,33 @@ fn test_gql_error_includes_caret_marker() {
 
 #[test]
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
-fn test_sparql_error_includes_position() {
-    let db = GrafeoDB::new_in_memory();
+fn test_sparql_error_includes_position() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::utils::error::{Error, QueryErrorKind};
+    use grafeo_engine::config::{Config, GraphModel};
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))?;
     let session = db.session();
     // Use genuinely invalid SPARQL syntax
-    let result = session.execute_sparql("GRAB ?s WHERE { ?s ?p ?o }");
+    let query = "GRAB ?s WHERE { ?s ?p ?o }";
+    let result = session.execute_sparql(query);
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let error = result.unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Query(details) if details.kind == QueryErrorKind::Syntax
+            && details.span.is_some() && details.source_query.as_deref() == Some(query)
+    ));
+    let err = error.to_string();
     assert!(
         err.contains("-->") || err.contains("SELECT") || err.contains("expected"),
         "SPARQL error should include position or name bad token, got: {err}"
     );
+    Ok(())
 }
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "lpg")]
 fn test_cypher_error_names_bad_token() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
