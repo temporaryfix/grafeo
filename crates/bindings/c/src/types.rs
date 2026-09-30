@@ -6,7 +6,15 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use grafeo_common::types::{PropertyKey, PropertyMap, Value};
+use grafeo_common::types::Value;
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
+use grafeo_common::types::{PropertyKey, PropertyMap};
 use grafeo_engine::database::GrafeoDB;
 
 // ---------------------------------------------------------------------------
@@ -31,9 +39,108 @@ impl Drop for GrafeoTransaction {
         if !self.committed && !self.rolled_back {
             let mut guard = self.session.lock();
             if let Some(ref mut session) = *guard {
-                let _ = session.rollback();
+                let _ = rollback_transaction(session);
             }
         }
+    }
+}
+
+pub(crate) fn begin_transaction(
+    session: &mut grafeo_engine::session::Session,
+) -> grafeo_common::Result<()> {
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    ))]
+    {
+        session.begin_transaction()
+    }
+    #[cfg(not(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    )))]
+    {
+        let _ = session;
+        Err(grafeo_common::utils::error::Error::Query(
+            grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                "Transactions require an enabled graph storage model",
+            ),
+        ))
+    }
+}
+
+pub(crate) fn commit_transaction(
+    session: &mut grafeo_engine::session::Session,
+) -> grafeo_common::Result<grafeo_common::types::EpochId> {
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    ))]
+    {
+        session.commit()
+    }
+    #[cfg(not(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    )))]
+    {
+        let _ = session;
+        Err(grafeo_common::utils::error::Error::Query(
+            grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                "Transactions require an enabled graph storage model",
+            ),
+        ))
+    }
+}
+
+pub(crate) fn rollback_transaction(
+    session: &mut grafeo_engine::session::Session,
+) -> grafeo_common::Result<()> {
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    ))]
+    {
+        session.rollback()
+    }
+    #[cfg(not(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    )))]
+    {
+        let _ = session;
+        Err(grafeo_common::utils::error::Error::Query(
+            grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                "Transactions require an enabled graph storage model",
+            ),
+        ))
     }
 }
 
@@ -80,6 +187,13 @@ pub fn json_to_value(v: &serde_json::Value) -> Value {
 }
 
 /// Serialize a [`PropertyMap`] to a JSON `CString`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 pub fn properties_to_json(props: &PropertyMap) -> CString {
     let obj: serde_json::Map<std::string::String, serde_json::Value> = props
         .iter()
@@ -90,6 +204,13 @@ pub fn properties_to_json(props: &PropertyMap) -> CString {
 }
 
 /// Parse a JSON C-string into a `Vec<(PropertyKey, Value)>` for node/edge creation.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 pub fn parse_properties(json_ptr: *const c_char) -> Option<Vec<(PropertyKey, Value)>> {
     if json_ptr.is_null() {
         return None;
@@ -108,6 +229,13 @@ pub fn parse_properties(json_ptr: *const c_char) -> Option<Vec<(PropertyKey, Val
 }
 
 /// Parse a JSON C-string into a `Vec<String>` (for labels).
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 pub fn parse_labels(json_ptr: *const c_char) -> Option<Vec<String>> {
     if json_ptr.is_null() {
         return None;
@@ -126,6 +254,13 @@ pub fn parse_labels(json_ptr: *const c_char) -> Option<Vec<String>> {
 }
 
 /// Parse a JSON C-string into a single `Value`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 pub fn parse_value(json_ptr: *const c_char) -> Option<Value> {
     if json_ptr.is_null() {
         return None;
@@ -139,19 +274,24 @@ pub fn parse_value(json_ptr: *const c_char) -> Option<Value> {
 }
 
 /// Parse a JSON C-string into a `HashMap<String, Value>` for query params.
-pub fn parse_params(json_ptr: *const c_char) -> Option<std::collections::HashMap<String, Value>> {
+pub fn parse_params(
+    json_ptr: *const c_char,
+) -> grafeo_common::Result<std::collections::HashMap<String, Value>> {
+    use grafeo_common::utils::error::Error;
     if json_ptr.is_null() {
-        return None;
+        return Ok(std::collections::HashMap::new());
     }
-    // SAFETY: Caller guarantees valid null-terminated C string.
-    let s = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+    // SAFETY: Caller guarantees a valid null-terminated C string.
+    let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
         .to_str()
-        .ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(s).ok()?;
-    let obj = parsed.as_object()?;
-    let map: std::collections::HashMap<String, Value> = obj
+        .map_err(|_| Error::InvalidValue("Parameters must be valid UTF-8".into()))?;
+    let parsed: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| Error::InvalidValue(format!("Invalid query parameters: {error}")))?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| Error::InvalidValue("Query parameters must be a JSON object".into()))?;
+    Ok(object
         .iter()
-        .map(|(k, v)| (k.clone(), json_to_value(v)))
-        .collect();
-    Some(map)
+        .map(|(key, value)| (key.clone(), json_to_value(value)))
+        .collect())
 }

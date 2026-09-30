@@ -22,7 +22,42 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(all(feature = "full", not(all(feature = "rdf", feature = "analytics"))))]
+compile_error!("C `full` must retain RDF and analytics support");
+
+#[cfg(feature = "cdc")]
+mod cdc;
 mod database;
 mod error;
+mod execution;
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
+mod index;
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    )
+))]
 mod stream;
+#[cfg(not(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    )
+)))]
+mod stream_stubs;
 mod types;

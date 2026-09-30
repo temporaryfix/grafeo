@@ -21,10 +21,20 @@ pub enum GrafeoStatus {
     ErrorInternal = 7,
     ErrorNullPointer = 8,
     ErrorInvalidUtf8 = 9,
+    ErrorCancelled = 10,
+    ErrorDeadline = 11,
+    ErrorResourceLimit = 12,
 }
 
 impl From<&grafeo_common::utils::error::Error> for GrafeoStatus {
     fn from(err: &grafeo_common::utils::error::Error) -> Self {
+        use grafeo_common::utils::error::ErrorCode;
+        match err.error_code() {
+            ErrorCode::QueryCancelled => return Self::ErrorCancelled,
+            ErrorCode::QueryTimeout => return Self::ErrorDeadline,
+            ErrorCode::StorageFull => return Self::ErrorResourceLimit,
+            _ => {}
+        }
         use grafeo_bindings_common::error::{ErrorCategory, classify_error};
         match classify_error(err) {
             ErrorCategory::Query => GrafeoStatus::ErrorQuery,
@@ -40,12 +50,20 @@ impl From<&grafeo_common::utils::error::Error> for GrafeoStatus {
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_CODE: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 /// Store an error message for later retrieval via [`grafeo_last_error`].
 pub fn set_last_error(msg: &str) {
+    LAST_ERROR_CODE.with(|cell| *cell.borrow_mut() = None);
     LAST_ERROR.with(|cell| {
-        *cell.borrow_mut() = CString::new(msg).ok();
+        // Length-delimited request names may contain NUL. Preserve the error
+        // as readable text instead of discarding it at the C-string boundary.
+        *cell.borrow_mut() = if msg.contains('\0') {
+            CString::new(msg.replace('\0', "\\0")).ok()
+        } else {
+            CString::new(msg).ok()
+        };
     });
 }
 
@@ -53,6 +71,7 @@ pub fn set_last_error(msg: &str) {
 /// the corresponding status code.
 pub fn set_error(err: &grafeo_common::utils::error::Error) -> GrafeoStatus {
     set_last_error(&err.to_string());
+    LAST_ERROR_CODE.with(|cell| *cell.borrow_mut() = CString::new(err.error_code().as_str()).ok());
     GrafeoStatus::from(err)
 }
 
@@ -69,9 +88,21 @@ pub extern "C" fn grafeo_last_error() -> *const c_char {
     })
 }
 
+/// Returns the stable native error code, or null for an unclassified FFI error.
+/// The pointer is borrowed until the next error update on this thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_last_error_code() -> *const c_char {
+    LAST_ERROR_CODE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
+
 /// Clears the last error.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_clear_error() {
+    LAST_ERROR_CODE.with(|cell| *cell.borrow_mut() = None);
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = None;
     });

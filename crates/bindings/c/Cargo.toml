@@ -13,10 +13,10 @@ crate-type = ["cdylib", "staticlib"]
 doc = false
 
 [dependencies]
-grafeo-engine = { path = "../../grafeo-engine" }
-grafeo-core = { path = "../../grafeo-core" }
-grafeo-common = { path = "../../grafeo-common" }
-grafeo-bindings-common = { path = "../common" }
+grafeo-engine = { workspace = true }
+grafeo-core = { workspace = true }
+grafeo-common = { workspace = true }
+grafeo-bindings-common = { workspace = true }
 
 serde_json = { version = "1.0", features = ["preserve_order"] }
 parking_lot.workspace = true
@@ -32,10 +32,12 @@ sql-pgq = ["grafeo-engine/sql-pgq"]
 vector-index = ["grafeo-engine/vector-index"]
 text-index = ["grafeo-engine/text-index"]
 hybrid-search = ["grafeo-engine/hybrid-search"]
-cdc = ["grafeo-engine/cdc"]
+cdc = ["grafeo-engine/cdc", "grafeo-bindings-common/cdc"]
 algos = ["grafeo-engine/algos"]
 triple-store = ["grafeo-engine/triple-store"]
-compact-store = ["grafeo-engine/compact-store"]
+ring-index = ["grafeo-engine/ring-index", "triple-store"]
+# Compact maintenance requires the LPG store, including without a query parser.
+compact-store = ["grafeo-engine/compact-store", "grafeo-engine/lpg"]
 jsonl-import = ["grafeo-engine/jsonl-import"]
 parquet-import = ["grafeo-engine/parquet-import"]
 languages = ["gql", "cypher", "sparql", "gremlin", "graphql", "sql-pgq"]
@@ -43,12 +45,27 @@ ai = ["vector-index", "text-index", "hybrid-search", "cdc"]
 storage = ["grafeo-engine/storage"]
 # Persona-based profiles
 lpg = ["grafeo-engine/lpg", "gql", "cypher", "gremlin", "sql-pgq", "storage", "grafeo-engine/regex"]
-rdf = ["triple-store", "gql", "sparql", "graphql", "storage", "grafeo-engine/regex"]
+# Comprehensive RDF query/index/storage profile. Does not enable gql/LPG.
+rdf = ["triple-store", "sparql", "graphql", "ring-index", "storage", "grafeo-engine/regex"]
+# Parser-free LPG + RDF quads + WAL.
+native = ["grafeo-engine/native", "triple-store"]
 analytics = ["algos", "vector-index", "text-index", "hybrid-search", "jsonl-import", "parquet-import"]
-edge = ["grafeo-engine/lpg", "gql", "grafeo-engine/regex-lite"]
+edge = ["grafeo-engine/lpg", "gql", "compact-store", "grafeo-engine/regex-lite"]
 # Deployment-based profiles (deprecated)
-embedded = ["gql", "ai", "algos", "compact-store", "grafeo-engine/parallel", "grafeo-engine/regex", "grafeo-engine/grafeo-file"]
-full = ["languages", "ai", "algos", "triple-store"]
+embedded = [
+    "grafeo-engine/lpg",
+    "gql",
+    "ai",
+    "algos",
+    "compact-store",
+    "grafeo-engine/parallel",
+    "grafeo-engine/regex",
+    "grafeo-engine/grafeo-file",
+    "grafeo-engine/wal",
+    "grafeo-engine/spill",
+    "grafeo-engine/mmap",
+]
+full = ["embedded", "languages", "rdf", "analytics", "ai"]
 
 [lints]
 workspace = true

@@ -7,8 +7,17 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::execution::GrafeoQueryOptions;
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 use grafeo_common::types::{EdgeId, NodeId};
-use grafeo_engine::config::{Config, StorageFormat};
+use grafeo_common::utils::error::{Error, Result as NativeResult};
+use grafeo_engine::config::{Config, GraphModel, StorageFormat};
 use grafeo_engine::database::GrafeoDB;
 
 use crate::error::{GrafeoStatus, set_error, set_last_error, str_from_ptr};
@@ -51,7 +60,11 @@ macro_rules! db_ref_or_null {
 }
 
 /// Serialize a `QueryResult` into a `GrafeoResult`.
-fn build_result(result: &grafeo_engine::database::QueryResult) -> *mut GrafeoResult {
+pub(crate) fn build_result(
+    result: &grafeo_engine::database::QueryResult,
+    max_bytes: usize,
+) -> NativeResult<GrafeoResult> {
+    crate::execution::preflight_c_result(result, max_bytes)?;
     let json_rows: Vec<serde_json::Value> = result
         .rows()
         .iter()
@@ -66,8 +79,10 @@ fn build_result(result: &grafeo_engine::database::QueryResult) -> *mut GrafeoRes
         })
         .collect();
 
-    let json_str = serde_json::to_string(&json_rows).unwrap_or_default();
-    let c_json = CString::new(json_str).unwrap_or_default();
+    let json_str = serde_json::to_string(&json_rows)
+        .map_err(|error| Error::Serialization(error.to_string()))?;
+    drop(json_rows);
+    let c_json = CString::new(json_str).map_err(|error| Error::Serialization(error.to_string()))?;
 
     // Extract typed entities (nodes and edges) from the result.
     let (raw_nodes, raw_edges) = grafeo_bindings_common::entity::extract_entities(result);
@@ -131,17 +146,117 @@ fn build_result(result: &grafeo_engine::database::QueryResult) -> *mut GrafeoRes
         })
         .collect();
 
-    let nodes_str = serde_json::to_string(&nodes_json_val).unwrap_or_default();
-    let edges_str = serde_json::to_string(&edges_json_val).unwrap_or_default();
+    let nodes_str = serde_json::to_string(&nodes_json_val)
+        .map_err(|error| Error::Serialization(error.to_string()))?;
+    let edges_str = serde_json::to_string(&edges_json_val)
+        .map_err(|error| Error::Serialization(error.to_string()))?;
 
-    Box::into_raw(Box::new(GrafeoResult {
+    Ok(GrafeoResult {
         json: c_json,
         row_count: result.rows().len(),
         execution_time_ms: result.execution_time_ms.unwrap_or(0.0),
         rows_scanned: result.rows_scanned.unwrap_or(0),
-        nodes_json: CString::new(nodes_str).unwrap_or_default(),
-        edges_json: CString::new(edges_str).unwrap_or_default(),
-    }))
+        nodes_json: CString::new(nodes_str)
+            .map_err(|error| Error::Serialization(error.to_string()))?,
+        edges_json: CString::new(edges_str)
+            .map_err(|error| Error::Serialization(error.to_string()))?,
+    })
+}
+
+fn result_pointer(
+    result: NativeResult<grafeo_engine::database::QueryResult>,
+    max_bytes: usize,
+) -> *mut GrafeoResult {
+    match result.and_then(|result| build_result(&result, max_bytes)) {
+        Ok(result) => Box::into_raw(Box::new(result)),
+        Err(error) => {
+            set_error(&error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn prepare_execution(
+    params_json: *const c_char,
+    options: *const GrafeoQueryOptions,
+    language: Option<&str>,
+) -> NativeResult<(
+    std::collections::HashMap<String, grafeo_common::types::Value>,
+    grafeo_engine::query::ExecutionOptions,
+)> {
+    let params = crate::types::parse_params(params_json)?;
+    // SAFETY: The C entry point requires a valid options struct or null.
+    let mut options = unsafe { crate::execution::options_from_ptr(options) }?;
+    if let Some(language) = language {
+        options.language = Some(language.to_owned());
+    } else if options.language.is_none() {
+        options.language = Some("gql".to_owned());
+    }
+    Ok((params, options))
+}
+
+fn execute_database(
+    db: *mut GrafeoDatabase,
+    query: *const c_char,
+    params_json: *const c_char,
+    options: *const GrafeoQueryOptions,
+    language: Option<&str>,
+) -> *mut GrafeoResult {
+    let db = db_ref_or_null!(db);
+    let Ok(query) = str_from_ptr(query) else {
+        return std::ptr::null_mut();
+    };
+    let (params, options) = match prepare_execution(params_json, options, language) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            set_error(&error);
+            return std::ptr::null_mut();
+        }
+    };
+    let max_bytes = options.result_limits.unwrap_or_default().max_bytes;
+    result_pointer(
+        db.inner.read().execute_with_options(query, params, options),
+        max_bytes,
+    )
+}
+
+fn execute_transaction(
+    tx: *mut GrafeoTransaction,
+    query: *const c_char,
+    params_json: *const c_char,
+    options: *const GrafeoQueryOptions,
+    language: Option<&str>,
+) -> *mut GrafeoResult {
+    if tx.is_null() {
+        set_last_error("Null transaction pointer");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: Caller retains the transaction handle for the duration of this call.
+    let tx = unsafe { &*tx };
+    let Ok(query) = str_from_ptr(query) else {
+        return std::ptr::null_mut();
+    };
+    let (params, options) = match prepare_execution(params_json, options, language) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            set_error(&error);
+            return std::ptr::null_mut();
+        }
+    };
+    let guard = tx.session.lock();
+    let Some(session) = guard.as_ref().filter(|_| !tx.committed && !tx.rolled_back) else {
+        set_error(&Error::Transaction(
+            grafeo_common::utils::error::TransactionError::InvalidState(
+                "Transaction is no longer active".into(),
+            ),
+        ));
+        return std::ptr::null_mut();
+    };
+    let max_bytes = options.result_limits.unwrap_or_default().max_bytes;
+    result_pointer(
+        session.execute_with_options(query, params, options),
+        max_bytes,
+    )
 }
 
 // =========================================================================
@@ -159,15 +274,12 @@ pub extern "C" fn grafeo_open_memory() -> *mut GrafeoDatabase {
     }))
 }
 
-/// Open or create a persistent database at `path`.
-///
-/// Returns an opaque pointer, or null on error.
-#[unsafe(no_mangle)]
-pub extern "C" fn grafeo_open(path: *const c_char) -> *mut GrafeoDatabase {
-    let Ok(path_str) = str_from_ptr(path) else {
-        return std::ptr::null_mut();
-    };
-    match GrafeoDB::with_config(Config::persistent(path_str)) {
+fn graph_model_from_c(model: u8) -> Option<GraphModel> {
+    GraphModel::from_u8(model)
+}
+
+fn db_from_config(config: Config) -> *mut GrafeoDatabase {
+    match GrafeoDB::with_config(config) {
         Ok(db) => Box::into_raw(Box::new(GrafeoDatabase {
             inner: Arc::new(RwLock::new(db)),
         })),
@@ -176,6 +288,42 @@ pub extern "C" fn grafeo_open(path: *const c_char) -> *mut GrafeoDatabase {
             std::ptr::null_mut()
         }
     }
+}
+
+/// Create an in-memory database with an explicit graph model.
+///
+/// `model`: 0 = LPG, 1 = RDF, 2 = BOTH.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_open_memory_model(model: u8) -> *mut GrafeoDatabase {
+    let Some(model) = graph_model_from_c(model) else {
+        set_last_error("Invalid graph model (expected 0=LPG, 1=RDF, 2=BOTH)");
+        return std::ptr::null_mut();
+    };
+    db_from_config(Config::in_memory().with_graph_model(model))
+}
+
+/// Open or create a persistent database at `path`.
+///
+/// Returns an opaque pointer, or null on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_open(path: *const c_char) -> *mut GrafeoDatabase {
+    let Ok(path_str) = str_from_ptr(path) else {
+        return std::ptr::null_mut();
+    };
+    db_from_config(Config::persistent(path_str))
+}
+
+/// Open or create a persistent database with an explicit graph model.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_open_with_model(path: *const c_char, model: u8) -> *mut GrafeoDatabase {
+    let Ok(path_str) = str_from_ptr(path) else {
+        return std::ptr::null_mut();
+    };
+    let Some(model) = graph_model_from_c(model) else {
+        set_last_error("Invalid graph model (expected 0=LPG, 1=RDF, 2=BOTH)");
+        return std::ptr::null_mut();
+    };
+    db_from_config(Config::persistent(path_str).with_graph_model(model))
 }
 
 /// Open an existing database in read-only mode.
@@ -234,7 +382,7 @@ pub extern "C" fn grafeo_close(db: *mut GrafeoDatabase) -> GrafeoStatus {
     }
     // SAFETY: Caller guarantees valid pointer from grafeo_open*.
     let db = unsafe { &*db };
-    match db.inner.read().close() {
+    match db.inner.read().try_close() {
         Ok(()) => GrafeoStatus::Ok,
         Err(e) => set_error(&e),
     }
@@ -255,6 +403,18 @@ pub extern "C" fn grafeo_version() -> *const c_char {
     // Include a trailing NUL in the byte literal.
     static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
     VERSION.as_ptr().cast::<c_char>()
+}
+
+/// Graph model this database was created with. 0=LPG, 1=RDF, 2=BOTH.
+/// Returns 0 and sets an error on a null handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_graph_model(db: *const GrafeoDatabase) -> u8 {
+    if db.is_null() {
+        set_last_error("Null database pointer");
+        return 0;
+    }
+    // SAFETY: Caller guarantees a valid pointer from grafeo_open*.
+    unsafe { &*db }.inner.read().graph_model().as_u8()
 }
 
 // =========================================================================
@@ -283,24 +443,25 @@ pub extern "C" fn grafeo_is_cdc_enabled(db: *mut GrafeoDatabase) -> bool {
 // Query Execution
 // =========================================================================
 
+/// Execute with optional parameters and caller-owned execution controls.
+/// A null options pointer uses bounded defaults; a null language selects GQL.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_execute_with_options(
+    db: *mut GrafeoDatabase,
+    query: *const c_char,
+    params_json: *const c_char,
+    options: *const GrafeoQueryOptions,
+) -> *mut GrafeoResult {
+    execute_database(db, query, params_json, options, None)
+}
+
 /// Execute a GQL query. Returns a result pointer, or null on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_execute(
     db: *mut GrafeoDatabase,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let guard = db.inner.read();
-    match guard.execute_language(query_str, "gql", None) {
-        Ok(result) => build_result(&result),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, std::ptr::null(), std::ptr::null(), Some("gql"))
 }
 
 /// Execute a GQL query with JSON-encoded parameters.
@@ -310,19 +471,7 @@ pub extern "C" fn grafeo_execute_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let guard = db.inner.read();
-    let params = crate::types::parse_params(params_json);
-    match guard.execute_language(query_str, "gql", params) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some("gql"))
 }
 
 /// Execute a Cypher query.
@@ -332,17 +481,13 @@ pub extern "C" fn grafeo_execute_cypher(
     db: *mut GrafeoDatabase,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    match db.inner.read().execute_language(query_str, "cypher", None) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(
+        db,
+        query,
+        std::ptr::null(),
+        std::ptr::null(),
+        Some("cypher"),
+    )
 }
 
 /// Execute a Gremlin query.
@@ -352,17 +497,13 @@ pub extern "C" fn grafeo_execute_gremlin(
     db: *mut GrafeoDatabase,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    match db.inner.read().execute_language(query_str, "gremlin", None) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(
+        db,
+        query,
+        std::ptr::null(),
+        std::ptr::null(),
+        Some("gremlin"),
+    )
 }
 
 /// Execute a GraphQL query.
@@ -372,17 +513,13 @@ pub extern "C" fn grafeo_execute_graphql(
     db: *mut GrafeoDatabase,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    match db.inner.read().execute_language(query_str, "graphql", None) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(
+        db,
+        query,
+        std::ptr::null(),
+        std::ptr::null(),
+        Some("graphql"),
+    )
 }
 
 /// Execute a SPARQL query.
@@ -392,17 +529,13 @@ pub extern "C" fn grafeo_execute_sparql(
     db: *mut GrafeoDatabase,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    match db.inner.read().execute_language(query_str, "sparql", None) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(
+        db,
+        query,
+        std::ptr::null(),
+        std::ptr::null(),
+        Some("sparql"),
+    )
 }
 
 /// Execute a SQL/PGQ query (SQL:2023 GRAPH_TABLE).
@@ -412,17 +545,7 @@ pub extern "C" fn grafeo_execute_sql(
     db: *mut GrafeoDatabase,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    match db.inner.read().execute_language(query_str, "sql", None) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, std::ptr::null(), std::ptr::null(), Some("sql"))
 }
 
 // =========================================================================
@@ -437,22 +560,7 @@ pub extern "C" fn grafeo_execute_cypher_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match db
-        .inner
-        .read()
-        .execute_language(query_str, "cypher", params)
-    {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some("cypher"))
 }
 
 /// Execute a Gremlin query with named parameters (JSON object).
@@ -463,22 +571,7 @@ pub extern "C" fn grafeo_execute_gremlin_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match db
-        .inner
-        .read()
-        .execute_language(query_str, "gremlin", params)
-    {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some("gremlin"))
 }
 
 /// Execute a GraphQL query with named parameters (JSON object).
@@ -489,22 +582,7 @@ pub extern "C" fn grafeo_execute_graphql_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match db
-        .inner
-        .read()
-        .execute_language(query_str, "graphql", params)
-    {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some("graphql"))
 }
 
 /// Execute a SPARQL query with named parameters (JSON object).
@@ -515,22 +593,7 @@ pub extern "C" fn grafeo_execute_sparql_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match db
-        .inner
-        .read()
-        .execute_language(query_str, "sparql", params)
-    {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some("sparql"))
 }
 
 /// Execute a SQL/PGQ query with named parameters (JSON object).
@@ -541,18 +604,7 @@ pub extern "C" fn grafeo_execute_sql_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match db.inner.read().execute_language(query_str, "sql", params) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some("sql"))
 }
 
 // =========================================================================
@@ -572,25 +624,10 @@ pub extern "C" fn grafeo_execute_language(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    let db = db_ref_or_null!(db);
-    let Ok(lang_str) = str_from_ptr(language) else {
+    let Ok(language) = str_from_ptr(language) else {
         return std::ptr::null_mut();
     };
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match db
-        .inner
-        .read()
-        .execute_language(query_str, lang_str, params)
-    {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_database(db, query, params_json, std::ptr::null(), Some(language))
 }
 
 // =========================================================================
@@ -766,6 +803,13 @@ pub extern "C" fn grafeo_current_schema(db: *const GrafeoDatabase) -> *const c_c
 
 /// Create a node with labels (JSON array) and optional properties (JSON object).
 /// Returns the new node ID, or `u64::MAX` on error.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_create_node(
     db: *mut GrafeoDatabase,
@@ -792,6 +836,13 @@ pub extern "C" fn grafeo_create_node(
 
 /// Get a node by ID. Writes into `out`. Returns `Ok` or an error status.
 /// On success, `out` must be freed with `grafeo_free_node`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_get_node(
     db: *mut GrafeoDatabase,
@@ -834,6 +885,13 @@ pub extern "C" fn grafeo_get_node(
 }
 
 /// Delete a node by ID. Returns 1 if deleted, 0 if not found.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_delete_node(db: *mut GrafeoDatabase, id: u64) -> i32 {
     if db.is_null() {
@@ -846,6 +904,14 @@ pub extern "C" fn grafeo_delete_node(db: *mut GrafeoDatabase, id: u64) -> i32 {
 }
 
 /// Set a property on a node. `value_json` is a JSON-encoded value.
+/// Returns an error status if the node is missing or the write is rejected.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_set_node_property(
     db: *mut GrafeoDatabase,
@@ -862,13 +928,24 @@ pub extern "C" fn grafeo_set_node_property(
         set_last_error("Invalid JSON value");
         return GrafeoStatus::ErrorSerialization;
     };
-    db.inner
+    match db
+        .inner
         .read()
-        .set_node_property(NodeId::new(id), key_str, value);
-    GrafeoStatus::Ok
+        .set_node_property(NodeId::new(id), key_str, value)
+    {
+        Ok(()) => GrafeoStatus::Ok,
+        Err(error) => set_error(&error),
+    }
 }
 
 /// Remove a property from a node. Returns 1 if removed, 0 if not found.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_remove_node_property(
     db: *mut GrafeoDatabase,
@@ -892,6 +969,13 @@ pub extern "C" fn grafeo_remove_node_property(
 }
 
 /// Add a label to a node. Returns 1 if added, 0 if already present.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_add_node_label(
     db: *mut GrafeoDatabase,
@@ -911,6 +995,13 @@ pub extern "C" fn grafeo_add_node_label(
 }
 
 /// Remove a label from a node. Returns 1 if removed, 0 if not present.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_remove_node_label(
     db: *mut GrafeoDatabase,
@@ -935,6 +1026,13 @@ pub extern "C" fn grafeo_remove_node_label(
 
 /// Get labels for a node as a JSON array string.
 /// Returns null if node not found. Caller must free with `grafeo_free_string`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_get_node_labels(db: *mut GrafeoDatabase, id: u64) -> *mut c_char {
     if db.is_null() {
@@ -997,6 +1095,13 @@ pub extern "C" fn grafeo_node_properties_json(node: *const GrafeoNode) -> *const
 
 /// Create an edge. `properties_json` may be null for no properties.
 /// Returns the new edge ID, or `u64::MAX` on error.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_create_edge(
     db: *mut GrafeoDatabase,
@@ -1028,6 +1133,13 @@ pub extern "C" fn grafeo_create_edge(
 
 /// Get an edge by ID. Writes into `out`. Returns `Ok` or error status.
 /// On success, `out` must be freed with `grafeo_free_edge`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_get_edge(
     db: *mut GrafeoDatabase,
@@ -1066,6 +1178,13 @@ pub extern "C" fn grafeo_get_edge(
 }
 
 /// Delete an edge by ID. Returns 1 if deleted, 0 if not found.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_delete_edge(db: *mut GrafeoDatabase, id: u64) -> i32 {
     if db.is_null() {
@@ -1078,6 +1197,14 @@ pub extern "C" fn grafeo_delete_edge(db: *mut GrafeoDatabase, id: u64) -> i32 {
 }
 
 /// Set a property on an edge.
+/// Returns an error status if the edge is missing or the write is rejected.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_set_edge_property(
     db: *mut GrafeoDatabase,
@@ -1094,13 +1221,24 @@ pub extern "C" fn grafeo_set_edge_property(
         set_last_error("Invalid JSON value");
         return GrafeoStatus::ErrorSerialization;
     };
-    db.inner
+    match db
+        .inner
         .read()
-        .set_edge_property(EdgeId(id), key_str, value);
-    GrafeoStatus::Ok
+        .set_edge_property(EdgeId(id), key_str, value)
+    {
+        Ok(()) => GrafeoStatus::Ok,
+        Err(error) => set_error(&error),
+    }
 }
 
 /// Remove a property from an edge. Returns 1 if removed, 0 if not found.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_remove_edge_property(
     db: *mut GrafeoDatabase,
@@ -1182,40 +1320,14 @@ pub extern "C" fn grafeo_edge_properties_json(edge: *const GrafeoEdge) -> *const
 // Property Indexes
 // =========================================================================
 
-/// Create a property index.
-#[unsafe(no_mangle)]
-pub extern "C" fn grafeo_create_property_index(
-    db: *mut GrafeoDatabase,
-    property: *const c_char,
-) -> GrafeoStatus {
-    let db = db_ref!(db);
-    let prop_str = match str_from_ptr(property) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    db.inner.read().create_property_index(prop_str);
-    GrafeoStatus::Ok
-}
-
-/// Drop a property index. Returns 1 if dropped, 0 if not found.
-#[unsafe(no_mangle)]
-pub extern "C" fn grafeo_drop_property_index(
-    db: *mut GrafeoDatabase,
-    property: *const c_char,
-) -> i32 {
-    if db.is_null() {
-        set_last_error("Null database pointer");
-        return -1;
-    }
-    // SAFETY: Caller guarantees valid pointer.
-    let db = unsafe { &*db };
-    let Ok(prop_str) = str_from_ptr(property) else {
-        return -1;
-    };
-    i32::from(db.inner.read().drop_property_index(prop_str))
-}
-
 /// Check if a property index exists. Returns 1 if exists, 0 otherwise.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_has_property_index(
     db: *mut GrafeoDatabase,
@@ -1234,6 +1346,13 @@ pub extern "C" fn grafeo_has_property_index(
 
 /// Find nodes by property value. Writes node IDs into `out_ids` and count
 /// into `out_count`. Caller must free `*out_ids` with `grafeo_free_node_ids`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_find_nodes_by_property(
     db: *mut GrafeoDatabase,
@@ -1279,7 +1398,11 @@ pub extern "C" fn grafeo_find_nodes_by_property(
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_free_node_ids(ids: *mut u64, count: usize) {
     if !ids.is_null() && count > 0 {
-        // SAFETY: Reconstructs the Vec that was forgotten in find_nodes_by_property.
+        // SAFETY: this memory was allocated as a `Vec<u64>` and shrink_to_fit'd
+        // (so capacity == count), which has the same allocation layout as a
+        // boxed slice of `count` elements — so reconstructing it as `Box<[u64]>`
+        // frees it with the correct layout. (clippy prefers this form when
+        // length == capacity.)
         unsafe {
             let slice = std::ptr::slice_from_raw_parts_mut(ids, count);
             drop(Box::from_raw(slice));
@@ -1290,110 +1413,6 @@ pub extern "C" fn grafeo_free_node_ids(ids: *mut u64, count: usize) {
 // =========================================================================
 // Vector Operations
 // =========================================================================
-
-/// Create a vector similarity index on a node property.
-/// `dimensions`, `m`, and `ef_construction` use -1 for default.
-/// `metric` may be null for default (cosine).
-#[cfg(feature = "vector-index")]
-#[unsafe(no_mangle)]
-pub extern "C" fn grafeo_create_vector_index(
-    db: *mut GrafeoDatabase,
-    label: *const c_char,
-    property: *const c_char,
-    dimensions: i32,
-    metric: *const c_char,
-    m: i32,
-    ef_construction: i32,
-) -> GrafeoStatus {
-    let db = db_ref!(db);
-    let label_str = match str_from_ptr(label) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let prop_str = match str_from_ptr(property) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    // reason: C FFI parameters are i32; the > 0 checks guarantee non-negative before widening to usize
-    #[allow(clippy::cast_sign_loss)]
-    let dims = if dimensions > 0 {
-        Some(dimensions as usize)
-    } else {
-        None
-    };
-    let metric_str = if metric.is_null() {
-        None
-    } else {
-        str_from_ptr(metric).ok()
-    };
-    // reason: value is non-negative by preceding guard check
-    #[allow(clippy::cast_sign_loss)]
-    let m_val = if m > 0 { Some(m as usize) } else { None };
-    // reason: value is non-negative by preceding validation
-    #[allow(clippy::cast_sign_loss)]
-    let ef_val = if ef_construction > 0 {
-        Some(ef_construction as usize)
-    } else {
-        None
-    };
-
-    match db
-        .inner
-        .read()
-        .create_vector_index(label_str, prop_str, dims, metric_str, m_val, ef_val, None)
-    {
-        Ok(()) => GrafeoStatus::Ok,
-        Err(e) => set_error(&e),
-    }
-}
-
-/// Drop a vector index for the given label and property.
-/// Returns 1 if removed, 0 if not found.
-#[cfg(feature = "vector-index")]
-#[unsafe(no_mangle)]
-pub extern "C" fn grafeo_drop_vector_index(
-    db: *mut GrafeoDatabase,
-    label: *const c_char,
-    property: *const c_char,
-) -> i32 {
-    if db.is_null() {
-        set_last_error("Null database pointer");
-        return 0;
-    }
-    // SAFETY: Caller guarantees valid pointer from grafeo_open*.
-    let db = unsafe { &*db };
-    let Ok(label_str) = str_from_ptr(label) else {
-        return 0;
-    };
-    let Ok(prop_str) = str_from_ptr(property) else {
-        return 0;
-    };
-    i32::from(db.inner.read().drop_vector_index(label_str, prop_str))
-}
-
-/// Rebuild a vector index by rescanning all matching nodes.
-/// Preserves original configuration.
-#[cfg(feature = "vector-index")]
-#[unsafe(no_mangle)]
-pub extern "C" fn grafeo_rebuild_vector_index(
-    db: *mut GrafeoDatabase,
-    label: *const c_char,
-    property: *const c_char,
-) -> GrafeoStatus {
-    let db = db_ref!(db);
-    let label_str = match str_from_ptr(label) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let prop_str = match str_from_ptr(property) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    match db.inner.read().rebuild_vector_index(label_str, prop_str) {
-        Ok(()) => GrafeoStatus::Ok,
-        Err(e) => set_error(&e),
-    }
-}
 
 /// Search for k nearest neighbors of a query vector.
 /// Results written to `out_ids` and `out_distances` arrays of length `*out_count`.
@@ -1578,6 +1597,12 @@ pub extern "C" fn grafeo_batch_create_nodes(
         *out_count = 0;
         *out_ids = std::ptr::null_mut();
     }
+    // `chunks(0)` panics, and a panic across the `extern "C"` boundary aborts the
+    // process (Rust 1.81+). Reject a zero dimension with an error instead.
+    if dimensions == 0 {
+        set_last_error("dimensions must be greater than zero");
+        return GrafeoStatus::ErrorQuery;
+    }
     let label_str = match str_from_ptr(label) {
         Ok(s) => s,
         Err(e) => return e,
@@ -1633,6 +1658,13 @@ pub extern "C" fn grafeo_free_vector_results(ids: *mut u64, distances: *mut f32,
 // =========================================================================
 
 /// Get the number of nodes.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_node_count(db: *mut GrafeoDatabase) -> usize {
     if db.is_null() {
@@ -1643,6 +1675,13 @@ pub extern "C" fn grafeo_node_count(db: *mut GrafeoDatabase) -> usize {
 }
 
 /// Get the number of edges.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_edge_count(db: *mut GrafeoDatabase) -> usize {
     if db.is_null() {
@@ -1666,7 +1705,7 @@ pub extern "C" fn grafeo_begin_transaction(db: *mut GrafeoDatabase) -> *mut Graf
     // SAFETY: Caller guarantees valid pointer.
     let db = unsafe { &*db };
     let mut session = db.inner.read().session();
-    match session.begin_transaction() {
+    match crate::types::begin_transaction(&mut session) {
         Ok(()) => Box::into_raw(Box::new(GrafeoTransaction {
             session: parking_lot::Mutex::new(Some(session)),
             committed: false,
@@ -1681,6 +1720,14 @@ pub extern "C" fn grafeo_begin_transaction(db: *mut GrafeoDatabase) -> *mut Graf
 
 /// Begin a transaction with a specific isolation level.
 /// Levels: 0 = ReadCommitted, 1 = SnapshotIsolation, 2 = Serializable.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "triple-store"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_begin_transaction_with_isolation(
     db: *mut GrafeoDatabase,
@@ -1717,37 +1764,25 @@ pub extern "C" fn grafeo_begin_transaction_with_isolation(
     }
 }
 
+/// Execute inside the transaction with bounded result and cancellation options.
+/// Admission failures use the native statement rollback fence.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_transaction_execute_with_options(
+    tx: *mut GrafeoTransaction,
+    query: *const c_char,
+    params_json: *const c_char,
+    options: *const GrafeoQueryOptions,
+) -> *mut GrafeoResult {
+    execute_transaction(tx, query, params_json, options, None)
+}
+
 /// Execute a query within a transaction.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_transaction_execute(
     tx: *mut GrafeoTransaction,
     query: *const c_char,
 ) -> *mut GrafeoResult {
-    if tx.is_null() {
-        set_last_error("Null transaction pointer");
-        return std::ptr::null_mut();
-    }
-    // SAFETY: Caller guarantees valid pointer.
-    let tx = unsafe { &*tx };
-    if tx.committed || tx.rolled_back {
-        set_last_error("Transaction is no longer active");
-        return std::ptr::null_mut();
-    }
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let guard = tx.session.lock();
-    let Some(session) = guard.as_ref() else {
-        set_last_error("Transaction is no longer active");
-        return std::ptr::null_mut();
-    };
-    match session.execute(query_str) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_transaction(tx, query, std::ptr::null(), std::ptr::null(), Some("gql"))
 }
 
 /// Execute a query with params within a transaction.
@@ -1757,36 +1792,7 @@ pub extern "C" fn grafeo_transaction_execute_with_params(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    if tx.is_null() {
-        set_last_error("Null transaction pointer");
-        return std::ptr::null_mut();
-    }
-    // SAFETY: Caller guarantees valid pointer.
-    let tx = unsafe { &*tx };
-    if tx.committed || tx.rolled_back {
-        set_last_error("Transaction is no longer active");
-        return std::ptr::null_mut();
-    }
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let guard = tx.session.lock();
-    let Some(session) = guard.as_ref() else {
-        set_last_error("Transaction is no longer active");
-        return std::ptr::null_mut();
-    };
-    let result = if let Some(params) = crate::types::parse_params(params_json) {
-        session.execute_with_params(query_str, params)
-    } else {
-        session.execute(query_str)
-    };
-    match result {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_transaction(tx, query, params_json, std::ptr::null(), Some("gql"))
 }
 
 /// Execute a query in the given language within a transaction.
@@ -1800,40 +1806,24 @@ pub extern "C" fn grafeo_transaction_execute_language(
     query: *const c_char,
     params_json: *const c_char,
 ) -> *mut GrafeoResult {
-    if tx.is_null() {
-        set_last_error("Null transaction pointer");
-        return std::ptr::null_mut();
-    }
-    // SAFETY: Caller guarantees valid pointer.
-    let tx = unsafe { &*tx };
-    if tx.committed || tx.rolled_back {
-        set_last_error("Transaction is no longer active");
-        return std::ptr::null_mut();
-    }
-    let Ok(lang_str) = str_from_ptr(language) else {
+    let Ok(language) = str_from_ptr(language) else {
         return std::ptr::null_mut();
     };
-    let Ok(query_str) = str_from_ptr(query) else {
-        return std::ptr::null_mut();
-    };
-    let guard = tx.session.lock();
-    let Some(session) = guard.as_ref() else {
-        set_last_error("Transaction is no longer active");
-        return std::ptr::null_mut();
-    };
-    let params = crate::types::parse_params(params_json);
-    match session.execute_language(query_str, lang_str, params) {
-        Ok(r) => build_result(&r),
-        Err(e) => {
-            set_error(&e);
-            std::ptr::null_mut()
-        }
-    }
+    execute_transaction(tx, query, params_json, std::ptr::null(), Some(language))
 }
 
 /// Commit a transaction.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_commit(tx: *mut GrafeoTransaction) -> GrafeoStatus {
+    grafeo_commit_epoch(tx, std::ptr::null_mut())
+}
+
+/// Commit a transaction and write the assigned epoch to `out_epoch` (nullable).
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_commit_epoch(
+    tx: *mut GrafeoTransaction,
+    out_epoch: *mut u64,
+) -> GrafeoStatus {
     if tx.is_null() {
         set_last_error("Null transaction pointer");
         return GrafeoStatus::ErrorNullPointer;
@@ -1850,9 +1840,13 @@ pub extern "C" fn grafeo_commit(tx: *mut GrafeoTransaction) -> GrafeoStatus {
     }
     let mut guard = tx.session.lock();
     if let Some(ref mut session) = *guard {
-        match session.commit() {
-            Ok(()) => {
+        match crate::types::commit_transaction(session) {
+            Ok(epoch) => {
                 tx.committed = true;
+                if !out_epoch.is_null() {
+                    // SAFETY: caller-owned out pointer.
+                    unsafe { *out_epoch = epoch.as_u64() };
+                }
                 GrafeoStatus::Ok
             }
             Err(e) => set_error(&e),
@@ -1860,6 +1854,52 @@ pub extern "C" fn grafeo_commit(tx: *mut GrafeoTransaction) -> GrafeoStatus {
     } else {
         set_last_error("Transaction is no longer active");
         GrafeoStatus::ErrorTransaction
+    }
+}
+
+/// Create a node inside an open transaction (parser-free LPG mutation).
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_transaction_create_node(
+    tx: *mut GrafeoTransaction,
+    labels_json: *const c_char,
+    properties_json: *const c_char,
+) -> u64 {
+    if tx.is_null() {
+        set_last_error("Null transaction pointer");
+        return u64::MAX;
+    }
+    // SAFETY: Caller guarantees valid pointer.
+    let tx = unsafe { &*tx };
+    if tx.committed || tx.rolled_back {
+        set_last_error("Transaction is no longer active");
+        return u64::MAX;
+    }
+    let labels = crate::types::parse_labels(labels_json).unwrap_or_default();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let guard = tx.session.lock();
+    let Some(session) = guard.as_ref() else {
+        set_last_error("Transaction is no longer active");
+        return u64::MAX;
+    };
+    if let Some(props) = crate::types::parse_properties(properties_json) {
+        let pairs: Vec<(&str, grafeo_common::types::Value)> =
+            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        match session.create_node_with_props(&label_refs, pairs) {
+            Ok(id) => id.as_u64(),
+            Err(e) => {
+                set_error(&e);
+                u64::MAX
+            }
+        }
+    } else {
+        session.create_node(&label_refs).as_u64()
     }
 }
 
@@ -1882,7 +1922,7 @@ pub extern "C" fn grafeo_rollback(tx: *mut GrafeoTransaction) -> GrafeoStatus {
     }
     let mut guard = tx.session.lock();
     if let Some(ref mut session) = *guard {
-        match session.rollback() {
+        match crate::types::rollback_transaction(session) {
             Ok(()) => {
                 tx.rolled_back = true;
                 GrafeoStatus::Ok
@@ -1901,6 +1941,364 @@ pub extern "C" fn grafeo_free_transaction(tx: *mut GrafeoTransaction) {
     if !tx.is_null() {
         // SAFETY: We take ownership back. Drop impl handles auto-rollback.
         unsafe { drop(Box::from_raw(tx)) };
+    }
+}
+
+// =========================================================================
+// RDF quads (N-Triples term strings)
+// =========================================================================
+
+#[cfg(not(feature = "triple-store"))]
+const RDF_FEATURE_REQUIRED: &str =
+    "RDF quad API requires the triple-store feature (native or rdf profile)";
+
+#[cfg(feature = "triple-store")]
+fn parse_rdf_term(s: &str) -> Option<grafeo_engine::Term> {
+    let s = s.trim();
+    grafeo_engine::Term::from_ntriples(s).or_else(|| {
+        if s.is_empty() || s.starts_with('"') || s.starts_with("_:") || s.starts_with('<') {
+            None
+        } else {
+            Some(grafeo_engine::Term::iri(s))
+        }
+    })
+}
+
+#[cfg(feature = "triple-store")]
+fn parse_rdf_subject(s: &str) -> Option<grafeo_engine::Term> {
+    let t = parse_rdf_term(s)?;
+    (t.is_iri() || t.is_blank_node()).then_some(t)
+}
+
+#[cfg(feature = "triple-store")]
+fn parse_rdf_predicate(s: &str) -> Option<grafeo_engine::Term> {
+    let t = parse_rdf_term(s)?;
+    t.is_iri().then_some(t)
+}
+
+#[cfg(feature = "triple-store")]
+fn parse_rdf_quad(
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    graph: *const c_char,
+) -> Result<grafeo_engine::Quad, GrafeoStatus> {
+    let Ok(s) = str_from_ptr(subject) else {
+        return Err(GrafeoStatus::ErrorInvalidUtf8);
+    };
+    let Ok(p) = str_from_ptr(predicate) else {
+        return Err(GrafeoStatus::ErrorInvalidUtf8);
+    };
+    let Ok(o) = str_from_ptr(object) else {
+        return Err(GrafeoStatus::ErrorInvalidUtf8);
+    };
+    let Some(subject) = parse_rdf_subject(s) else {
+        set_last_error("Invalid RDF subject (IRI or blank node)");
+        return Err(GrafeoStatus::ErrorQuery);
+    };
+    let Some(predicate) = parse_rdf_predicate(p) else {
+        set_last_error("Invalid RDF predicate (IRI)");
+        return Err(GrafeoStatus::ErrorQuery);
+    };
+    let Some(object) = parse_rdf_term(o) else {
+        set_last_error("Invalid RDF object (N-Triples term)");
+        return Err(GrafeoStatus::ErrorQuery);
+    };
+    let triple = grafeo_engine::Triple::new(subject, predicate, object);
+    if graph.is_null() {
+        return Ok(grafeo_engine::Quad::new(triple));
+    }
+    let Ok(g) = str_from_ptr(graph) else {
+        return Err(GrafeoStatus::ErrorInvalidUtf8);
+    };
+    if g.is_empty() {
+        return Ok(grafeo_engine::Quad::new(triple));
+    }
+    let iri = g
+        .strip_prefix('<')
+        .and_then(|inner| inner.strip_suffix('>'))
+        .unwrap_or(g);
+    Ok(grafeo_engine::Quad::named(triple, iri))
+}
+
+/// Insert one RDF quad. `graph` may be NULL (default graph).
+/// Terms are N-Triples (`<iri>`, `"lex"`, `"lex"^^<dt>`, `"lex"@lang`) or bare IRIs.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_insert_rdf_quad(
+    db: *mut GrafeoDatabase,
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    graph: *const c_char,
+) -> GrafeoStatus {
+    let db = db_ref!(db);
+    #[cfg(not(feature = "triple-store"))]
+    {
+        let _ = (subject, predicate, object, graph, db);
+        set_last_error(RDF_FEATURE_REQUIRED);
+        GrafeoStatus::ErrorDatabase
+    }
+    #[cfg(feature = "triple-store")]
+    {
+        let quad = match parse_rdf_quad(subject, predicate, object, graph) {
+            Ok(q) => q,
+            Err(status) => return status,
+        };
+        match db.inner.read().insert_rdf_quads([quad]) {
+            Ok(_) => GrafeoStatus::Ok,
+            Err(e) => set_error(&e),
+        }
+    }
+}
+
+#[cfg(feature = "triple-store")]
+fn parse_rdf_quads_c(
+    subjects: *const *const c_char,
+    predicates: *const *const c_char,
+    objects: *const *const c_char,
+    graphs: *const *const c_char,
+    count: usize,
+) -> Result<Vec<grafeo_engine::Quad>, GrafeoStatus> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if subjects.is_null() || predicates.is_null() || objects.is_null() {
+        set_last_error("Null RDF term array");
+        return Err(GrafeoStatus::ErrorNullPointer);
+    }
+    let mut quads = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: caller supplies `count` parallel C-string arrays.
+        let subject = unsafe { *subjects.add(i) };
+        let predicate = unsafe { *predicates.add(i) };
+        let object = unsafe { *objects.add(i) };
+        let graph = if graphs.is_null() {
+            std::ptr::null()
+        } else {
+            unsafe { *graphs.add(i) }
+        };
+        quads.push(parse_rdf_quad(subject, predicate, object, graph)?);
+    }
+    Ok(quads)
+}
+
+/// Bulk-insert RDF quads. `graphs` may be NULL (all default graph).
+/// `out_inserted` and `out_epoch` may be NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_insert_rdf_quads(
+    db: *mut GrafeoDatabase,
+    subjects: *const *const c_char,
+    predicates: *const *const c_char,
+    objects: *const *const c_char,
+    graphs: *const *const c_char,
+    count: usize,
+    out_inserted: *mut usize,
+    out_epoch: *mut u64,
+) -> GrafeoStatus {
+    let db = db_ref!(db);
+    #[cfg(not(feature = "triple-store"))]
+    {
+        let _ = (
+            subjects,
+            predicates,
+            objects,
+            graphs,
+            count,
+            out_inserted,
+            out_epoch,
+            db,
+        );
+        set_last_error(RDF_FEATURE_REQUIRED);
+        GrafeoStatus::ErrorDatabase
+    }
+    #[cfg(feature = "triple-store")]
+    {
+        let quads = match parse_rdf_quads_c(subjects, predicates, objects, graphs, count) {
+            Ok(q) => q,
+            Err(status) => return status,
+        };
+        match db.inner.read().insert_rdf_quads(quads) {
+            Ok((n, epoch)) => {
+                if !out_inserted.is_null() {
+                    unsafe { *out_inserted = n };
+                }
+                if !out_epoch.is_null() {
+                    unsafe { *out_epoch = epoch.as_u64() };
+                }
+                GrafeoStatus::Ok
+            }
+            Err(e) => set_error(&e),
+        }
+    }
+}
+
+/// Exact typed-quad membership. `graph` may be NULL (default graph).
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_contains_rdf_quad(
+    db: *mut GrafeoDatabase,
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    graph: *const c_char,
+) -> bool {
+    if db.is_null() {
+        set_last_error("Null database pointer");
+        return false;
+    }
+    #[cfg(not(feature = "triple-store"))]
+    {
+        let _ = (subject, predicate, object, graph);
+        set_last_error(RDF_FEATURE_REQUIRED);
+        false
+    }
+    #[cfg(feature = "triple-store")]
+    {
+        let db = unsafe { &*db };
+        let Ok(quad) = parse_rdf_quad(subject, predicate, object, graph) else {
+            return false;
+        };
+        match db.inner.read().try_contains_rdf_quad(&quad) {
+            Ok(found) => found,
+            Err(error) => {
+                set_last_error(&error.to_string());
+                false
+            }
+        }
+    }
+}
+
+/// Insert one RDF quad in an open transaction.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_transaction_insert_rdf_quad(
+    tx: *mut GrafeoTransaction,
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    graph: *const c_char,
+) -> GrafeoStatus {
+    if tx.is_null() {
+        set_last_error("Null transaction pointer");
+        return GrafeoStatus::ErrorNullPointer;
+    }
+    #[cfg(not(feature = "triple-store"))]
+    {
+        let _ = (subject, predicate, object, graph);
+        set_last_error(RDF_FEATURE_REQUIRED);
+        GrafeoStatus::ErrorDatabase
+    }
+    #[cfg(feature = "triple-store")]
+    {
+        let tx = unsafe { &*tx };
+        if tx.committed || tx.rolled_back {
+            set_last_error("Transaction is no longer active");
+            return GrafeoStatus::ErrorTransaction;
+        }
+        let quad = match parse_rdf_quad(subject, predicate, object, graph) {
+            Ok(q) => q,
+            Err(status) => return status,
+        };
+        let guard = tx.session.lock();
+        let Some(session) = guard.as_ref() else {
+            set_last_error("Transaction is no longer active");
+            return GrafeoStatus::ErrorTransaction;
+        };
+        match session.insert_rdf_quads([quad]) {
+            Ok(_) => GrafeoStatus::Ok,
+            Err(e) => set_error(&e),
+        }
+    }
+}
+
+/// Bulk-insert RDF quads in an open transaction. `graphs` may be NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_transaction_insert_rdf_quads(
+    tx: *mut GrafeoTransaction,
+    subjects: *const *const c_char,
+    predicates: *const *const c_char,
+    objects: *const *const c_char,
+    graphs: *const *const c_char,
+    count: usize,
+    out_inserted: *mut usize,
+) -> GrafeoStatus {
+    if tx.is_null() {
+        set_last_error("Null transaction pointer");
+        return GrafeoStatus::ErrorNullPointer;
+    }
+    #[cfg(not(feature = "triple-store"))]
+    {
+        let _ = (subjects, predicates, objects, graphs, count, out_inserted);
+        set_last_error(RDF_FEATURE_REQUIRED);
+        GrafeoStatus::ErrorDatabase
+    }
+    #[cfg(feature = "triple-store")]
+    {
+        let tx = unsafe { &*tx };
+        if tx.committed || tx.rolled_back {
+            set_last_error("Transaction is no longer active");
+            return GrafeoStatus::ErrorTransaction;
+        }
+        let quads = match parse_rdf_quads_c(subjects, predicates, objects, graphs, count) {
+            Ok(q) => q,
+            Err(status) => return status,
+        };
+        let guard = tx.session.lock();
+        let Some(session) = guard.as_ref() else {
+            set_last_error("Transaction is no longer active");
+            return GrafeoStatus::ErrorTransaction;
+        };
+        match session.insert_rdf_quads(quads) {
+            Ok(n) => {
+                if !out_inserted.is_null() {
+                    unsafe { *out_inserted = n };
+                }
+                GrafeoStatus::Ok
+            }
+            Err(e) => set_error(&e),
+        }
+    }
+}
+
+/// Exact typed-quad membership in an open transaction (includes pending writes).
+#[unsafe(no_mangle)]
+pub extern "C" fn grafeo_transaction_contains_rdf_quad(
+    tx: *mut GrafeoTransaction,
+    subject: *const c_char,
+    predicate: *const c_char,
+    object: *const c_char,
+    graph: *const c_char,
+) -> bool {
+    if tx.is_null() {
+        set_last_error("Null transaction pointer");
+        return false;
+    }
+    #[cfg(not(feature = "triple-store"))]
+    {
+        let _ = (subject, predicate, object, graph);
+        set_last_error(RDF_FEATURE_REQUIRED);
+        false
+    }
+    #[cfg(feature = "triple-store")]
+    {
+        let tx = unsafe { &*tx };
+        if tx.committed || tx.rolled_back {
+            set_last_error("Transaction is no longer active");
+            return false;
+        }
+        let Ok(quad) = parse_rdf_quad(subject, predicate, object, graph) else {
+            return false;
+        };
+        let guard = tx.session.lock();
+        let Some(session) = guard.as_ref() else {
+            set_last_error("Transaction is no longer active");
+            return false;
+        };
+        match session.try_contains_rdf_quad(&quad) {
+            Ok(found) => found,
+            Err(error) => {
+                set_last_error(&error.to_string());
+                false
+            }
+        }
     }
 }
 
@@ -1950,13 +2348,27 @@ pub extern "C" fn grafeo_save(db: *mut GrafeoDatabase, path: *const c_char) -> G
         Ok(s) => s,
         Err(e) => return e,
     };
+    #[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
     match db.inner.read().save(path_str) {
         Ok(()) => GrafeoStatus::Ok,
         Err(e) => set_error(&e),
     }
+    #[cfg(not(any(feature = "storage", feature = "embedded", feature = "native")))]
+    {
+        let _ = (db, path_str);
+        set_last_error("File persistence requires storage or the embedded/native profile");
+        GrafeoStatus::ErrorStorage
+    }
 }
 
 /// Create a full backup of the database.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_backup_full(
     db: *mut GrafeoDatabase,
@@ -1967,13 +2379,27 @@ pub extern "C" fn grafeo_backup_full(
         Ok(s) => s,
         Err(e) => return e,
     };
+    #[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
     match db.inner.read().backup_full(std::path::Path::new(dir)) {
         Ok(_) => GrafeoStatus::Ok,
         Err(e) => set_error(&e),
     }
+    #[cfg(not(any(feature = "storage", feature = "embedded", feature = "native")))]
+    {
+        let _ = (db, dir);
+        set_last_error("File persistence requires storage or the embedded/native profile");
+        GrafeoStatus::ErrorStorage
+    }
 }
 
 /// Create an incremental backup (WAL records since last backup).
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_backup_incremental(
     db: *mut GrafeoDatabase,
@@ -1984,6 +2410,7 @@ pub extern "C" fn grafeo_backup_incremental(
         Ok(s) => s,
         Err(e) => return e,
     };
+    #[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
     match db
         .inner
         .read()
@@ -1991,6 +2418,12 @@ pub extern "C" fn grafeo_backup_incremental(
     {
         Ok(_) => GrafeoStatus::Ok,
         Err(e) => set_error(&e),
+    }
+    #[cfg(not(any(feature = "storage", feature = "embedded", feature = "native")))]
+    {
+        let _ = (db, dir);
+        set_last_error("File persistence requires storage or the embedded/native profile");
+        GrafeoStatus::ErrorStorage
     }
 }
 
@@ -2009,6 +2442,7 @@ pub extern "C" fn grafeo_restore_to_epoch(
         Ok(s) => s,
         Err(e) => return e,
     };
+    #[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
     match grafeo_engine::GrafeoDB::restore_to_epoch(
         std::path::Path::new(dir),
         grafeo_common::types::EpochId::new(epoch),
@@ -2016,6 +2450,12 @@ pub extern "C" fn grafeo_restore_to_epoch(
     ) {
         Ok(()) => GrafeoStatus::Ok,
         Err(e) => set_error(&e),
+    }
+    #[cfg(not(any(feature = "storage", feature = "embedded", feature = "native")))]
+    {
+        let _ = (dir, epoch, out);
+        set_last_error("File persistence requires storage or the embedded/native profile");
+        GrafeoStatus::ErrorStorage
     }
 }
 
@@ -2033,11 +2473,11 @@ pub extern "C" fn grafeo_wal_checkpoint(db: *mut GrafeoDatabase) -> GrafeoStatus
 // CompactStore
 // =========================================================================
 
-/// Converts the database to a read-only CompactStore for faster queries.
+/// Folds retained committed LPG history into a columnar base with a writable overlay.
 ///
-/// Takes a snapshot of all nodes and edges, builds a columnar store with
-/// CSR adjacency, and switches to read-only mode. After this call, write
-/// operations will fail.
+/// Call again to fold later overlay writes. Requires no active transactions
+/// or live Sessions. Failure returns a non-OK status and sets the last error.
+/// This is not a durability checkpoint or a history-retention lease.
 #[cfg(feature = "compact-store")]
 #[unsafe(no_mangle)]
 pub extern "C" fn grafeo_compact(db: *mut GrafeoDatabase) -> GrafeoStatus {
@@ -2185,6 +2625,235 @@ mod tests {
     use std::ffi::CString;
 
     #[test]
+    #[cfg(feature = "gql")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn bounded_eager_language_params_and_invalid_params_control_reuse() {
+        use crate::execution::{grafeo_query_control_create, grafeo_query_control_free};
+        let db = grafeo_open_memory();
+        let params = c"{\"number\":42,\"nested\":[\"unicode \\u03bb\",null,{\"yes\":true}]}";
+        let query = c"RETURN $number AS number, $nested AS nested";
+        for result in [
+            grafeo_execute_with_params(db, query.as_ptr(), params.as_ptr()),
+            grafeo_execute_language(db, c"gql".as_ptr(), query.as_ptr(), params.as_ptr()),
+        ] {
+            assert!(!result.is_null());
+            let rows: serde_json::Value =
+                serde_json::from_str(str_from_ptr(grafeo_result_json(result)).unwrap()).unwrap();
+            assert_eq!(
+                rows,
+                serde_json::json!([{"number":42,"nested":["unicode λ",null,{"yes":true}]}])
+            );
+            assert_eq!(grafeo_result_row_count(result), 1);
+            grafeo_free_result(result);
+        }
+        let control = grafeo_query_control_create(-1);
+        let options = GrafeoQueryOptions {
+            control,
+            max_rows: 1,
+            max_bytes: 64 * 1024,
+            language: c"gql".as_ptr(),
+        };
+        assert!(
+            grafeo_execute_with_options(db, query.as_ptr(), c"[]".as_ptr(), &raw const options)
+                .is_null()
+        );
+        let result =
+            grafeo_execute_with_options(db, query.as_ptr(), params.as_ptr(), &raw const options);
+        assert!(
+            !result.is_null(),
+            "invalid params must not consume the execution owner"
+        );
+        grafeo_free_result(result);
+        // SAFETY: test owns this live control allocation exactly once.
+        unsafe {
+            grafeo_query_control_free(control);
+        }
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "gql",
+        any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native"
+        )
+    ))]
+    fn bounded_eager_copy_denial_rolls_back_mutation_and_fresh_control_succeeds() {
+        use crate::execution::{grafeo_query_control_create, grafeo_query_control_free};
+        use grafeo_common::types::Value;
+        use grafeo_engine::query::{ExecutionOptions, ResultLimits};
+        let payload = "λ".repeat(128);
+        let native = GrafeoDB::new_in_memory()
+            .execute_with_options(
+                "RETURN $payload AS payload",
+                std::collections::HashMap::from([(
+                    "payload".to_owned(),
+                    Value::from(payload.clone()),
+                )]),
+                ExecutionOptions {
+                    result_limits: Some(ResultLimits {
+                        max_rows: 1,
+                        max_bytes: 4096,
+                    }),
+                    language: Some("gql".into()),
+                    ..ExecutionOptions::default()
+                },
+            )
+            .expect("fixture fits the native result cap");
+        assert!(
+            crate::execution::preflight_c_result(&native, 4096).is_err(),
+            "C copying is the rejecting boundary"
+        );
+        let params = CString::new(serde_json::json!({"payload":payload}).to_string()).unwrap();
+        let query = c"INSERT (n:CopyBudgetProbe {payload: $payload}) RETURN n.payload AS payload";
+        let db = grafeo_open_memory();
+        let denied = grafeo_query_control_create(-1);
+        let options = GrafeoQueryOptions {
+            control: denied,
+            max_rows: 1,
+            max_bytes: 4096,
+            language: c"gql".as_ptr(),
+        };
+        assert!(
+            grafeo_execute_with_options(db, query.as_ptr(), params.as_ptr(), &raw const options)
+                .is_null()
+        );
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error_code()),
+            Ok("GRAFEO-S001")
+        );
+        assert_eq!(
+            grafeo_node_count(db),
+            0,
+            "copied-result denial must precede commit"
+        );
+        // SAFETY: test owns this live control allocation exactly once.
+        unsafe {
+            grafeo_query_control_free(denied);
+        }
+        let fresh = grafeo_query_control_create(-1);
+        let larger = GrafeoQueryOptions {
+            control: fresh,
+            max_bytes: 64 * 1024,
+            ..options
+        };
+        let result =
+            grafeo_execute_with_options(db, query.as_ptr(), params.as_ptr(), &raw const larger);
+        assert!(!result.is_null());
+        assert_eq!(grafeo_result_row_count(result), 1);
+        assert_eq!(grafeo_node_count(db), 1);
+        grafeo_free_result(result);
+        // SAFETY: test owns this live control allocation exactly once.
+        unsafe {
+            grafeo_query_control_free(fresh);
+        }
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "gql",
+        any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native"
+        )
+    ))]
+    fn bounded_transaction_copy_denial_restores_statement_and_allows_fresh_control() {
+        use crate::execution::{grafeo_query_control_create, grafeo_query_control_free};
+        let db = grafeo_open_memory();
+        let tx = grafeo_begin_transaction(db);
+        assert!(!tx.is_null());
+        let params =
+            CString::new(serde_json::json!({"payload":"x".repeat(256)}).to_string()).unwrap();
+        let query = c"INSERT (n:TxCopyProbe {payload: $payload}) RETURN n.payload AS payload";
+        let denied = grafeo_query_control_create(-1);
+        let options = GrafeoQueryOptions {
+            control: denied,
+            max_rows: 1,
+            max_bytes: 4096,
+            language: c"gql".as_ptr(),
+        };
+        assert!(
+            grafeo_transaction_execute_with_options(
+                tx,
+                query.as_ptr(),
+                params.as_ptr(),
+                &raw const options
+            )
+            .is_null()
+        );
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error_code()),
+            Ok("GRAFEO-S001")
+        );
+        let count = grafeo_transaction_execute_language(
+            tx,
+            c"gql".as_ptr(),
+            c"MATCH (n:TxCopyProbe) RETURN count(n) AS count".as_ptr(),
+            std::ptr::null(),
+        );
+        assert!(!count.is_null());
+        assert_eq!(
+            str_from_ptr(grafeo_result_json(count)),
+            Ok("[{\"count\":0}]")
+        );
+        grafeo_free_result(count);
+        // SAFETY: test owns this live control allocation exactly once.
+        unsafe {
+            grafeo_query_control_free(denied);
+        }
+        let fresh = grafeo_query_control_create(-1);
+        let larger = GrafeoQueryOptions {
+            control: fresh,
+            max_bytes: 64 * 1024,
+            ..options
+        };
+        let result = grafeo_transaction_execute_with_options(
+            tx,
+            query.as_ptr(),
+            params.as_ptr(),
+            &raw const larger,
+        );
+        assert!(!result.is_null());
+        grafeo_free_result(result);
+        // SAFETY: test owns this live control allocation exactly once.
+        unsafe {
+            grafeo_query_control_free(fresh);
+        }
+        assert_eq!(grafeo_rollback(tx), GrafeoStatus::Ok);
+        grafeo_free_transaction(tx);
+        assert_eq!(
+            grafeo_node_count(db),
+            0,
+            "explicit rollback must discard the successful retry"
+        );
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_open_memory_and_close() {
         let db = grafeo_open_memory();
         assert!(!db.is_null());
@@ -2196,6 +2865,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_create_node_and_get() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["Person"]"#).unwrap();
@@ -2219,6 +2895,143 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn test_parser_free_transaction_commit_rollback_and_isolation() {
+        let db = grafeo_open_memory();
+        assert!(!db.is_null());
+        assert!(grafeo_begin_transaction_with_isolation(db, 3).is_null());
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error()),
+            Ok("Invalid isolation level (expected 0, 1, or 2)")
+        );
+
+        for isolation in 0..=2 {
+            let tx = grafeo_begin_transaction_with_isolation(db, isolation);
+            assert!(!tx.is_null());
+            let node = grafeo_transaction_create_node(
+                tx,
+                c"[\"Native\"]".as_ptr(),
+                c"{\"name\":\"committed\"}".as_ptr(),
+            );
+            assert_ne!(node, u64::MAX);
+            let mut epoch = 0;
+            assert_eq!(grafeo_commit_epoch(tx, &raw mut epoch), GrafeoStatus::Ok);
+            assert!(epoch > 0);
+            grafeo_free_transaction(tx);
+            let mut visible = std::ptr::null_mut();
+            assert_eq!(
+                grafeo_get_node(db, node, &raw mut visible),
+                GrafeoStatus::Ok
+            );
+            assert!(!visible.is_null());
+            assert_eq!(
+                str_from_ptr(grafeo_node_properties_json(visible)),
+                Ok("{\"name\":\"committed\"}")
+            );
+            grafeo_free_node(visible);
+
+            let tx = grafeo_begin_transaction_with_isolation(db, isolation);
+            assert!(!tx.is_null());
+            let rolled_back = grafeo_transaction_create_node(
+                tx,
+                c"[\"Native\"]".as_ptr(),
+                c"{\"name\":\"rolled back\"}".as_ptr(),
+            );
+            assert_ne!(rolled_back, u64::MAX);
+            assert_eq!(grafeo_rollback(tx), GrafeoStatus::Ok);
+            grafeo_free_transaction(tx);
+            assert_eq!(
+                grafeo_get_node(db, rolled_back, &raw mut visible),
+                GrafeoStatus::ErrorDatabase
+            );
+            assert!(visible.is_null());
+        }
+        assert_eq!(grafeo_node_count(db), 3);
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[cfg(not(feature = "gql"))]
+    #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn test_parser_free_profile_rejects_query_without_mutation() {
+        let db = grafeo_open_memory();
+        assert!(!db.is_null());
+        assert!(grafeo_execute(db, c"CREATE (:Unexpected)".as_ptr()).is_null());
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error_code()),
+            Ok("GRAFEO-Q002")
+        );
+        assert_eq!(grafeo_node_count(db), 0);
+        let tx = grafeo_begin_transaction(db);
+        assert!(!tx.is_null());
+        assert!(grafeo_transaction_execute(tx, c"CREATE (:Unexpected)".as_ptr()).is_null());
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error_code()),
+            Ok("GRAFEO-Q002")
+        );
+        assert_eq!(grafeo_rollback(tx), GrafeoStatus::Ok);
+        grafeo_free_transaction(tx);
+        assert_eq!(grafeo_node_count(db), 0);
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[cfg(not(any(feature = "storage", feature = "embedded", feature = "native")))]
+    #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn test_memory_only_file_operations_reject_without_output_or_mutation() {
+        let db = grafeo_open_memory();
+        assert!(!db.is_null());
+        let node = grafeo_create_node(db, c"[\"Kept\"]".as_ptr(), std::ptr::null());
+        assert_ne!(node, u64::MAX);
+        let path = std::env::temp_dir().join(format!("grafeo-c-no-storage-{}", std::process::id()));
+        assert!(!path.exists());
+        let output = CString::new(path.to_str().unwrap()).unwrap();
+        for status in [
+            grafeo_save(db, output.as_ptr()),
+            grafeo_backup_full(db, output.as_ptr()),
+            grafeo_backup_incremental(db, output.as_ptr()),
+            grafeo_restore_to_epoch(output.as_ptr(), 1, output.as_ptr()),
+        ] {
+            assert_eq!(status, GrafeoStatus::ErrorStorage);
+        }
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error()),
+            Ok("File persistence requires storage or the embedded/native profile")
+        );
+        assert!(!path.exists());
+        assert_eq!(grafeo_node_count(db), 1);
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_create_edge_and_get() {
         let db = grafeo_open_memory();
         let labels_a = CString::new(r#"["Person"]"#).unwrap();
@@ -2247,6 +3060,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gql")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_execute_query() {
         let db = grafeo_open_memory();
         let create = CString::new("CREATE (:Person {name: 'Alix', age: 30})").unwrap();
@@ -2275,6 +3096,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_null_pointer_safety() {
         // All functions should handle null gracefully.
         let result = grafeo_execute(std::ptr::null_mut(), std::ptr::null());
@@ -2289,6 +3117,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gql")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_transaction_commit() {
         let db = grafeo_open_memory();
         let tx = grafeo_begin_transaction(db);
@@ -2312,6 +3148,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gql")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_transaction_rollback() {
         let db = grafeo_open_memory();
 
@@ -2339,6 +3183,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_node_property_crud() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["Person"]"#).unwrap();
@@ -2357,6 +3208,61 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn test_property_setters_reject_missing_entities() {
+        let db = grafeo_open_memory();
+        assert!(!db.is_null());
+        let labels = CString::new(r#"["N"]"#).unwrap();
+        let node = grafeo_create_node(db, labels.as_ptr(), std::ptr::null());
+        let other = grafeo_create_node(db, labels.as_ptr(), std::ptr::null());
+        let edge_type = CString::new("R").unwrap();
+        let edge = grafeo_create_edge(db, node, other, edge_type.as_ptr(), std::ptr::null());
+        assert_ne!(node, u64::MAX);
+        assert_ne!(other, u64::MAX);
+        assert_ne!(edge, u64::MAX);
+        let key = CString::new("score").unwrap();
+        let value = CString::new("42").unwrap();
+
+        assert_eq!(
+            grafeo_set_node_property(db, 99_999, key.as_ptr(), value.as_ptr()),
+            GrafeoStatus::ErrorDatabase
+        );
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error()),
+            Ok("GRAFEO-V002: Node not found: 99999")
+        );
+        assert_eq!(
+            grafeo_set_edge_property(db, 99_999, key.as_ptr(), value.as_ptr()),
+            GrafeoStatus::ErrorDatabase
+        );
+        assert_eq!(
+            str_from_ptr(crate::error::grafeo_last_error()),
+            Ok("GRAFEO-V003: Edge not found: 99999")
+        );
+        assert_eq!(grafeo_node_count(db), 2);
+        assert_eq!(grafeo_edge_count(db), 1);
+
+        assert_eq!(
+            grafeo_set_node_property(db, node, key.as_ptr(), value.as_ptr()),
+            GrafeoStatus::Ok
+        );
+        assert_eq!(
+            grafeo_set_edge_property(db, edge, key.as_ptr(), value.as_ptr()),
+            GrafeoStatus::Ok
+        );
+        assert_eq!(grafeo_remove_node_property(db, node, key.as_ptr()), 1);
+        assert_eq!(grafeo_remove_edge_property(db, edge, key.as_ptr()), 1);
+        assert_eq!(grafeo_close(db), GrafeoStatus::Ok);
+        grafeo_free_database(db);
+    }
+
+    #[test]
     fn test_version() {
         let v = grafeo_version();
         assert!(!v.is_null());
@@ -2368,6 +3274,13 @@ mod tests {
     // ── Edge property CRUD ──
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_edge_property_crud() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["N"]"#).unwrap();
@@ -2399,6 +3312,13 @@ mod tests {
     // ── Delete operations ──
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_delete_node_and_edge() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["N"]"#).unwrap();
@@ -2429,6 +3349,13 @@ mod tests {
     // ── Label operations ──
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_label_operations() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["Person"]"#).unwrap();
@@ -2462,6 +3389,14 @@ mod tests {
     // ── Execute with parameters ──
 
     #[test]
+    #[cfg(feature = "gql")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_execute_with_params() {
         let db = grafeo_open_memory();
 
@@ -2487,6 +3422,13 @@ mod tests {
     // ── Property index operations ──
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_property_index_lifecycle() {
         let db = grafeo_open_memory();
         let prop = CString::new("name").unwrap();
@@ -2495,7 +3437,15 @@ mod tests {
         assert_eq!(grafeo_has_property_index(db, prop.as_ptr()), 0);
 
         // Create index
-        let status = grafeo_create_property_index(db, prop.as_ptr());
+        let request = crate::index::GrafeoIndexRequest {
+            property: crate::index::GrafeoUtf8 {
+                data: b"name".as_ptr(),
+                len: 4,
+            },
+            ..Default::default()
+        };
+        let mut owner = u32::MAX;
+        let status = crate::index::grafeo_create_index(db, &raw const request, &raw mut owner);
         assert_eq!(status, GrafeoStatus::Ok);
         assert_eq!(grafeo_has_property_index(db, prop.as_ptr()), 1);
 
@@ -2522,9 +3472,18 @@ mod tests {
         }
 
         // Drop index
-        assert_eq!(grafeo_drop_property_index(db, prop.as_ptr()), 1);
+        let mut dropped = -1;
+        assert_eq!(
+            crate::index::grafeo_drop_index(db, owner, &raw mut dropped),
+            GrafeoStatus::Ok
+        );
+        assert_eq!(dropped, 1);
         assert_eq!(grafeo_has_property_index(db, prop.as_ptr()), 0);
-        assert_eq!(grafeo_drop_property_index(db, prop.as_ptr()), 0);
+        assert_eq!(
+            crate::index::grafeo_drop_index(db, owner, &raw mut dropped),
+            GrafeoStatus::Ok
+        );
+        assert_eq!(dropped, 0);
 
         grafeo_close(db);
         grafeo_free_database(db);
@@ -2533,6 +3492,13 @@ mod tests {
     // ── Database info ──
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_database_info() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["Person"]"#).unwrap();
@@ -2553,6 +3519,14 @@ mod tests {
     // ── Result metadata ──
 
     #[test]
+    #[cfg(feature = "gql")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_result_metadata() {
         let db = grafeo_open_memory();
         let create = CString::new("CREATE (:N {x: 1}), (:N {x: 2}), (:N {x: 3})").unwrap();
@@ -2577,6 +3551,13 @@ mod tests {
     // ── Edge accessor functions ──
 
     #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn test_edge_accessors() {
         let db = grafeo_open_memory();
         let labels = CString::new(r#"["N"]"#).unwrap();
@@ -2614,6 +3595,182 @@ mod tests {
         assert!(props_str.contains("2020"));
 
         grafeo_free_edge(edge_ptr);
+        grafeo_close(db);
+        grafeo_free_database(db);
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn test_open_memory_model_lpg() {
+        let db = grafeo_open_memory_model(0);
+        assert!(!db.is_null());
+        assert_eq!(grafeo_graph_model(db), 0);
+        grafeo_close(db);
+        grafeo_free_database(db);
+    }
+
+    #[cfg(feature = "triple-store")]
+    #[test]
+    fn test_insert_contains_rdf_quad() {
+        let db = grafeo_open_memory_model(1); // RDF
+        assert!(!db.is_null());
+        assert_eq!(grafeo_graph_model(db), 1);
+
+        let s = CString::new("<http://ex.org/s>").unwrap();
+        let p = CString::new("<http://ex.org/p>").unwrap();
+        let o = CString::new(r#""Alix""#).unwrap();
+        let g = CString::new("http://ex.org/g").unwrap();
+        let status = grafeo_insert_rdf_quad(db, s.as_ptr(), p.as_ptr(), o.as_ptr(), g.as_ptr());
+        assert_eq!(status, GrafeoStatus::Ok);
+        assert!(grafeo_contains_rdf_quad(
+            db,
+            s.as_ptr(),
+            p.as_ptr(),
+            o.as_ptr(),
+            g.as_ptr()
+        ));
+
+        grafeo_close(db);
+        grafeo_free_database(db);
+    }
+
+    #[cfg(feature = "triple-store")]
+    #[test]
+    fn test_rdf_quad_tx_rollback() {
+        let db = grafeo_open_memory_model(1);
+        assert!(!db.is_null());
+        let s = CString::new("http://ex.org/s").unwrap();
+        let p = CString::new("http://ex.org/p").unwrap();
+        let o = CString::new(r#""pending""#).unwrap();
+
+        let tx = grafeo_begin_transaction(db);
+        assert!(!tx.is_null());
+        let status = grafeo_transaction_insert_rdf_quad(
+            tx,
+            s.as_ptr(),
+            p.as_ptr(),
+            o.as_ptr(),
+            std::ptr::null(),
+        );
+        assert_eq!(status, GrafeoStatus::Ok);
+        assert!(grafeo_transaction_contains_rdf_quad(
+            tx,
+            s.as_ptr(),
+            p.as_ptr(),
+            o.as_ptr(),
+            std::ptr::null()
+        ));
+        assert_eq!(grafeo_rollback(tx), GrafeoStatus::Ok);
+        grafeo_free_transaction(tx);
+
+        assert!(!grafeo_contains_rdf_quad(
+            db,
+            s.as_ptr(),
+            p.as_ptr(),
+            o.as_ptr(),
+            std::ptr::null()
+        ));
+
+        grafeo_close(db);
+        grafeo_free_database(db);
+    }
+
+    #[cfg(feature = "triple-store")]
+    #[test]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn test_bulk_quads_commit_epoch_mixed_tx() {
+        let db = grafeo_open_memory_model(2); // BOTH
+        let s1 = CString::new("<http://ex.org/s1>").unwrap();
+        let s2 = CString::new("<http://ex.org/s2>").unwrap();
+        let p = CString::new("<http://ex.org/p>").unwrap();
+        let o1 = CString::new(r#""a""#).unwrap();
+        let o2 = CString::new(r#""b""#).unwrap();
+        let subjects = [s1.as_ptr(), s2.as_ptr()];
+        let predicates = [p.as_ptr(), p.as_ptr()];
+        let objects = [o1.as_ptr(), o2.as_ptr()];
+        let mut inserted = 0usize;
+        let mut epoch = 0u64;
+        let status = grafeo_insert_rdf_quads(
+            db,
+            subjects.as_ptr(),
+            predicates.as_ptr(),
+            objects.as_ptr(),
+            std::ptr::null(),
+            2,
+            &raw mut inserted,
+            &raw mut epoch,
+        );
+        assert_eq!(status, GrafeoStatus::Ok);
+        assert_eq!(inserted, 2);
+        assert!(epoch > 0);
+
+        let tx = grafeo_begin_transaction(db);
+        assert!(!tx.is_null());
+        let labels = CString::new(r#"["Person"]"#).unwrap();
+        let nid = grafeo_transaction_create_node(tx, labels.as_ptr(), std::ptr::null());
+        assert_ne!(nid, u64::MAX);
+
+        let s3 = CString::new("<http://ex.org/s3>").unwrap();
+        let o3 = CString::new(r#""tx""#).unwrap();
+        let subjects = [s3.as_ptr()];
+        let predicates = [p.as_ptr()];
+        let objects = [o3.as_ptr()];
+        let mut tx_inserted = 0usize;
+        assert_eq!(
+            grafeo_transaction_insert_rdf_quads(
+                tx,
+                subjects.as_ptr(),
+                predicates.as_ptr(),
+                objects.as_ptr(),
+                std::ptr::null(),
+                1,
+                &raw mut tx_inserted,
+            ),
+            GrafeoStatus::Ok
+        );
+        assert_eq!(tx_inserted, 1);
+        let mut commit_epoch = 0u64;
+        assert_eq!(
+            grafeo_commit_epoch(tx, &raw mut commit_epoch),
+            GrafeoStatus::Ok
+        );
+        assert!(commit_epoch >= epoch);
+        grafeo_free_transaction(tx);
+
+        assert!(grafeo_contains_rdf_quad(
+            db,
+            s3.as_ptr(),
+            p.as_ptr(),
+            o3.as_ptr(),
+            std::ptr::null()
+        ));
+        grafeo_close(db);
+        grafeo_free_database(db);
+    }
+
+    #[cfg(feature = "triple-store")]
+    #[test]
+    fn test_literal_subject_rejected() {
+        let db = grafeo_open_memory_model(1);
+        assert!(!db.is_null());
+        let s = CString::new(r#""not-an-iri""#).unwrap();
+        let p = CString::new("<http://ex.org/p>").unwrap();
+        let o = CString::new(r#""v""#).unwrap();
+        let status =
+            grafeo_insert_rdf_quad(db, s.as_ptr(), p.as_ptr(), o.as_ptr(), std::ptr::null());
+        assert_ne!(status, GrafeoStatus::Ok);
         grafeo_close(db);
         grafeo_free_database(db);
     }
