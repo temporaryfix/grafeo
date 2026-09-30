@@ -82,7 +82,7 @@ tests:
       }
     expect:
       rows:
-        - [chat]
+        - ['"chat"@fr']
 
   - name: multiple_language_tags
     # Same predicate with different language tags should produce distinct triples.
@@ -121,8 +121,7 @@ tests:
   # ---------------------------------------------------------------------------
 
   - name: integer_typed_literal
-    # Insert "30"^^xsd:integer and retrieve its lexical value.
-    # Grafeo stores RDF literal values as strings internally.
+    # Retrieve the complete typed term, including its datatype.
     setup:
       - |
         INSERT DATA {
@@ -134,11 +133,11 @@ tests:
       }
     expect:
       rows:
-        - [30]
+        - ['"30"^^<http://www.w3.org/2001/XMLSchema#integer>']
 
   - name: bare_integer_literal
-    # A bare integer 30 in SPARQL is shorthand for "30"^^xsd:integer.
-    # Both forms should store equivalently and return the lexical value.
+    # A bare integer 25 in SPARQL is shorthand for "25"^^xsd:integer.
+    # Both forms should store equivalently and preserve the datatype in the result.
     setup:
       - |
         INSERT DATA {
@@ -150,7 +149,7 @@ tests:
       }
     expect:
       rows:
-        - [25]
+        - ['"25"^^<http://www.w3.org/2001/XMLSchema#integer>']
 
   - name: decimal_literal
     # A bare decimal 19.99 is shorthand for "19.99"^^xsd:decimal.
@@ -165,7 +164,7 @@ tests:
       }
     expect:
       rows:
-        - [19.99]
+        - ['"19.99"^^<http://www.w3.org/2001/XMLSchema#decimal>']
 
   # ---------------------------------------------------------------------------
   # Boolean Literals
@@ -184,7 +183,7 @@ tests:
       }
     expect:
       rows:
-        - [true]
+        - ['"true"^^<http://www.w3.org/2001/XMLSchema#boolean>']
 
   - name: boolean_false_literal
     # The keyword false is shorthand for "false"^^xsd:boolean.
@@ -199,7 +198,7 @@ tests:
       }
     expect:
       rows:
-        - [false]
+        - ['"false"^^<http://www.w3.org/2001/XMLSchema#boolean>']
 
   # ---------------------------------------------------------------------------
   # Numeric Comparisons

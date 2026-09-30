@@ -91,8 +91,7 @@ tests:
 
   - name: modify_update_numeric_value
     # MODIFY with numeric literals: delete old integer, insert new integer.
-    # Regression test: RdfModifyOperator must parse string-typed bindings
-    # back to typed literals so the DELETE matches the stored triple.
+    # The bound old term retains its datatype so DELETE matches exactly.
     setup:
       - |
         INSERT DATA {
@@ -105,7 +104,7 @@ tests:
     query: "SELECT ?v WHERE { <http://ex.org/item> <http://ex.org/version> ?v }"
     expect:
       rows:
-        - [2]
+        - ['"2"^^<http://www.w3.org/2001/XMLSchema#integer>']
 
   - name: modify_delete_only_with_where
     # DELETE clause with WHERE but no INSERT: removes matching triples.
@@ -320,7 +319,7 @@ tests:
 
   - name: modify_update_boolean_value
     # MODIFY with boolean literals: same type-mismatch risk as integers.
-    # Boolean `true` is stored as xsd:boolean but bound as string "true".
+    # The old and replacement terms retain xsd:boolean identity.
     setup:
       - |
         INSERT DATA {
@@ -333,10 +332,10 @@ tests:
     query: "SELECT ?v WHERE { <http://ex.org/feature> <http://ex.org/enabled> ?v }"
     expect:
       rows:
-        - [false]
+        - ['"false"^^<http://www.w3.org/2001/XMLSchema#boolean>']
 
-  - name: modify_update_double_value
-    # MODIFY with double literals: stored as xsd:double, bound as string.
+  - name: modify_update_decimal_value
+    # Bare fractional literals are xsd:decimal; preserve that exact type.
     setup:
       - |
         INSERT DATA {
@@ -349,11 +348,11 @@ tests:
     query: "SELECT ?v WHERE { <http://ex.org/sensor> <http://ex.org/reading> ?v }"
     expect:
       rows:
-        - [2.72]
+        - ['"2.72"^^<http://www.w3.org/2001/XMLSchema#decimal>']
 
   - name: modify_multiple_typed_values_in_one_pass
     # MODIFY that deletes and replaces typed values for multiple subjects
-    # in a single pass. Exercises the fallback delete path for each binding.
+    # in a single pass. Retains exact term identity for each bound delete.
     setup:
       - |
         INSERT DATA {
@@ -372,9 +371,9 @@ tests:
     expect:
       ordered: true
       rows:
-        - [http://ex.org/a, 0]
-        - [http://ex.org/b, 0]
-        - [http://ex.org/c, 30]
+        - [http://ex.org/a, '"0"^^<http://www.w3.org/2001/XMLSchema#integer>']
+        - [http://ex.org/b, '"0"^^<http://www.w3.org/2001/XMLSchema#integer>']
+        - [http://ex.org/c, '"30"^^<http://www.w3.org/2001/XMLSchema#integer>']
 
   - name: modify_where_no_match_leaves_store_unchanged
     # DELETE/INSERT/WHERE where the WHERE clause matches nothing: no changes.

@@ -87,8 +87,8 @@ tests:
   - name: alter_node_type_add_and_drop_property
     statements:
       - "CREATE NODE TYPE Sensor (id INTEGER NOT NULL)"
-      - "ALTER NODE TYPE Sensor ADD PROPERTY location STRING"
-      - "ALTER NODE TYPE Sensor DROP PROPERTY location"
+      - "ALTER NODE TYPE Sensor ADD location STRING"
+      - "ALTER NODE TYPE Sensor DROP location"
       - "INSERT (:Sensor {id: 1})"
       - "MATCH (s:Sensor) RETURN s.id"
     expect:
@@ -102,8 +102,8 @@ tests:
   - name: alter_edge_type_add_and_drop_property
     statements:
       - "CREATE EDGE TYPE MONITORS (interval INTEGER)"
-      - "ALTER EDGE TYPE MONITORS ADD PROPERTY threshold FLOAT"
-      - "ALTER EDGE TYPE MONITORS DROP PROPERTY threshold"
+      - "ALTER EDGE TYPE MONITORS ADD threshold FLOAT"
+      - "ALTER EDGE TYPE MONITORS DROP threshold"
       - "MATCH ()-[r:MONITORS]->() RETURN count(r) AS cnt"
     expect:
       rows:
@@ -206,6 +206,7 @@ tests:
       - "CREATE EDGE TYPE REPORTS_TO"
       - "CREATE GRAPH TYPE org_chart (NODE TYPE Employee, EDGE TYPE REPORTS_TO)"
       - "CREATE GRAPH hr_graph TYPED org_chart"
+      - "DROP GRAPH hr_graph"
       - "DROP GRAPH TYPE org_chart"
       - "DROP NODE TYPE Employee"
       - "DROP EDGE TYPE REPORTS_TO"
@@ -213,3 +214,12 @@ tests:
     expect:
       rows:
         - [0]
+
+  - name: drop_bound_graph_type_rejected
+    setup:
+      - "CREATE NODE TYPE BoundEmployee (name STRING)"
+      - "CREATE GRAPH TYPE bound_org (NODE TYPE BoundEmployee)"
+      - "CREATE GRAPH bound_hr TYPED bound_org"
+    query: "DROP GRAPH TYPE bound_org"
+    expect:
+      error: "while it is bound to graph(s)"

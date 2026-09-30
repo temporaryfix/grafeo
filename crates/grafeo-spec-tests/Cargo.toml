@@ -16,7 +16,6 @@ graphql = []
 sparql = []
 sql-pgq = []
 triple-store = []
-rdf = ["triple-store"]  # Deprecated: use triple-store
 vector-index = []
 text-index = []
 algos = []

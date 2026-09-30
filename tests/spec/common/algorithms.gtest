@@ -219,10 +219,15 @@ tests:
       - "INSERT (:City {name: 'Paris'})"
       - "MATCH (a:City {name: 'Amsterdam'}), (b:City {name: 'Berlin'}) INSERT (a)-[:ROUTE {km: 650}]->(b)"
       - "MATCH (a:City {name: 'Berlin'}), (b:City {name: 'Paris'}) INSERT (a)-[:ROUTE {km: 1050}]->(b)"
-    query: "CALL grafeo.sssp('Amsterdam', 'km')"
+    # Named sources explicitly select the property used for lookup.
+    query: "CALL grafeo.sssp('Amsterdam', 'km', 'name') YIELD distance RETURN distance ORDER BY distance"
     expect:
-      columns: [node_id, distance]
-      count: 3
+      columns: [distance]
+      ordered: true
+      rows:
+        - [0]
+        - [650]
+        - [1700]
 
   # ---------------------------------------------------------------------------
   # BFS / DFS Traversal
@@ -387,7 +392,7 @@ tests:
   - name: call_unknown_procedure
     query: "CALL grafeo.nonexistent()"
     expect:
-      error: "Unknown procedure"
+      error: "unknown procedure 'grafeo.nonexistent'"
 
   - name: call_yield_nonexistent_column
     setup:

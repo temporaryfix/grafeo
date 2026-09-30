@@ -305,6 +305,8 @@ tests:
         ?item <http://ex.org/nonexistent_category> ?category
       } GROUP BY ?category
     expect:
+      # Explicit GROUP BY has no groups when its input is empty.
+      # https://www.w3.org/TR/sparql11-query/#defn_aggGroup
       count: 0
 
   - name: min_max_on_single_group
@@ -331,6 +333,31 @@ tests:
       - |
         INSERT DATA {
           <http://ex.org/alix> <http://ex.org/dept> "Engineering" .
+          <http://ex.org/alix> <http://ex.org/perf> 90 .
+          <http://ex.org/gus> <http://ex.org/dept> "Engineering" .
+          <http://ex.org/gus> <http://ex.org/perf> 85 .
+          <http://ex.org/jules> <http://ex.org/dept> "Support" .
+          <http://ex.org/jules> <http://ex.org/perf> 60 .
+          <http://ex.org/mia> <http://ex.org/dept> "Support" .
+          <http://ex.org/mia> <http://ex.org/perf> 55 .
+        }
+    query: |
+      SELECT ?dept (AVG(?p) AS ?avg_perf) WHERE {
+        ?person <http://ex.org/dept> ?dept .
+        ?person <http://ex.org/perf> ?p .
+      } GROUP BY ?dept
+      HAVING (AVG(?p) > 80)
+    expect:
+      rows:
+        - [Engineering, '"87.5"^^<http://www.w3.org/2001/XMLSchema#decimal>']
+
+  - name: having_with_avg_rejects_plain_strings
+    # AVG requires numeric operands; numeric-looking strings cause an error.
+    # https://www.w3.org/TR/sparql11-query/#defn_aggAvg
+    setup:
+      - |
+        INSERT DATA {
+          <http://ex.org/alix> <http://ex.org/dept> "Engineering" .
           <http://ex.org/alix> <http://ex.org/perf> "90" .
           <http://ex.org/gus> <http://ex.org/dept> "Engineering" .
           <http://ex.org/gus> <http://ex.org/perf> "85" .
@@ -346,4 +373,4 @@ tests:
       } GROUP BY ?dept
       HAVING (AVG(?p) > 80)
     expect:
-      count: 1
+      count: 0

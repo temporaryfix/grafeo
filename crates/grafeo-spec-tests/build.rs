@@ -869,13 +869,13 @@ fn generate_single_test(output: &mut String, spec: &TestSpec<'_>) {
     let model = &file.meta.model;
 
     // Feature gate: languages that require specific feature flags.
-    // graphql-rdf needs both "graphql" and "rdf" features.
+    // RDF query languages require the Rust triple-store feature.
     let feature_gates: Vec<&str> = match language {
         "cypher" => vec!["cypher"],
         "gremlin" => vec!["gremlin"],
         "graphql" => vec!["graphql"],
-        "graphql-rdf" => vec!["graphql", "rdf"],
-        "sparql" => vec!["sparql"],
+        "graphql-rdf" => vec!["graphql", "triple-store"],
+        "sparql" => vec!["sparql", "triple-store"],
         "sql-pgq" | "sql_pgq" => vec!["sql-pgq"],
         _ => vec![],
     };
@@ -903,7 +903,7 @@ fn generate_single_test(output: &mut String, spec: &TestSpec<'_>) {
         "gremlin",
         "graphql",
         "sql-pgq",
-        "rdf",
+        "triple-store",
         "algos",
         "vector-index",
         "text-index",
@@ -918,11 +918,19 @@ fn generate_single_test(output: &mut String, spec: &TestSpec<'_>) {
         "spill",
         "mmap",
     ];
-    let cargo_requires: Vec<&str> = all_requires
-        .iter()
-        .filter(|r| CARGO_FEATURES.contains(r))
-        .copied()
-        .collect();
+    // Shared spec capabilities are independent of each binding's feature names.
+    // RDF is the model capability; Rust exposes it as `triple-store`.
+    let mut cargo_requires = Vec::new();
+    for requirement in all_requires {
+        let feature = if requirement == "rdf" {
+            "triple-store"
+        } else {
+            requirement
+        };
+        if CARGO_FEATURES.contains(&feature) && !cargo_requires.contains(&feature) {
+            cargo_requires.push(feature);
+        }
+    }
 
     if !cargo_requires.is_empty() {
         let cfg_parts: Vec<String> = cargo_requires
@@ -940,13 +948,29 @@ fn generate_single_test(output: &mut String, spec: &TestSpec<'_>) {
     writeln!(output, "    #[test]").unwrap();
     writeln!(output, "    fn {fn_name}() {{").unwrap();
 
+    // Fixture model follows the actual execution routes. Shared GraphQL
+    // "RDF-like" datasets use LPG setup statements, while SPARQL and the
+    // explicit GraphQL-RDF route need the native RDF plane.
+    let effective_dataset = tc.dataset.as_deref().unwrap_or(&file.meta.dataset);
+    let rdf_language = |lang: &str| matches!(lang, "sparql" | "graphql-rdf");
+    let needs_rdf =
+        rdf_language(language) || (!tc.setup.is_empty() && rdf_language(&file.meta.language));
+    let needs_lpg = !rdf_language(language)
+        || effective_dataset != "empty"
+        || (!tc.setup.is_empty() && !rdf_language(&file.meta.language));
+    let graph_model = if needs_lpg { "Both" } else { "Rdf" };
+
     // Create DB and load dataset. The persistent variant exercises the
     // WAL-wrapped store path that `GrafeoDB::open()` always produces, so
     // regressions in wrapper delegation (e.g. #308) fail here instead of
     // slipping past the in-memory-only suite.
     match db_source {
         DbSource::InMemory => {
-            writeln!(output, "        let db = GrafeoDB::new_in_memory();").unwrap();
+            if needs_rdf {
+                writeln!(output, "        let db = GrafeoDB::with_config(grafeo_engine::Config::in_memory().with_graph_model(grafeo_engine::GraphModel::{graph_model})).expect(\"create spec database\");").unwrap();
+            } else {
+                writeln!(output, "        let db = GrafeoDB::new_in_memory();").unwrap();
+            }
         }
         DbSource::Persistent => {
             writeln!(
@@ -954,15 +978,18 @@ fn generate_single_test(output: &mut String, spec: &TestSpec<'_>) {
                 "        let _tmp = tempfile::tempdir().expect(\"tempdir for persistent spec test\");"
             )
             .unwrap();
-            writeln!(
-                output,
-                "        let db = GrafeoDB::open(_tmp.path().join(\"spec.grafeo\")).expect(\"open persistent GrafeoDB for spec test\");"
-            )
-            .unwrap();
+            if needs_rdf {
+                writeln!(output, "        let db = GrafeoDB::with_config(grafeo_engine::Config::persistent(_tmp.path().join(\"spec.grafeo\")).with_graph_model(grafeo_engine::GraphModel::{graph_model})).expect(\"open persistent spec database\");").unwrap();
+            } else {
+                writeln!(
+                    output,
+                    "        let db = GrafeoDB::open(_tmp.path().join(\"spec.grafeo\")).expect(\"open persistent GrafeoDB for spec test\");"
+                )
+                .unwrap();
+            }
         }
     }
 
-    let effective_dataset = tc.dataset.as_deref().unwrap_or(&file.meta.dataset);
     if effective_dataset != "empty" {
         let dataset_path = format!("tests/spec/datasets/{}.setup", effective_dataset);
         writeln!(

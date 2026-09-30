@@ -46,7 +46,7 @@ tests:
       }
     expect:
       rows:
-        - [Berlin Express, 87]
+        - [Berlin Express, '"87"^^<http://www.w3.org/2001/XMLSchema#integer>']
 
   - name: subquery_with_aggregation
     skip: "subquery aggregate feeding outer filter"

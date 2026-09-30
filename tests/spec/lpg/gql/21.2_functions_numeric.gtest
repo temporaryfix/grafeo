@@ -160,11 +160,13 @@ tests:
   # ---------------------------------------------------------------------------
 
   - name: power_returns_result
-    query: RETURN 2.0 ^ 10.0 AS r
+    query: RETURN power(2.0, 10.0) AS r
     expect:
-      count: 1
+      rows:
+        - [1024]
 
   - name: power_square_root
-    query: RETURN 9.0 ^ 0.5 AS r
+    query: RETURN power(9.0, 0.5) AS r
     expect:
-      count: 1
+      rows:
+        - [3]
