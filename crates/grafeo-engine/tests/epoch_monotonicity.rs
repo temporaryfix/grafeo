@@ -54,7 +54,7 @@ fn concurrent_commits_produce_strictly_increasing_epochs() {
     }
 
     let changes = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap();
 
     // Invariant 1: events are sorted by epoch
@@ -130,17 +130,17 @@ fn changes_between_no_gaps() {
 
     // Full range
     let all = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap();
     let all_count = all.iter().filter(|e| e.kind == ChangeKind::Create).count();
     assert_eq!(all_count, 10, "Full range should have 10 creates");
 
     // First half
-    let first_half = db.changes_between(EpochId::new(0), epochs[4]).unwrap();
+    let first_half = db.fixture_changes(EpochId::new(0)..=epochs[4]).unwrap();
 
     // Second half
     let second_half = db
-        .changes_between(EpochId::new(epochs[4].as_u64() + 1), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(epochs[4].as_u64() + 1)..=EpochId::new(u64::MAX))
         .unwrap();
 
     // Union of halves should equal full range
@@ -175,7 +175,7 @@ fn changes_between_range_bounds_strict() {
 
     // Query middle range [epoch_1, epoch_3]
     let middle = db
-        .changes_between(commit_epochs[1], commit_epochs[3])
+        .fixture_changes(commit_epochs[1]..=commit_epochs[3])
         .unwrap();
 
     // All returned events must be within bounds
@@ -235,7 +235,7 @@ fn concurrent_sessions_cdc_event_count_matches() {
     }
 
     let changes = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap();
 
     let create_count = changes
@@ -307,7 +307,7 @@ fn transaction_rollback_leaves_no_epoch_holes() {
     }
 
     let changes = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap();
 
     // Only committed events
@@ -332,3 +332,9 @@ fn transaction_rollback_leaves_no_epoch_holes() {
         );
     }
 }
+
+#[cfg(feature = "cdc")]
+#[path = "support/cdc_pages.rs"]
+mod cdc_pages;
+#[cfg(feature = "cdc")]
+use cdc_pages::CdcFixtureChanges;

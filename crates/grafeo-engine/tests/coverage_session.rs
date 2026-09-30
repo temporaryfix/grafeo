@@ -6,10 +6,14 @@
 //! cargo test -p grafeo-engine --features full --test coverage_session
 //! ```
 
-use grafeo_common::types::{EpochId, Value};
+#[cfg(feature = "lpg")]
+use grafeo_common::types::EpochId;
+#[cfg(any(feature = "lpg", feature = "sparql"))]
+use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
 /// Creates 2 Person nodes: Alix (age 30) and Gus (age 25).
+#[cfg(feature = "lpg")]
 fn setup() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -39,6 +43,7 @@ fn setup() -> GrafeoDB {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_session_set_and_get_parameter() {
     let db = setup();
     let session = db.session();
@@ -53,11 +58,12 @@ fn test_session_set_and_get_parameter() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_reset_session_clears_state() {
     let db = setup();
     let session = db.session();
     session.set_parameter("key", Value::String("val".into()));
-    session.reset_session();
+    session.reset_session().unwrap();
     assert_eq!(session.get_parameter("key"), None);
 }
 
@@ -66,6 +72,7 @@ fn test_reset_session_clears_state() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_set_time_zone_direct() {
     let db = setup();
     let session = db.session();
@@ -78,6 +85,7 @@ fn test_set_time_zone_direct() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_graph_model_default() {
     let db = setup();
     let session = db.session();
@@ -91,6 +99,7 @@ fn test_graph_model_default() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_viewing_epoch_lifecycle() {
     let db = setup();
     let session = db.session();
@@ -102,6 +111,8 @@ fn test_viewing_epoch_lifecycle() {
 }
 
 #[test]
+#[cfg(feature = "gql")]
+#[cfg(feature = "lpg")]
 fn test_execute_at_epoch() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -126,6 +137,7 @@ fn test_execute_at_epoch() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_savepoint_outside_transaction_fails() {
     let db = setup();
     let session = db.session();
@@ -138,6 +150,7 @@ fn test_savepoint_outside_transaction_fails() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_release_savepoint_via_api() {
     let db = setup();
     let mut session = db.session();
@@ -162,6 +175,7 @@ fn test_release_savepoint_via_api() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_begin_transaction_with_serializable_isolation() {
     let db = setup();
     let mut session = db.session();
@@ -178,6 +192,7 @@ fn test_begin_transaction_with_serializable_isolation() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_execute_with_params_direct() {
     let db = setup();
     let session = db.session();
@@ -197,6 +212,7 @@ fn test_execute_with_params_direct() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_use_graph_via_gql() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -209,6 +225,7 @@ fn test_use_graph_via_gql() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_optional_match_no_match() {
     let db = setup();
     let session = db.session();
@@ -225,6 +242,7 @@ fn test_optional_match_no_match() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_optional_match_with_where() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -252,6 +270,7 @@ fn test_optional_match_with_where() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_standalone_return_arithmetic() {
     let db = GrafeoDB::new_in_memory();
     let s = db.session();
@@ -261,6 +280,7 @@ fn test_standalone_return_arithmetic() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_standalone_return_string() {
     let db = GrafeoDB::new_in_memory();
     let s = db.session();
@@ -270,6 +290,7 @@ fn test_standalone_return_string() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_standalone_return_list() {
     let db = GrafeoDB::new_in_memory();
     let s = db.session();
@@ -287,6 +308,7 @@ fn test_standalone_return_list() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_unwind_list() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -299,6 +321,7 @@ fn test_unwind_list() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_call_subquery() {
     let db = setup();
     let session = db.session();
@@ -315,6 +338,7 @@ fn test_call_subquery() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_session_recovers_after_parse_error() {
     let db = setup();
     let session = db.session();
@@ -329,6 +353,7 @@ fn test_session_recovers_after_parse_error() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_session_recovers_after_runtime_error() {
     let db = setup();
     let session = db.session();
@@ -341,6 +366,7 @@ fn test_session_recovers_after_runtime_error() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_session_recovers_after_rollback() {
     let db = setup();
     let mut session = db.session();
@@ -368,6 +394,7 @@ fn test_session_recovers_after_rollback() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_prepare_commit_lifecycle() {
     let db = GrafeoDB::new_in_memory();
     let mut session = db.session();
@@ -399,6 +426,7 @@ fn test_prepare_commit_lifecycle() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_prepare_commit_abort() {
     let db = GrafeoDB::new_in_memory();
     let mut session = db.session();
@@ -414,6 +442,7 @@ fn test_prepare_commit_abort() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_prepare_commit_without_transaction_fails() {
     let db = GrafeoDB::new_in_memory();
     let mut session = db.session();
@@ -435,6 +464,7 @@ fn test_prepare_commit_without_transaction_fails() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_begin_transaction_with_read_committed() {
     let db = setup();
     let mut session = db.session();
@@ -447,18 +477,32 @@ fn test_begin_transaction_with_read_committed() {
 }
 
 #[test]
-fn test_begin_transaction_with_serializable() {
+#[cfg(feature = "lpg")]
+fn test_begin_transaction_with_serializable_now_supported() {
+    // Increment 2f: Serializable is now a real OCC-validated isolation level.
+    // begin_transaction_with_isolation must succeed; a plain MATCH query must
+    // commit cleanly (SSI validation fires but no conflict exists).
     let db = setup();
     let mut session = db.session();
     session
         .begin_transaction_with_isolation(grafeo_engine::transaction::IsolationLevel::Serializable)
-        .unwrap();
-    let r = session.execute("MATCH (p:Person) RETURN count(p)").unwrap();
-    assert_eq!(r.rows()[0][0], Value::Int64(2));
-    session.commit().unwrap();
+        .expect("Serializable begin must succeed");
+    session
+        .execute("MATCH (n) RETURN n")
+        .expect("MATCH under Serializable must succeed");
+    session.commit().expect("Serializable commit must succeed");
+
+    // SnapshotIsolation is unaffected.
+    let mut s2 = db.session();
+    s2.begin_transaction_with_isolation(
+        grafeo_engine::transaction::IsolationLevel::SnapshotIsolation,
+    )
+    .unwrap();
+    s2.commit().unwrap();
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_begin_transaction_with_isolation_nested_creates_savepoint() {
     let db = setup();
     let mut session = db.session();
@@ -482,6 +526,7 @@ fn test_begin_transaction_with_isolation_nested_creates_savepoint() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_scalar_int64() {
     let db = setup();
     let count: i64 = db.query_scalar("MATCH (p:Person) RETURN count(p)").unwrap();
@@ -489,6 +534,7 @@ fn test_query_scalar_int64() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_query_scalar_string() {
     let db = setup();
     let name: String = db
@@ -502,6 +548,7 @@ fn test_query_scalar_string() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_clear_plan_cache() {
     let db = setup();
     let session = db.session();
@@ -586,8 +633,9 @@ fn test_execute_sparql_with_params() {
 // CDC (Change Data Capture) session methods
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cdc")]
+#[cfg(all(feature = "lpg", feature = "cdc"))]
 mod cdc_tests {
+    use crate::cdc_pages::CdcFixtureChanges;
     use grafeo_common::types::{EpochId, Value};
     use grafeo_engine::{Config, GrafeoDB};
 
@@ -599,10 +647,13 @@ mod cdc_tests {
     fn test_cdc_history_records_create() {
         let db = cdc_db();
         let node_id = db.create_node(&["Person"]);
-        db.set_node_property(node_id, "name", Value::String("Alix".into()));
+        db.set_node_property(node_id, "name", Value::String("Alix".into()))
+            .expect("set node property");
 
         let session = db.session();
-        let history = session.history(node_id).unwrap();
+        let history = session
+            .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+            .unwrap();
         // At minimum, the create event should be recorded
         assert!(
             !history.is_empty(),
@@ -620,11 +671,15 @@ mod cdc_tests {
     fn test_cdc_history_records_update() {
         let db = cdc_db();
         let node_id = db.create_node(&["Person"]);
-        db.set_node_property(node_id, "name", Value::String("Alix".into()));
-        db.set_node_property(node_id, "name", Value::String("Gus".into()));
+        db.set_node_property(node_id, "name", Value::String("Alix".into()))
+            .expect("set node property");
+        db.set_node_property(node_id, "name", Value::String("Gus".into()))
+            .expect("set node property");
 
         let session = db.session();
-        let history = session.history(node_id).unwrap();
+        let history = session
+            .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+            .unwrap();
         let update_count = history
             .iter()
             .filter(|e| e.kind == grafeo_engine::cdc::ChangeKind::Update)
@@ -639,12 +694,17 @@ mod cdc_tests {
     fn test_cdc_history_since_filters_by_epoch() {
         let db = cdc_db();
         let node_id = db.create_node(&["Person"]);
-        db.set_node_property(node_id, "name", Value::String("Alix".into()));
+        db.set_node_property(node_id, "name", Value::String("Alix".into()))
+            .expect("set node property");
 
         let session = db.session();
         // history_since with a very high epoch should return nothing
         let history = session
-            .history_since(node_id, EpochId::new(u64::MAX))
+            .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery {
+                entity_id: (node_id).into(),
+                graph: grafeo_engine::cdc::HistoryGraph::All,
+                since_epoch: EpochId::new(u64::MAX),
+            })
             .unwrap();
         assert!(
             history.is_empty(),
@@ -652,7 +712,13 @@ mod cdc_tests {
         );
 
         // history_since with epoch 0 should return everything
-        let history = session.history_since(node_id, EpochId::new(0)).unwrap();
+        let history = session
+            .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery {
+                entity_id: (node_id).into(),
+                graph: grafeo_engine::cdc::HistoryGraph::All,
+                since_epoch: EpochId::new(0),
+            })
+            .unwrap();
         assert!(
             !history.is_empty(),
             "history_since epoch 0 should return all events"
@@ -668,7 +734,7 @@ mod cdc_tests {
         let session = db.session();
         // Get all changes from epoch 0 to a large epoch
         let changes = session
-            .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+            .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
             .unwrap();
         assert!(
             changes.len() >= 2,
@@ -683,6 +749,7 @@ mod cdc_tests {
 // ============================================================================
 
 /// Creates a partial network: Alix->Gus, Vincent has no outgoing edges.
+#[cfg(feature = "lpg")]
 fn setup_questioned_edge() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -702,6 +769,7 @@ fn setup_questioned_edge() -> GrafeoDB {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_questioned_edge_preserves_source_rows() {
     let db = setup_questioned_edge();
     let session = db.session();
@@ -729,6 +797,7 @@ fn test_questioned_edge_preserves_source_rows() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_questioned_edge_null_when_no_match() {
     let db = setup_questioned_edge();
     let session = db.session();
@@ -750,6 +819,7 @@ fn test_questioned_edge_null_when_no_match() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_questioned_edge_with_target_label_filter() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -799,6 +869,7 @@ fn test_questioned_edge_with_target_label_filter() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn test_questioned_edge_combined_with_optional_match() {
     let db = setup_questioned_edge();
     let session = db.session();
@@ -835,3 +906,7 @@ fn test_questioned_edge_combined_with_optional_match() {
     assert_eq!(alix_row[1].as_str(), Some("Gus"));
     assert_eq!(alix_row[2].as_str(), Some("Amsterdam"));
 }
+
+#[cfg(all(feature = "lpg", feature = "cdc"))]
+#[path = "support/cdc_pages.rs"]
+mod cdc_pages;

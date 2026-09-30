@@ -76,13 +76,18 @@ mod negative_validation {
         let session = db.session();
         session.execute("CREATE GRAPH real").unwrap();
         session.execute("SESSION SET GRAPH real").unwrap();
-        assert_eq!(session.current_graph(), Some("real".to_string()));
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["real"])
+                .expect("literal graph path")
+        );
 
         // Failed SET should not change the current graph
         let _ = session.execute("SESSION SET GRAPH nosuchgraph");
         assert_eq!(
-            session.current_graph(),
-            Some("real".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["real"])
+                .expect("literal graph path"),
             "Failed SESSION SET GRAPH should not change current graph"
         );
     }
@@ -144,9 +149,10 @@ mod independence {
         session.execute("SESSION SET SCHEMA analytics").unwrap();
         assert_eq!(session.current_schema(), Some("analytics".to_string()));
         assert_eq!(
-            session.current_graph(),
-            None,
-            "Setting schema should not set graph"
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["analytics/__default__"])
+                .expect("literal graph path"),
+            "Setting schema keeps the language default and resolves its exact path"
         );
     }
 
@@ -156,7 +162,11 @@ mod independence {
         let session = db.session();
         session.execute("CREATE GRAPH mydb").unwrap();
         session.execute("SESSION SET GRAPH mydb").unwrap();
-        assert_eq!(session.current_graph(), Some("mydb".to_string()));
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path")
+        );
         assert_eq!(
             session.current_schema(),
             None,
@@ -175,7 +185,11 @@ mod independence {
         session.execute("CREATE GRAPH mydb").unwrap();
         session.execute("SESSION SET GRAPH mydb").unwrap();
         assert_eq!(session.current_schema(), Some("analytics".to_string()));
-        assert_eq!(session.current_graph(), Some("mydb".to_string()));
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["analytics/mydb"])
+                .expect("literal graph path")
+        );
     }
 
     #[test]
@@ -192,8 +206,9 @@ mod independence {
 
         assert_eq!(session.current_schema(), None, "Schema should be reset");
         assert_eq!(
-            session.current_graph(),
-            Some("mydb".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path"),
             "Graph should be unchanged after resetting schema"
         );
     }
@@ -210,7 +225,12 @@ mod independence {
 
         session.execute("SESSION RESET GRAPH").unwrap();
 
-        assert_eq!(session.current_graph(), None, "Graph should be reset");
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["analytics/__default__"])
+                .expect("literal graph path"),
+            "Graph should resolve to the schema default"
+        );
         assert_eq!(
             session.current_schema(),
             Some("analytics".to_string()),
@@ -327,7 +347,10 @@ mod selective_reset {
         session.execute("SESSION RESET SCHEMA").unwrap();
 
         assert_eq!(session.current_schema(), None, "Schema should be cleared");
-        assert!(session.current_graph().is_some(), "Graph should remain");
+        assert!(
+            !session.current_graph_path().components().is_empty(),
+            "Graph should remain"
+        );
         assert!(session.time_zone().is_some(), "Time zone should remain");
     }
 
@@ -339,7 +362,12 @@ mod selective_reset {
 
         session.execute("SESSION RESET GRAPH").unwrap();
 
-        assert_eq!(session.current_graph(), None, "Graph should be cleared");
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["myschema/__default__"])
+                .expect("literal graph path"),
+            "Graph should resolve to the schema default"
+        );
         assert!(session.current_schema().is_some(), "Schema should remain");
         assert!(session.time_zone().is_some(), "Time zone should remain");
     }
@@ -354,7 +382,10 @@ mod selective_reset {
 
         assert_eq!(session.time_zone(), None, "Time zone should be cleared");
         assert!(session.current_schema().is_some(), "Schema should remain");
-        assert!(session.current_graph().is_some(), "Graph should remain");
+        assert!(
+            !session.current_graph_path().components().is_empty(),
+            "Graph should remain"
+        );
     }
 
     #[test]
@@ -376,7 +407,10 @@ mod selective_reset {
             "Session parameters should be cleared"
         );
         assert!(session.current_schema().is_some(), "Schema should remain");
-        assert!(session.current_graph().is_some(), "Graph should remain");
+        assert!(
+            !session.current_graph_path().components().is_empty(),
+            "Graph should remain"
+        );
         assert!(session.time_zone().is_some(), "Time zone should remain");
     }
 
@@ -389,7 +423,11 @@ mod selective_reset {
         session.execute("SESSION RESET").unwrap();
 
         assert_eq!(session.current_schema(), None, "Schema should be cleared");
-        assert_eq!(session.current_graph(), None, "Graph should be cleared");
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::root(),
+            "Graph should be cleared"
+        );
         assert_eq!(session.time_zone(), None, "Time zone should be cleared");
         assert_eq!(
             session.viewing_epoch(),
@@ -409,7 +447,11 @@ mod selective_reset {
             .unwrap();
 
         assert_eq!(session.current_schema(), None, "Schema should be cleared");
-        assert_eq!(session.current_graph(), None, "Graph should be cleared");
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::root(),
+            "Graph should be cleared"
+        );
         assert_eq!(session.time_zone(), None, "Time zone should be cleared");
     }
 }
@@ -456,8 +498,9 @@ mod state_persistence {
             .unwrap();
         assert_eq!(result.row_count(), 2, "Both inserts should go to mydb");
         assert_eq!(
-            session.current_graph(),
-            Some("mydb".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path"),
             "Graph should persist"
         );
     }
@@ -517,8 +560,9 @@ mod state_persistence {
 
         // Graph context should still be mydb after commit
         assert_eq!(
-            session.current_graph(),
-            Some("mydb".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path"),
             "Graph should persist after COMMIT"
         );
         let result = session.execute("MATCH (n) RETURN n").unwrap();
@@ -544,8 +588,9 @@ mod state_persistence {
 
         // Graph context should still be mydb (session state is not transactional)
         assert_eq!(
-            session.current_graph(),
-            Some("mydb".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path"),
             "SESSION SET GRAPH should survive ROLLBACK"
         );
 

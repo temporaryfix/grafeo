@@ -21,6 +21,14 @@ use grafeo_common::testing::statement_failure::{
 };
 use grafeo_engine::GrafeoDB;
 
+#[cfg(all(
+    feature = "triple-store",
+    feature = "sparql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+use grafeo_engine::{Config, DurabilityMode, GraphModel};
+
 fn db() -> GrafeoDB {
     GrafeoDB::new_in_memory()
 }
@@ -118,5 +126,217 @@ fn injected_commit_failure_rolls_back_prior_writes() {
         remaining.row_count(),
         0,
         "injected commit failure must leave no writes visible"
+    );
+}
+
+#[test]
+fn nested_injected_commit_failure_aborts_every_frame_and_resets_depth() {
+    let db = db();
+    let mut session = db.session();
+
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["AbortedOuter"]).is_valid());
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["AbortedNestedOne"]).is_valid());
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["AbortedNestedTwo"]).is_valid());
+
+    let error =
+        with_commit_failure(|| session.commit()).expect_err("the injected nested commit must fail");
+    assert!(
+        error.to_string().contains("injected commit failure"),
+        "unexpected commit error: {error}"
+    );
+    assert!(
+        !session.in_transaction(),
+        "commit failure must abort the outer transaction, not only the innermost savepoint"
+    );
+    assert_eq!(
+        db.node_count(),
+        0,
+        "writes from every nesting depth must be discarded"
+    );
+    assert!(
+        !db.is_durability_poisoned(),
+        "a successful pre-prepare rollback must leave durability healthy"
+    );
+
+    // A single commit must finish this new outer transaction. If the failed
+    // transaction left stale nesting depth, this would only release a phantom
+    // nested frame (or fail while looking for its internal savepoint).
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["Survivor"]).is_valid());
+    session.commit().expect("a later transaction must commit");
+    assert!(
+        !session.in_transaction(),
+        "the later transaction must not inherit stale nesting depth"
+    );
+    assert_eq!(db.node_count(), 1);
+}
+
+#[cfg(all(
+    feature = "triple-store",
+    feature = "sparql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+fn sidecar_wal_dir(path: &std::path::Path) -> std::path::PathBuf {
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(".wal");
+    std::path::PathBuf::from(sidecar)
+}
+
+#[cfg(all(
+    feature = "triple-store",
+    feature = "sparql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let destination_entry = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &destination_entry);
+        } else {
+            std::fs::copy(entry.path(), destination_entry).unwrap();
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "triple-store",
+    feature = "sparql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+fn copy_live_database(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::copy(source, destination).unwrap();
+    let source_wal = sidecar_wal_dir(source);
+    if source_wal.exists() {
+        copy_tree(&source_wal, &sidecar_wal_dir(destination));
+    }
+}
+
+#[cfg(all(
+    feature = "triple-store",
+    feature = "sparql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+fn persistent_both_sync(path: &std::path::Path) -> GrafeoDB {
+    GrafeoDB::with_config(
+        Config::persistent(path)
+            .with_graph_model(GraphModel::Both)
+            .with_wal_durability(DurabilityMode::Sync),
+    )
+    .expect("open persistent dual-model database")
+}
+
+#[cfg(all(
+    feature = "triple-store",
+    feature = "sparql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+#[test]
+fn nested_injected_commit_failure_aborts_both_models_and_cannot_recover() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("nested-injected-failure.grafeo");
+    let crash_copy = directory
+        .path()
+        .join("nested-injected-failure-crash-copy.grafeo");
+    let db = persistent_both_sync(&path);
+    let mut session = db.session();
+
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["AbortedOuter"]).is_valid());
+    session
+        .execute_sparql(
+            r#"INSERT DATA {
+                <http://example.com/aborted-outer> <http://example.com/p> "outer" .
+            }"#,
+        )
+        .unwrap();
+
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["AbortedNested"]).is_valid());
+    session
+        .execute_sparql(
+            r#"INSERT DATA {
+                GRAPH <http://example.com/aborted-graph> {
+                    <http://example.com/aborted-nested> <http://example.com/p> "nested" .
+                }
+            }"#,
+        )
+        .unwrap();
+
+    with_commit_failure(|| session.commit())
+        .expect_err("the injected nested commit must abort the mixed transaction");
+    assert!(!session.in_transaction());
+    assert_eq!(db.node_count(), 0, "all pending LPG nodes must be gone");
+    assert_eq!(
+        session
+            .execute_sparql("SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o } }")
+            .unwrap()
+            .row_count(),
+        0,
+        "all pending RDF quads must be gone"
+    );
+    assert!(
+        db.rdf_store()
+            .graph("http://example.com/aborted-graph")
+            .is_none(),
+        "the failed transaction must not retain named-graph identity"
+    );
+
+    session.begin_transaction().unwrap();
+    assert!(session.create_node(&["Survivor"]).is_valid());
+    session
+        .execute_sparql(
+            r#"INSERT DATA {
+                <http://example.com/survivor> <http://example.com/p> "live" .
+            }"#,
+        )
+        .unwrap();
+    session
+        .commit()
+        .expect("a later mixed transaction must commit");
+    assert!(!session.in_transaction());
+    assert_eq!(db.node_count(), 1);
+    assert_eq!(
+        session
+            .execute_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .row_count(),
+        1
+    );
+
+    db.wal().expect("persistent database WAL").sync().unwrap();
+    copy_live_database(&path, &crash_copy);
+    std::mem::forget(session);
+    std::mem::forget(db);
+
+    let recovered = persistent_both_sync(&crash_copy);
+    assert_eq!(
+        recovered.node_count(),
+        1,
+        "WAL recovery must keep only the later committed LPG node"
+    );
+    assert_eq!(
+        recovered
+            .execute_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .row_count(),
+        1,
+        "WAL recovery must keep only the later committed RDF triple"
+    );
+    assert!(
+        recovered
+            .rdf_store()
+            .graph("http://example.com/aborted-graph")
+            .is_none(),
+        "WAL recovery must not resurrect aborted named-graph state"
     );
 }
