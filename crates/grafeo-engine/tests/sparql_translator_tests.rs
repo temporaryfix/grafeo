@@ -170,11 +170,12 @@ mod tests {
 
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 mod explain_integration {
-    use grafeo_engine::GrafeoDB;
+    use grafeo_engine::{Config, GrafeoDB, GraphModel};
 
     #[test]
     fn test_sparql_explain_returns_plan() {
-        let db = GrafeoDB::new_in_memory();
+        let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))
+            .expect("open in-memory rdf db");
         db.execute_sparql(
             r#"INSERT DATA { <http://example.org/alix> <http://xmlns.com/foaf/0.1/name> "Alix" }"#,
         )

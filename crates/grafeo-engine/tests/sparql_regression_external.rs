@@ -7,10 +7,13 @@
 
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 mod tests {
+    use grafeo_common::types::Value;
     use grafeo_engine::GrafeoDB;
+    use grafeo_engine::config::{Config, GraphModel};
 
     fn rdf_db() -> GrafeoDB {
-        GrafeoDB::new_in_memory()
+        GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))
+            .expect("RDF fixture configuration must be supported")
     }
 
     fn insert_people(db: &GrafeoDB) {
@@ -50,6 +53,7 @@ mod tests {
             1,
             "OPTIONAL with no match should still return 1 row"
         );
+        assert_eq!(r.rows(), vec![vec![Value::from("Vincent"), Value::Null]]);
     }
 
     #[test]
@@ -63,7 +67,7 @@ mod tests {
         )
         .unwrap();
 
-        // Both OPTIONALLs match
+        // The first OPTIONAL matches; the second must preserve the row with NULL.
         let r = db
             .execute_sparql(
                 r#"SELECT ?name ?age ?extra WHERE {
@@ -77,6 +81,10 @@ mod tests {
             r.row_count(),
             1,
             "Multiple OPTIONALLs must not cause the base result to disappear"
+        );
+        assert_eq!(
+            r.rows(),
+            vec![vec![Value::from("X"), Value::from("10"), Value::Null]],
         );
     }
 
@@ -95,6 +103,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.row_count(), 1, "COUNT over empty should return 1 row");
         // COUNT of empty set is 0 per SPARQL spec
+        assert_eq!(r.rows(), vec![vec![Value::Int64(0)]]);
     }
 
     // ========================================================================
@@ -126,6 +135,8 @@ mod tests {
             2,
             "UNION must return results from both branches"
         );
+        assert!(r.rows().contains(&vec![Value::from("Alix")]));
+        assert!(r.rows().contains(&vec![Value::from("Amsterdam")]));
     }
 
     // ========================================================================
@@ -148,6 +159,8 @@ mod tests {
             .execute_sparql(r#"SELECT ?v WHERE { ?s <http://ex.org/val> ?v FILTER(?v > "15") }"#)
             .unwrap();
         assert_eq!(r.row_count(), 2, "FILTER > should match 20 and 30");
+        assert!(r.rows().contains(&vec![Value::from("20")]));
+        assert!(r.rows().contains(&vec![Value::from("30")]));
     }
 
     #[test]
@@ -165,6 +178,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r.row_count(), 1, "Only Vincent has name without age");
+        assert_eq!(r.rows(), vec![vec![Value::from("Vincent")]]);
     }
 
     // ========================================================================
@@ -191,6 +205,8 @@ mod tests {
             2,
             "DISTINCT should collapse duplicate 'Person' to 1"
         );
+        assert!(r.rows().contains(&vec![Value::from("City")]));
+        assert!(r.rows().contains(&vec![Value::from("Person")]));
     }
 
     // ========================================================================
@@ -207,6 +223,7 @@ mod tests {
             .execute_sparql("SELECT ?o WHERE { <http://ex.org/x> <http://ex.org/p> ?o }")
             .unwrap();
         assert_eq!(r.row_count(), 1);
+        assert_eq!(r.rows(), vec![vec![Value::from("hello")]]);
     }
 
     #[test]
@@ -237,6 +254,7 @@ mod tests {
             .execute_sparql("SELECT ?o WHERE { <http://ex.org/x> <http://ex.org/p> ?o }")
             .unwrap();
         assert_eq!(r.row_count(), 1, "Re-inserted triple must be visible");
+        assert_eq!(r.rows(), vec![vec![Value::from("new")]]);
     }
 
     // ========================================================================
@@ -257,6 +275,17 @@ mod tests {
             .execute_sparql("SELECT ?s WHERE { ?s <http://ex.org/val> ?v } LIMIT 3")
             .unwrap();
         assert_eq!(r.row_count(), 3, "LIMIT 3 should return exactly 3 rows");
+        let rows = r.rows();
+        let expected: Vec<_> = (0..10)
+            .map(|i| vec![Value::from(format!("http://ex.org/n{i}"))])
+            .collect();
+        for (index, row) in rows.iter().enumerate() {
+            assert!(expected.contains(row), "unexpected LIMIT result: {row:?}");
+            assert!(
+                !rows[..index].contains(row),
+                "duplicate LIMIT result: {row:?}"
+            );
+        }
     }
 
     #[test]
@@ -280,6 +309,13 @@ mod tests {
             all.row_count() - 2,
             "OFFSET 2 should skip 2 rows"
         );
+        assert_eq!(
+            all.rows(),
+            (0..5)
+                .map(|i| vec![Value::from(i.to_string())])
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(offset.rows(), &all.rows()[2..]);
     }
 
     // ========================================================================
@@ -302,7 +338,14 @@ mod tests {
             .execute_sparql("SELECT ?n WHERE { ?s <http://ex.org/name> ?n } ORDER BY ?n")
             .unwrap();
         assert_eq!(r.row_count(), 3);
-        // First result should be alphabetically first
+        assert_eq!(
+            r.rows(),
+            vec![
+                vec![Value::from("Alix")],
+                vec![Value::from("Gus")],
+                vec![Value::from("Vincent")]
+            ],
+        );
     }
 
     // ========================================================================
@@ -330,6 +373,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r.row_count(), 2, "Should have 2 groups: City and Person");
+        assert_eq!(
+            r.rows(),
+            vec![
+                vec![Value::from("City"), Value::Int64(1)],
+                vec![Value::from("Person"), Value::Int64(2)],
+            ],
+        );
     }
 
     // ========================================================================
@@ -350,6 +400,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r.row_count(), 2, "Alix and Gus have both name and age");
+        assert_eq!(
+            r.rows(),
+            vec![
+                vec![Value::from("Alix"), Value::from("30")],
+                vec![Value::from("Gus"), Value::from("25")],
+            ],
+        );
     }
 
     // ========================================================================
@@ -370,5 +427,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r.row_count(), 1, "Only Alix starts with A");
+        assert_eq!(r.rows(), vec![vec![Value::from("Alix")]]);
     }
 }
