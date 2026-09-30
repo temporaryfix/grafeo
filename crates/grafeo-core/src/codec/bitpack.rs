@@ -445,10 +445,6 @@ impl BitPackedInts {
     ///
     /// The result is always in `1..=64`.
     ///
-    /// # Panics
-    ///
-    /// Cannot panic: the result of `64 - leading_zeros()` is always in
-    /// `1..=64`, which fits `u8`.
     #[must_use]
     pub fn bits_needed(value: u64) -> u8 {
         if value == 0 {
@@ -456,7 +452,10 @@ impl BitPackedInts {
         } else {
             // leading_zeros() returns u32 in [0, 63] for non-zero u64;
             // (64 - n) is in [1, 64], which always fits u8.
-            u8::try_from(64u32 - value.leading_zeros()).expect("bits_needed result is in 1..=64")
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                (u64::BITS - value.leading_zeros()) as u8
+            }
         }
     }
 

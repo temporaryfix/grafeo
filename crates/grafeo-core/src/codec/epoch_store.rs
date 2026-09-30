@@ -485,6 +485,27 @@ pub struct EpochStore {
     epoch_count: AtomicUsize,
 }
 
+/// Retained cold-block writer paired with its detached retirement owner.
+#[cfg(all(feature = "lpg", feature = "tiered-storage"))]
+pub(crate) struct PreparedEpochStoreReplacement<'target, 'source> {
+    target: &'target EpochStore,
+    blocks: parking_lot::RwLockWriteGuard<'target, HashMap<EpochId, CompressedEpochBlock>>,
+    source: &'source mut EpochStore,
+}
+
+#[cfg(all(feature = "lpg", feature = "tiered-storage"))]
+impl PreparedEpochStoreReplacement<'_, '_> {
+    pub(crate) fn install(&mut self) {
+        std::mem::swap(&mut *self.blocks, self.source.blocks.get_mut());
+        let size = self.source.total_size.load(Ordering::Relaxed);
+        let count = self.source.epoch_count.load(Ordering::Relaxed);
+        let old_size = self.target.total_size.swap(size, Ordering::AcqRel);
+        let old_count = self.target.epoch_count.swap(count, Ordering::AcqRel);
+        self.source.total_size.store(old_size, Ordering::Relaxed);
+        self.source.epoch_count.store(old_count, Ordering::Relaxed);
+    }
+}
+
 impl Default for EpochStore {
     fn default() -> Self {
         Self::new()
@@ -492,6 +513,39 @@ impl Default for EpochStore {
 }
 
 impl EpochStore {
+    /// Pins existing cold storage until complete structural/backing publication.
+    #[cfg(all(feature = "lpg", feature = "tiered-storage"))]
+    pub(crate) fn prepare_replacement<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedEpochStoreReplacement<'target, 'source>> {
+        Some(PreparedEpochStoreReplacement {
+            target: self,
+            blocks: self.blocks.try_write()?,
+            source,
+        })
+    }
+
+    /// Excludes cold publication while a pristine hot-only image is installed.
+    #[cfg(all(feature = "lpg", feature = "tiered-storage"))]
+    pub(crate) fn try_empty_restore_guard(&self) -> Option<impl Sized + '_> {
+        let blocks = self.blocks.try_write()?;
+        if !blocks.is_empty()
+            || self.total_size.load(Ordering::Acquire) != 0
+            || self.epoch_count.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        Some(blocks)
+    }
+
+    #[cfg(all(feature = "lpg", feature = "tiered-storage"))]
+    pub(crate) fn is_empty_restore_image(&mut self) -> bool {
+        self.blocks.get_mut().is_empty()
+            && self.total_size.load(Ordering::Acquire) == 0
+            && self.epoch_count.load(Ordering::Acquire) == 0
+    }
+
     /// Creates a new empty epoch store.
     #[must_use]
     pub fn new() -> Self {

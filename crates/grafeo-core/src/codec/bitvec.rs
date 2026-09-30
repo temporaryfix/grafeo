@@ -1,11 +1,11 @@
 //! Stores booleans as individual bits - 8x smaller than `Vec<bool>`.
 //!
 //! Use this when you're tracking lots of boolean flags (like null bitmaps
-//! or set membership). Phase 3b: storage split into an immutable
+//! or set membership). Storage is split into an immutable
 //! `BitVector` (refcounted [`Bytes`]) and a mutable [`BitVectorBuilder`]
 //! that produces one via [`freeze`](BitVectorBuilder::freeze). This is
 //! the Apache Arrow / Lance "Array + Builder" idiom; the immutable side
-//! supports zero-copy mmap-backing for Phase 3c, while the builder
+//! supports zero-copy mmap backing, while the builder
 //! retains the cheap word-level mutations needed by succinct-index
 //! construction (rank/select, wavelet trees, Elias-Fano).
 //!
@@ -53,13 +53,7 @@ impl Eq for BitVector {}
 impl serde::Serialize for BitVector {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // On-disk shape stays `{data: Vec<u64>, len: usize}` for backward
-        // compatibility with the v1 LpgStoreSection format. Internal
-        // storage is now `Bytes`; we materialize a `Vec<u64>` only for
-        // serialization.
-        let words: Vec<u64> = (0..self.word_count())
-            .map(|i| self.word_at(i).unwrap_or(0))
-            .collect();
+        let words: Vec<u64> = self.words().collect();
         let mut s = serializer.serialize_struct("BitVector", 2)?;
         s.serialize_field("data", &words)?;
         s.serialize_field("len", &self.len)?;
@@ -98,7 +92,7 @@ impl<'de> Deserialize<'de> for BitVector {
                 let len: usize = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                validate_bitvec(len, &data).map_err(de::Error::custom)
+                validate_bitvec(len, data).map_err(de::Error::custom)
             }
 
             fn visit_map<V>(self, mut map: V) -> Result<BitVector, V::Error>
@@ -127,7 +121,7 @@ impl<'de> Deserialize<'de> for BitVector {
 
                 let data = data.ok_or_else(|| de::Error::missing_field("data"))?;
                 let len = len.ok_or_else(|| de::Error::missing_field("len"))?;
-                validate_bitvec(len, &data).map_err(de::Error::custom)
+                validate_bitvec(len, data).map_err(de::Error::custom)
             }
         }
 
@@ -136,7 +130,7 @@ impl<'de> Deserialize<'de> for BitVector {
     }
 }
 
-/// Phase 6a: format-validation error returned by [`BitVector::from_mmap`].
+/// Format-validation error returned by checked [`BitVector`] constructors.
 ///
 /// Distinct from [`io::Error`] because format mismatches are a recoverable
 /// classification problem (caller may try a different format version),
@@ -173,18 +167,9 @@ impl std::error::Error for BitVectorFormatError {}
 
 /// Validates that `len` and `data` are consistent, returning a valid
 /// `BitVector` or an error message.
-fn validate_bitvec(len: usize, data: &[u64]) -> Result<BitVector, String> {
-    let expected_words = len.div_ceil(64);
-    if data.len() != expected_words {
-        return Err(format!(
-            "BitVector invariant violated: len={len} requires {expected_words} words, but data contains {} words",
-            data.len()
-        ));
-    }
-    Ok(BitVector {
-        data: words_to_bytes(data),
-        len,
-    })
+fn validate_bitvec(len: usize, data: Vec<u64>) -> Result<BitVector, String> {
+    BitVector::from_raw_parts(data, len)
+        .map_err(|error| format!("BitVector invariant violated: {error}"))
 }
 
 /// Encodes `words` as little-endian bytes wrapped in a refcounted `Bytes`.
@@ -197,43 +182,42 @@ fn words_to_bytes(words: &[u64]) -> Bytes {
 }
 
 impl BitVector {
-    /// Reconstructs from pre-packed raw parts (legacy: `Vec<u64>` words).
+    /// Reconstructs from pre-packed little-endian `u64` words.
     ///
     /// Used by section deserialization that holds words on the heap.
-    /// Phase 3c will add [`from_bytes_storage`](Self::from_bytes_storage)
-    /// for mmap-backed construction.
-    #[must_use]
-    pub fn from_raw_parts(data: Vec<u64>, len: usize) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `data` contains exactly `ceil(len / 64)`
+    /// words.
+    pub fn from_raw_parts(data: Vec<u64>, len: usize) -> Result<Self, BitVectorFormatError> {
+        let expected_bytes = len.div_ceil(64) * 8;
+        let actual_bytes = data.len() * 8;
+        if actual_bytes != expected_bytes {
+            return Err(BitVectorFormatError::ByteLengthMismatch {
+                len,
+                expected_bytes,
+                actual_bytes,
+            });
+        }
+        Ok(Self {
             data: words_to_bytes(&data),
             len,
-        }
+        })
     }
 
-    /// Constructs from pre-encoded bytes (Phase 3c entry point).
+    /// Constructs from pre-encoded bytes without copying.
     ///
     /// `data` must be `ceil(len / 64) * 8` bytes of little-endian
-    /// `u64` words. Used by the mmap path so a column can hold a
-    /// slice of mapped memory without copying.
-    #[must_use]
-    pub fn from_bytes_storage(data: Bytes, len: usize) -> Self {
-        Self { data, len }
-    }
-
-    /// Phase 6a: zero-copy mmap constructor.
-    ///
-    /// Adopts a refcounted [`Bytes`] slice (typically produced by
-    /// `Bytes::from_owner(mmap)` or a sub-slice thereof) as the
-    /// backing storage without copying. The on-disk contract is
-    /// little-endian `u64` words, with `len` total bits stored in
-    /// `ceil(len / 64) * 8` bytes.
+    /// `u64` words. Heap-owned, shared, and mmap-backed [`Bytes`] use the
+    /// same checked path.
     ///
     /// # Errors
     ///
     /// Returns an error if the byte length doesn't match the expected
     /// `ceil(len / 64) * 8` for the declared bit count. This guards
-    /// against truncated or oversized mmap regions.
-    pub fn from_mmap(data: Bytes, len: usize) -> Result<Self, BitVectorFormatError> {
+    /// against truncated or oversized storage regions.
+    pub fn from_bytes_storage(data: Bytes, len: usize) -> Result<Self, BitVectorFormatError> {
         let expected_bytes = len.div_ceil(64) * 8;
         if data.len() != expected_bytes {
             return Err(BitVectorFormatError::ByteLengthMismatch {
@@ -256,9 +240,7 @@ impl BitVector {
 
     /// Creates a bit vector from a slice of booleans.
     ///
-    /// Routes through a [`BitVectorBuilder`] internally; Phase 3b
-    /// preserves the original convenience API for callers that already
-    /// have the bools materialized.
+    /// Routes through a [`BitVectorBuilder`] internally.
     #[must_use]
     pub fn from_bools(bools: &[bool]) -> Self {
         let mut builder = BitVectorBuilder::with_capacity(bools.len());
@@ -319,7 +301,7 @@ impl BitVector {
     /// Returns the word at `idx`, or `None` if out of range.
     ///
     /// Reads via `from_le_bytes`; supports unaligned `Bytes` slices
-    /// (e.g., mmap-backed sub-slices in Phase 3c).
+    /// (e.g., mmap-backed sub-slices).
     #[must_use]
     pub fn word_at(&self, idx: usize) -> Option<u64> {
         let start = idx.checked_mul(8)?;
@@ -328,10 +310,20 @@ impl BitVector {
         Some(u64::from_le_bytes(chunk))
     }
 
+    /// Iterates over decoded little-endian backing words.
+    fn words(&self) -> impl Iterator<Item = u64> + '_ {
+        self.data.chunks_exact(8).map(|chunk| {
+            let [b0, b1, b2, b3, b4, b5, b6, b7] = chunk else {
+                return 0;
+            };
+            u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7])
+        })
+    }
+
     /// Returns the raw byte storage.
     ///
-    /// Phase 3c serializers use this to write the storage out directly
-    /// (the on-disk format already matches our LE word layout).
+    /// Serializers use this to write the storage out directly because the
+    /// on-disk format already matches the little-endian word layout.
     #[must_use]
     pub fn data_bytes(&self) -> &Bytes {
         &self.data
@@ -343,21 +335,20 @@ impl BitVector {
         if self.is_empty() {
             return 0;
         }
-        let full_words = self.len / 64;
         let remaining_bits = self.len % 64;
+        let last_word = self.word_count().saturating_sub(1);
 
-        let mut count: usize = (0..full_words)
-            .map(|i| self.word_at(i).unwrap_or(0).count_ones() as usize)
-            .sum();
-
-        if remaining_bits > 0
-            && let Some(word) = self.word_at(full_words)
-        {
-            let mask = (1u64 << remaining_bits) - 1;
-            count += (word & mask).count_ones() as usize;
-        }
-
-        count
+        self.words()
+            .enumerate()
+            .map(|(index, word)| {
+                let masked = if remaining_bits > 0 && index == last_word {
+                    word & ((1u64 << remaining_bits) - 1)
+                } else {
+                    word
+                };
+                masked.count_ones() as usize
+            })
+            .sum()
     }
 
     /// Returns the number of bits set to false.
@@ -367,45 +358,30 @@ impl BitVector {
     }
 
     /// Converts back to a `Vec<bool>`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if internal storage is shorter than `len()` bits — an
-    /// invariant violation that would indicate a bug in
-    /// [`from_bytes_storage`](Self::from_bytes_storage) caller's
-    /// data validation.
     #[must_use]
     pub fn to_bools(&self) -> Vec<bool> {
-        (0..self.len)
-            .map(|i| self.get(i).expect("index within len"))
-            .collect()
+        self.iter().collect()
     }
 
     /// Returns an iterator over the bits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if internal storage is shorter than `len()` bits.
     pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
-        (0..self.len).map(move |i| self.get(i).expect("index within len"))
+        self.words()
+            .flat_map(|word| (0..64).map(move |bit| word & (1u64 << bit) != 0))
+            .take(self.len)
     }
 
     /// Returns an iterator over indices where bits are true.
-    ///
-    /// # Panics
-    ///
-    /// Panics if internal storage is shorter than `len()` bits.
     pub fn ones_iter(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.len).filter(move |&i| self.get(i).expect("index within len"))
+        self.iter()
+            .enumerate()
+            .filter_map(|(index, set)| set.then_some(index))
     }
 
     /// Returns an iterator over indices where bits are false.
-    ///
-    /// # Panics
-    ///
-    /// Panics if internal storage is shorter than `len()` bits.
     pub fn zeros_iter(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.len).filter(move |&i| !self.get(i).expect("index within len"))
+        self.iter()
+            .enumerate()
+            .filter_map(|(index, set)| (!set).then_some(index))
     }
 
     /// Returns the compression ratio (original bytes / compressed bytes).
@@ -428,8 +404,11 @@ impl BitVector {
     pub fn and(&self, other: &Self) -> Self {
         let len = self.len.min(other.len);
         let num_words = len.div_ceil(64);
-        let words: Vec<u64> = (0..num_words)
-            .map(|i| self.word_at(i).unwrap_or(0) & other.word_at(i).unwrap_or(0))
+        let words: Vec<u64> = self
+            .words()
+            .zip(other.words())
+            .take(num_words)
+            .map(|(left, right)| left & right)
             .collect();
         Self {
             data: words_to_bytes(&words),
@@ -442,8 +421,11 @@ impl BitVector {
     pub fn or(&self, other: &Self) -> Self {
         let len = self.len.min(other.len);
         let num_words = len.div_ceil(64);
-        let words: Vec<u64> = (0..num_words)
-            .map(|i| self.word_at(i).unwrap_or(0) | other.word_at(i).unwrap_or(0))
+        let words: Vec<u64> = self
+            .words()
+            .zip(other.words())
+            .take(num_words)
+            .map(|(left, right)| left | right)
             .collect();
         Self {
             data: words_to_bytes(&words),
@@ -454,10 +436,7 @@ impl BitVector {
     /// Performs bitwise NOT.
     #[must_use]
     pub fn not(&self) -> Self {
-        let num_words = self.word_count();
-        let words: Vec<u64> = (0..num_words)
-            .map(|i| !self.word_at(i).unwrap_or(0))
-            .collect();
+        let words: Vec<u64> = self.words().map(|word| !word).collect();
         Self {
             data: words_to_bytes(&words),
             len: self.len,
@@ -469,8 +448,11 @@ impl BitVector {
     pub fn xor(&self, other: &Self) -> Self {
         let len = self.len.min(other.len);
         let num_words = len.div_ceil(64);
-        let words: Vec<u64> = (0..num_words)
-            .map(|i| self.word_at(i).unwrap_or(0) ^ other.word_at(i).unwrap_or(0))
+        let words: Vec<u64> = self
+            .words()
+            .zip(other.words())
+            .take(num_words)
+            .map(|(left, right)| left ^ right)
             .collect();
         Self {
             data: words_to_bytes(&words),
@@ -521,17 +503,15 @@ impl BitVector {
         let num_words = len.div_ceil(64);
         let needed = 4 + num_words * 8;
 
-        if bytes.len() < needed {
+        if bytes.len() != needed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "BitVector truncated",
+                "BitVector storage length does not match its declared bit length",
             ));
         }
 
-        Ok(Self {
-            data: Bytes::copy_from_slice(&bytes[4..needed]),
-            len,
-        })
+        Self::from_bytes_storage(Bytes::copy_from_slice(&bytes[4..]), len)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }
 
@@ -914,7 +894,7 @@ mod tests {
         assert_eq!(bv.count_ones(), 64);
     }
 
-    // ── Phase 3b: Bytes-backed storage ────────────────────────────────
+    // ── Bytes-backed storage ──────────────────────────────────────────
 
     #[test]
     fn test_bitvec_word_at_returns_words_from_bytes() {
@@ -943,6 +923,26 @@ mod tests {
     }
 
     #[test]
+    fn raw_parts_reject_a_word_count_that_does_not_match_the_bit_length() {
+        assert!(BitVector::from_raw_parts(Vec::new(), 1).is_err());
+        assert!(BitVector::from_raw_parts(vec![0, 0], 1).is_err());
+    }
+
+    #[test]
+    fn byte_storage_rejects_a_byte_count_that_does_not_match_the_bit_length() {
+        assert!(BitVector::from_bytes_storage(Bytes::new(), 1).is_err());
+        assert!(BitVector::from_bytes_storage(Bytes::from(vec![0; 16]), 1).is_err());
+    }
+
+    #[test]
+    fn byte_format_rejects_trailing_storage() {
+        let mut encoded = BitVector::from_bools(&[true]).to_bytes().unwrap();
+        encoded.extend_from_slice(&[0; 8]);
+
+        assert!(BitVector::from_bytes(&encoded).is_err());
+    }
+
+    #[test]
     fn test_bitvec_serde_round_trip_with_bytes_storage() {
         let bools: Vec<bool> = (0..130).map(|i| i % 7 == 0).collect();
         let bv = BitVector::from_bools(&bools);
@@ -956,16 +956,17 @@ mod tests {
         }
     }
 
-    // ── Phase 6a: from_mmap zero-copy constructor ─────────────────────
+    // ── Zero-copy byte-storage constructor ────────────────────────────
 
-    /// Round-trip via `from_mmap`: take an existing BitVector's bytes,
+    /// Round-trip via `from_bytes_storage`: take an existing BitVector's bytes,
     /// adopt them as a fresh BitVector, verify all bits.
     #[test]
-    fn alix_from_mmap_round_trips_via_data_bytes() {
+    fn alix_from_byte_storage_round_trips_via_data_bytes() {
         let bools: Vec<bool> = (0..200).map(|i| i % 5 == 0).collect();
         let original = BitVector::from_bools(&bools);
         let bytes = original.data_bytes().clone();
-        let mmapped = BitVector::from_mmap(bytes, original.len()).expect("from_mmap");
+        let mmapped =
+            BitVector::from_bytes_storage(bytes, original.len()).expect("valid byte storage");
         assert_eq!(mmapped.len(), original.len());
         for (i, &b) in bools.iter().enumerate() {
             assert_eq!(mmapped.get(i), Some(b), "bit {i}");
@@ -978,10 +979,10 @@ mod tests {
 
     /// Truncated buffer is rejected — guards against partial mmap regions.
     #[test]
-    fn gus_from_mmap_rejects_short_buffer() {
+    fn gus_from_byte_storage_rejects_short_buffer() {
         // len=200 needs ceil(200/64)*8 = 32 bytes; provide only 16.
         let short = bytes::Bytes::from(vec![0u8; 16]);
-        let result = BitVector::from_mmap(short, 200);
+        let result = BitVector::from_bytes_storage(short, 200);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(
@@ -996,18 +997,18 @@ mod tests {
 
     /// Oversized buffer is also rejected — symmetric guard.
     #[test]
-    fn vincent_from_mmap_rejects_long_buffer() {
+    fn vincent_from_byte_storage_rejects_long_buffer() {
         // len=10 needs ceil(10/64)*8 = 8 bytes; provide 16.
         let long = bytes::Bytes::from(vec![0u8; 16]);
-        let result = BitVector::from_mmap(long, 10);
+        let result = BitVector::from_bytes_storage(long, 10);
         assert!(result.is_err());
     }
 
-    /// Empty bitvector via from_mmap — len=0, 0 bytes.
+    /// Empty bitvector via byte storage — len=0, 0 bytes.
     #[test]
-    fn jules_from_mmap_handles_empty() {
+    fn jules_from_byte_storage_handles_empty() {
         let empty = bytes::Bytes::new();
-        let bv = BitVector::from_mmap(empty, 0).expect("empty mmap");
+        let bv = BitVector::from_bytes_storage(empty, 0).expect("empty byte storage");
         assert_eq!(bv.len(), 0);
         assert!(bv.is_empty());
     }
@@ -1019,32 +1020,33 @@ mod tests {
     /// the same address, then mutating one side is impossible (Bytes is
     /// immutable) — the test confirms shape, not write-isolation.
     #[test]
-    fn mia_from_mmap_is_zero_copy() {
+    fn mia_from_byte_storage_is_zero_copy() {
         let original = BitVector::from_bools(&[true; 1024]);
         let source_bytes = original.data_bytes().clone();
         let source_ptr = source_bytes.as_ptr();
 
-        let mmapped = BitVector::from_mmap(source_bytes, 1024).expect("from_mmap");
+        let mmapped =
+            BitVector::from_bytes_storage(source_bytes, 1024).expect("valid byte storage");
         // The mmapped bitvector's storage points at the same address —
         // no allocation occurred.
         assert_eq!(
             mmapped.data_bytes().as_ptr(),
             source_ptr,
-            "from_mmap must NOT allocate; Bytes refcount sharing required"
+            "from_bytes_storage must NOT allocate; Bytes refcount sharing required"
         );
     }
 
     /// LE word contract: a hand-crafted LE byte pattern decodes to the
     /// expected u64 words. Guards against accidental endianness drift.
     #[test]
-    fn shosanna_from_mmap_locks_le_word_contract() {
+    fn shosanna_from_byte_storage_locks_le_word_contract() {
         // Bytes [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08] in LE
         // decode to 0x0807060504030201.
         let bytes = bytes::Bytes::from(vec![
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // word 0
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // word 1: all-ones
         ]);
-        let bv = BitVector::from_mmap(bytes, 128).expect("from_mmap");
+        let bv = BitVector::from_bytes_storage(bytes, 128).expect("valid byte storage");
         assert_eq!(bv.word_at(0), Some(0x0807_0605_0403_0201));
         assert_eq!(bv.word_at(1), Some(0xFFFF_FFFF_FFFF_FFFF));
     }

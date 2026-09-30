@@ -277,13 +277,22 @@ impl TypeSpecificCompressor {
 
         match codec {
             CompressionCodec::None => {
-                let mut data = Vec::with_capacity(values.len() * 8);
+                let byte_len = values.len().checked_mul(8).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "raw integer size overflow")
+                })?;
+                let mut data = Vec::new();
+                data.try_reserve_exact(byte_len).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        format!("cannot allocate raw integer payload: {error}"),
+                    )
+                })?;
                 for &v in values {
                     data.extend_from_slice(&v.to_le_bytes());
                 }
                 Ok(CompressedData {
                     codec,
-                    uncompressed_size: values.len() * 8,
+                    uncompressed_size: byte_len,
                     data,
                     metadata: CompressionMetadata::None,
                 })
@@ -324,7 +333,10 @@ impl TypeSpecificCompressor {
                     },
                 })
             }
-            _ => unreachable!("Unexpected codec for integers"),
+            unsupported => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("codec {} cannot encode integer values", unsupported.name()),
+            )),
         }
     }
 
@@ -362,9 +374,6 @@ impl TypeSpecificCompressor {
 
     /// Decompresses u64 values.
     ///
-    /// For `CompressionCodec::None`, trailing bytes that do not form a complete
-    /// `u64` are silently dropped.
-    ///
     /// # Errors
     ///
     /// Returns `Err` if the compressed payload is malformed (e.g. invalid
@@ -373,6 +382,12 @@ impl TypeSpecificCompressor {
     pub fn decompress_integers(data: &CompressedData) -> io::Result<Vec<u64>> {
         match data.codec {
             CompressionCodec::None => {
+                if !data.data.len().is_multiple_of(8) || data.uncompressed_size != data.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "raw integer payload must be canonical whole u64 values",
+                    ));
+                }
                 let mut values = Vec::with_capacity(data.data.len() / 8);
                 for chunk in data.data.chunks_exact(8) {
                     values.push(u64::from_le_bytes(
@@ -479,6 +494,18 @@ mod tests {
 
         let decompressed = TypeSpecificCompressor::decompress_integers(&compressed).unwrap();
         assert_eq!(values, decompressed);
+    }
+
+    #[test]
+    fn raw_integer_payload_rejects_trailing_bytes() {
+        let compressed = CompressedData {
+            codec: CompressionCodec::None,
+            uncompressed_size: 9,
+            data: vec![0; 9],
+            metadata: CompressionMetadata::None,
+        };
+
+        assert!(TypeSpecificCompressor::decompress_integers(&compressed).is_err());
     }
 
     #[test]
