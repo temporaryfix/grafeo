@@ -9,6 +9,8 @@
 //! cargo test -p grafeo-engine --test planner_coverage --all-features
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 

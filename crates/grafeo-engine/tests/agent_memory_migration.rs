@@ -89,31 +89,40 @@ fn test_incremental_growth_with_persistence() {
     let mut inserted = 0u64;
 
     // First open: create DB and seed first batch
-    {
+    let (expected_owner, expected_config) = {
         let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
         for i in 0..batch_size {
             let node = db.create_node(&["Memory"]);
-            db.set_node_property(node, "text", Value::String(format!("fact_{i}").into()));
-            db.set_node_property(node, "timestamp", Value::Int64(1_700_000_000 + i));
-            db.set_node_property(node, "confidence", Value::Float64(0.5 + (i as f64) * 0.001));
+            db.set_node_property(node, "text", Value::String(format!("fact_{i}").into()))
+                .expect("set node property");
+            db.set_node_property(node, "timestamp", Value::Int64(1_700_000_000 + i))
+                .expect("set node property");
+            db.set_node_property(node, "confidence", Value::Float64(0.5 + (i as f64) * 0.001))
+                .expect("set node property");
             db.set_node_property(
                 node,
                 "embedding",
                 Value::Vector(random_384d_vector(i as u64).into()),
-            );
+            )
+            .expect("set node property");
         }
         inserted += batch_size as u64;
 
         // Create vector index after first batch
-        db.create_vector_index(
-            "Memory",
-            "embedding",
-            Some(384),
-            Some("cosine"),
-            None,
-            None,
-            None,
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Memory".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(384),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
         .expect("create vector index");
 
         // Verify search works
@@ -122,37 +131,65 @@ fn test_incremental_growth_with_persistence() {
             .expect("search");
         assert_eq!(results.len(), 5, "should find 5 results from first batch");
 
+        let owners = db.list_indexes();
+        assert_eq!(owners.len(), 1);
+        let owner = (
+            owners[0].name.clone(),
+            owners[0].index_type.clone(),
+            owners[0].target.clone(),
+        );
+        let index = grafeo_engine::database::testing::root_lpg_store(&db)
+            .get_vector_index("Memory", "embedding")
+            .expect("owned vector index");
+        let config = format!("{:?}", index.config());
+        drop(index);
         db.close().unwrap();
-    }
+        (owner, config)
+    };
+    let assert_recovered_index = |db: &GrafeoDB| {
+        let owners = db.list_indexes();
+        assert_eq!(owners.len(), 1, "reopen preserves one canonical owner");
+        assert_eq!(
+            (&owners[0].name, &owners[0].index_type, &owners[0].target),
+            (&expected_owner.0, &expected_owner.1, &expected_owner.2)
+        );
+        let index = grafeo_engine::database::testing::root_lpg_store(db)
+            .get_vector_index("Memory", "embedding")
+            .expect("recovered vector index");
+        assert_eq!(
+            format!("{:?}", index.config()),
+            expected_config,
+            "reopen preserves every resolved HNSW configuration field"
+        );
+        let results = db
+            .vector_search("Memory", "embedding", &random_384d_vector(0), 5, None, None)
+            .expect("recovered index must search before further writes");
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|(_, distance)| distance.is_finite()));
+    };
 
     // Continue inserting in batches, reopening periodically
     while inserted < total_nodes as u64 {
         let db = GrafeoDB::open(&path).unwrap();
 
-        // Index metadata is persisted in snapshot v4 (single-file format),
-        // but WAL-based persistence requires manual recreation after reopen.
-        db.create_vector_index(
-            "Memory",
-            "embedding",
-            Some(384),
-            Some("cosine"),
-            None,
-            None,
-            None,
-        )
-        .expect("recreate vector index after reopen");
+        // Canonical ownership and resolved configuration survive WAL recovery.
+        assert_recovered_index(&db);
 
         let batch_end = (inserted + reopen_every as u64).min(total_nodes as u64);
         for i in inserted..batch_end {
             let node = db.create_node(&["Memory"]);
-            db.set_node_property(node, "text", Value::String(format!("fact_{i}").into()));
-            db.set_node_property(node, "timestamp", Value::Int64(1_700_000_000 + i as i64));
-            db.set_node_property(node, "confidence", Value::Float64(0.5 + (i as f64) * 0.001));
+            db.set_node_property(node, "text", Value::String(format!("fact_{i}").into()))
+                .expect("set node property");
+            db.set_node_property(node, "timestamp", Value::Int64(1_700_000_000 + i as i64))
+                .expect("set node property");
+            db.set_node_property(node, "confidence", Value::Float64(0.5 + (i as f64) * 0.001))
+                .expect("set node property");
             db.set_node_property(
                 node,
                 "embedding",
                 Value::Vector(random_384d_vector(i).into()),
-            );
+            )
+            .expect("set node property");
         }
         inserted = batch_end;
 
@@ -177,6 +214,7 @@ fn test_incremental_growth_with_persistence() {
 
     // Final reopen: verify everything survived
     let db = GrafeoDB::open(&path).unwrap();
+    assert_recovered_index(&db);
     assert_eq!(
         db.node_count(),
         total_nodes,
@@ -201,17 +239,23 @@ fn bench_hnsw_at_20k() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
     }
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     // Insert remaining incrementally
@@ -221,7 +265,8 @@ fn bench_hnsw_at_20k() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
 
         // Measure at milestones
         let count = (i + 1) as usize;
@@ -268,20 +313,26 @@ fn test_hnsw_recall_at_2k() {
     for i in 0..count as u64 {
         let vec = random_384d_vector(i);
         let node = db.create_node(&["Memory"]);
-        db.set_node_property(node, "embedding", Value::Vector(vec.clone().into()));
+        db.set_node_property(node, "embedding", Value::Vector(vec.clone().into()))
+            .expect("set node property");
         id_to_index.insert(node.as_u64(), i as usize);
         all_vectors.push(vec);
     }
 
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     // Measure recall@10 for 20 queries
@@ -345,17 +396,23 @@ fn test_concurrent_vector_search_during_writes() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
     }
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     let num_readers = 4;
@@ -382,7 +439,8 @@ fn test_concurrent_vector_search_during_writes() {
                     node,
                     "embedding",
                     Value::Vector(random_384d_vector(10_000 + i as u64).into()),
-                );
+                )
+                .expect("set node property");
                 write_success.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -469,7 +527,8 @@ fn test_close_reopen_preserves_data() {
         for i in 0..100 {
             let label = ENTITY_LABELS[i % ENTITY_LABELS.len()];
             let node = db.create_node(&[label]);
-            db.set_node_property(node, "name", Value::String(format!("entity_{i}").into()));
+            db.set_node_property(node, "name", Value::String(format!("entity_{i}").into()))
+                .expect("set node property");
             node_ids.push(node);
         }
         // Create some edges via direct API
@@ -534,7 +593,8 @@ fn test_storage_size_100_entities() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
         node_ids.push(node);
     }
     // Create 150 edges via direct API
@@ -618,7 +678,8 @@ fn bench_storage_size_5400_entities() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
         node_ids.push(node);
     }
 
@@ -700,19 +761,25 @@ fn bench_vector_index_rebuild_5k() {
                 node,
                 "embedding",
                 Value::Vector(random_384d_vector(i).into()),
-            );
+            )
+            .expect("set node property");
         }
 
         // Create index before close (so it gets persisted in snapshot v4)
-        db.create_vector_index(
-            "Memory",
-            "embedding",
-            Some(384),
-            Some("cosine"),
-            None,
-            None,
-            None,
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Memory".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(384),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
         .expect("create index");
 
         // Verify search works before close
@@ -741,15 +808,20 @@ fn bench_vector_index_rebuild_5k() {
     // The single-file format (snapshot v4) persists index metadata and
     // rebuilds the index from data on load. Measure if search works immediately.
     let rebuild_start = Instant::now();
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("recreate vector index after reopen");
     let rebuild_time = rebuild_start.elapsed();
 
@@ -808,18 +880,24 @@ fn test_byov_384_cosine() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
     }
 
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     // Search with the same vector as node 0: should return node 0 as closest
@@ -850,7 +928,7 @@ fn test_byov_384_cosine() {
 
 #[test]
 fn test_byov_all_metrics() {
-    for metric in &["cosine", "euclidean", "dot_product", "manhattan"] {
+    for metric in ["cosine", "euclidean", "dot_product", "manhattan"] {
         let db = GrafeoDB::new_in_memory();
 
         for i in 0..20u64 {
@@ -859,18 +937,24 @@ fn test_byov_all_metrics() {
                 node,
                 "embedding",
                 Value::Vector(random_384d_vector(i).into()),
-            );
+            )
+            .expect("set node property");
         }
 
-        db.create_vector_index(
-            "Memory",
-            "embedding",
-            Some(384),
-            Some(metric),
-            None,
-            None,
-            None,
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Memory".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(384),
+                metric: Some(metric.into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
         .unwrap_or_else(|e| panic!("create index with {metric}: {e}"));
 
         let results = db
@@ -899,16 +983,22 @@ fn test_byov_incremental_after_index() {
         sentinel,
         "embedding",
         Value::Vector(random_384d_vector(9999).into()),
-    );
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
     )
+    .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     // Insert 100 nodes incrementally
@@ -918,7 +1008,8 @@ fn test_byov_incremental_after_index() {
             node,
             "embedding",
             Value::Vector(random_384d_vector(i).into()),
-        );
+        )
+        .expect("set node property");
 
         if (i + 1) % 25 == 0 {
             let results = db
@@ -1091,15 +1182,20 @@ fn test_batch_create_nodes_384() {
     let ids = db.batch_create_nodes("Memory", "embedding", vectors);
     assert_eq!(ids.len(), 200, "should create 200 nodes");
 
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(384),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(384),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     let results = db

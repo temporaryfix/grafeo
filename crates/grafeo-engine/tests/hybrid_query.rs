@@ -24,72 +24,96 @@ fn setup_article_db() -> GrafeoDB {
 
     // Create articles with embeddings and text
     let a1 = db.create_node(&["Article"]);
-    db.set_node_property(a1, "title", Value::String("Graph Neural Networks".into()));
+    db.set_node_property(a1, "title", Value::String("Graph Neural Networks".into()))
+        .expect("set node property");
     db.set_node_property(
         a1,
         "body",
         Value::String(
             "attention mechanisms in graph neural networks for node classification".into(),
         ),
-    );
+    )
+    .expect("set node property");
     db.set_node_property(
         a1,
         "embedding",
         Value::Vector(vec![0.9f32, 0.1, 0.0].into()),
-    );
+    )
+    .expect("set node property");
 
     let a2 = db.create_node(&["Article"]);
-    db.set_node_property(a2, "title", Value::String("Rust Database Internals".into()));
+    db.set_node_property(a2, "title", Value::String("Rust Database Internals".into()))
+        .expect("set node property");
     db.set_node_property(
         a2,
         "body",
         Value::String("building a database engine in rust with MVCC transactions".into()),
-    );
+    )
+    .expect("set node property");
     db.set_node_property(
         a2,
         "embedding",
         Value::Vector(vec![0.1f32, 0.9, 0.0].into()),
-    );
+    )
+    .expect("set node property");
 
     let a3 = db.create_node(&["Article"]);
     db.set_node_property(
         a3,
         "title",
         Value::String("Transformer Architectures".into()),
-    );
+    )
+    .expect("set node property");
     db.set_node_property(
         a3,
         "body",
         Value::String("attention mechanisms and transformer models for natural language".into()),
-    );
+    )
+    .expect("set node property");
     db.set_node_property(
         a3,
         "embedding",
         Value::Vector(vec![0.8f32, 0.2, 0.1].into()),
-    );
+    )
+    .expect("set node property");
 
     // Create user + friend with relationships
     let user = db.create_node(&["User"]);
-    db.set_node_property(user, "name", Value::String("Alix".into()));
+    db.set_node_property(user, "name", Value::String("Alix".into()))
+        .expect("set node property");
     let friend = db.create_node(&["User"]);
-    db.set_node_property(friend, "name", Value::String("Vincent".into()));
+    db.set_node_property(friend, "name", Value::String("Vincent".into()))
+        .expect("set node property");
     db.create_edge(user, friend, "FOLLOWS");
     db.create_edge(friend, a1, "WROTE");
     db.create_edge(friend, a2, "WROTE");
 
     // Create indexes
-    db.create_vector_index(
-        "Article",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create vector index");
-    db.create_text_index("Article", "body")
-        .expect("create text index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .expect("create text index");
 
     db
 }
@@ -209,7 +233,8 @@ fn test_text_score_without_index_fallthrough() {
     let db = GrafeoDB::new_in_memory();
     // Create nodes but NO text index
     let n = db.create_node(&["Article"]);
-    db.set_node_property(n, "body", Value::String("some body text about rust".into()));
+    db.set_node_property(n, "body", Value::String("some body text about rust".into()))
+        .expect("set node property");
 
     let session = db.session();
     let result = session
@@ -233,20 +258,24 @@ fn test_vector_without_index_brute_force() {
     let db = GrafeoDB::new_in_memory();
     // Create articles WITHOUT a vector index
     let a1 = db.create_node(&["Article"]);
-    db.set_node_property(a1, "title", Value::String("Graph Neural Networks".into()));
+    db.set_node_property(a1, "title", Value::String("Graph Neural Networks".into()))
+        .expect("set node property");
     db.set_node_property(
         a1,
         "embedding",
         Value::Vector(vec![0.9f32, 0.1, 0.0].into()),
-    );
+    )
+    .expect("set node property");
 
     let a2 = db.create_node(&["Article"]);
-    db.set_node_property(a2, "title", Value::String("Rust Database Internals".into()));
+    db.set_node_property(a2, "title", Value::String("Rust Database Internals".into()))
+        .expect("set node property");
     db.set_node_property(
         a2,
         "embedding",
         Value::Vector(vec![0.1f32, 0.9, 0.0].into()),
-    );
+    )
+    .expect("set node property");
 
     // NO vector index created — should fall back to brute-force per-row evaluation
     let session = db.session();
@@ -794,36 +823,58 @@ fn test_text_score_with_int_threshold() {
 fn test_compound_with_scalar_remainder() {
     let db = GrafeoDB::new_in_memory();
     let a1 = db.create_node(&["Article"]);
-    db.set_node_property(a1, "title", Value::String("A1".into()));
-    db.set_node_property(a1, "body", Value::String("attention mechanisms".into()));
+    db.set_node_property(a1, "title", Value::String("A1".into()))
+        .expect("set node property");
+    db.set_node_property(a1, "body", Value::String("attention mechanisms".into()))
+        .expect("set node property");
     db.set_node_property(
         a1,
         "embedding",
         Value::Vector(vec![0.9_f32, 0.1, 0.0].into()),
-    );
-    db.set_node_property(a1, "published", Value::Bool(true));
+    )
+    .expect("set node property");
+    db.set_node_property(a1, "published", Value::Bool(true))
+        .expect("set node property");
 
     let a2 = db.create_node(&["Article"]);
-    db.set_node_property(a2, "title", Value::String("A2".into()));
-    db.set_node_property(a2, "body", Value::String("attention mechanisms".into()));
+    db.set_node_property(a2, "title", Value::String("A2".into()))
+        .expect("set node property");
+    db.set_node_property(a2, "body", Value::String("attention mechanisms".into()))
+        .expect("set node property");
     db.set_node_property(
         a2,
         "embedding",
         Value::Vector(vec![0.9_f32, 0.1, 0.0].into()),
-    );
-    db.set_node_property(a2, "published", Value::Bool(false));
-
-    db.create_vector_index(
-        "Article",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
     )
+    .expect("set node property");
+    db.set_node_property(a2, "published", Value::Bool(false))
+        .expect("set node property");
+
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
-    db.create_text_index("Article", "body").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     let session = db.session();
     let result = session
@@ -851,22 +902,29 @@ fn test_compound_with_scalar_remainder() {
 fn test_compound_or_with_missing_text_index_falls_through() {
     let db = GrafeoDB::new_in_memory();
     let a1 = db.create_node(&["Article"]);
-    db.set_node_property(a1, "body", Value::String("rust".into()));
+    db.set_node_property(a1, "body", Value::String("rust".into()))
+        .expect("set node property");
     db.set_node_property(
         a1,
         "embedding",
         Value::Vector(vec![1.0_f32, 0.0, 0.0].into()),
-    );
-
-    db.create_vector_index(
-        "Article",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
     )
+    .expect("set node property");
+
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
     // NB: no text index — compound OR pushdown should fall through
 
@@ -903,8 +961,10 @@ fn test_order_by_euclidean_distance_ascending() {
     ];
     for (title, emb) in &docs {
         let n = db.create_node(&["Doc"]);
-        db.set_node_property(n, "title", Value::String((*title).into()));
-        db.set_node_property(n, "embedding", Value::Vector(emb.clone().into()));
+        db.set_node_property(n, "title", Value::String((*title).into()))
+            .expect("set node property");
+        db.set_node_property(n, "embedding", Value::Vector(emb.clone().into()))
+            .expect("set node property");
     }
 
     let session = db.session();
@@ -1086,15 +1146,37 @@ fn test_text_score_two_properties_same_variable_and_query() {
     //   a1: title "rust guide",   body "rust tutorial"
     //   a2: title "other stuff",  body "rust tutorial"
     let a1 = db.create_node(&["Article"]);
-    db.set_node_property(a1, "title", Value::String("rust guide".into()));
-    db.set_node_property(a1, "body", Value::String("rust tutorial".into()));
+    db.set_node_property(a1, "title", Value::String("rust guide".into()))
+        .expect("set node property");
+    db.set_node_property(a1, "body", Value::String("rust tutorial".into()))
+        .expect("set node property");
 
     let a2 = db.create_node(&["Article"]);
-    db.set_node_property(a2, "title", Value::String("other stuff".into()));
-    db.set_node_property(a2, "body", Value::String("rust tutorial".into()));
+    db.set_node_property(a2, "title", Value::String("other stuff".into()))
+        .expect("set node property");
+    db.set_node_property(a2, "body", Value::String("rust tutorial".into()))
+        .expect("set node property");
 
-    db.create_text_index("Article", "body").unwrap();
-    db.create_text_index("Article", "title").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "title".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     let session = db.session();
 
@@ -1109,7 +1191,8 @@ fn test_text_score_two_properties_same_variable_and_query() {
         .execute(
             "MATCH (doc:Article) \
              WHERE text_score(doc.body, 'rust') > 0.0 \
-             RETURN doc.title, text_score(doc.title, 'rust') AS title_score \
+             RETURN doc.title, text_score(doc.title, 'rust') AS title_score, \
+                    text_match(doc.title, 'rust') AS title_match \
              ORDER BY doc.title",
         )
         .expect("query with two text_score calls on different properties should execute");
@@ -1122,6 +1205,12 @@ fn test_text_score_two_properties_same_variable_and_query() {
 
     // After ORDER BY doc.title: "other stuff" (a2) comes before "rust guide" (a1).
     let rows = result.rows();
+    assert_eq!(
+        rows[0][2],
+        Value::Bool(false),
+        "nonmatch is false, not NULL"
+    );
+    assert_eq!(rows[1][2], Value::Bool(true));
     let a2_title_score = match &rows[0][1] {
         Value::Float64(f) => *f,
         other => panic!("expected Float64 title score for a2, got {other:?}"),

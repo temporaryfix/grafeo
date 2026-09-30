@@ -8,6 +8,8 @@
 //! cargo test -p grafeo-engine --features full --test mutation_planning
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -138,6 +140,269 @@ fn test_unwind_create() {
 }
 
 #[test]
+fn test_unwind_create_computed_property() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    let result = session
+        .execute("UNWIND [1, 2, 2] AS e CREATE (n:Computed {id: e + 1}) RETURN e, n.id")
+        .unwrap();
+
+    let mut pairs: Vec<(i64, i64)> = result
+        .rows()
+        .iter()
+        .map(|row| {
+            let e = match &row[0] {
+                Value::Int64(value) => *value,
+                other => panic!("expected Int64 e, got {other:?}"),
+            };
+            let id = match &row[1] {
+                Value::Int64(value) => *value,
+                other => panic!("expected Int64 n.id, got {other:?}"),
+            };
+            (e, id)
+        })
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 2), (2, 3), (2, 3)]);
+
+    let stored = session
+        .execute("MATCH (n:Computed) RETURN n.id ORDER BY n.id")
+        .unwrap();
+    let values: Vec<Value> = stored.rows().iter().map(|row| row[0].clone()).collect();
+    assert_eq!(
+        values,
+        vec![Value::Int64(2), Value::Int64(3), Value::Int64(3)]
+    );
+}
+
+#[cfg(feature = "cypher")]
+#[test]
+fn test_cypher_unwind_create_computed_property() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    let result = session
+        .execute_cypher("UNWIND [1, 2, 2] AS e CREATE (n:Computed {id: e + 1}) RETURN e, n.id")
+        .unwrap();
+
+    let mut pairs: Vec<(i64, i64)> = result
+        .rows()
+        .iter()
+        .map(|row| {
+            let e = match &row[0] {
+                Value::Int64(value) => *value,
+                other => panic!("expected Int64 e, got {other:?}"),
+            };
+            let id = match &row[1] {
+                Value::Int64(value) => *value,
+                other => panic!("expected Int64 n.id, got {other:?}"),
+            };
+            (e, id)
+        })
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 2), (2, 3), (2, 3)]);
+
+    let stored = session
+        .execute("MATCH (n:Computed) RETURN n.id ORDER BY n.id")
+        .unwrap();
+    let values: Vec<Value> = stored.rows().iter().map(|row| row[0].clone()).collect();
+    assert_eq!(
+        values,
+        vec![Value::Int64(2), Value::Int64(3), Value::Int64(3)]
+    );
+}
+
+#[test]
+fn test_create_computed_property_variants() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    let result = session
+        .execute(
+            "UNWIND [-2, null] AS e \
+             CREATE (n:ComputedVariants {computed: e + 1, copied: e, literal: 'ok', magnitude: abs(e)}) \
+             RETURN e, n.computed, n.copied, n.literal, n.magnitude",
+        )
+        .unwrap();
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(result.rows()[0][0], Value::Int64(-2));
+    assert_eq!(result.rows()[0][1], Value::Int64(-1));
+    assert_eq!(result.rows()[0][2], Value::Int64(-2));
+    assert_eq!(result.rows()[0][3], Value::String("ok".into()));
+    assert_eq!(result.rows()[0][4], Value::Int64(2));
+    assert_eq!(result.rows()[1][0], Value::Null);
+    assert_eq!(result.rows()[1][1], Value::Null);
+    assert_eq!(result.rows()[1][2], Value::Null);
+    assert_eq!(result.rows()[1][3], Value::String("ok".into()));
+    assert_eq!(result.rows()[1][4], Value::Null);
+}
+
+#[test]
+fn test_create_computed_property_empty_input() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    let result = session
+        .execute("UNWIND [] AS e CREATE (:EmptyComputed {id: e + 1}) RETURN e")
+        .unwrap();
+    assert!(result.rows().is_empty());
+    assert_eq!(db.node_count(), 0);
+}
+
+#[test]
+fn test_chained_create_reads_prior_computed_node() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    let result = session
+        .execute(
+            "UNWIND [1] AS e \
+             CREATE (a:ComputedChain {value: e + 1}) \
+             CREATE (b:ComputedChain {value: a.value + 1}) \
+             RETURN a.value, b.value",
+        )
+        .unwrap();
+
+    assert_eq!(result.rows(), &[vec![Value::Int64(2), Value::Int64(3)]]);
+}
+
+#[test]
+fn test_unwind_create_computed_edge_properties() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute("CREATE (:Endpoint {id: 'a'}), (:Endpoint {id: 'b'})")
+        .unwrap();
+
+    let result = session
+        .execute(
+            "MATCH (a:Endpoint {id: 'a'}), (b:Endpoint {id: 'b'}) \
+             UNWIND [1, 2, 2] AS e \
+             CREATE (a)-[r:ComputedEdge {weight: e + 1}]->(b) \
+             RETURN e, r.weight",
+        )
+        .unwrap();
+    let mut weights: Vec<(i64, i64)> = result
+        .rows()
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Int64(e), Value::Int64(weight)) => (*e, *weight),
+            other => panic!("expected integer edge rows, got {other:?}"),
+        })
+        .collect();
+    weights.sort_unstable();
+    assert_eq!(weights, vec![(1, 2), (2, 3), (2, 3)]);
+
+    let stored = session
+        .execute(
+            "MATCH (a:Endpoint {id: 'a'})-[r:ComputedEdge]->(b:Endpoint {id: 'b'}) \
+             RETURN r.weight ORDER BY r.weight",
+        )
+        .unwrap();
+    assert_eq!(stored.rows().len(), 3);
+    assert_eq!(
+        stored
+            .rows()
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(2), Value::Int64(3), Value::Int64(3)]
+    );
+}
+
+#[cfg(feature = "cypher")]
+#[test]
+fn test_cypher_unwind_create_computed_edge_properties() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute_cypher("CREATE (:Endpoint {id: 'a'}), (:Endpoint {id: 'b'})")
+        .unwrap();
+
+    session
+        .execute_cypher(
+            "MATCH (a:Endpoint {id: 'a'}), (b:Endpoint {id: 'b'}) \
+             UNWIND [1, 2, 2] AS e \
+             CREATE (a)-[r:ComputedEdge {weight: e + 1}]->(b)",
+        )
+        .unwrap();
+
+    let stored = session
+        .execute("MATCH (a:Endpoint {id: 'a'})-[r:ComputedEdge]->(b:Endpoint {id: 'b'}) RETURN r.weight ORDER BY r.weight")
+        .unwrap();
+    assert_eq!(stored.rows().len(), 3);
+    assert_eq!(
+        stored
+            .rows()
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(2), Value::Int64(3), Value::Int64(3)]
+    );
+}
+
+#[test]
+fn test_computed_create_rollback() {
+    let db = GrafeoDB::new_in_memory();
+    let mut session = db.session();
+    session
+        .execute("CREATE (:RollbackEndpoint {id: 'a'}), (:RollbackEndpoint {id: 'b'})")
+        .unwrap();
+    session.begin_transaction().unwrap();
+    session
+        .execute("UNWIND [1, 2] AS e CREATE (:RollbackComputed {id: e + 1})")
+        .unwrap();
+    session
+        .execute(
+            "MATCH (a:RollbackEndpoint {id: 'a'}), (b:RollbackEndpoint {id: 'b'}) \
+             UNWIND [1] AS e \
+             CREATE (a)-[:RollbackComputed {weight: e + 1}]->(b)",
+        )
+        .unwrap();
+    session.rollback().unwrap();
+
+    let result = session
+        .execute("MATCH (n:RollbackComputed) RETURN n.id")
+        .unwrap();
+    assert!(result.rows().is_empty());
+    let edges = session
+        .execute("MATCH (:RollbackEndpoint)-[r:RollbackComputed]->(:RollbackEndpoint) RETURN r")
+        .unwrap();
+    assert!(edges.rows().is_empty());
+}
+
+#[test]
+fn test_create_computed_scratch_name_collision_stays_hidden() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    session
+        .execute(
+            "CREATE (a:ScratchEndpoint {id: 'a'})-[:Seed {weight: 1.0}]->(b:ScratchEndpoint {id: 'b'})",
+        )
+        .unwrap();
+    let result = session
+        .execute(
+            "MATCH (a:ScratchEndpoint)-[__create_expr_id_0:Seed]->(b:ScratchEndpoint) \
+             CREATE (n:ScratchCollision {id: __create_expr_id_0.weight + 0.5}) \
+             RETURN n.id",
+        )
+        .unwrap();
+    assert_eq!(result.rows(), &[vec![Value::Float64(1.5)]]);
+
+    let result = session
+        .execute("UNWIND [1] AS e CREATE (n:HiddenScratch {id: e + 1}) RETURN *")
+        .unwrap();
+    assert_eq!(result.columns, vec!["e", "n"]);
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0].len(), 2);
+    assert_eq!(result.rows()[0][0], Value::Int64(1));
+}
+
+#[test]
 fn test_unwind_create_map_property_access() {
     // Regression test: UNWIND with map list + property access in CREATE
     // Previously all properties resolved to NULL (bug in plan_create_node)
@@ -160,6 +425,30 @@ fn test_unwind_create_map_property_access() {
     assert_eq!(result.rows()[0][1], Value::String("Gus".into()));
     assert_eq!(result.rows()[1][0], Value::String("u2".into()));
     assert_eq!(result.rows()[1][1], Value::String("Harm".into()));
+}
+
+#[test]
+fn test_unwind_create_computed_map_property() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+
+    session
+        .execute(
+            "UNWIND [{id: 1}, {id: 2}] AS props \
+             CREATE (:ComputedMap {id: props.id + 1})",
+        )
+        .unwrap();
+    let result = session
+        .execute("MATCH (n:ComputedMap) RETURN n.id ORDER BY n.id")
+        .unwrap();
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(2), Value::Int64(3)]
+    );
 }
 
 #[test]
@@ -1144,6 +1433,86 @@ fn test_chained_independent_optional_gql() {
     assert_eq!(result.rows()[0][0], Value::String("Alix".into()));
     assert_eq!(result.rows()[0][1], Value::String("TechCorp".into()));
     assert_eq!(result.rows()[0][2], Value::Null);
+
+    #[cfg(feature = "cypher")]
+    {
+        // A filtered anchor must constrain both optional RHS plans even when
+        // an unrelated MATCH contributes duplicate input rows.  Parallel R1
+        // edges produce two matches; the absent R2 branch must stay NULL.
+        session
+            .execute_cypher(
+                "CREATE (o:Order {business_id: 'b1'}), \
+                        (a:Account {id: 'a1'}), \
+                        (foreign_o:Order {business_id: 'b2'}), \
+                        (foreign_a:Account {id: 'foreign-a'}), \
+                        (foreign_c:Account {id: 'foreign-c'}), \
+                        (:Unrelated {id: 'u0'}), \
+                        (:Unrelated {id: 'u1'})",
+            )
+            .unwrap();
+        session
+            .execute_cypher(
+                "MATCH (o:Order {business_id: 'b1'}), (a:Account {id: 'a1'}) \
+                 CREATE (o)-[:R1]->(a)",
+            )
+            .unwrap();
+        session
+            .execute_cypher(
+                "MATCH (o:Order {business_id: 'b1'}), (a:Account {id: 'a1'}) \
+                 CREATE (o)-[:R1]->(a)",
+            )
+            .unwrap();
+        session
+            .execute_cypher(
+                "MATCH (o:Order {business_id: 'b2'}), (a:Account {id: 'foreign-a'}) \
+                 CREATE (o)-[:R1]->(a)",
+            )
+            .unwrap();
+        session
+            .execute_cypher(
+                "MATCH (o:Order {business_id: 'b2'}), (c:Account {id: 'foreign-c'}) \
+                 CREATE (o)-[:R2]->(c)",
+            )
+            .unwrap();
+
+        let cypher_result = session
+            .execute_cypher(
+                "MATCH (o:Order), (u:Unrelated) \
+                 WHERE o.business_id = 'b1' \
+                 OPTIONAL MATCH (o)-[:R1]->(a:Account) \
+                 OPTIONAL MATCH (o)-[:R2]->(c:Account) \
+                 RETURN o.business_id, u.id, a.id, c.id \
+                 ORDER BY u.id, a.id",
+            )
+            .unwrap();
+        let expected = vec![
+            vec![
+                Value::String("b1".into()),
+                Value::String("u0".into()),
+                Value::String("a1".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::String("b1".into()),
+                Value::String("u0".into()),
+                Value::String("a1".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::String("b1".into()),
+                Value::String("u1".into()),
+                Value::String("a1".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::String("b1".into()),
+                Value::String("u1".into()),
+                Value::String("a1".into()),
+                Value::Null,
+            ],
+        ];
+        assert_eq!(cypher_result.rows(), expected.as_slice());
+    }
 }
 
 // ============================================================================

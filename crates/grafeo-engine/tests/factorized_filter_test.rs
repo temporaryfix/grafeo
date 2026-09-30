@@ -1,5 +1,7 @@
 //! Test to debug factorized execution with filters
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 

@@ -3,7 +3,7 @@
 //! These tests verify that async WAL checkpoint and snapshot operations
 //! work correctly end-to-end through the GrafeoDB API.
 
-#![cfg(feature = "async-storage")]
+#![cfg(all(feature = "async-storage", feature = "grafeo-file"))]
 
 use std::sync::Arc;
 
@@ -21,6 +21,72 @@ fn extract_strings(rows: &[Vec<Value>]) -> Vec<String> {
         .collect();
     values.sort();
     values
+}
+
+#[tokio::test]
+#[cfg(feature = "compact-store")]
+async fn rejected_managed_edges_stay_absent_after_async_checkpoint()
+-> grafeo_common::utils::error::Result<()> {
+    use grafeo_common::types::NodeId;
+    use grafeo_engine::auth::Role;
+
+    for compact in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("managed.grafeo");
+        let mut db = GrafeoDB::open(&path)?;
+        let source = db.create_node(&["Source"]);
+        let destination = db.create_node(&["Destination"]);
+        if compact {
+            db.compact()?;
+        }
+        let db = Arc::new(db);
+
+        let reader = db.session_with_role(Role::ReadOnly);
+        let before_read_only = db.wal_status()?.record_count;
+        assert!(
+            reader
+                .create_edge_with_props(source, destination, "DENIED", [])
+                .is_err()
+        );
+        assert_eq!(db.wal_status()?.record_count, before_read_only);
+
+        let writer = db.session();
+        assert!(
+            writer
+                .create_edge_with_props(source, NodeId::INVALID, "MISSING", [])
+                .is_err()
+        );
+        assert_eq!(db.node_count(), 2);
+        assert_eq!(db.edge_count(), 0);
+        let edge = writer.create_edge_with_props(
+            source,
+            destination,
+            "COMMITTED",
+            [("value", Value::Int64(7))],
+        )?;
+        assert!(edge.is_valid());
+        db.async_wal_checkpoint().await?;
+        db.close()?;
+        drop(writer);
+        drop(reader);
+        drop(db);
+
+        let reopened = GrafeoDB::open(&path)?;
+        assert_eq!(reopened.node_count(), 2);
+        assert_eq!(reopened.edge_count(), 1);
+        let result = reopened.execute("MATCH ()-[e:COMMITTED]->() RETURN e.value")?;
+        assert_eq!(result.rows(), &[vec![Value::Int64(7)]]);
+        for rejected in ["DENIED", "MISSING"] {
+            assert!(
+                reopened
+                    .execute(&format!("MATCH ()-[e:{rejected}]->() RETURN e"))?
+                    .rows()
+                    .is_empty()
+            );
+        }
+        reopened.close()?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

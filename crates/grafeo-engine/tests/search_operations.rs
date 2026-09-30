@@ -10,6 +10,8 @@
 //! cargo test -p grafeo-engine --features full --test search_operations
 //! ```
 
+#![cfg(feature = "lpg")]
+
 // ============================================================================
 // Vector search tests
 // ============================================================================
@@ -25,36 +27,70 @@ mod vector {
     }
 
     fn setup_vector_db() -> GrafeoDB {
+        setup_vector_db_with_owner().0
+    }
+
+    fn setup_vector_db_with_owner() -> (GrafeoDB, grafeo_common::types::IndexId) {
         let db = GrafeoDB::new_in_memory();
 
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
-        db.set_node_property(n1, "category", Value::String("science".into()));
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
+        db.set_node_property(n1, "category", Value::String("science".into()))
+            .expect("set node property");
 
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
-        db.set_node_property(n2, "category", Value::String("science".into()));
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
+        db.set_node_property(n2, "category", Value::String("science".into()))
+            .expect("set node property");
 
         let n3 = db.create_node(&["Doc"]);
-        db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0));
-        db.set_node_property(n3, "category", Value::String("art".into()));
+        db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0))
+            .expect("set node property");
+        db.set_node_property(n3, "category", Value::String("art".into()))
+            .expect("set node property");
 
         let n4 = db.create_node(&["Doc"]);
-        db.set_node_property(n4, "emb", vec3(0.9, 0.1, 0.0));
-        db.set_node_property(n4, "category", Value::String("science".into()));
+        db.set_node_property(n4, "emb", vec3(0.9, 0.1, 0.0))
+            .expect("set node property");
+        db.set_node_property(n4, "category", Value::String("science".into()))
+            .expect("set node property");
 
-        db.create_property_index("category");
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: None,
+            property: "category".into(),
+            kind: grafeo_engine::IndexCreateKind::Property,
+        })
+        .expect("create property index");
+        let owner = db
+            .create_index(grafeo_engine::CreateIndexRequest {
+                graph: Default::default(),
+                name: None,
+                label: Some("Doc".into()),
+                property: "emb".into(),
+                kind: grafeo_engine::IndexCreateKind::Vector {
+                    dimensions: Some(3),
+                    metric: Some("cosine".into()),
+                    m: None,
+                    ef_construction: None,
+                    ef: None,
+                    quantization: None,
+                },
+            })
             .expect("create vector index");
 
-        db
+        (db, owner)
     }
 
     #[test]
     fn test_vector_search_no_index_error() {
         let db = GrafeoDB::new_in_memory();
         let n = db.create_node(&["Doc"]);
-        db.set_node_property(n, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         // No vector index created: search should fail
         let result = db.vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 5, None, None);
@@ -147,7 +183,7 @@ mod vector {
 
     #[test]
     fn test_drop_and_recreate_vector_index() {
-        let db = setup_vector_db();
+        let (db, owner) = setup_vector_db_with_owner();
 
         // Search works
         let r1 = db
@@ -156,15 +192,30 @@ mod vector {
         assert_eq!(r1.len(), 2);
 
         // Drop index
-        assert!(db.drop_vector_index("Doc", "emb"));
+        assert!(db.drop_index(owner).expect("drop vector owner"));
 
         // Search should fail
         let err = db.vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 2, None, None);
         assert!(err.is_err(), "search after drop should error");
 
         // Recreate index
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
+        let replacement = db
+            .create_index(grafeo_engine::CreateIndexRequest {
+                graph: Default::default(),
+                name: None,
+                label: Some("Doc".into()),
+                property: "emb".into(),
+                kind: grafeo_engine::IndexCreateKind::Vector {
+                    dimensions: Some(3),
+                    metric: Some("cosine".into()),
+                    m: None,
+                    ef_construction: None,
+                    ef: None,
+                    quantization: None,
+                },
+            })
             .expect("recreate index");
+        assert!(replacement > owner);
 
         // Search works again
         let r2 = db
@@ -178,15 +229,30 @@ mod vector {
         let db = GrafeoDB::new_in_memory();
 
         // Create index FIRST, on empty data
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-            .expect("create empty index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .expect("create empty index");
 
         // Add nodes AFTER index exists (no rebuild)
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         // Search should find both nodes WITHOUT calling rebuild_vector_index
         let results = db
@@ -205,7 +271,7 @@ mod vector {
 
     #[test]
     fn test_rebuild_vector_index_preserves_results() {
-        let db = setup_vector_db();
+        let (db, owner) = setup_vector_db_with_owner();
         let query = &[1.0_f32, 0.0, 0.0];
 
         // Search before rebuild
@@ -214,7 +280,7 @@ mod vector {
             .expect("search before rebuild");
 
         // Rebuild
-        db.rebuild_vector_index("Doc", "emb").expect("rebuild");
+        db.rebuild_index(owner).expect("rebuild");
 
         // Search after rebuild
         let after = db
@@ -248,21 +314,29 @@ mod vector {
     fn test_scalar_quantized_vector_index() {
         let db = GrafeoDB::new_in_memory();
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
         let n3 = db.create_node(&["Doc"]);
-        db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0));
+        db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0))
+            .expect("set node property");
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("scalar"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("scalar".into()),
+            },
+        })
         .expect("create scalar quantized index");
 
         let results = db
@@ -276,19 +350,26 @@ mod vector {
     fn test_binary_quantized_vector_index() {
         let db = GrafeoDB::new_in_memory();
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("euclidean"),
-            None,
-            None,
-            Some("binary"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("euclidean".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("binary".into()),
+            },
+        })
         .expect("create binary quantized index");
 
         let results = db
@@ -305,18 +386,24 @@ mod vector {
         for i in 0..10 {
             let n = db.create_node(&["Doc"]);
             let vec: Vec<f32> = (0..8).map(|j| ((i * 8 + j) as f32) / 80.0).collect();
-            db.set_node_property(n, "emb", Value::Vector(vec.into()));
+            db.set_node_property(n, "emb", Value::Vector(vec.into()))
+                .expect("set node property");
         }
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(8),
-            Some("euclidean"),
-            None,
-            None,
-            Some("product"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(8),
+                metric: Some("euclidean".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("product".into()),
+            },
+        })
         .expect("create product quantized index");
 
         let results = db
@@ -330,22 +417,29 @@ mod vector {
         let db = GrafeoDB::new_in_memory();
 
         // Create quantized index on empty data with explicit dimensions
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("scalar"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("scalar".into()),
+            },
+        })
         .expect("create empty scalar index");
 
         // Add nodes after index creation
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         let results = db
             .vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 2, None, None)
@@ -357,22 +451,30 @@ mod vector {
     fn test_rebuild_preserves_quantization_type() {
         let db = GrafeoDB::new_in_memory();
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("binary"),
-        )
-        .expect("create binary index");
+        let owner = db
+            .create_index(grafeo_engine::CreateIndexRequest {
+                graph: Default::default(),
+                name: None,
+                label: Some("Doc".into()),
+                property: "emb".into(),
+                kind: grafeo_engine::IndexCreateKind::Vector {
+                    dimensions: Some(3),
+                    metric: Some("cosine".into()),
+                    m: None,
+                    ef_construction: None,
+                    ef: None,
+                    quantization: Some("binary".into()),
+                },
+            })
+            .expect("create binary index");
 
-        db.rebuild_vector_index("Doc", "emb").expect("rebuild");
+        db.rebuild_index(owner).expect("rebuild");
 
         // Search should still work after rebuild
         let results = db
@@ -392,25 +494,41 @@ mod text {
     use grafeo_engine::GrafeoDB;
 
     fn setup_text_db() -> GrafeoDB {
+        setup_text_db_with_owner().0
+    }
+
+    fn setup_text_db_with_owner() -> (GrafeoDB, grafeo_common::types::IndexId) {
         let db = GrafeoDB::new_in_memory();
 
         let n1 = db.create_node(&["Article"]);
-        db.set_node_property(n1, "title", Value::String("Rust graph database".into()));
+        db.set_node_property(n1, "title", Value::String("Rust graph database".into()))
+            .expect("set node property");
 
         let n2 = db.create_node(&["Article"]);
-        db.set_node_property(n2, "title", Value::String("Python machine learning".into()));
+        db.set_node_property(n2, "title", Value::String("Python machine learning".into()))
+            .expect("set node property");
 
         let n3 = db.create_node(&["Article"]);
         db.set_node_property(
             n3,
             "title",
             Value::String("Rust systems programming".into()),
-        );
+        )
+        .expect("set node property");
 
-        db.create_text_index("Article", "title")
+        let owner = db
+            .create_index(grafeo_engine::CreateIndexRequest {
+                graph: Default::default(),
+                name: None,
+                label: Some("Article".into()),
+                property: "title".into(),
+                kind: grafeo_engine::IndexCreateKind::Text {
+                    min_token_length: None,
+                },
+            })
             .expect("create text index");
 
-        db
+        (db, owner)
     }
 
     #[test]
@@ -427,7 +545,8 @@ mod text {
     fn test_text_search_no_index_error() {
         let db = GrafeoDB::new_in_memory();
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String("test".into()));
+        db.set_node_property(n, "title", Value::String("test".into()))
+            .expect("set node property");
 
         // No text index: should error
         let result = db.text_search("Article", "title", "test", 10);
@@ -451,7 +570,8 @@ mod text {
 
         // Add a new article
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String("Rust web framework".into()));
+        db.set_node_property(n, "title", Value::String("Rust web framework".into()))
+            .expect("set node property");
 
         let results = db.text_search("Article", "title", "Rust", 10).unwrap();
 
@@ -464,21 +584,33 @@ mod text {
 
     #[test]
     fn test_drop_and_rebuild_text_index() {
-        let db = setup_text_db();
+        let (db, owner) = setup_text_db_with_owner();
 
         // Search works
         let r1 = db.text_search("Article", "title", "Rust", 10).unwrap();
         assert!(!r1.is_empty());
 
         // Drop index
-        assert!(db.drop_text_index("Article", "title"));
+        assert!(db.drop_index(owner).expect("drop text owner"));
 
         // Search should fail
         let err = db.text_search("Article", "title", "Rust", 10);
         assert!(err.is_err());
 
-        // Rebuild index
-        db.rebuild_text_index("Article", "title").unwrap();
+        // Rebuild cannot resurrect a retired owner; recreation gets a new owner.
+        assert!(db.rebuild_index(owner).is_err());
+        let replacement = db
+            .create_index(grafeo_engine::CreateIndexRequest {
+                graph: Default::default(),
+                name: None,
+                label: Some("Article".into()),
+                property: "title".into(),
+                kind: grafeo_engine::IndexCreateKind::Text {
+                    min_token_length: None,
+                },
+            })
+            .expect("recreate text index");
+        assert!(replacement > owner);
 
         // Search works again
         let r2 = db.text_search("Article", "title", "Rust", 10).unwrap();
@@ -507,38 +639,67 @@ mod hybrid {
             n1,
             "content",
             Value::String("Rust graph database engine".into()),
-        );
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        )
+        .expect("set node property");
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let n2 = db.create_node(&["Doc"]);
         db.set_node_property(
             n2,
             "content",
             Value::String("Python machine learning framework".into()),
-        );
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        )
+        .expect("set node property");
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         let n3 = db.create_node(&["Doc"]);
         db.set_node_property(
             n3,
             "content",
             Value::String("Rust systems programming language".into()),
-        );
-        db.set_node_property(n3, "emb", vec3(0.9, 0.1, 0.0));
+        )
+        .expect("set node property");
+        db.set_node_property(n3, "emb", vec3(0.9, 0.1, 0.0))
+            .expect("set node property");
 
         let n4 = db.create_node(&["Doc"]);
         db.set_node_property(
             n4,
             "content",
             Value::String("Graph neural network research".into()),
-        );
-        db.set_node_property(n4, "emb", vec3(0.5, 0.5, 0.0));
+        )
+        .expect("set node property");
+        db.set_node_property(n4, "emb", vec3(0.5, 0.5, 0.0))
+            .expect("set node property");
 
         // Create both indexes
-        db.create_text_index("Doc", "content")
-            .expect("create text index");
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-            .expect("create vector index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "content".into(),
+            kind: grafeo_engine::IndexCreateKind::Text {
+                min_token_length: None,
+            },
+        })
+        .expect("create text index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .expect("create vector index");
 
         db
     }
@@ -658,16 +819,33 @@ mod hybrid {
         let db = GrafeoDB::new_in_memory();
 
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "content", Value::String("Rust graph database".into()));
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "content", Value::String("Rust graph database".into()))
+            .expect("set node property");
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "content", Value::String("Python ML".into()));
-        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(n2, "content", Value::String("Python ML".into()))
+            .expect("set node property");
+        db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         // Create ONLY vector index, no text index
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-            .expect("create vector index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .expect("create vector index");
 
         // hybrid_search should work, using only vector source
         let results = db
@@ -693,12 +871,22 @@ mod hybrid {
         let db = GrafeoDB::new_in_memory();
 
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "content", Value::String("Rust graph database".into()));
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "content", Value::String("Rust graph database".into()))
+            .expect("set node property");
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         // Create ONLY text index, no vector index
-        db.create_text_index("Doc", "content")
-            .expect("create text index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "content".into(),
+            kind: grafeo_engine::IndexCreateKind::Text {
+                min_token_length: None,
+            },
+        })
+        .expect("create text index");
 
         // hybrid_search with a vector query should still work, using only text source
         let results = db
@@ -724,8 +912,10 @@ mod hybrid {
         let db = GrafeoDB::new_in_memory();
 
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "content", Value::String("Rust graph database".into()));
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(n1, "content", Value::String("Rust graph database".into()))
+            .expect("set node property");
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         // No indexes at all
         let results = db
@@ -808,9 +998,23 @@ mod concurrent_vector {
 
         // Seed initial data
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-            .unwrap();
+        db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .unwrap();
 
         let db_read = std::sync::Arc::clone(&db);
         let db_write = std::sync::Arc::clone(&db);
@@ -820,7 +1024,9 @@ mod concurrent_vector {
             for i in 0..10 {
                 let n = db_write.create_node(&["Doc"]);
                 let x = (i as f32) / 10.0;
-                db_write.set_node_property(n, "emb", vec3(x, 1.0 - x, 0.0));
+                db_write
+                    .set_node_property(n, "emb", vec3(x, 1.0 - x, 0.0))
+                    .expect("set node property");
             }
         });
 
@@ -852,8 +1058,18 @@ mod concurrent_text {
             n1,
             "content",
             Value::String("initial document about graphs".into()),
-        );
-        db.create_text_index("Doc", "content").unwrap();
+        )
+        .expect("set node property");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "content".into(),
+            kind: grafeo_engine::IndexCreateKind::Text {
+                min_token_length: None,
+            },
+        })
+        .unwrap();
 
         let db_read = std::sync::Arc::clone(&db);
         let db_write = std::sync::Arc::clone(&db);
@@ -861,11 +1077,13 @@ mod concurrent_text {
         let writer = std::thread::spawn(move || {
             for i in 0..10 {
                 let n = db_write.create_node(&["Doc"]);
-                db_write.set_node_property(
-                    n,
-                    "content",
-                    Value::String(format!("document number {i} about databases").into()),
-                );
+                db_write
+                    .set_node_property(
+                        n,
+                        "content",
+                        Value::String(format!("document number {i} about databases").into()),
+                    )
+                    .expect("set node property");
             }
         });
 
@@ -899,26 +1117,37 @@ mod quantized_vector {
         let db = GrafeoDB::new_in_memory();
 
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
-        db.set_node_property(alix, "name", Value::from("Alix"));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
+        db.set_node_property(alix, "name", Value::from("Alix"))
+            .expect("set node property");
 
         let gus = db.create_node(&["Doc"]);
-        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0));
-        db.set_node_property(gus, "name", Value::from("Gus"));
+        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
+        db.set_node_property(gus, "name", Value::from("Gus"))
+            .expect("set node property");
 
         let vincent = db.create_node(&["Doc"]);
-        db.set_node_property(vincent, "emb", vec3(0.9, 0.1, 0.0));
-        db.set_node_property(vincent, "name", Value::from("Vincent"));
+        db.set_node_property(vincent, "emb", vec3(0.9, 0.1, 0.0))
+            .expect("set node property");
+        db.set_node_property(vincent, "name", Value::from("Vincent"))
+            .expect("set node property");
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("scalar"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("scalar".into()),
+            },
+        })
         .expect("create scalar-quantized index");
 
         let results = db
@@ -935,23 +1164,31 @@ mod quantized_vector {
         let db = GrafeoDB::new_in_memory();
 
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let gus = db.create_node(&["Doc"]);
-        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         let vincent = db.create_node(&["Doc"]);
-        db.set_node_property(vincent, "emb", vec3(0.0, 0.0, 1.0));
+        db.set_node_property(vincent, "emb", vec3(0.0, 0.0, 1.0))
+            .expect("set node property");
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("euclidean"),
-            None,
-            None,
-            Some("binary"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("euclidean".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("binary".into()),
+            },
+        })
         .expect("create binary-quantized index");
 
         let results = db
@@ -968,14 +1205,29 @@ mod quantized_vector {
         let db = GrafeoDB::new_in_memory();
 
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let gus = db.create_node(&["Doc"]);
-        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         // Explicit None quantization
-        db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-            .expect("create non-quantized index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .expect("create non-quantized index");
 
         let results = db
             .vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 1, None, None)
@@ -990,18 +1242,24 @@ mod quantized_vector {
         let db = GrafeoDB::new_in_memory();
 
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         // "none" string should be equivalent to None
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("none"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("none".into()),
+            },
+        })
         .expect("create index with 'none' quantization");
 
         let results = db
@@ -1015,17 +1273,23 @@ mod quantized_vector {
         let db = GrafeoDB::new_in_memory();
 
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
-        let result = db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("invalid_type"),
-        );
+        let result = db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("invalid_type".into()),
+            },
+        });
         assert!(result.is_err(), "invalid quantization type should error");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1039,23 +1303,30 @@ mod quantized_vector {
         // Create quantized index with explicit dimensions but no data yet
         let db = GrafeoDB::new_in_memory();
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("scalar"),
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: Some("scalar".into()),
+            },
+        })
         .expect("create empty scalar-quantized index");
 
         // Insert after index creation
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let gus = db.create_node(&["Doc"]);
-        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
         let results = db
             .vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 1, None, None)
@@ -1074,25 +1345,32 @@ mod quantized_vector {
         let db = GrafeoDB::new_in_memory();
 
         let alix = db.create_node(&["Doc"]);
-        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0));
+        db.set_node_property(alix, "emb", vec3(1.0, 0.0, 0.0))
+            .expect("set node property");
 
         let gus = db.create_node(&["Doc"]);
-        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0));
+        db.set_node_property(gus, "emb", vec3(0.0, 1.0, 0.0))
+            .expect("set node property");
 
-        db.create_vector_index(
-            "Doc",
-            "emb",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            Some("binary"),
-        )
-        .expect("create binary-quantized index");
+        let owner = db
+            .create_index(grafeo_engine::CreateIndexRequest {
+                graph: Default::default(),
+                name: None,
+                label: Some("Doc".into()),
+                property: "emb".into(),
+                kind: grafeo_engine::IndexCreateKind::Vector {
+                    dimensions: Some(3),
+                    metric: Some("cosine".into()),
+                    m: None,
+                    ef_construction: None,
+                    ef: None,
+                    quantization: Some("binary".into()),
+                },
+            })
+            .expect("create binary-quantized index");
 
         // Rebuild should preserve the binary quantization
-        db.rebuild_vector_index("Doc", "emb")
-            .expect("rebuild should succeed");
+        db.rebuild_index(owner).expect("rebuild should succeed");
 
         let results = db
             .vector_search("Doc", "emb", &[1.0, 0.0, 0.0], 1, None, None)

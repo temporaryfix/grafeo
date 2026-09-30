@@ -20,6 +20,8 @@
 //! cargo test -p grafeo-engine --test project_coverage --all-features
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -318,12 +320,8 @@ fn order_by_nulls_last_puts_nulls_at_bottom() {
 
 #[test]
 fn order_by_desc_with_nulls_ordering() {
-    // DESC combined with an explicit NULLS clause exercises the Descending
-    // branch of the direction match plus the NullOrder pass-through. The
-    // underlying sort operator reverses the whole comparison (including null
-    // position) when direction=Descending, so DESC+NULLS LAST ends up placing
-    // nulls first. We pin that observed behavior so regressions in either
-    // plan_sort's mapping or the sort operator's semantics get caught.
+    // Direction controls non-null values; the explicit NULLS clause controls
+    // final null placement independently.
     let db = people_graph();
     let session = db.session();
 
@@ -335,24 +333,17 @@ fn order_by_desc_with_nulls_ordering() {
         .unwrap();
 
     assert_eq!(r.rows().len(), 5);
-    // The underlying sort operator reverses the comparison including null
-    // position for DESC, so DESC NULLS LAST currently produces nulls first.
-    // Pin the full row ordering so any regression in either plan_sort's
-    // mapping or the sort operator's null handling is caught, not just
-    // the non-null subsequence.
     let ages: Vec<Value> = r.rows().iter().map(|row| row[1].clone()).collect();
     assert_eq!(
         ages,
         vec![
-            Value::Null,
-            Value::Null,
             Value::Int64(40),
             Value::Int64(30),
             Value::Int64(25),
+            Value::Null,
+            Value::Null,
         ],
-        "DESC NULLS LAST currently places nulls first due to the operator \
-         reversing null position along with value comparison; if this test \
-         fails the sort semantics changed",
+        "DESC NULLS LAST must keep nulls after every non-null value",
     );
 }
 

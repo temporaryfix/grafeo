@@ -5,6 +5,76 @@
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
+use std::collections::BTreeSet;
+
+mod support;
+
+const DISTINCT_REACHABILITY_EDGES: &[(&str, &str, &str)] = &[
+    ("s", "a", "s-a"),
+    ("s", "b", "s-b"),
+    ("a", "d", "a-d"),
+    ("b", "d", "b-d"),
+    ("d", "e", "d-e"),
+    ("e", "d", "e-d"),
+    ("g", "g", "g-g"),
+    ("u", "v", "u-v"),
+];
+
+fn distinct_reachability_db() -> GrafeoDB {
+    let db = GrafeoDB::new_in_memory();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    for key in ["s", "a", "b", "d", "e", "g", "u", "v"] {
+        session
+            .execute(&format!(
+                "INSERT (:Node {{key: '{key}', name: 'Node-{key}'}})"
+            ))
+            .unwrap();
+    }
+    for &(source, target, tag) in DISTINCT_REACHABILITY_EDGES {
+        session
+            .execute(&format!(
+                "MATCH (a:Node {{key: '{source}'}}), \
+                        (b:Node {{key: '{target}'}}) \
+                 INSERT (a)-[:REL {{tag: '{tag}'}}]->(b)"
+            ))
+            .unwrap();
+    }
+    session.commit().unwrap();
+    db
+}
+
+fn distinct_reachability_bfs(max_depth: usize) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut frontier = vec!["s"];
+    for _ in 0..max_depth {
+        let mut next = Vec::new();
+        for source in frontier {
+            for &(edge_source, target, _) in DISTINCT_REACHABILITY_EDGES {
+                if edge_source == source {
+                    seen.insert(target.to_string());
+                    next.push(target);
+                }
+            }
+        }
+        frontier = next;
+    }
+    seen
+}
+
+fn value_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.to_string(),
+        other => panic!("expected string value, got {other:?}"),
+    }
+}
+
+fn value_list_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::List(values) => values.iter().map(value_string).collect(),
+        other => panic!("expected string list, got {other:?}"),
+    }
+}
 
 /// Creates 3 Person nodes (Alix age 30, Gus age 25, Vincent age 35) with 2 KNOWS edges.
 fn setup_db() -> GrafeoDB {
@@ -614,18 +684,17 @@ fn test_is_not_normalized() {
 #[test]
 fn test_parenthesized_path_mode_trail() {
     // G049: TRAIL mode inside parenthesized pattern prevents edge repetition
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
-    // Alix -> Gus -> Vincent, with TRAIL mode (no repeated edges)
+    // The shared fixture has free endpoints and a cycle; DISTINCT must expose
+    // exactly the REL-reachable targets at depths 1..3, including u->v
+    // because the starting endpoint is also free.
     let result = session
-        .execute(
-            "MATCH (TRAIL (a)-[:KNOWS]->(b)){1,3} RETURN DISTINCT b.name AS name ORDER BY name",
-        )
+        .execute("MATCH (TRAIL (a:Node)-[:REL]->(b)){1,3} RETURN DISTINCT b.id AS id ORDER BY id")
         .unwrap();
-    // Should find paths: Alix->Gus, Gus->Vincent, Alix->Gus->Vincent
-    assert!(
-        !result.rows().is_empty(),
-        "TRAIL quantified pattern should produce results"
+    assert_eq!(
+        support::sorted_ids(&result),
+        vec!["a", "b", "d", "e", "f", "g", "h", "v"]
     );
 }
 
@@ -680,52 +749,37 @@ fn test_parenthesized_path_mode_with_where() {
 // ISO: G048
 #[test]
 fn test_subpath_variable_binding() {
-    // G048: (p = (a)-[:KNOWS]->(b)){1,2} binds path variable p
-    let db = setup_db();
+    // G048: a quantified subpath binds p at each path length.
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH (p = (a:Person {name: 'Alix'})-[:KNOWS]->(b)){1,2} RETURN length(p) AS len ORDER BY len",
+            "MATCH (p = (a:Node {id: 's'})-[:REL]->(b)){1,2} RETURN length(p) AS len ORDER BY len",
         )
         .unwrap();
-    assert!(
-        !result.rows().is_empty(),
-        "Subpath variable should produce results"
-    );
-    // Should include 1-hop (Alix->Gus) and 2-hop (Alix->Gus->Vincent)
     let lengths: Vec<i64> = result
         .rows()
         .iter()
-        .filter_map(|r| match &r[0] {
-            Value::Int64(n) => Some(*n),
-            _ => None,
-        })
+        .map(|row| row[0].as_int64().expect("every path length is an integer"))
         .collect();
-    assert!(
-        lengths.contains(&1),
-        "Should have 1-hop path, got: {lengths:?}"
-    );
-    assert!(
-        lengths.contains(&2),
-        "Should have 2-hop path, got: {lengths:?}"
-    );
+    assert_eq!(lengths, vec![1, 1, 2, 2, 2, 2]);
 }
 
 // ISO: G048
 #[test]
 fn test_subpath_variable_nodes_edges() {
     // G048: nodes(p) and edges(p) should work with subpath variables
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
-        .execute("MATCH (p = (a:Person {name: 'Alix'})-[:KNOWS]->(b)){1,1} RETURN nodes(p) AS ns")
+        .execute(
+            "MATCH (p = (a:Node {id: 's'})-[:REL]->(b)){1,1} RETURN b.id AS id, nodes(p) AS ns",
+        )
         .unwrap();
-    assert_eq!(result.rows().len(), 1, "Single 1-hop path expected");
-    // nodes(p) should be a list with 2 elements (Alix, Gus)
-    if let Value::List(nodes) = &result.rows()[0][0] {
-        assert_eq!(nodes.len(), 2, "Path should have 2 nodes");
-    } else {
-        panic!("Expected list for nodes(p), got: {:?}", result.rows()[0][0]);
+    assert_eq!(result.rows().len(), 2, "free endpoint has s->a and s->b");
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert!(matches!(&row[1], Value::List(nodes) if nodes.len() == 2));
     }
 }
 
@@ -734,27 +788,35 @@ fn test_subpath_variable_nodes_edges() {
 // ISO: G080
 #[test]
 fn test_simplified_outgoing_path() {
-    // G080: -/:KNOWS/-> is equivalent to -[:KNOWS]->
-    let db = setup_db();
+    // G080: simplified outgoing syntax preserves parallel edge rows.
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
-        .execute("MATCH (a:Person {name: 'Alix'})-/:KNOWS/->(b) RETURN b.name AS name")
+        .execute("MATCH (a:Node {id: 's'})-/:OTHER/->(b) RETURN b.id AS id")
         .unwrap();
-    assert_eq!(result.rows().len(), 1);
-    assert_eq!(result.rows()[0][0], Value::String("Gus".into()));
+    assert_eq!(
+        result.rows().len(),
+        2,
+        "parallel OTHER edges preserve multiplicity"
+    );
+    assert_eq!(support::sorted_ids(&result), vec!["x", "x"]);
 }
 
 // ISO: G080
 #[test]
 fn test_simplified_incoming_path() {
-    // G080: <-/:KNOWS/- is equivalent to <-[:KNOWS]-
-    let db = setup_db();
+    // G080: simplified incoming syntax preserves parallel edge rows.
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
-        .execute("MATCH (b:Person {name: 'Gus'})<-/:KNOWS/-(a) RETURN a.name AS name")
+        .execute("MATCH (b:Node {id: 'x'})<-/:OTHER/-(a) RETURN a.id AS id")
         .unwrap();
-    assert_eq!(result.rows().len(), 1);
-    assert_eq!(result.rows()[0][0], Value::String("Alix".into()));
+    assert_eq!(
+        result.rows().len(),
+        2,
+        "parallel OTHER edges preserve multiplicity"
+    );
+    assert_eq!(support::sorted_ids(&result), vec!["s", "s"]);
 }
 
 // ISO: G039, G080
@@ -1217,62 +1279,58 @@ fn test_delete_expression_property_access() {
 #[test]
 fn test_path_as_value() {
     // GV55: Path as first-class value type
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
-        .execute("MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) RETURN p")
+        .execute("MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) RETURN b.id AS id, p")
         .unwrap();
-    assert!(
-        !result.rows().is_empty(),
-        "Path variable should return results"
-    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
     // The result should be a Path value
-    let path_val = &result.rows()[0][0];
-    assert!(
-        matches!(path_val, Value::Path { .. }),
-        "Expected Path value, got {:?}",
-        path_val
-    );
+    for row in result.rows() {
+        assert!(
+            matches!(&row[1], Value::Path { .. }),
+            "Expected Path value, got {:?}",
+            row[1]
+        );
+    }
 }
 
 // ISO: GF04
 #[test]
 fn test_path_length_function() {
     // GF04: length(path) returns number of edges
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
-             RETURN length(p) AS len",
+            "MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) \
+             RETURN b.id AS id, length(p) AS len",
         )
         .unwrap();
-    assert!(!result.rows().is_empty());
-    assert_eq!(
-        result.rows()[0][0],
-        Value::Int64(1),
-        "Single-hop path should have length 1"
-    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert_eq!(row[1], Value::Int64(1));
+    }
 }
 
 // ISO: GF04
 #[test]
 fn test_path_nodes_function() {
     // GF04: nodes(path) returns list of nodes
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
-             RETURN nodes(p) AS node_list",
+            "MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) \
+             RETURN b.id AS id, nodes(p) AS node_list",
         )
         .unwrap();
-    assert!(!result.rows().is_empty());
-    match &result.rows()[0][0] {
-        Value::List(items) => {
-            assert_eq!(items.len(), 2, "Single-hop path should have 2 nodes");
-        }
-        other => panic!("Expected List from nodes(), got {:?}", other),
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert!(matches!(&row[1], Value::List(items) if items.len() == 2));
     }
 }
 
@@ -1280,20 +1338,18 @@ fn test_path_nodes_function() {
 #[test]
 fn test_path_edges_function() {
     // GF04: edges(path) returns list of edges
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
-             RETURN edges(p) AS edge_list",
+            "MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) \
+             RETURN b.id AS id, edges(p) AS edge_list",
         )
         .unwrap();
-    assert!(!result.rows().is_empty());
-    match &result.rows()[0][0] {
-        Value::List(items) => {
-            assert_eq!(items.len(), 1, "Single-hop path should have 1 edge");
-        }
-        other => panic!("Expected List from edges(), got {:?}", other),
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert!(matches!(&row[1], Value::List(items) if items.len() == 1));
     }
 }
 
@@ -1301,60 +1357,57 @@ fn test_path_edges_function() {
 #[test]
 fn test_path_is_acyclic() {
     // GF04: isAcyclic(path) - a simple A->B path should be acyclic
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
-             RETURN isAcyclic(p) AS is_acyclic_result",
+            "MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) \
+             RETURN b.id AS id, isAcyclic(p) AS is_acyclic_result",
         )
         .unwrap();
-    assert!(!result.rows().is_empty());
-    assert_eq!(
-        result.rows()[0][0],
-        Value::Bool(true),
-        "A->B path should be acyclic"
-    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert_eq!(row[1], Value::Bool(true));
+    }
 }
 
 // ISO: GF04
 #[test]
 fn test_path_is_simple() {
     // GF04: isSimple(path) - no repeated nodes
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
-             RETURN isSimple(p) AS is_simple_result",
+            "MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) \
+             RETURN b.id AS id, isSimple(p) AS is_simple_result",
         )
         .unwrap();
-    assert!(!result.rows().is_empty());
-    assert_eq!(
-        result.rows()[0][0],
-        Value::Bool(true),
-        "A->B path should be simple"
-    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert_eq!(row[1], Value::Bool(true));
+    }
 }
 
 // ISO: GF04
 #[test]
 fn test_path_is_trail() {
     // GF04: isTrail(path) - no repeated edges
-    let db = setup_db();
+    let db = support::adversarial_path_graph();
     let session = db.session();
     let result = session
         .execute(
-            "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
-             RETURN isTrail(p) AS is_trail_result",
+            "MATCH p = (a:Node {id: 's'})-[:REL]->(b:Node) \
+             RETURN b.id AS id, isTrail(p) AS is_trail_result",
         )
         .unwrap();
-    assert!(!result.rows().is_empty());
-    assert_eq!(
-        result.rows()[0][0],
-        Value::Bool(true),
-        "A->B path should be a trail"
-    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(support::sorted_ids(&result), vec!["a", "b"]);
+    for row in result.rows() {
+        assert_eq!(row[1], Value::Bool(true));
+    }
 }
 
 // ISO: GF04
@@ -2639,16 +2692,43 @@ fn test_create_graph_like() {
 }
 
 #[test]
-fn test_create_graph_as_copy_of() {
+fn test_create_graph_as_copy_of() -> Result<(), Box<dyn std::error::Error>> {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
 
-    session.execute("CREATE GRAPH original").unwrap();
-    session
-        .execute("CREATE GRAPH clone AS COPY OF original")
-        .unwrap();
-    // Verify the clone exists
-    session.execute("USE GRAPH clone").unwrap();
+    session.execute("CREATE GRAPH original")?;
+    session.execute("USE GRAPH original")?;
+    session.execute(
+        "INSERT (a:Person {name: 'Alix'})-[:KNOWS {weight: 7}]->(b:Person {name: 'Bea'})",
+    )?;
+    session.execute("CREATE INDEX original_name FOR (n:Person) ON (n.name)")?;
+    session.execute("CREATE GRAPH clone AS COPY OF original")?;
+    session.execute("USE GRAPH clone")?;
+    assert_eq!(
+        session
+            .execute("MATCH (a)-[r:KNOWS]->(b) RETURN a.name, r.weight, b.name")?
+            .rows(),
+        &[vec![
+            Value::from("Alix"),
+            Value::from(7_i64),
+            Value::from("Bea")
+        ]],
+    );
+    let plan = session.execute("EXPLAIN MATCH (n:Person) WHERE n.name = 'Alix' RETURN n.name")?;
+    assert!(
+        plan.rows()[0][0]
+            .as_str()
+            .is_some_and(|plan| plan.contains("[index: name]"))
+    );
+    session.execute("MATCH (n:Person) WHERE n.name = 'Alix' SET n.name = 'Copy'")?;
+    session.execute("USE GRAPH original")?;
+    assert_eq!(
+        session
+            .execute("MATCH (n:Person) WHERE n.name = 'Alix' RETURN n.name")?
+            .rows(),
+        &[vec![Value::from("Alix")]],
+    );
+    Ok(())
 }
 
 #[test]
@@ -3193,4 +3273,358 @@ fn test_remove_nonexistent_property_no_crash() {
     let result = session.execute("MATCH (t:Thing) REMOVE t.nonexistent");
     assert!(result.is_ok());
     session.commit().unwrap();
+}
+
+#[test]
+fn distinct_reachability_matches_independent_bfs() {
+    let db = distinct_reachability_db();
+    let session = db.session();
+    let result = session
+        .execute(
+            "MATCH (source:Node {key: 's'})-[:REL*1..4]->(target:Node) \
+             RETURN DISTINCT target.key AS key, target.name AS name ORDER BY key",
+        )
+        .unwrap();
+
+    let expected_keys = distinct_reachability_bfs(4);
+    let expected: Vec<(String, String)> = expected_keys
+        .iter()
+        .map(|key| (key.clone(), format!("Node-{key}")))
+        .collect();
+    let actual: Vec<(String, String)> = result
+        .rows()
+        .iter()
+        .map(|row| (value_string(&row[0]), value_string(&row[1])))
+        .collect();
+    assert_eq!(actual, expected);
+    assert!(!actual.iter().any(|(key, _)| key == "g"));
+    assert!(!actual.iter().any(|(key, _)| key == "u" || key == "v"));
+
+    let count = session
+        .execute(
+            "MATCH (source:Node {key: 's'})-[:REL*1..4]->(target:Node) \
+             RETURN COUNT(DISTINCT target) AS reachable",
+        )
+        .unwrap();
+    assert_eq!(
+        count.rows()[0][0],
+        Value::Int64(i64::try_from(expected.len()).unwrap())
+    );
+}
+
+#[test]
+fn distinct_reachability_bounds_expand_rows_as_depth_grows() {
+    let db = distinct_reachability_db();
+    let session = db.session();
+    for depth in [4, 32] {
+        for consumer in ["DISTINCT target.key", "count(DISTINCT target)"] {
+            let result = session.execute(&format!(
+                "PROFILE MATCH (source:Node {{key: 's'}})-[:REL*1..{depth}]->(target:Node) RETURN {consumer}"
+            )).unwrap();
+            let profile = value_string(&result.rows()[0][0]);
+            let expand = profile
+                .lines()
+                .find(|line| line.trim_start().starts_with("VariableLengthExpand ("))
+                .expect("profile must include the actual expand");
+            let rows = expand
+                .split("  rows=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(rows, 4, "depth={depth}, consumer={consumer}: {profile}");
+        }
+        // The same input still contains two walks at every depth. The bounded
+        // DISTINCT output above must come from pruning inside the expand.
+        let result = session
+            .execute(&format!(
+                "MATCH (source:Node {{key: 's'}})-[:REL*1..{depth}]->(target:Node) RETURN count(*)"
+            ))
+            .unwrap();
+        assert_eq!(result.rows()[0][0], Value::Int64(2 * depth));
+    }
+}
+
+#[test]
+fn distinct_reachability_preserves_walk_multiplicity() {
+    let db = distinct_reachability_db();
+    let session = db.session();
+    let result = session
+        .execute(
+            "MATCH (source:Node {key: 's'})-[:REL*1..4]->(target:Node) \
+             RETURN COUNT(*) AS paths",
+        )
+        .unwrap();
+
+    // Two routes reach d, and the d <-> e cycle supplies one continuation at
+    // each subsequent depth: 2 + 2 + 2 + 2 bounded walks.
+    assert_eq!(result.rows()[0][0], Value::Int64(8));
+}
+
+#[test]
+fn distinct_reachability_preserves_path_observations() {
+    let db = distinct_reachability_db();
+    let session = db.session();
+    let result = session
+        .execute(
+            "MATCH p = (source:Node {key: 's'})-[:REL*1..4]->(target:Node) \
+             RETURN length(p) AS hops, \
+                    [n IN nodes(p) | n.key] AS node_keys, \
+                    [e IN edges(p) | e.tag] AS edge_tags",
+        )
+        .unwrap();
+
+    let mut observed = BTreeSet::new();
+    for row in result.rows() {
+        let hops = match &row[0] {
+            Value::Int64(hops) => usize::try_from(*hops).unwrap(),
+            other => panic!("expected integer path length, got {other:?}"),
+        };
+        let node_keys = value_list_strings(&row[1]);
+        let edge_tags = value_list_strings(&row[2]);
+        assert_eq!(node_keys.len(), hops + 1);
+        assert_eq!(edge_tags.len(), hops);
+        let expected_tags: Vec<String> = node_keys
+            .windows(2)
+            .map(|pair| format!("{}-{}", pair[0], pair[1]))
+            .collect();
+        assert_eq!(edge_tags, expected_tags);
+        observed.insert(node_keys.join("-"));
+    }
+
+    assert_eq!(
+        observed,
+        BTreeSet::from([
+            "s-a".to_string(),
+            "s-b".to_string(),
+            "s-a-d".to_string(),
+            "s-b-d".to_string(),
+            "s-a-d-e".to_string(),
+            "s-b-d-e".to_string(),
+            "s-a-d-e-d".to_string(),
+            "s-b-d-e-d".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn path_edge_comprehension_preserves_aliased_list_provenance() {
+    let db = distinct_reachability_db();
+    let session = db.session();
+    for projection in [
+        "WITH edges(p) AS es",
+        "WITH edges(p) AS first WITH first AS es",
+    ] {
+        let result = session
+            .execute(&format!(
+                "MATCH p = (source:Node {{key: 's'}})-[:REL*1..4]->(target:Node) \
+                 {projection} RETURN [e IN es | e.tag] AS tags"
+            ))
+            .unwrap();
+        let observed: BTreeSet<String> = result
+            .rows()
+            .iter()
+            .map(|row| value_list_strings(&row[0]).join(","))
+            .collect();
+        assert_eq!(
+            observed,
+            BTreeSet::from([
+                "s-a".to_string(),
+                "s-b".to_string(),
+                "s-a,a-d".to_string(),
+                "s-b,b-d".to_string(),
+                "s-a,a-d,d-e".to_string(),
+                "s-b,b-d,d-e".to_string(),
+                "s-a,a-d,d-e,e-d".to_string(),
+                "s-b,b-d,d-e,e-d".to_string(),
+            ]),
+            "{projection}"
+        );
+    }
+}
+
+fn expected_path_edge_tag_sequences() -> BTreeSet<String> {
+    [
+        "s-a",
+        "s-b",
+        "s-a,a-d",
+        "s-b,b-d",
+        "s-a,a-d,d-e",
+        "s-b,b-d,d-e",
+        "s-a,a-d,d-e,e-d",
+        "s-b,b-d,d-e,e-d",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+#[test]
+fn path_edge_alias_survives_with_distinct() {
+    let db = distinct_reachability_db();
+    let result = db
+        .session()
+        .execute(
+            "MATCH p = (source:Node {key: 's'})-[:REL*1..4]->(target:Node) \
+         WITH DISTINCT edges(p) AS es RETURN [e IN es | e.tag] AS tags",
+        )
+        .unwrap();
+    let observed: BTreeSet<String> = result
+        .rows()
+        .iter()
+        .map(|row| value_list_strings(&row[0]).join(","))
+        .collect();
+    assert_eq!(observed, expected_path_edge_tag_sequences());
+}
+
+#[cfg(feature = "cypher")]
+#[test]
+fn path_edge_alias_survives_cypher_sort_limit_and_skip() {
+    let db = distinct_reachability_db();
+    for (modifier, expected) in [
+        ("ORDER BY size(es)", expected_path_edge_tag_sequences()),
+        (
+            "LIMIT 2",
+            BTreeSet::from(["s-a".to_string(), "s-b".to_string()]),
+        ),
+        (
+            "SKIP 2 LIMIT 2",
+            BTreeSet::from(["s-a,a-d".to_string(), "s-b,b-d".to_string()]),
+        ),
+        (
+            "ORDER BY size(es) LIMIT 2",
+            BTreeSet::from(["s-a".to_string(), "s-b".to_string()]),
+        ),
+        (
+            "ORDER BY size(es) SKIP 2 LIMIT 2",
+            BTreeSet::from(["s-a,a-d".to_string(), "s-b,b-d".to_string()]),
+        ),
+    ] {
+        let result = db
+            .execute_cypher(&format!(
+                "MATCH p = (source:Node {{key: 's'}})-[:REL*1..4]->(target:Node) \
+             WITH relationships(p) AS es {modifier} RETURN [e IN es | e.tag] AS tags"
+            ))
+            .unwrap();
+        let observed: BTreeSet<String> = result
+            .rows()
+            .iter()
+            .map(|row| value_list_strings(&row[0]).join(","))
+            .collect();
+        assert_eq!(observed, expected, "{modifier}");
+    }
+}
+
+#[test]
+fn distinct_reachability_preserves_path_values_and_node_observations() {
+    let db = distinct_reachability_db();
+    let session = db.session();
+    let result = session
+        .execute(
+            "MATCH p = (source:Node {key: 's'})-[:REL*1..4]->(target:Node) \
+             RETURN DISTINCT p, length(p) AS hops, \
+                    [n IN nodes(p) | n.key] AS node_keys",
+        )
+        .unwrap();
+
+    let mut observed = BTreeSet::new();
+    for row in result.rows() {
+        let (path_nodes, path_edges) = match &row[0] {
+            Value::Path { nodes, edges } => (nodes.len(), edges.len()),
+            other => panic!("expected path value, got {other:?}"),
+        };
+        let hops = match &row[1] {
+            Value::Int64(hops) => usize::try_from(*hops).unwrap(),
+            other => panic!("expected integer path length, got {other:?}"),
+        };
+        let node_keys = value_list_strings(&row[2]);
+        assert_eq!(path_nodes, hops + 1);
+        assert_eq!(path_edges, hops);
+        assert_eq!(node_keys.len(), hops + 1);
+        observed.insert(node_keys.join("-"));
+    }
+
+    assert_eq!(
+        observed,
+        BTreeSet::from([
+            "s-a".to_string(),
+            "s-b".to_string(),
+            "s-a-d".to_string(),
+            "s-b-d".to_string(),
+            "s-a-d-e".to_string(),
+            "s-b-d-e".to_string(),
+            "s-a-d-e-d".to_string(),
+            "s-b-d-e-d".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn distinct_statistics_and_bivariate_follow_public_query_path() {
+    let db = GrafeoDB::new_in_memory();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    session.execute("INSERT (:DistinctPoint {x: 1, y: 10}), (:DistinctPoint {x: 3, y: 30}), (:DistinctPoint {x: 3, y: 30})").unwrap();
+    session.commit().unwrap();
+    let result = session.execute("MATCH (p:DistinctPoint) RETURN stddev_pop(DISTINCT p.x), percentile_cont(DISTINCT p.x, 0.5), REGR_COUNT(DISTINCT p.y, p.x)").unwrap();
+    assert_eq!(
+        result.rows(),
+        &[vec![
+            Value::Float64(1.0),
+            Value::Float64(2.0),
+            Value::Int64(2)
+        ]]
+    );
+}
+
+#[test]
+fn distinct_statistical_reachability_keeps_results_and_bounds_expand_rows() {
+    let db = distinct_reachability_db();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    for (key, score) in [("a", 1), ("b", 3), ("d", 3), ("e", 5)] {
+        session
+            .execute(&format!(
+                "MATCH (n:Node {{key: '{key}'}}) SET n.score = {score}"
+            ))
+            .unwrap();
+    }
+    session.commit().unwrap();
+    let query = "MATCH (source:Node {key: 's'})-[:REL*1..32]->(target:Node) RETURN stddev_pop(DISTINCT target.score), percentile_cont(DISTINCT target.score, 0.5), REGR_COUNT(DISTINCT target.score, target.score), sum(DISTINCT target.score), avg(DISTINCT target.score), min(DISTINCT target.score), max(DISTINCT target.score)";
+    let result = session.execute(query).unwrap();
+    assert_eq!(result.rows().len(), 1);
+    let expected = [(8.0_f64 / 3.0).sqrt(), 3.0, 3.0, 9.0, 3.0, 1.0, 5.0];
+    for (value, expected) in result.rows()[0].iter().zip(expected) {
+        let actual = match value {
+            Value::Int64(value) => *value as f64,
+            Value::Float64(value) => *value,
+            other => panic!("expected numeric result, got {other:?}"),
+        };
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
+    let result = session.execute(&format!("PROFILE {query}")).unwrap();
+    let profile = value_string(&result.rows()[0][0]);
+    let expand = profile
+        .lines()
+        .find(|line| line.trim_start().starts_with("VariableLengthExpand ("))
+        .expect("profile must include the actual expand");
+    let rows = expand
+        .split("  rows=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    assert_eq!(
+        rows, 4,
+        "all DISTINCT statistical consumers must prune in the expand: {profile}"
+    );
 }

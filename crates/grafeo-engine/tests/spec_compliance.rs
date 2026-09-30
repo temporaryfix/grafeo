@@ -8,13 +8,21 @@
 //! cargo test -p grafeo-engine --features full --test spec_compliance
 //! ```
 
-use grafeo_common::types::{PropertyKey, Value};
+#[cfg(feature = "gql")]
+mod support;
+
+#[cfg(feature = "gql")]
+use grafeo_common::types::PropertyKey;
+#[cfg(any(feature = "gql", feature = "cypher"))]
+use grafeo_common::types::Value;
+#[cfg(any(feature = "gql", feature = "cypher"))]
 use grafeo_engine::GrafeoDB;
 
 // ============================================================================
 // Test Fixtures
 // ============================================================================
 
+#[cfg(any(feature = "gql", feature = "cypher"))]
 fn social_network() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -66,11 +74,14 @@ fn social_network() -> GrafeoDB {
         .unwrap();
 
     let e1 = session.create_edge(alix, gus, "KNOWS");
-    db.set_edge_property(e1, "since", Value::Int64(2020));
+    db.set_edge_property(e1, "since", Value::Int64(2020))
+        .expect("set edge property");
     let e2 = session.create_edge(alix, harm, "KNOWS");
-    db.set_edge_property(e2, "since", Value::Int64(2019));
+    db.set_edge_property(e2, "since", Value::Int64(2019))
+        .expect("set edge property");
     let e3 = session.create_edge(gus, harm, "KNOWS");
-    db.set_edge_property(e3, "since", Value::Int64(2021));
+    db.set_edge_property(e3, "since", Value::Int64(2021))
+        .expect("set edge property");
     session.create_edge(alix, techcorp, "WORKS_AT");
     session.create_edge(gus, techcorp, "WORKS_AT");
     session.create_edge(dave, techcorp, "WORKS_AT");
@@ -82,6 +93,7 @@ fn social_network() -> GrafeoDB {
     db
 }
 
+#[cfg(feature = "gql")]
 fn extract_strings(db: &GrafeoDB, query: &str) -> Vec<String> {
     let session = db.session();
     let result = session.execute(query).unwrap();
@@ -396,28 +408,35 @@ mod gql_statements {
 
     #[test]
     fn iso_path_quantifier_exact() {
-        let db = social_network();
+        let db = support::adversarial_path_graph();
         let session = db.session();
-        // {1} means exactly 1 hop
-        let result = session
-            .execute("MATCH (a:Person)-[:KNOWS{1}]->(b:Person) RETURN a.name, b.name")
-            .unwrap();
-        // Exactly 3 direct KNOWS edges: Alix->Gus, Alix->Harm, Gus->Harm
-        assert_eq!(result.row_count(), 3, "Should find direct connections");
+        // Exact-one-hop syntax must retain each parallel edge to a free target.
+        for (kind, expected) in [("REL", vec!["a", "b"]), ("OTHER", vec!["x", "x"])] {
+            let result = session
+                .execute(&format!(
+                    "MATCH (a:Node {{id: 's'}})-[:{kind}{{1}}]->(b:Node) RETURN b.id"
+                ))
+                .unwrap();
+            assert_eq!(support::sorted_ids(&result), expected, "edge type {kind}");
+        }
     }
 
     #[test]
     fn iso_path_quantifier_range() {
-        let db = social_network();
+        let db = support::adversarial_path_graph();
         let session = db.session();
-        // {1,2} means 1 to 2 hops
-        let result = session
-            .execute(
-                "MATCH (a:Person)-[:KNOWS{1,2}]->(b:Person) WHERE a.name = 'Alix' RETURN b.name",
-            )
-            .unwrap();
-        // 1-hop: Gus, Harm; 2-hop: Gus->Harm = Harm again
-        assert_eq!(result.row_count(), 3);
+        // From EDGES: s->a,b; a->d,h; b->d,g. Both routes to d survive.
+        for (kind, expected) in [
+            ("REL", vec!["a", "b", "d", "d", "g", "h"]),
+            ("OTHER", vec!["x", "x"]),
+        ] {
+            let result = session
+                .execute(&format!(
+                    "MATCH (a:Node)-[:{kind}{{1,2}}]->(b:Node) WHERE a.id = 's' RETURN b.id"
+                ))
+                .unwrap();
+            assert_eq!(support::sorted_ids(&result), expected, "edge type {kind}");
+        }
     }
 
     #[test]
@@ -627,7 +646,11 @@ mod gql_session_commands {
         session.execute("CREATE GRAPH workspace").unwrap();
         let result = session.execute("USE GRAPH workspace");
         assert!(result.is_ok());
-        assert_eq!(session.current_graph(), Some("workspace".to_string()));
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["workspace"])
+                .expect("literal graph path")
+        );
     }
 
     #[test]
@@ -654,7 +677,11 @@ mod gql_session_commands {
         session.execute("CREATE GRAPH analytics").unwrap();
         let result = session.execute("SESSION SET GRAPH analytics");
         assert!(result.is_ok());
-        assert_eq!(session.current_graph(), Some("analytics".to_string()));
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["analytics"])
+                .expect("literal graph path")
+        );
     }
 
     #[test]
@@ -666,8 +693,12 @@ mod gql_session_commands {
         let result = session.execute("SESSION SET SCHEMA myschema");
         assert!(result.is_ok());
         assert_eq!(session.current_schema(), Some("myschema".to_string()));
-        // Graph should remain unaffected
-        assert_eq!(session.current_graph(), None);
+        // The language default resolves within the selected schema.
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["myschema/__default__"])
+                .expect("literal graph path")
+        );
     }
 
     #[test]
@@ -691,7 +722,10 @@ mod gql_session_commands {
         // Reset clears everything (Section 7.2 GR1+GR2+GR3)
         let result = session.execute("SESSION RESET");
         assert!(result.is_ok());
-        assert_eq!(session.current_graph(), None);
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::root()
+        );
         assert_eq!(session.current_schema(), None);
         assert_eq!(session.time_zone(), None);
     }
@@ -709,7 +743,10 @@ mod gql_session_commands {
         assert!(result.is_ok());
         assert_eq!(session.current_schema(), None);
         // Graph should remain set
-        assert_eq!(session.current_graph(), Some("g1".to_string()));
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["g1"]).expect("literal graph path")
+        );
     }
 
     #[test]
@@ -723,7 +760,11 @@ mod gql_session_commands {
         session.execute("SESSION SET SCHEMA s1").unwrap();
         let result = session.execute("SESSION RESET GRAPH");
         assert!(result.is_ok());
-        assert_eq!(session.current_graph(), None);
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["s1/__default__"])
+                .expect("literal graph path")
+        );
         // Schema should remain set
         assert_eq!(session.current_schema(), Some("s1".to_string()));
     }
@@ -900,54 +941,102 @@ mod gql_path_features {
 
     #[test]
     fn any_shortest_path() {
-        let db = social_network();
-        let session = db.session();
-        let result = session
-            .execute(
-                "MATCH ANY SHORTEST (a:Person)-[:KNOWS*]->(b:Person) \
-                 WHERE a.name = 'Alix' AND b.name = 'Harm' \
-                 RETURN a.name, b.name",
-            )
-            .unwrap();
-        // Alix->Harm is 1 hop (direct), the single shortest path
-        assert_eq!(result.row_count(), 1);
+        let db = support::adversarial_path_graph();
+        for (kind, expected) in [
+            ("REL", vec!["a", "b", "d", "e", "f", "g", "h"]),
+            ("OTHER", vec!["x"]),
+        ] {
+            let result = db
+                .session()
+                .execute(&format!(
+                    "MATCH ANY SHORTEST (a:Node)-[:{kind}*]->(b:Node) WHERE a.id = 's' RETURN b.id"
+                ))
+                .unwrap();
+            assert_eq!(support::sorted_ids(&result), expected, "edge type {kind}");
+        }
     }
 
     #[test]
     fn all_shortest_path() {
-        let db = social_network();
-        let session = db.session();
-        let result = session
+        let db = support::adversarial_path_graph();
+        // The diamond supplies two minimal routes to d, e and f. The longer
+        // s-a-h-d route is excluded; cycles and the disconnected u-v add none.
+        let result = db
+            .session()
+            .execute("MATCH ALL SHORTEST (a:Node)-[:REL*]->(b:Node) WHERE a.id = 's' RETURN b.id")
+            .unwrap();
+        assert_eq!(
+            support::sorted_ids(&result),
+            ["a", "b", "d", "d", "e", "e", "f", "f", "g", "h"]
+        );
+        let parallel = db
+            .session()
             .execute(
-                "MATCH ALL SHORTEST (a:Person)-[:KNOWS*]->(b:Person) \
-                 WHERE a.name = 'Alix' AND b.name = 'Harm' \
-                 RETURN a.name, b.name",
+                "MATCH p = ALL SHORTEST (a:Node {id: 's'})-[:OTHER*]->(b:Node) \
+             RETURN b.id, [edge IN edges(p) | id(edge)]",
             )
             .unwrap();
-        // Only one shortest path: Alix->Harm (1 hop, direct)
-        assert_eq!(result.row_count(), 1);
+        assert_eq!(support::sorted_ids(&parallel), ["x", "x"]);
+        let identities: std::collections::BTreeSet<_> = parallel
+            .rows()
+            .iter()
+            .map(|row| {
+                let Value::List(edges) = &row[1] else {
+                    panic!("expected path edge IDs: {:?}", row[1]);
+                };
+                assert_eq!(edges.len(), 1);
+                edges[0].as_int64().expect("raw edge ID")
+            })
+            .collect();
+        assert_eq!(
+            identities.len(),
+            2,
+            "parallel shortest paths have distinct edge identities"
+        );
     }
 
     #[test]
     fn path_mode_walk() {
-        let db = social_network();
-        let session = db.session();
-        let result = session
-            .execute("MATCH WALK (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN a.name, b.name")
+        let db = support::adversarial_path_graph();
+        // Bounded EDGES enumeration: repeated g->g contributes four g rows.
+        let result = db
+            .session()
+            .execute("MATCH WALK (a:Node {id: 's'})-[:REL*1..5]->(b:Node) RETURN b.id")
             .unwrap();
-        // No cycles in KNOWS: 3 one-hop + 1 two-hop = 4
-        assert_eq!(result.row_count(), 4);
+        assert_eq!(
+            support::sorted_ids(&result),
+            [
+                "a", "b", "d", "d", "d", "e", "e", "e", "e", "e", "f", "f", "f", "g", "g", "g",
+                "g", "h",
+            ]
+        );
+        let parallel = db
+            .session()
+            .execute("MATCH WALK (a:Node {id: 's'})-[:OTHER*1..5]->(b:Node) RETURN b.id")
+            .unwrap();
+        assert_eq!(support::sorted_ids(&parallel), ["x", "x"]);
     }
 
     #[test]
     fn path_mode_trail() {
-        let db = social_network();
-        let session = db.session();
-        let result = session
-            .execute("MATCH TRAIL (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN a.name, b.name")
+        let db = support::adversarial_path_graph();
+        // Trails may use e->f->e once, but may not repeat the same g->g edge.
+        // Thus only g's third and fourth WALK occurrences disappear at depth 5.
+        let result = db
+            .session()
+            .execute("MATCH TRAIL (a:Node {id: 's'})-[:REL*1..5]->(b:Node) RETURN b.id")
             .unwrap();
-        // No cycles in KNOWS: 3 one-hop + 1 two-hop = 4
-        assert_eq!(result.row_count(), 4);
+        assert_eq!(
+            support::sorted_ids(&result),
+            [
+                "a", "b", "d", "d", "d", "e", "e", "e", "e", "e", "f", "f", "f", "g", "g", "h",
+            ]
+        );
+        let parallel = db
+            .session()
+            .execute("MATCH TRAIL (a:Node {id: 's'})-[:OTHER*1..5]->(b:Node) RETURN b.id")
+            .unwrap();
+        assert_eq!(support::sorted_ids(&parallel), ["x", "x"]);
     }
 }
 

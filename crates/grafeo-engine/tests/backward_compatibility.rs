@@ -4,6 +4,8 @@
 //! round-tripped (export then import) without data loss. If the format
 //! changes, the fixture must be regenerated.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 

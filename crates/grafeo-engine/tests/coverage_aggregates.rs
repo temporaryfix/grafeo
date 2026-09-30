@@ -2,6 +2,7 @@
 //!
 //! Targets: aggregate.rs (45.45%), common.rs (64.48%), expression.rs (82.32%)
 // Test values are small known constants
+#![cfg(feature = "lpg")]
 #![allow(clippy::cast_possible_truncation)]
 //!
 //! ```bash

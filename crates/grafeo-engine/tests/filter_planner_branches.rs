@@ -11,6 +11,8 @@
 //! cargo test -p grafeo-engine --all-features --test filter_planner_branches
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 use grafeo_engine::database::QueryResult;
@@ -157,7 +159,14 @@ fn zone_map_or_branch_evaluates_without_crashing() {
 #[test]
 fn indexed_equality_plus_range_uses_remaining_predicate_path() {
     let db = social_graph();
-    db.create_property_index("city");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "city".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
     let session = db.session();
 
     // city = 'Amsterdam' should be pushed down through the index; the age
@@ -476,7 +485,14 @@ fn range_predicate_only_gt_literal_on_left() {
 #[test]
 fn equality_with_null_literal_is_not_pushed_down() {
     let db = social_graph();
-    db.create_property_index("city");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "city".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
     let session = db.session();
 
     // `n.city = NULL` is always UNKNOWN, so no rows. The important thing is

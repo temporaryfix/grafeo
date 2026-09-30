@@ -6,6 +6,8 @@
 //! cargo test -p grafeo-engine --features full --test coverage_memory
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 

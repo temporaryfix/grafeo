@@ -1,5 +1,6 @@
 //! Benchmark comparison: Factorized vs Non-factorized execution
 // Test indices are small known values
+#![cfg(feature = "lpg")]
 #![allow(clippy::cast_possible_wrap)]
 
 use grafeo_common::types::Value;

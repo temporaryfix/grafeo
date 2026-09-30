@@ -580,13 +580,22 @@ fn test_call_dijkstra_basic() {
 fn test_call_sssp_basic() {
     let db = create_call_test_graph();
     let session = db.session();
-    // sssp requires a {source: N} map parameter, but SQL/PGQ CALL doesn't support
-    // map arguments in the same way as GQL. Test that it at least produces a meaningful error.
-    let result = session.execute_sql("CALL grafeo.sssp(0)");
-    assert!(
-        result.is_err(),
-        "sssp without named source param should error"
-    );
+    let result = session.execute_sql("CALL grafeo.sssp(0)").unwrap();
+    assert_eq!(result.columns[0], "node_id");
+    assert_eq!(result.columns[1], "distance");
+    assert_eq!(result.row_count(), 5);
+    let distances: std::collections::HashMap<i64, f64> = result
+        .rows()
+        .iter()
+        .map(|row| (row[0].as_int64().unwrap(), row[1].as_float64().unwrap()))
+        .collect();
+    assert_eq!(distances.len(), 5);
+    assert_eq!(distances.get(&0), Some(&0.0));
+    assert_eq!(distances.get(&1), Some(&1.0));
+    assert_eq!(distances.get(&2), Some(&1.0));
+    assert_eq!(distances.get(&3), Some(&2.0));
+    assert_eq!(distances.get(&4), Some(&1.0));
+    assert!(session.execute_sql("CALL grafeo.sssp(-1)").is_err());
 }
 
 #[test]

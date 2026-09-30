@@ -10,6 +10,9 @@
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
+mod support;
+use support::{adversarial_path_graph, sorted_ids, walk_count};
+
 fn db() -> GrafeoDB {
     GrafeoDB::new_in_memory()
 }
@@ -152,66 +155,106 @@ mod quantified_paths {
 
     #[test]
     fn variable_length_one_hop() {
-        let db = chain_graph();
+        let db = adversarial_path_graph();
         let session = db.session();
 
         let result = session
-            .execute("MATCH (a:Person {name: 'Alix'})-[:KNOWS*1..1]->(b) RETURN b.name")
+            .execute("MATCH (a:Node {id: 's'})-[:REL*1..1]->(b) RETURN b.id ORDER BY b.id")
             .unwrap();
-        assert_eq!(result.row_count(), 1, "1..1 should match exactly one hop");
-        assert_eq!(result.rows()[0][0], Value::String("Gus".into()));
+        assert_eq!(sorted_ids(&result), ["a", "b"]);
     }
 
     #[test]
     fn variable_length_two_hops() {
-        let db = chain_graph();
+        let db = adversarial_path_graph();
         let session = db.session();
 
         let result = session
-            .execute("MATCH (a:Person {name: 'Alix'})-[:KNOWS*2..2]->(b) RETURN b.name")
+            .execute("MATCH (a:Node {id: 's'})-[:REL*2..2]->(b) RETURN b.id ORDER BY b.id")
             .unwrap();
-        assert_eq!(result.row_count(), 1, "2..2 should reach Vincent");
-        assert_eq!(result.rows()[0][0], Value::String("Vincent".into()));
+        assert_eq!(sorted_ids(&result), ["d", "d", "g", "h"]);
     }
 
     #[test]
     fn variable_length_range() {
-        let db = chain_graph();
+        let db = adversarial_path_graph();
         let session = db.session();
 
         let result = session
-            .execute(
-                "MATCH (a:Person {name: 'Alix'})-[:KNOWS*1..2]->(b) RETURN b.name ORDER BY b.name",
-            )
+            .execute("MATCH (a:Node {id: 's'})-[:REL*1..2]->(b) RETURN b.id ORDER BY b.id")
             .unwrap();
-        assert_eq!(
-            result.row_count(),
-            2,
-            "1..2 should reach both Gus and Vincent"
-        );
+        assert_eq!(result.row_count(), walk_count("s", 1, 2, "REL"),);
+        assert_eq!(sorted_ids(&result), ["a", "b", "d", "d", "g", "h"]);
     }
 
     #[test]
     fn variable_length_no_match() {
-        let db = chain_graph();
+        let db = adversarial_path_graph();
         let session = db.session();
 
         let result = session
-            .execute("MATCH (a:Person {name: 'Vincent'})-[:KNOWS*1..5]->(b) RETURN b.name")
+            .execute("MATCH (a:Node {id: 'x'})-[:REL*1..5]->(b) RETURN b.id")
             .unwrap();
-        assert_eq!(result.row_count(), 0, "Vincent has no outgoing KNOWS edges");
+        assert_eq!(result.row_count(), 0, "x has no outgoing REL edges");
+
+        let reachable = session
+            .execute("MATCH (a:Node {id: 's'})-[:REL*1..5]->(b) RETURN b.id")
+            .unwrap();
+        let ids = sorted_ids(&reachable);
+        assert!(!ids.iter().any(|id| matches!(id.as_str(), "u" | "v" | "x")));
     }
 
     #[test]
     fn variable_length_star() {
-        let db = chain_graph();
+        let db = adversarial_path_graph();
         let session = db.session();
 
         // * is shorthand for 1..unlimited
         let result = session
-            .execute("MATCH (a:Person {name: 'Alix'})-[:KNOWS*]->(b) RETURN b.name ORDER BY b.name")
+            .execute("MATCH p=(a:Node {id: 's'})-[:OTHER*]->(b) RETURN b.id, [e IN edges(p) | id(e)] ORDER BY b.id")
             .unwrap();
-        assert_eq!(result.row_count(), 2, "* should reach all reachable nodes");
+        assert_eq!(result.row_count(), 2, "* retains both parallel OTHER walks");
+        assert_eq!(
+            result
+                .rows()
+                .iter()
+                .map(|row| row[0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["x", "x"]
+        );
+        let ids: std::collections::BTreeSet<_> = result
+            .rows()
+            .iter()
+            .filter_map(|row| match &row[1] {
+                Value::List(edges) => {
+                    assert_eq!(edges.len(), 1);
+                    edges.first().and_then(|edge| edge.as_int64())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "parallel unbounded walks retain edge identity"
+        );
+
+        let chain = chain_graph();
+        let chain_result = chain
+            .session()
+            .execute(
+                "MATCH (a:Person {name: 'Alix'})-[:KNOWS*]->(b) \
+                 RETURN b.name ORDER BY b.name",
+            )
+            .unwrap();
+        assert_eq!(
+            chain_result
+                .rows()
+                .iter()
+                .map(|row| row[0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Gus", "Vincent"]
+        );
     }
 }
 

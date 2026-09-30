@@ -877,24 +877,64 @@ mod cyclic_traversal {
 
 mod concurrent_merge {
     use super::*;
+    use grafeo_common::utils::error::{Error, TransactionError};
+    use grafeo_engine::transaction::IsolationLevel;
 
     #[test]
     #[ignore = "stress test: run locally before releases"]
-    fn concurrent_merge_no_duplicates() {
+    fn concurrent_serializable_merge_no_duplicates() {
+        // SnapshotIsolation permits write skew between transactions that both
+        // observe an absent key. Request SSI for this cross-transaction invariant.
+        const WORKERS: usize = 10;
+        const MAX_ATTEMPTS: usize = 128;
         let db = std::sync::Arc::new(db());
-        let handles: Vec<_> = (0..10)
+        let first_snapshot = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let handles: Vec<_> = (0..WORKERS)
             .map(|_| {
                 let db = std::sync::Arc::clone(&db);
+                let first_snapshot = std::sync::Arc::clone(&first_snapshot);
                 std::thread::spawn(move || {
-                    let s = db.session();
-                    s.execute("MERGE (:Singleton {key: 'only_one'})").unwrap();
+                    for attempt in 0..MAX_ATTEMPTS {
+                        let mut s = db.session();
+                        s.begin_transaction_with_isolation(IsolationLevel::Serializable)
+                            .unwrap();
+                        if attempt == 0 {
+                            first_snapshot.wait();
+                        }
+                        let result = s
+                            .execute("MERGE (n:Singleton {key: 'only_one'}) RETURN id(n)")
+                            .and_then(|rows| {
+                                assert_eq!(rows.row_count(), 1);
+                                s.commit()?;
+                                Ok(rows.rows()[0][0].clone())
+                            });
+                        match result {
+                            Ok(id) => {
+                                assert!(!s.in_transaction());
+                                return (id, attempt);
+                            }
+                            Err(Error::Transaction(
+                                TransactionError::WriteConflict(_)
+                                | TransactionError::SerializationFailure(_),
+                            )) => {
+                                if s.in_transaction() {
+                                    s.rollback().unwrap();
+                                }
+                                assert!(!s.in_transaction());
+                                std::thread::yield_now();
+                            }
+                            Err(error) => panic!("unexpected MERGE failure: {error}"),
+                        }
+                    }
+                    panic!("Serializable MERGE exhausted {MAX_ATTEMPTS} transaction attempts")
                 })
             })
             .collect();
 
-        for h in handles {
-            h.join().unwrap();
-        }
+        let committed: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(committed.len(), WORKERS);
+        assert!(committed.iter().any(|(_, retries)| *retries > 0));
+        assert!(committed.iter().all(|(id, _)| *id == committed[0].0));
 
         let s = db.session();
         let r = s
@@ -903,7 +943,7 @@ mod concurrent_merge {
         assert_eq!(
             r.rows()[0][0],
             Value::Int64(1),
-            "Concurrent MERGE should produce exactly 1 node"
+            "Concurrent Serializable MERGE must produce exactly 1 node"
         );
     }
 }
@@ -3557,6 +3597,7 @@ mod order_by_aliased_property {
 // PropertyAccess on a non-entity column.
 // ============================================================================
 
+#[cfg(feature = "cypher")]
 mod order_by_relationship_traversal_218 {
     use super::*;
 

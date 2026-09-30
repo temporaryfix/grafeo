@@ -6,8 +6,13 @@
 //! cargo test -p grafeo-engine --test coverage_patterns
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
+
+mod support;
+use support::{adversarial_path_graph, sorted_ids, walk_count};
 
 /// Creates a chain graph: 5 nodes (A-E), 4 LINK edges, 1 SHORTCUT edge.
 fn chain_graph() -> GrafeoDB {
@@ -53,58 +58,94 @@ fn chain_graph() -> GrafeoDB {
 
 #[test]
 fn test_variable_length_1_to_3() {
-    let db = chain_graph();
+    let db = adversarial_path_graph();
     let s = db.session();
     let r = s
         .execute(
-            "MATCH (a:Node {name: 'A'})-[:LINK *1..3]->(b:Node) \
-             RETURN b.name AS name ORDER BY name",
+            "MATCH (a:Node {id: 's'})-[:REL *1..3]->(b:Node) \
+             RETURN b.id AS id ORDER BY id",
         )
         .unwrap();
-    assert_eq!(r.rows().len(), 3, "1..3 hops from A via LINK: B, C, D");
-    let names: Vec<&str> = r
+    assert_eq!(r.rows().len(), walk_count("s", 1, 3, "REL"));
+    let actual: Vec<_> = r
         .rows()
         .iter()
-        .filter_map(|row| match &row[0] {
-            Value::String(s) => Some(s.as_str()),
-            _ => None,
-        })
+        .map(|row| row[0].as_str().unwrap().to_owned())
         .collect();
+    assert_eq!(actual, ["a", "b", "d", "d", "d", "e", "e", "g", "g", "h"]);
     assert_eq!(
-        names,
-        vec!["B", "C", "D"],
-        "ORDER BY name should sort alphabetically"
+        sorted_ids(&r),
+        ["a", "b", "d", "d", "d", "e", "e", "g", "g", "h"]
     );
 }
 
 #[test]
 fn test_variable_length_exact_2() {
-    let db = chain_graph();
+    let db = adversarial_path_graph();
     let s = db.session();
     let r = s
         .execute(
-            "MATCH (a:Node {name: 'A'})-[:LINK *2..2]->(b:Node) \
-             RETURN b.name AS name",
+            "MATCH (a:Node {id: 's'})-[:REL *2..2]->(b:Node) \
+             RETURN b.id AS id ORDER BY id",
         )
         .unwrap();
-    assert_eq!(r.rows().len(), 1);
-    assert_eq!(r.rows()[0][0], Value::String("C".into()));
+    assert_eq!(sorted_ids(&r), ["d", "d", "g", "h"]);
 }
 
 #[test]
 fn test_variable_length_unbounded() {
-    let db = chain_graph();
+    let db = adversarial_path_graph();
     let s = db.session();
     let r = s
+        .execute(
+            "MATCH p=(a:Node {id: 's'})-[:OTHER*]->(b:Node) \
+             RETURN b.id AS id, [e IN edges(p) | id(e)] ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows().len(),
+        2,
+        "unbounded OTHER must retain both parallel s->x walks"
+    );
+    assert_eq!(
+        r.rows()
+            .iter()
+            .map(|row| row[0].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["x", "x"]
+    );
+    let edge_ids: std::collections::BTreeSet<_> = r
+        .rows()
+        .iter()
+        .filter_map(|row| match &row[1] {
+            Value::List(edges) => {
+                assert_eq!(edges.len(), 1);
+                edges.first().and_then(|edge| edge.as_int64())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        edge_ids.len(),
+        2,
+        "parallel walks retain distinct edge identity"
+    );
+
+    let chain = chain_graph();
+    let chain_result = chain
+        .session()
         .execute(
             "MATCH (a:Node {name: 'A'})-[:LINK*]->(b:Node) \
              RETURN b.name AS name ORDER BY name",
         )
         .unwrap();
     assert_eq!(
-        r.rows().len(),
-        4,
-        "Unbounded hops from A via LINK: B, C, D, E"
+        chain_result
+            .rows()
+            .iter()
+            .map(|row| row[0].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["B", "C", "D", "E"]
     );
 }
 
@@ -288,7 +329,8 @@ fn test_edge_property_filter() {
         .create_node_with_props(&["Person"], [("name", Value::String("Gus".into()))])
         .unwrap();
     let e = session.create_edge(a, b, "RATED");
-    db.set_edge_property(e, "stars", Value::Int64(5));
+    db.set_edge_property(e, "stars", Value::Int64(5))
+        .expect("set edge property");
 
     let r = session
         .execute("MATCH (a:Person)-[r:RATED]->(b:Person) WHERE r.stars >= 4 RETURN b.name AS name")

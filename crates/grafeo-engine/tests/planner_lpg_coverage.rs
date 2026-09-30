@@ -46,12 +46,27 @@ fn vector_graph(metric: &str, with_index: bool) -> GrafeoDB {
         ("far", vec![0.0f32, 1.0, 0.0]),
     ] {
         let n = db.create_node(&["Doc"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "embedding", Value::Vector(vec.into()));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "embedding", Value::Vector(vec.into()))
+            .expect("set node property");
     }
     if with_index {
-        db.create_vector_index("Doc", "embedding", Some(3), Some(metric), None, None, None)
-            .unwrap();
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some(metric.into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .unwrap();
     }
     db
 }
@@ -72,10 +87,29 @@ fn strings_col0(result: &grafeo_engine::database::QueryResult) -> Vec<String> {
 // project.rs: RETURN function dispatch (type/length/nodes/edges, CASE)
 // ============================================================================
 
+/// Retaining fixtures must not weaken the owning database's close boundary.
+#[test]
+fn session_rejects_queries_after_fixture_owner_drop() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::utils::error::{Error, TransactionError};
+
+    let db = social_graph();
+    let session = db.session();
+    let query = "MATCH (n:Person) RETURN n.name";
+    assert_eq!(session.execute(query)?.row_count(), 5);
+    drop(db);
+    assert!(matches!(
+        session.execute(query),
+        Err(Error::Transaction(TransactionError::InvalidState(reason)))
+            if reason == "database is closed"
+    ));
+    Ok(())
+}
+
 /// type(r) dispatch (project.rs line 139-160).
 #[test]
 fn test_project_type_function() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH ()-[r:KNOWS]->() RETURN type(r) AS t")
         .unwrap();
@@ -88,7 +122,8 @@ fn test_project_type_function() {
 /// length(p) dispatch over a `_path_length_` column (project.rs line 162-194).
 #[test]
 fn test_project_length_function() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS*1..3]->(b:Person) \
@@ -107,7 +142,8 @@ fn test_project_length_function() {
 /// nodes()/edges() dispatch over `_path_nodes_` / `_path_edges_` (line 196-230).
 #[test]
 fn test_project_nodes_and_edges_functions() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH p = (a:Person {name: 'Alix'})-[:KNOWS*1..2]->(b:Person) \
@@ -127,7 +163,8 @@ fn test_project_nodes_and_edges_functions() {
 /// CASE expression arm in plan_return_projection (line 241).
 #[test]
 fn test_project_case_expression_ok() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (n:Person) \
@@ -151,7 +188,8 @@ fn test_project_case_expression_ok() {
 /// (line 600-657) and extra-column stripping after Sort (line 853-870).
 #[test]
 fn test_sort_by_property_not_in_return() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (a:Person {name: 'Alix'})-[:KNOWS]->(b:Person) \
@@ -167,7 +205,8 @@ fn test_sort_by_property_not_in_return() {
 /// augmented return + expr-extra stripping (expr_extra_count branch).
 #[test]
 fn test_sort_by_complex_expression_not_in_return() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) RETURN n.name AS name ORDER BY labels(n)[0], n.name")
         .unwrap();
@@ -186,7 +225,8 @@ fn test_sort_by_complex_expression_not_in_return() {
 #[cfg(feature = "vector-index")]
 #[test]
 fn test_topk_negative_wrong_direction() {
-    let session = vector_graph("cosine", true).session();
+    let db = vector_graph("cosine", true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (d:Doc) RETURN d.title \
@@ -201,7 +241,8 @@ fn test_topk_negative_wrong_direction() {
 #[cfg(feature = "vector-index")]
 #[test]
 fn test_topk_negative_no_index() {
-    let session = vector_graph("cosine", false).session();
+    let db = vector_graph("cosine", false);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (d:Doc) RETURN d.title \
@@ -218,19 +259,27 @@ fn test_topk_negative_no_index() {
 fn test_topk_negative_wrong_variable() {
     let db = GrafeoDB::new_in_memory();
     let d = db.create_node(&["Doc"]);
-    db.set_node_property(d, "title", Value::String("doc1".into()));
-    db.set_node_property(d, "embedding", Value::Vector(vec![0.9f32, 0.1, 0.0].into()));
+    db.set_node_property(d, "title", Value::String("doc1".into()))
+        .expect("set node property");
+    db.set_node_property(d, "embedding", Value::Vector(vec![0.9f32, 0.1, 0.0].into()))
+        .expect("set node property");
     let o = db.create_node(&["Other"]);
-    db.set_node_property(o, "embedding", Value::Vector(vec![0.5f32, 0.5, 0.0].into()));
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.set_node_property(o, "embedding", Value::Vector(vec![0.5f32, 0.5, 0.0].into()))
+        .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let session = db.session();
@@ -253,7 +302,8 @@ fn test_topk_negative_wrong_variable() {
 /// Impossible literal forces EmptyOperator via the zone-map short-circuit.
 #[test]
 fn test_zone_map_negative_early_exit() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) WHERE n.age = 999999 RETURN n.name")
         .unwrap();
@@ -268,7 +318,14 @@ fn test_zone_map_negative_early_exit() {
 #[test]
 fn test_compound_filter_with_remaining_predicate() {
     let db = social_graph();
-    db.create_property_index("name");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "name".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
     let r = db
         .session()
         .execute("MATCH (n:Person) WHERE n.name = 'Alix' AND n.age > 25 RETURN n.name")
@@ -281,7 +338,14 @@ fn test_compound_filter_with_remaining_predicate() {
 #[test]
 fn test_compound_filter_remaining_predicate_filters_out() {
     let db = social_graph();
-    db.create_property_index("name");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "name".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
     let r = db
         .session()
         .execute("MATCH (n:Person) WHERE n.name = 'Alix' AND n.age > 35 RETURN n.name")
@@ -296,7 +360,8 @@ fn test_compound_filter_remaining_predicate_filters_out() {
 /// Inclusive bounds (Ge + Le) hit extract_between_predicate.
 #[test]
 fn test_between_range_pattern() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) WHERE n.age >= 25 AND n.age <= 35 RETURN n.name ORDER BY n.name")
         .unwrap();
@@ -306,7 +371,8 @@ fn test_between_range_pattern() {
 /// Exclusive bounds (Gt + Lt) also route through extract_between_predicate.
 #[test]
 fn test_between_range_exclusive() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) WHERE n.age > 25 AND n.age < 35 RETURN n.name")
         .unwrap();
@@ -322,7 +388,8 @@ fn test_between_range_exclusive() {
 /// triggers plan_correlated_exists (ApplyOperator with EXISTS mode).
 #[test]
 fn test_correlated_exists_subquery() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (n:Person) \
@@ -341,7 +408,8 @@ fn test_correlated_exists_subquery() {
 #[cfg(feature = "vector-index")]
 #[test]
 fn test_vector_predicate_extraction_with_index() {
-    let session = vector_graph("euclidean", true).session();
+    let db = vector_graph("euclidean", true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (d:Doc) WHERE euclidean_distance(d.embedding, [0.9, 0.1, 0.0]) < 0.5 \
@@ -355,7 +423,8 @@ fn test_vector_predicate_extraction_with_index() {
 #[cfg(feature = "vector-index")]
 #[test]
 fn test_vector_predicate_extraction_no_index() {
-    let session = vector_graph("euclidean", false).session();
+    let db = vector_graph("euclidean", false);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (d:Doc) WHERE euclidean_distance(d.embedding, [0.9, 0.1, 0.0]) < 0.5 \
@@ -381,10 +450,21 @@ fn test_plan_text_scan_with_threshold() {
         ("ML Systems", "attention mechanisms in neural networks"),
     ] {
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "body", Value::String(body.into()));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "body", Value::String(body.into()))
+            .expect("set node property");
     }
-    db.create_text_index("Article", "body").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     let r = db
         .session()
@@ -411,7 +491,8 @@ fn test_plan_text_scan_with_threshold() {
 #[cfg(feature = "vector-index")]
 #[test]
 fn test_plan_vector_scan_min_similarity() {
-    let session = vector_graph("cosine", true).session();
+    let db = vector_graph("cosine", true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (d:Doc) WHERE cosine_similarity(d.embedding, [0.9, 0.1, 0.0]) > 0.5 \
@@ -425,7 +506,8 @@ fn test_plan_vector_scan_min_similarity() {
 #[cfg(feature = "vector-index")]
 #[test]
 fn test_plan_vector_scan_max_distance() {
-    let session = vector_graph("euclidean", true).session();
+    let db = vector_graph("euclidean", true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (d:Doc) WHERE euclidean_distance(d.embedding, [0.9, 0.1, 0.0]) < 0.5 \
@@ -446,17 +528,24 @@ fn test_plan_vector_scan_max_distance() {
 fn test_resolve_vector_literal_from_numeric_list() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Doc"]);
-    db.set_node_property(a, "title", Value::String("target".into()));
-    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 2.0, 3.0].into()));
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.set_node_property(a, "title", Value::String("target".into()))
+        .expect("set node property");
+    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 2.0, 3.0].into()))
+        .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let session = db.session();
@@ -485,17 +574,24 @@ fn test_resolve_vector_literal_from_numeric_list() {
 fn test_resolve_vector_literal_non_literal_falls_through() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Doc"]);
-    db.set_node_property(a, "title", Value::String("target".into()));
-    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 2.0, 3.0].into()));
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.set_node_property(a, "title", Value::String("target".into()))
+        .expect("set node property");
+    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 2.0, 3.0].into()))
+        .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let result = db
@@ -562,17 +658,24 @@ fn test_plan_horizontal_aggregate_edge() {
 fn test_score_reuse_isolates_different_query_vectors() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Doc"]);
-    db.set_node_property(a, "title", Value::String("x-aligned".into()));
-    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 0.0, 0.0].into()));
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.set_node_property(a, "title", Value::String("x-aligned".into()))
+        .expect("set node property");
+    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 0.0, 0.0].into()))
+        .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let r = db
@@ -615,24 +718,33 @@ fn test_vector_scan_metric_mismatch_uses_brute_force() {
     // A is close to query in Euclidean space (distance ~1.41) but far in cosine.
     // B is far in Euclidean space (distance ~99) but cosine-identical to query.
     let a = db.create_node(&["Doc"]);
-    db.set_node_property(a, "title", Value::String("near".into()));
-    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 0.0, 0.0].into()));
+    db.set_node_property(a, "title", Value::String("near".into()))
+        .expect("set node property");
+    db.set_node_property(a, "embedding", Value::Vector(vec![1.0f32, 0.0, 0.0].into()))
+        .expect("set node property");
     let b = db.create_node(&["Doc"]);
-    db.set_node_property(b, "title", Value::String("far".into()));
+    db.set_node_property(b, "title", Value::String("far".into()))
+        .expect("set node property");
     db.set_node_property(
         b,
         "embedding",
         Value::Vector(vec![0.0f32, 100.0, 0.0].into()),
-    );
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
     )
+    .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let r = db

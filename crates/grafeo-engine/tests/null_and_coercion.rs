@@ -7,6 +7,8 @@
 //! cargo test -p grafeo-engine --features full --test null_and_coercion
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 

@@ -1,6 +1,8 @@
 //! Integration tests for role-based access control in sessions and the
 //! database projection API.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_engine::GrafeoDB;
 use grafeo_engine::auth::{Identity, Role};
 
@@ -65,11 +67,45 @@ fn session_with_identity_readonly_cannot_write() {
 
 #[test]
 fn session_with_role_readonly() {
-    let db = GrafeoDB::new_in_memory();
-    let session = db.session_with_role(Role::ReadOnly);
+    use grafeo_common::types::Value;
+    use grafeo_common::utils::error::{Error, QueryErrorKind};
 
-    let result = session.execute("INSERT (:City {name: 'Amsterdam'})");
-    assert!(result.is_err(), "ReadOnly role should not allow writes");
+    let db = GrafeoDB::new_in_memory();
+    db.session()
+        .execute("INSERT (:City {name: 'Amsterdam'})")
+        .unwrap();
+    let session = db.session_with_role(Role::ReadOnly);
+    let expected = vec![vec![Value::from("Amsterdam")]];
+    let read = session.execute("MATCH (c:City) RETURN c.name").unwrap();
+    assert_eq!(read.rows(), expected.as_slice());
+
+    let error = session
+        .execute("INSERT (:City {name: 'Berlin'})")
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Query(query)
+            if query.kind == QueryErrorKind::Semantic
+                && query.message.contains("permission denied")),
+        "ReadOnly role should reject the write with its permission error: {error}"
+    );
+    assert!(!session.in_transaction());
+    assert_eq!(db.node_count(), 1);
+    assert_eq!(
+        session
+            .execute("MATCH (c:City) RETURN c.name")
+            .unwrap()
+            .rows(),
+        expected.as_slice(),
+        "the read-only session remains usable after a rejected write"
+    );
+    assert_eq!(
+        db.session()
+            .execute("MATCH (c:City) RETURN c.name")
+            .unwrap()
+            .rows(),
+        expected.as_slice(),
+        "the rejected write must leave committed data unchanged"
+    );
 }
 
 #[test]
@@ -241,39 +277,72 @@ fn get_projection_by_name() {
 
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 #[test]
-fn sparql_select_with_readonly_succeeds() {
-    let db = GrafeoDB::new_in_memory();
+fn sparql_select_with_readonly_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::types::Value;
+    use grafeo_engine::config::{Config, GraphModel};
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Both))?;
 
     // Seed some RDF data via admin session
     let admin = db.session();
-    let _ = admin.execute_sparql(
+    admin.execute_sparql(
         "INSERT DATA { <http://example.org/alix> <http://example.org/name> \"Alix\" . }",
-    );
+    )?;
 
     let session = db.session_with_role(Role::ReadOnly);
-    let result = session.execute_sparql("SELECT ?s ?o WHERE { ?s <http://example.org/name> ?o }");
-    assert!(
-        result.is_ok(),
-        "ReadOnly should execute SPARQL SELECT: {:?}",
-        result.err()
+    let result =
+        session.execute_sparql("SELECT ?s ?o WHERE { ?s <http://example.org/name> ?o }")?;
+    assert_eq!(
+        result.rows(),
+        vec![vec![
+            Value::from("http://example.org/alix"),
+            Value::from("Alix")
+        ]],
     );
+    Ok(())
 }
 
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 #[test]
-fn sparql_insert_with_readonly_fails() {
-    let db = GrafeoDB::new_in_memory();
-    let session = db.session_with_role(Role::ReadOnly);
+fn sparql_insert_with_readonly_fails() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::types::Value;
+    use grafeo_engine::config::{Config, GraphModel};
 
-    let result = session.execute_sparql(
-        "INSERT DATA { <http://example.org/gus> <http://example.org/name> \"Gus\" . }",
-    );
-    assert!(result.is_err(), "ReadOnly should not execute SPARQL INSERT");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("permission denied") || err_msg.contains("read-only"),
-        "Error should mention permission denial, got: {err_msg}"
-    );
+    let insert = "INSERT DATA { <http://example.org/gus> <http://example.org/name> \"Gus\" . }";
+    let select = "SELECT ?s ?o WHERE { ?s <http://example.org/name> ?o } ORDER BY ?s";
+    for writer_role in [Role::Admin, Role::ReadWrite] {
+        let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Both))?;
+        let admin = db.session();
+        admin.execute_sparql(
+            "INSERT DATA { <http://example.org/alix> <http://example.org/name> \"Alix\" . }",
+        )?;
+        let before = vec![vec![
+            Value::from("http://example.org/alix"),
+            Value::from("Alix"),
+        ]];
+        assert_eq!(admin.execute_sparql(select)?.rows(), before);
+
+        let session = db.session_with_role(Role::ReadOnly);
+        let result = session.execute_sparql(insert);
+        assert!(result.is_err(), "ReadOnly should not execute SPARQL INSERT");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("permission denied") || err_msg.contains("read-only"),
+            "Error should mention permission denial, got: {err_msg}"
+        );
+        assert_eq!(admin.execute_sparql(select)?.rows(), before);
+
+        // The identical request is valid for each admitted writer role.
+        db.session_with_role(writer_role).execute_sparql(insert)?;
+        assert_eq!(
+            session.execute_sparql(select)?.rows(),
+            vec![
+                before[0].clone(),
+                vec![Value::from("http://example.org/gus"), Value::from("Gus")],
+            ],
+        );
+    }
+    Ok(())
 }
 
 // ── SPARQL permission checks on RDF-model database ─────────────

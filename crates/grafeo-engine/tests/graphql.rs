@@ -8,7 +8,7 @@
 //! cargo test -p grafeo-engine --features graphql --test graphql
 //! ```
 
-#![cfg(feature = "graphql")]
+#![cfg(all(feature = "lpg", feature = "graphql"))]
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;

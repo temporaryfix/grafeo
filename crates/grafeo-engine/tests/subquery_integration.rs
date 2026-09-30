@@ -10,6 +10,8 @@
 //! cargo test -p grafeo-engine --features full --test subquery_integration
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 

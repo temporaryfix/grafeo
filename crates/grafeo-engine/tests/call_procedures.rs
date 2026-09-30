@@ -2,10 +2,78 @@
 //!
 //! Tests CALL statement parsing + execution across GQL, Cypher, and SQL/PGQ.
 
-#![cfg(feature = "algos")]
+#![cfg(all(
+    feature = "lpg",
+    any(feature = "gql", feature = "cypher", feature = "sql-pgq")
+))]
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
+
+fn assert_native_call_availability(
+    execute: impl Fn(
+        &grafeo_engine::Session,
+        &str,
+    ) -> grafeo_common::utils::error::Result<grafeo_engine::database::QueryResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = setup_graph();
+    let session = db.session();
+    let listing = execute(&session, "CALL grafeo.procedures()")?;
+    let names: Vec<_> = listing
+        .rows()
+        .iter()
+        .filter_map(|row| row.first().and_then(Value::as_str))
+        .collect();
+    for name in [
+        "grafeo.labels",
+        "grafeo.relationshipTypes",
+        "grafeo.propertyKeys",
+    ] {
+        assert!(names.contains(&name), "missing native procedure {name}");
+    }
+    assert_eq!(names.contains(&"grafeo.pagerank"), cfg!(feature = "algos"));
+    for (query, expected) in [
+        ("CALL db.labels()", "Person"),
+        ("CALL db.relationshipTypes()", "KNOWS"),
+        ("CALL db.propertyKeys()", "name"),
+    ] {
+        let result = execute(&session, query)?;
+        assert!(
+            result
+                .rows()
+                .iter()
+                .any(|row| row.first().and_then(Value::as_str) == Some(expected))
+        );
+    }
+    let algorithm = execute(&session, "CALL grafeo.pagerank()");
+    if cfg!(feature = "algos") {
+        assert_eq!(algorithm?.row_count(), 3);
+    } else {
+        let error = algorithm.err().ok_or("disabled algorithm executed")?;
+        assert!(error.to_string().contains("unknown procedure"), "{error}");
+    }
+    assert_eq!(db.node_count(), 3);
+    Ok(())
+}
+
+#[cfg(feature = "gql")]
+#[test]
+fn native_gql_calls_respect_algorithm_feature_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_call_availability(|session, query| session.execute(query))
+}
+
+#[cfg(feature = "cypher")]
+#[test]
+fn native_cypher_calls_respect_algorithm_feature_boundary() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_call_availability(|session, query| session.execute_cypher(query))
+}
+
+#[cfg(feature = "sql-pgq")]
+#[test]
+fn native_sql_calls_respect_algorithm_feature_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_call_availability(|session, query| session.execute_sql(query))
+}
 
 /// Creates 3 Person nodes (Alix, Gus, Harm) with 2 KNOWS edges.
 fn setup_graph() -> GrafeoDB {
@@ -14,9 +82,12 @@ fn setup_graph() -> GrafeoDB {
     let gus = db.create_node(&["Person"]);
     let harm = db.create_node(&["Person"]);
 
-    db.set_node_property(alix, "name", Value::from("Alix"));
-    db.set_node_property(gus, "name", Value::from("Gus"));
-    db.set_node_property(harm, "name", Value::from("Harm"));
+    db.set_node_property(alix, "name", Value::from("Alix"))
+        .expect("set node property");
+    db.set_node_property(gus, "name", Value::from("Gus"))
+        .expect("set node property");
+    db.set_node_property(harm, "name", Value::from("Harm"))
+        .expect("set node property");
 
     db.create_edge(alix, gus, "KNOWS");
     db.create_edge(gus, harm, "KNOWS");
@@ -27,6 +98,7 @@ fn setup_graph() -> GrafeoDB {
 // ==================== GQL Parser Tests ====================
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_pagerank() {
     let db = setup_graph();
     let session = db.session();
@@ -39,6 +111,7 @@ fn test_gql_call_pagerank() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_pagerank_with_params() {
     let db = setup_graph();
     let session = db.session();
@@ -64,6 +137,7 @@ fn test_gql_call_pagerank_with_params() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_with_yield() {
     let db = setup_graph();
     let session = db.session();
@@ -77,6 +151,7 @@ fn test_gql_call_with_yield() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_with_yield_alias() {
     let db = setup_graph();
     let session = db.session();
@@ -90,6 +165,7 @@ fn test_gql_call_with_yield_alias() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_connected_components() {
     let db = setup_graph();
     let session = db.session();
@@ -108,6 +184,7 @@ fn test_gql_call_connected_components() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_without_namespace() {
     let db = setup_graph();
     let session = db.session();
@@ -117,20 +194,25 @@ fn test_gql_call_without_namespace() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_unknown_procedure() {
+    use grafeo_common::utils::error::{Error, QueryErrorKind};
+
     let db = setup_graph();
     let session = db.session();
     let result = session.execute("CALL grafeo.nonexistent()");
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let err = result.unwrap_err();
     assert!(
-        err.contains("Unknown procedure"),
-        "Expected 'Unknown procedure' error, got: {}",
-        err
+        matches!(&err, Error::Query(query)
+            if query.kind == QueryErrorKind::Semantic
+                && query.message.contains("unknown procedure 'grafeo.nonexistent'")),
+        "Expected a structured unknown-procedure error, got: {err}"
     );
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_procedures_list() {
     let db = setup_graph();
     let session = db.session();
@@ -143,6 +225,7 @@ fn test_gql_call_procedures_list() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_empty_graph() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -154,6 +237,7 @@ fn test_gql_call_empty_graph() {
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "algos")]
 fn test_cypher_call_pagerank() {
     let db = setup_graph();
     let session = db.session();
@@ -167,6 +251,7 @@ fn test_cypher_call_pagerank() {
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "algos")]
 fn test_cypher_call_with_yield() {
     let db = setup_graph();
     let session = db.session();
@@ -180,6 +265,7 @@ fn test_cypher_call_with_yield() {
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "algos")]
 fn test_cypher_call_connected_components() {
     let db = setup_graph();
     let session = db.session();
@@ -194,6 +280,7 @@ fn test_cypher_call_connected_components() {
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "algos")]
 fn test_sql_pgq_call_pagerank() {
     let db = setup_graph();
     let session = db.session();
@@ -207,6 +294,7 @@ fn test_sql_pgq_call_pagerank() {
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "algos")]
 fn test_sql_pgq_call_with_yield() {
     let db = setup_graph();
     let session = db.session();
@@ -222,6 +310,7 @@ fn test_sql_pgq_call_with_yield() {
 
 #[test]
 #[cfg(all(feature = "cypher", feature = "sql-pgq"))]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_language_parity_pagerank() {
     let db = setup_graph();
     let session = db.session();
@@ -240,6 +329,7 @@ fn test_language_parity_pagerank() {
 // ==================== Algorithm-Specific Tests ====================
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_bfs() {
     let db = setup_graph();
     let session = db.session();
@@ -254,6 +344,7 @@ fn test_call_bfs() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_clustering_coefficient() {
     let db = setup_graph();
     let session = db.session();
@@ -279,6 +370,7 @@ fn test_call_clustering_coefficient() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_degree_centrality() {
     let db = setup_graph();
     let session = db.session();
@@ -294,6 +386,7 @@ fn test_call_degree_centrality() {
 // ==================== Case Insensitivity ====================
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_case_insensitive() {
     let db = setup_graph();
     let session = db.session();
@@ -307,6 +400,7 @@ fn test_call_case_insensitive() {
 // ==================== Edge Cases & Error Paths ====================
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_yield_nonexistent_column() {
     let db = setup_graph();
     let session = db.session();
@@ -321,6 +415,7 @@ fn test_call_yield_nonexistent_column() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_yield_duplicate_columns() {
     let db = setup_graph();
     let session = db.session();
@@ -338,6 +433,7 @@ fn test_call_yield_duplicate_columns() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_procedures_list_has_expected_columns() {
     let db = setup_graph();
     let session = db.session();
@@ -359,6 +455,7 @@ fn test_call_procedures_list_has_expected_columns() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_multiple_algorithms_on_same_graph() {
     let db = setup_graph();
     let session = db.session();
@@ -380,6 +477,7 @@ fn test_call_multiple_algorithms_on_same_graph() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_bfs_with_invalid_source() {
     let db = setup_graph();
     let session = db.session();
@@ -397,13 +495,16 @@ fn test_call_bfs_with_invalid_source() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_shortest_path_disconnected() {
     let db = GrafeoDB::new_in_memory();
     // Create two disconnected components
     let a = db.create_node(&["Node"]);
     let b = db.create_node(&["Node"]);
-    db.set_node_property(a, "name", Value::from("A"));
-    db.set_node_property(b, "name", Value::from("B"));
+    db.set_node_property(a, "name", Value::from("A"))
+        .expect("set node property");
+    db.set_node_property(b, "name", Value::from("B"))
+        .expect("set node property");
     // No edge between them
 
     let session = db.session();
@@ -420,6 +521,7 @@ fn test_call_shortest_path_disconnected() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_pagerank_single_node() {
     let db = GrafeoDB::new_in_memory();
     db.create_node(&["Isolated"]);
@@ -437,6 +539,7 @@ fn test_call_pagerank_single_node() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_call_yield_all_then_specific() {
     let db = setup_graph();
     let session = db.session();
@@ -464,6 +567,7 @@ fn test_call_yield_all_then_specific() {
 // ==================== Phase 2: YIELD + WHERE + RETURN ====================
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_where() {
     let db = setup_graph();
     let session = db.session();
@@ -484,6 +588,7 @@ fn test_gql_call_yield_where() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_where_filters_rows() {
     let db = setup_graph();
     let session = db.session();
@@ -509,6 +614,7 @@ fn test_gql_call_yield_where_filters_rows() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return() {
     let db = setup_graph();
     let session = db.session();
@@ -523,6 +629,7 @@ fn test_gql_call_yield_return() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_with_alias() {
     let db = setup_graph();
     let session = db.session();
@@ -536,6 +643,7 @@ fn test_gql_call_yield_return_with_alias() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_order_by() {
     let db = setup_graph();
     let session = db.session();
@@ -565,6 +673,7 @@ fn test_gql_call_yield_return_order_by() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_limit() {
     let db = setup_graph();
     let session = db.session();
@@ -576,6 +685,7 @@ fn test_gql_call_yield_return_limit() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_where_return_order_limit() {
     let db = setup_graph();
     let session = db.session();
@@ -612,6 +722,7 @@ fn test_gql_call_yield_where_return_order_limit() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_skip() {
     let db = setup_graph();
     let session = db.session();
@@ -623,6 +734,7 @@ fn test_gql_call_yield_return_skip() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_order_skip_limit() {
     let db = setup_graph();
     let session = db.session();
@@ -640,6 +752,7 @@ fn test_gql_call_yield_return_order_skip_limit() {
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "algos")]
 fn test_sql_pgq_call_yield_where() {
     let db = setup_graph();
     let session = db.session();
@@ -653,6 +766,7 @@ fn test_sql_pgq_call_yield_where() {
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "algos")]
 fn test_sql_pgq_call_yield_order_by_limit() {
     let db = setup_graph();
     let session = db.session();
@@ -677,6 +791,7 @@ fn test_sql_pgq_call_yield_order_by_limit() {
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "algos")]
 fn test_sql_pgq_call_yield_where_order_limit() {
     let db = setup_graph();
     let session = db.session();
@@ -694,6 +809,7 @@ fn test_sql_pgq_call_yield_where_order_limit() {
 
 #[test]
 #[cfg(feature = "sql-pgq")]
+#[cfg(feature = "algos")]
 fn test_sql_pgq_call_yield_where_return_skip_limit() {
     let db = setup_graph();
     let session = db.session();
@@ -716,6 +832,7 @@ fn test_sql_pgq_call_yield_where_return_skip_limit() {
 // ==================== Phase 2: GQL ORDER ASC + RETURN DISTINCT ====================
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_order_asc() {
     let db = setup_graph();
     let session = db.session();
@@ -745,6 +862,7 @@ fn test_gql_call_yield_return_order_asc() {
 }
 
 #[test]
+#[cfg(all(feature = "algos", feature = "gql"))]
 fn test_gql_call_yield_return_distinct() {
     let db = setup_graph();
     let session = db.session();
@@ -775,6 +893,7 @@ fn test_gql_call_yield_return_distinct() {
 
 #[test]
 #[cfg(feature = "cypher")]
+#[cfg(feature = "algos")]
 fn test_cypher_call_yield_where_return() {
     let db = setup_graph();
     let session = db.session();

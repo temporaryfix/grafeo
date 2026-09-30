@@ -16,6 +16,17 @@
 //! cargo test -p grafeo-engine --features graphql --test query_correctness -- graphql
 //! ```
 
+#![cfg(all(
+    feature = "lpg",
+    any(
+        feature = "gql",
+        feature = "cypher",
+        feature = "gremlin",
+        feature = "graphql",
+        feature = "sql-pgq"
+    )
+))]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -2368,6 +2379,7 @@ mod gql_conformance_edge_cases {
     }
 }
 
+#[cfg(feature = "sql-pgq")]
 mod sql_pgq_correctness {
     use super::*;
 

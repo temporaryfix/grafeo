@@ -13,14 +13,20 @@ use grafeo_engine::database::QueryResult;
 fn setup() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Doc"]);
-    db.set_node_property(a, "name", Value::from("A"));
-    db.set_node_property(a, "emb", Value::Vector(vec![1.0f32, 0.0, 0.0].into()));
+    db.set_node_property(a, "name", Value::from("A"))
+        .expect("set node property");
+    db.set_node_property(a, "emb", Value::Vector(vec![1.0f32, 0.0, 0.0].into()))
+        .expect("set node property");
     let b = db.create_node(&["Doc"]);
-    db.set_node_property(b, "name", Value::from("B"));
-    db.set_node_property(b, "emb", Value::Vector(vec![0.0f32, 1.0, 0.0].into()));
+    db.set_node_property(b, "name", Value::from("B"))
+        .expect("set node property");
+    db.set_node_property(b, "emb", Value::Vector(vec![0.0f32, 1.0, 0.0].into()))
+        .expect("set node property");
     let c = db.create_node(&["Doc"]);
-    db.set_node_property(c, "name", Value::from("C"));
-    db.set_node_property(c, "emb", Value::Vector(vec![1.0f32, 0.0, 0.0].into())); // identical to A
+    db.set_node_property(c, "name", Value::from("C"))
+        .expect("set node property");
+    db.set_node_property(c, "emb", Value::Vector(vec![1.0f32, 0.0, 0.0].into()))
+        .expect("set node property"); // identical to A
     db
 }
 

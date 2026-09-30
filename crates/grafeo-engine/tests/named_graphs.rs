@@ -135,7 +135,7 @@ mod tests {
 
         // Create a named graph and populate it via store API
         let rdf = db.rdf_store();
-        rdf.graph_or_create("http://ex.org/g1");
+        rdf.graph_or_create("http://ex.org/g1").unwrap();
         if let Some(g) = rdf.graph("http://ex.org/g1") {
             use grafeo_core::graph::rdf::{Literal, Term, Triple};
             g.insert(Triple::new(
@@ -175,7 +175,7 @@ mod tests {
 
         // Populate named graph via store API
         let rdf = db.rdf_store();
-        let g = rdf.graph_or_create("http://ex.org/g1");
+        let g = rdf.graph_or_create("http://ex.org/g1").unwrap();
         {
             use grafeo_core::graph::rdf::{Literal, Term, Triple};
             g.insert(Triple::new(
@@ -214,13 +214,13 @@ mod tests {
         let rdf = db.rdf_store();
         {
             use grafeo_core::graph::rdf::{Literal, Term, Triple};
-            let g1 = rdf.graph_or_create("http://ex.org/g1");
+            let g1 = rdf.graph_or_create("http://ex.org/g1").unwrap();
             g1.insert(Triple::new(
                 Term::iri("http://ex.org/gus"),
                 Term::iri("http://ex.org/name"),
                 Term::Literal(Literal::simple("Gus")),
             ));
-            let g2 = rdf.graph_or_create("http://ex.org/g2");
+            let g2 = rdf.graph_or_create("http://ex.org/g2").unwrap();
             g2.insert(Triple::new(
                 Term::iri("http://ex.org/harm"),
                 Term::iri("http://ex.org/name"),
@@ -388,7 +388,7 @@ mod tests {
         let rdf = db.rdf_store();
         {
             use grafeo_core::graph::rdf::{Literal, Term, Triple};
-            let g = rdf.graph_or_create("http://ex.org/g1");
+            let g = rdf.graph_or_create("http://ex.org/g1").unwrap();
             g.insert(Triple::new(
                 Term::iri("http://ex.org/gus"),
                 Term::iri("http://ex.org/name"),

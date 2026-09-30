@@ -63,27 +63,44 @@ fn article_fixture(text_index: bool, vector_index: bool) -> GrafeoDB {
     ];
     for (title, body, emb, published) in rows {
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "body", Value::String(body.into()));
-        db.set_node_property(n, "embedding", Value::Vector(emb.into()));
-        db.set_node_property(n, "published", Value::Bool(published));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "body", Value::String(body.into()))
+            .expect("set node property");
+        db.set_node_property(n, "embedding", Value::Vector(emb.into()))
+            .expect("set node property");
+        db.set_node_property(n, "published", Value::Bool(published))
+            .expect("set node property");
     }
 
     if vector_index {
-        db.create_vector_index(
-            "Article",
-            "embedding",
-            Some(3),
-            Some("cosine"),
-            None,
-            None,
-            None,
-        )
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Article".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: Some("cosine".into()),
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
         .expect("create vector index");
     }
     if text_index {
-        db.create_text_index("Article", "body")
-            .expect("create text index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Article".into()),
+            property: "body".into(),
+            kind: grafeo_engine::IndexCreateKind::Text {
+                min_token_length: None,
+            },
+        })
+        .expect("create text index");
     }
     db
 }
@@ -126,7 +143,8 @@ fn strings_col0(r: &QueryResult) -> Vec<String> {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_or_vector_or_text() {
-    let session = article_fixture(true, true).session();
+    let db = article_fixture(true, true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -155,7 +173,8 @@ fn test_hybrid_or_vector_or_text() {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_or_swapped_order() {
-    let session = article_fixture(true, true).session();
+    let db = article_fixture(true, true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -182,7 +201,8 @@ fn test_hybrid_or_swapped_order() {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_and_with_scalar_remainder() {
-    let session = article_fixture(true, true).session();
+    let db = article_fixture(true, true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -219,7 +239,8 @@ fn test_hybrid_and_with_scalar_remainder() {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_and_missing_text_index_falls_through() {
-    let session = article_fixture(false, true).session();
+    let db = article_fixture(false, true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -236,7 +257,8 @@ fn test_hybrid_and_missing_text_index_falls_through() {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_or_missing_text_index_falls_through() {
-    let session = article_fixture(false, true).session();
+    let db = article_fixture(false, true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -255,7 +277,8 @@ fn test_hybrid_or_missing_text_index_falls_through() {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_and_missing_vector_index_falls_through() {
-    let session = article_fixture(true, false).session();
+    let db = article_fixture(true, false);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -278,7 +301,8 @@ fn test_hybrid_and_missing_vector_index_falls_through() {
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
 fn test_hybrid_and_non_literal_vector_falls_through() {
-    let session = article_fixture(true, true).session();
+    let db = article_fixture(true, true);
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (doc:Article) \
@@ -305,23 +329,33 @@ fn test_hybrid_and_non_literal_vector_falls_through() {
 /// (text) has none. Hits the `(Some, None)` match arm returning Some(expr).
 #[cfg(all(feature = "text-index", feature = "vector-index"))]
 #[test]
-fn test_hybrid_or_with_nested_and_scalar() {
-    let session = article_fixture(true, true).session();
+fn test_hybrid_or_with_nested_and_scalar() -> Result<(), Box<dyn std::error::Error>> {
+    let db = article_fixture(true, true);
+    let session = db.session();
 
     // Not all parsers build exactly this shape, so allow the execution to
     // succeed either as a compound hybrid or a per-row filter fallback.
     // The important thing for coverage is that the planner walks
     // extract_scalar_remaining on the outer OR.
-    let r = session.execute(
+    let result = session.execute(
         "MATCH (doc:Article) \
          WHERE (cosine_similarity(doc.embedding, [0.9, 0.1, 0.0]) > 0.5 AND doc.published = true) \
             OR text_match(doc.body, 'rust database') \
          RETURN doc.title",
+    )?;
+    assert_eq!(result.row_count(), 3);
+    assert_eq!(result.column_count(), 1);
+    let mut titles = strings_col0(&result);
+    titles.sort();
+    assert_eq!(
+        titles,
+        vec![
+            "Graph Neural Networks",
+            "Rust Database Internals",
+            "Transformer Architectures",
+        ],
     );
-    if let Ok(rs) = r {
-        // At minimum, the rust article (text branch) must be included.
-        assert!(rs.row_count() >= 1);
-    }
+    Ok(())
 }
 
 // ============================================================================
@@ -341,11 +375,23 @@ fn test_text_pushdown_with_remaining() {
     ];
     for (title, body, published) in rows {
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "body", Value::String(body.into()));
-        db.set_node_property(n, "published", Value::Bool(published));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "body", Value::String(body.into()))
+            .expect("set node property");
+        db.set_node_property(n, "published", Value::Bool(published))
+            .expect("set node property");
     }
-    db.create_text_index("Article", "body").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     let r = db
         .session()
@@ -377,11 +423,23 @@ fn test_text_pushdown_with_remaining_reversed() {
     ];
     for (title, body, published) in rows {
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "body", Value::String(body.into()));
-        db.set_node_property(n, "published", Value::Bool(published));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "body", Value::String(body.into()))
+            .expect("set node property");
+        db.set_node_property(n, "published", Value::Bool(published))
+            .expect("set node property");
     }
-    db.create_text_index("Article", "body").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     let r = db
         .session()
@@ -412,19 +470,27 @@ fn test_vector_pushdown_with_remaining() {
     ];
     for (title, emb, published) in rows {
         let n = db.create_node(&["Doc"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "embedding", Value::Vector(emb.into()));
-        db.set_node_property(n, "published", Value::Bool(published));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "embedding", Value::Vector(emb.into()))
+            .expect("set node property");
+        db.set_node_property(n, "published", Value::Bool(published))
+            .expect("set node property");
     }
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let r = db
@@ -459,18 +525,25 @@ fn test_vector_scan_with_similarity_and_distance() {
     ];
     for (title, emb) in rows {
         let n = db.create_node(&["Doc"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "embedding", Value::Vector(emb.into()));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "embedding", Value::Vector(emb.into()))
+            .expect("set node property");
     }
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     // Cosine > 0.8 AND euclidean < 0.5 restricts to the 'same' and 'near' docs
@@ -512,10 +585,21 @@ fn test_plan_text_scan_threshold_only_no_limit() {
         ("unrelated", "graphs and queries"),
     ] {
         let n = db.create_node(&["Article"]);
-        db.set_node_property(n, "title", Value::String(title.into()));
-        db.set_node_property(n, "body", Value::String(body.into()));
+        db.set_node_property(n, "title", Value::String(title.into()))
+            .expect("set node property");
+        db.set_node_property(n, "body", Value::String(body.into()))
+            .expect("set node property");
     }
-    db.create_text_index("Article", "body").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     let r = db
         .session()
@@ -544,17 +628,24 @@ fn test_plan_text_scan_threshold_only_no_limit() {
 fn test_resolve_vector_literal_string_element_falls_through() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&["Doc"]);
-    db.set_node_property(n, "title", Value::String("only".into()));
-    db.set_node_property(n, "embedding", Value::Vector(vec![0.9f32, 0.1, 0.0].into()));
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.set_node_property(n, "title", Value::String("only".into()))
+        .expect("set node property");
+    db.set_node_property(n, "embedding", Value::Vector(vec![0.9f32, 0.1, 0.0].into()))
+        .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     // Using a plain variable reference as the query vector (not a literal list)
@@ -587,7 +678,14 @@ fn test_resolve_vector_literal_string_element_falls_through() {
 #[test]
 fn test_property_index_equality_pushdown_no_tx() {
     let db = social_graph();
-    db.create_property_index("name");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "name".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
 
     // Run via the default session (not inside BEGIN/COMMIT) so transaction_id
     // is None and the non-transactional `get_node_at_epoch` branch fires.
@@ -623,7 +721,8 @@ fn test_property_equality_no_index_uses_label_scan() {
 /// range result with nodes_by_label(label) before applying MVCC visibility.
 #[test]
 fn test_range_pushdown_with_label_intersect() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) WHERE n.age >= 30 RETURN n.name ORDER BY n.name")
         .unwrap();
@@ -642,7 +741,8 @@ fn test_range_pushdown_with_label_intersect() {
 /// of `extract_range_predicate`.
 #[test]
 fn test_range_pushdown_reversed_operand_order() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) WHERE 35 < n.age RETURN n.name")
         .unwrap();
@@ -660,7 +760,8 @@ fn test_range_pushdown_reversed_operand_order() {
 /// a normal filter.
 #[test]
 fn test_between_different_properties_falls_back() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (n:Person) WHERE n.age >= 25 AND n.age > 30 \
@@ -679,7 +780,8 @@ fn test_between_different_properties_falls_back() {
 /// `(BinaryOp::Le, BinaryOp::Ge)` match arm.
 #[test]
 fn test_between_reversed_bound_order() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute("MATCH (n:Person) WHERE n.age <= 35 AND n.age >= 25 RETURN n.name ORDER BY n.name")
         .unwrap();
@@ -698,7 +800,8 @@ fn test_between_reversed_bound_order() {
 /// `extract_complex_exists` and plans as an anti-semi-join.
 #[test]
 fn test_not_exists_standalone_anti_join() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (n:Person) \
@@ -725,7 +828,8 @@ fn test_not_exists_standalone_anti_join() {
 /// right subtree.
 #[test]
 fn test_exists_and_inside_nested_and() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (n:Person) \
@@ -794,7 +898,8 @@ fn test_count_comparison_reversed_operand() {
 /// `extract_exists_from_or` after inspecting both operands.
 #[test]
 fn test_or_with_no_exists_uses_regular_filter() {
-    let session = social_graph().session();
+    let db = social_graph();
+    let session = db.session();
     let r = session
         .execute(
             "MATCH (n:Person) \
@@ -812,18 +917,17 @@ fn test_or_with_no_exists_uses_regular_filter() {
 /// Complex EXISTS on the left side of an OR takes the Union+Distinct rewrite
 /// path in `plan_exists_or_as_union`.
 #[test]
-fn test_complex_exists_or_scalar_uses_union() {
-    let session = social_graph().session();
-    let r = session.execute(
+fn test_complex_exists_or_scalar_uses_union() -> Result<(), Box<dyn std::error::Error>> {
+    let db = social_graph();
+    let session = db.session();
+    let result = session.execute(
         "MATCH (n:Person) \
              WHERE EXISTS { MATCH (n)-[:KNOWS]->(m) WHERE m.age > 30 } \
                 OR n.city = 'Prague' \
              RETURN n.name ORDER BY n.name",
-    );
-    // Result is tolerated but shape is validated: must succeed without panic.
-    if let Ok(rs) = r {
-        let names = strings_col0(&rs);
-        // Mia is in Prague.
-        assert!(names.contains(&"Mia".to_string()));
-    }
+    )?;
+    assert_eq!(result.row_count(), 3);
+    assert_eq!(result.column_count(), 1);
+    assert_eq!(strings_col0(&result), vec!["Alix", "Gus", "Mia"]);
+    Ok(())
 }

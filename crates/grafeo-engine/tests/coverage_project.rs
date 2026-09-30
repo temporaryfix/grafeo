@@ -12,6 +12,8 @@
 //! Test data uses Tarantino characters and European cities per project
 //! conventions.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -956,4 +958,154 @@ fn schema_derivation_preserves_edge_column_type() {
         "edge should be resolved to Map, got {:?}",
         result.rows()[0][0]
     );
+}
+
+/// Capture expected values from the admitted IDs, independently of query projection.
+fn materialized_edge_fixture() -> Result<(GrafeoDB, Vec<Value>), Box<dyn std::error::Error>> {
+    use grafeo_common::types::PropertyKey;
+    use std::collections::BTreeMap;
+
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    // Conflicting properties on numerically colliding IDs expose an accidental
+    // raw Edge -> Any downgrade: generic property lookup tries the node first.
+    let vincent = session.create_node_with_props(
+        &["Person"],
+        [("name", "Vincent".into()), ("since", Value::Int64(-1))],
+    )?;
+    let jules = session.create_node_with_props(
+        &["Person"],
+        [("name", "Jules".into()), ("since", Value::Int64(-2))],
+    )?;
+    let mia = session.create_node_with_props(
+        &["Person"],
+        [("name", "Mia".into()), ("since", Value::Int64(-3))],
+    )?;
+    let mut expected = Vec::new();
+    for (src, dst, since) in [
+        (vincent, jules, 2019),
+        (jules, mia, 2020),
+        (vincent, mia, 2021),
+    ] {
+        let edge =
+            session.create_edge_with_props(src, dst, "KNOWS", [("since", Value::Int64(since))])?;
+        assert!(
+            [vincent, jules, mia]
+                .iter()
+                .any(|node| node.as_u64() == edge.as_u64()),
+            "fixture must distinguish node and edge property lookup",
+        );
+        expected.push(Value::Map(
+            BTreeMap::from([
+                (
+                    PropertyKey::new("_id"),
+                    Value::Int64(i64::try_from(edge.as_u64())?),
+                ),
+                (PropertyKey::new("_type"), Value::from("KNOWS")),
+                (
+                    PropertyKey::new("_source"),
+                    Value::Int64(i64::try_from(src.as_u64())?),
+                ),
+                (
+                    PropertyKey::new("_target"),
+                    Value::Int64(i64::try_from(dst.as_u64())?),
+                ),
+                (PropertyKey::new("since"), Value::Int64(since)),
+            ])
+            .into(),
+        ));
+    }
+    assert_eq!(
+        db.edge_count(),
+        3,
+        "LIMIT 1 must copy a partial input chunk"
+    );
+    drop(session);
+    Ok((db, expected))
+}
+
+#[test]
+fn materialized_edge_maps_survive_limit_skip_and_sort() -> Result<(), Box<dyn std::error::Error>> {
+    let (db, expected) = materialized_edge_fixture()?;
+    let session = db.session();
+    for (projection, expected_index) in [
+        ("RETURN r LIMIT 1", None),
+        ("WITH r RETURN r LIMIT 1", None),
+        ("RETURN r SKIP 1 LIMIT 1", None),
+        ("RETURN r ORDER BY r.since SKIP 1 LIMIT 1", Some(1)),
+        ("RETURN r AS relation LIMIT 1", None),
+    ] {
+        let query = format!("MATCH (:Person)-[r:KNOWS]->(:Person) {projection}");
+        let result = session.execute(&query)?;
+        let rows = result.rows();
+        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(rows[0].len(), 1, "{query}");
+        if let Some(index) = expected_index {
+            assert_eq!(rows[0][0], expected[index], "{query}");
+        } else {
+            assert!(expected.contains(&rows[0][0]), "{query}: {:?}", rows[0]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn materialized_edge_scalar_shadow_survives_pagination() -> Result<(), Box<dyn std::error::Error>> {
+    let (db, _) = materialized_edge_fixture()?;
+    let session = db.session();
+    for (projection, expected) in [
+        (
+            "WITH r.since AS r RETURN r ORDER BY r SKIP 1 LIMIT 1",
+            Value::Int64(2020),
+        ),
+        ("WITH 'kept' AS r RETURN r LIMIT 1", Value::from("kept")),
+        ("RETURN type(r) AS r LIMIT 1", Value::from("KNOWS")),
+    ] {
+        let query = format!("MATCH (:Person)-[r:KNOWS]->(:Person) {projection}");
+        assert_eq!(
+            session.execute(&query)?.rows(),
+            vec![vec![expected]],
+            "{query}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn materialized_edge_schema_keeps_unresolved_ids_through_with()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (db, _) = materialized_edge_fixture()?;
+    let session = db.session();
+    for (projection, since) in [
+        (
+            "WITH r RETURN type(r), r.since ORDER BY r.since LIMIT 1",
+            2019,
+        ),
+        (
+            "WITH r AS rel RETURN type(rel), rel.since ORDER BY rel.since SKIP 1 LIMIT 1",
+            2020,
+        ),
+    ] {
+        let query = format!("MATCH (:Person)-[r:KNOWS]->(:Person) {projection}");
+        assert_eq!(
+            session.execute(&query)?.rows(),
+            vec![vec![Value::from("KNOWS"), Value::Int64(since)]],
+            "{query}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn materialized_edge_mixed_return_keeps_map_and_property() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (db, expected) = materialized_edge_fixture()?;
+    let result = db.session().execute(
+        "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r, r.since AS since ORDER BY since LIMIT 1",
+    )?;
+    assert_eq!(
+        result.rows(),
+        vec![vec![expected[0].clone(), Value::Int64(2019)]]
+    );
+    Ok(())
 }

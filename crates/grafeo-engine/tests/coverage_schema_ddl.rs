@@ -91,18 +91,38 @@ fn test_create_or_replace_edge_type() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_alter_node_type_add_and_drop_property() {
+fn test_alter_node_type_add_and_drop_property() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::types::Value;
+
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
     session
         .execute("CREATE NODE TYPE Sensor (id INTEGER NOT NULL)")
         .unwrap();
-    session
-        .execute("ALTER NODE TYPE Sensor ADD PROPERTY location STRING")
-        .unwrap();
-    session
-        .execute("ALTER NODE TYPE Sensor DROP PROPERTY location")
-        .unwrap();
+    let before_result = session.execute("SHOW NODE TYPES")?;
+    let before = before_result.rows();
+    assert_eq!(
+        before,
+        vec![vec![
+            Value::from("Sensor"),
+            Value::from("id INT64 NOT NULL"),
+            Value::from(""),
+            Value::from("")
+        ]]
+    );
+    session.execute("ALTER NODE TYPE Sensor ADD location STRING")?;
+    assert_eq!(
+        session.execute("SHOW NODE TYPES")?.rows(),
+        vec![vec![
+            Value::from("Sensor"),
+            Value::from("id INT64 NOT NULL, location STRING"),
+            Value::from(""),
+            Value::from("")
+        ]],
+    );
+    session.execute("ALTER NODE TYPE Sensor DROP location")?;
+    assert_eq!(session.execute("SHOW NODE TYPES")?.rows(), before);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -110,18 +130,38 @@ fn test_alter_node_type_add_and_drop_property() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_alter_edge_type_add_and_drop_property() {
+fn test_alter_edge_type_add_and_drop_property() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_common::types::Value;
+
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
     session
         .execute("CREATE EDGE TYPE MONITORS (interval INTEGER)")
         .unwrap();
-    session
-        .execute("ALTER EDGE TYPE MONITORS ADD PROPERTY threshold FLOAT")
-        .unwrap();
-    session
-        .execute("ALTER EDGE TYPE MONITORS DROP PROPERTY threshold")
-        .unwrap();
+    let before_result = session.execute("SHOW EDGE TYPES")?;
+    let before = before_result.rows();
+    assert_eq!(
+        before,
+        vec![vec![
+            Value::from("MONITORS"),
+            Value::from("interval INT64"),
+            Value::from(""),
+            Value::from("")
+        ]]
+    );
+    session.execute("ALTER EDGE TYPE MONITORS ADD threshold FLOAT")?;
+    assert_eq!(
+        session.execute("SHOW EDGE TYPES")?.rows(),
+        vec![vec![
+            Value::from("MONITORS"),
+            Value::from("interval INT64, threshold FLOAT64"),
+            Value::from(""),
+            Value::from("")
+        ]],
+    );
+    session.execute("ALTER EDGE TYPE MONITORS DROP threshold")?;
+    assert_eq!(session.execute("SHOW EDGE TYPES")?.rows(), before);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +339,11 @@ fn test_full_schema_lifecycle() {
         .execute("CREATE GRAPH hr_graph TYPED org_chart")
         .unwrap();
 
-    // Clean up
+    // Bound graph types cannot be removed out from under their graph.
+    assert!(session.execute("DROP GRAPH TYPE org_chart").is_err());
+
+    // Clean up in dependency order.
+    session.execute("DROP GRAPH hr_graph").unwrap();
     session.execute("DROP GRAPH TYPE org_chart").unwrap();
     session.execute("DROP NODE TYPE Employee").unwrap();
     session.execute("DROP EDGE TYPE REPORTS_TO").unwrap();
