@@ -19,9 +19,12 @@ Hybrid search combines BM25 text relevance with HNSW vector similarity, then fus
     `hybrid_search()` is best when you want a single top-K list with RRF or
     weighted fusion.
 
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
 ## Prerequisites
 
-Hybrid search requires the `hybrid-search` feature flag, which is included in the `embedded`, `server`, and `full` profiles. It also depends on `text-index` and `vector-index`.
+Hybrid search requires the `hybrid-search` feature flag, which is included in the `ai` and `analytics` profiles. It also depends on `text-index` and `vector-index`.
 
 ## Setup
 
@@ -43,8 +46,8 @@ db.create_node(["Doc"], {
 })
 
 # Create BOTH indexes
-db.create_text_index("Doc", "content")
-db.create_vector_index("Doc", "embedding", dimensions=5, metric="cosine")
+text_owner = db.create_index("content", kind="text", label="Doc")
+vector_owner = db.create_index("embedding", kind="vector", label="Doc", dimensions=5, metric="cosine")
 ```
 
 ## Searching

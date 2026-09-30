@@ -15,7 +15,7 @@ tags:
 !!! warning "Feature flag requirements"
     Offline sync depends on several feature flags:
 
-    - **grafeo (engine):** the `cdc` feature must be enabled for change tracking. It is included in the `ai` and `embedded` profiles.
+    - **grafeo (engine):** the `cdc` feature must be enabled for change tracking. It is included in the `ai` capability and the native embedded expansion.
     - **grafeo-server:** the `replication` feature must be enabled, and the server must be started with `--replication-mode primary` for the primary instance (or `--replication-mode replica` for replicas).
     - **grafeo-server:** the `sync` feature must be enabled for the `POST /db/{name}/sync` endpoint.
 
@@ -196,9 +196,11 @@ committed state.
 
 ### Epoch monotonicity
 
-The `epoch` field in change events is strictly monotonic: `changes_between(from, to)` returns
-events with no gaps, no duplicates, and strictly increasing epoch values. This is enforced by
-stress tests with 5 concurrent writers.
+Native `changes_after(cursor, max_events, max_bytes)` pages preserve commit order.
+Events in one transaction share an epoch, so event epochs are nondecreasing.
+The exclusive sequence cursor resumes without repeating retained events; epoch
+filters belong in the bounded consumer loop. See [CDC](cdc.md#bounded-feed-pages).
+This native contract does not by itself qualify the server sync protocol.
 
 ### Atomic sync apply
 

@@ -9,7 +9,17 @@ tags:
 
 # Observability
 
-Grafeo provides built-in observability through the `metrics` feature flag: query metrics, transaction metrics, plan cache statistics, Prometheus export and structured tracing spans. All counters use lock-free atomics, so recording a metric is a single atomic increment with no contention.
+Grafeo provides built-in observability through the `metrics` feature flag: query metrics, transaction metrics, plan cache statistics, Prometheus export and structured tracing spans. The metrics counters use atomic updates.
+
+## Query resource profiles
+
+`PROFILE` reports query-wide memory and spill history alongside operator rows and timing. Repeated query-wide counters on different operator nodes describe the same query; do not add them together. These counters do not require the `metrics` feature.
+
+With authenticated spill configured, physical statistics distinguish retained reservations from sampled file allocation. `spill_physical_reserved_bytes` includes the query leaf and conservative filesystem allowances; `spill_physical_peak_bytes` retains its high-water mark after cleanup. `spill_observed_file_bytes_at_publication` and its peak sample file allocation at publication boundaries; they exclude root/leaf metadata and unsampled staging growth. They are not a complete filesystem-usage measurement. `spill_physical=unavailable` means no authenticated query reservation is admitted or its physical accounting owner is busy; sampling does not wait for that owner.
+
+`spill_cleanup_failed=true` means explicit query cleanup failed. Its known retained reservation remains visible as `spill_cleanup_debt_bytes`. If `spill_reservation_uncertain=true`, a quota transaction did not resolve conclusively: treat the byte count as known retained usage, not an exact total. Successful retirement clears live reservation/debt while preserving peaks. Streaming profiles retain their final snapshot after completion, cancellation or explicit close; repeated close does not retry failed cleanup.
+
+The separate `root-wide last_cleanup_*` line describes the last successful bounded startup cleanup pass, including preserved invalid/foreign entries and the root-wide charge at that pass. This includes other queries and unresolved crash debt, not just the profiled query. `truncated=true` means the pass reached its enumeration bound; preserved leaves remain charged. A failed cleanup pass returns an error rather than publishing a success report. The snapshot is not a live root-usage gauge.
 
 ## Metrics
 
@@ -21,7 +31,7 @@ grafeo = { version = "0.5", features = ["metrics"] }
 ```
 
 !!! note
-    The `metrics` feature is included in the `server` profile. For other profiles, add it explicitly with `features = ["metrics"]`.
+    The `metrics` feature is included in the `enterprise` profile. For other profiles, add it explicitly with `features = ["metrics"]`.
 
 ### Retrieving a Snapshot
 
@@ -366,7 +376,7 @@ grafeo = { version = "0.5", features = ["cdc"] }
 ```
 
 !!! note
-    The `cdc` feature is included in the `ai`, `server`, and `full` profiles. For other profiles, add it explicitly with `features = ["cdc"]`.
+    The `cdc` feature is included in the `ai` profile and the production capability expansion. For other profiles, add it explicitly with `features = ["cdc"]`.
 
 ### Change Events
 
@@ -399,28 +409,40 @@ session.commit()
 node_id = db.execute("MATCH (s:Server) RETURN id(s)")[0][0]
 
 # Full history for a single node
-events = db.node_history(node_id)
+page = db.node_history_after(node_id, None, 128, 1024 * 1024)
+events = page["events"]  # Resume with page["next"] to consume additional bounded pages.
 for e in events:
     print(f"epoch={e['epoch']}  kind={e['kind']}  after={e['after']}")
 # epoch=1  kind=create  after={'name': 'web-01', 'status': 'active'}
 # epoch=2  kind=update  after={'status': 'retired'}
 
 # History since a known epoch (incremental polling)
-recent = db.node_history_since(node_id, since_epoch=2)
+recent = db.node_history_after(node_id, None, 128, 1024 * 1024, since_epoch=2)
 
 # Edge history
-edge_events = db.edge_history(edge_id)
+edge_page = db.edge_history_after(edge_id, None, 128, 1024 * 1024)
 ```
 
-### Range Queries
+### Bounded feed pages
 
-`changes_between(start_epoch, end_epoch)` returns all change events across all entities within an epoch range. This is the foundation for replication and offline sync:
+`changes_after(cursor, max_events, max_bytes)` returns an owned page of retained
+native events and canonical resume bytes. Both limits are required. Apply an
+epoch filter while consuming bounded pages:
 
 ```python
-# Collect everything that changed between epoch 10 and 20
-events = db.changes_between(start_epoch=10, end_epoch=20)
-for e in events:
-    print(f"{e['entity_type']} {e['entity_id']}: {e['kind']} at epoch {e['epoch']}")
+cursor = None
+while True:
+    page = db.changes_after(cursor, 128, 1024 * 1024)
+    if page["next"] == cursor:
+        break
+    cursor = page["next"]
+    for event in page["events"]:
+        if 10 <= event["epoch"] <= 20:
+            print(event)
 ```
 
-The grafeo-server HTTP API exposes this as `GET /db/{name}/changes?since={epoch}`. See [Offline Sync](offline-sync.md) for the full pull/push protocol.
+A filtered empty page may advance. The unchanged cursor marks the current end;
+keep it to resume future commits. See [CDC](cdc.md#bounded-feed-pages) for bounds,
+visibility, structured errors and persistence semantics. The separate server
+sync protocol requires its own acceptance; native cursor support does not
+qualify that HTTP route.

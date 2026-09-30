@@ -19,6 +19,10 @@ const db = GrafeoDB.create();
 // Persistent database
 const db = GrafeoDB.create('./my_graph.db');
 
+// Select RDF-only or dual-model storage at creation time
+const rdfDb = GrafeoDB.create(undefined, 'rdf');
+const mixedDb = GrafeoDB.create('./mixed.db', 'both');
+
 // Open existing database
 const db = GrafeoDB.open('./my_graph.db');
 ```
@@ -27,8 +31,43 @@ const db = GrafeoDB.open('./my_graph.db');
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `create(path?)` | `path: string \| undefined` | Create a database (in-memory if no path) |
+| `create(path?, graphModel?)` | `path: string \| null \| undefined`, `graphModel: "lpg" \| "rdf" \| "both"` | Create a database (in-memory if no path); LPG is the default model |
 | `open(path)` | `path: string` | Open an existing database |
+
+The graph model is persisted and fixed when the database is created. Opening a
+database recovers its stored model; query methods do not silently add a second
+model.
+
+The `lpg`, `embedded`, `edge`, `native` and `full` Node profiles expose native
+node/edge CRUD and transaction `createNode`. The `native` profile keeps query
+parsers disabled. The memory-only `edge` profile omits save/backup methods;
+adding storage enables persistence. Saving works with either stored graph model;
+backup methods additionally require compiled LPG support.
+
+## Native RDF insertion
+
+With `triple-store` support, RDF and dual-model databases accept native quads
+without a query parser. Terms use N-Triples spelling or bare IRIs. Each bulk
+item is `[subject, predicate, object]` or includes a fourth graph IRI.
+
+```typescript
+const db = GrafeoDB.create(undefined, 'rdf');
+const [inserted, epoch] = db.insertRdfQuads([
+  ['http://example.org/s', 'http://example.org/p', '"value"'],
+]);
+// inserted is a number; epoch is an exact unsigned decimal string.
+const exactEpoch = BigInt(epoch);
+db.close();
+```
+
+`insertRdfQuad(subject, predicate, object, graph?)` returns numeric `0` or `1`.
+`insertRdfQuads(quads)` returns `[insertedCount, epochString]`. Counts fit an
+unsigned 32-bit integer; oversized bulk input is rejected before mutation.
+The epoch remains exact above JavaScript's safe-integer and signed 64-bit ranges.
+Transactions expose the same two insertion methods, both returning numeric
+counts; changes become visible outside the transaction after commit. Duplicate
+quads do not increase the inserted count. `containsRdfQuad(...)` checks exact
+typed membership in the database or transaction.
 
 ## Query Methods
 
@@ -80,6 +119,9 @@ Execute a SPARQL query against the RDF triple store. Requires the `sparql` featu
 ```typescript
 async executeSparql(query: string, params?: object): Promise<QueryResult>
 ```
+
+The database must have been created with `graphModel` set to `"rdf"` or
+`"both"`.
 
 ### executeSql()
 
@@ -134,6 +176,10 @@ Set a property on a node.
 ```typescript
 setNodeProperty(id: number, key: string, value: any): void
 ```
+
+Returns normally only after a successful write. A missing or deleted node throws
+an `Error`; the setter does not create the node. Property-size/schema rejection,
+closed-database and durability failures also propagate as errors.
 
 ### removeNodeProperty()
 
@@ -208,6 +254,10 @@ Set a property on an edge.
 setEdgeProperty(id: number, key: string, value: any): void
 ```
 
+Returns normally only after a successful write. A missing or deleted edge throws
+an `Error`; the setter does not create the edge. Other engine write failures
+also propagate as errors.
+
 ### removeEdgeProperty()
 
 Remove a property from an edge. Returns `true` if the property existed.
@@ -240,41 +290,45 @@ const tx = db.beginTransaction();
 const tx = db.beginTransaction('serializable');
 ```
 
+## Index Owners
+
+```typescript
+interface CreateIndexRequest {
+  property: string;
+  kind?: "property" | "btree" | "text" | "vector";
+  graph?: string[];
+  name?: string;
+  label?: string;
+  dimensions?: number;
+  metric?: string;
+  m?: number;
+  efConstruction?: number;
+  quantization?: string;
+}
+createIndex(request: CreateIndexRequest): Promise<number>
+dropIndex(owner: number): Promise<boolean>
+rebuildIndex(owner: number): Promise<void>
+```
+
+Creation returns a committed unsigned 32-bit owner ID. Duplicate names or physical targets are errors. Graph paths are component arrays: `[]` selects root, `[""]` an empty-named child, and `["a/b"]` differs from `["a", "b"]`. Property/BTree indexes forbid a label; Text/Vector require one. Rebuild atomically preserves the owner and its full resolved configuration; it does not recreate a dropped index. Drop returns false only for an absent owner. Engine failures propagate through the binding's error channel.
+
+All three methods are asynchronous. Omitted `kind` means `"property"`.
+The numeric/configuration options apply only to Vector; invalid options and
+unavailable features reject the promise. Normal writes maintain indexes
+automatically.
+
+```typescript
+const vectorOwner = await db.createIndex({
+  kind: "vector", label: "Document", property: "embedding",
+  dimensions: 384, metric: "cosine", quantization: "scalar",
+});
+await db.rebuildIndex(vectorOwner);
+const dropped = await db.dropIndex(vectorOwner);
+```
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
 ## Vector Search
-
-### createVectorIndex()
-
-Create an HNSW vector similarity index on a node property.
-
-```typescript
-async createVectorIndex(
-  label: string,
-  property: string,
-  dimensions?: number,
-  metric?: string,     // 'cosine' (default), 'euclidean', 'dot'
-  m?: number,          // connections per node (default: 16)
-  efConstruction?: number  // build quality (default: 128)
-): Promise<void>
-```
-
-### dropVectorIndex()
-
-Drop a vector index. Returns `true` if the index existed.
-
-```typescript
-async dropVectorIndex(label: string, property: string): Promise<boolean>
-```
-
-### rebuildVectorIndex()
-
-Rebuild a vector index by rescanning all matching nodes. Preserves the original index configuration.
-
-!!! note "Auto-sync: rebuild is rarely needed"
-    Vector indexes auto-sync when you call `setNodeProperty()`, `batchCreateNodes()`, or `batchCreateNodesWithProps()` with vector data. You only need `rebuildVectorIndex()` after importing data through non-standard paths or to compact the index after many deletions.
-
-```typescript
-async rebuildVectorIndex(label: string, property: string): Promise<void>
-```
 
 ### vectorSearch()
 
@@ -350,29 +404,7 @@ async mmrSearch(
 
 ## Text Search
 
-### createTextIndex()
-
-Create a BM25 text index on a node property for full-text search. The index is automatically kept in sync as nodes are created, updated, or deleted. You do not need to call `rebuildTextIndex()` after normal write operations.
-
-```typescript
-async createTextIndex(label: string, property: string): Promise<void>
-```
-
-### dropTextIndex()
-
-Drop a text index. Returns `true` if the index existed.
-
-```typescript
-async dropTextIndex(label: string, property: string): Promise<boolean>
-```
-
-### rebuildTextIndex()
-
-Rebuild a text index by rescanning all matching nodes. Text indexes auto-sync on normal writes; you only need this after importing data through non-standard paths.
-
-```typescript
-async rebuildTextIndex(label: string, property: string): Promise<void>
-```
+Create Text indexes with `await db.createIndex({kind: "text", label: "Article", property: "title"})`. They are maintained automatically by normal writes.
 
 ### textSearch()
 
@@ -389,7 +421,7 @@ async textSearch(
 
 ### hybridSearch()
 
-Combine text (BM25) and vector similarity search. For best results, create both a text index (`createTextIndex()`) and a vector index (`createVectorIndex()`). If either index is missing, that source is silently omitted from fusion.
+Combine text (BM25) and vector similarity search. For best results, create both a text index (`createIndex({kind: "text", ...})`) and a vector index (`createIndex({kind: "vector", ...})`). If either index is missing, that source is silently omitted from fusion.
 
 Returns `[[nodeId, score], ...]` sorted by fused score **descending** (higher = more relevant). These are fusion scores, **not** distances.
 
@@ -455,47 +487,57 @@ async vectorSearchText(
 
 These methods require the `cdc` feature flag.
 
-### nodeHistory()
+### nodeHistoryAfter() / edgeHistoryAfter()
 
-Returns the full change history for a node.
-
-```typescript
-async nodeHistory(nodeId: number): Promise<ChangeEvent[]>
-```
-
-### edgeHistory()
-
-Returns the full change history for an edge.
+Read owned bounded entity history through the shared durable feed. IDs and the
+optional inclusive epoch are exact unsigned decimal strings. Both limits are
+required positive safe integers. Pass `null` initially, then the exact `next`
+Buffer; stop only when it is unchanged, even for an empty filtered page.
 
 ```typescript
-async edgeHistory(edgeId: number): Promise<ChangeEvent[]>
+nodeHistoryAfter(nodeId: string, cursor: Buffer | null, maxEvents: number,
+  maxBytes: number, sinceEpoch?: string): Promise<JsChangePage>
+edgeHistoryAfter(edgeId: string, cursor: Buffer | null, maxEvents: number,
+  maxBytes: number, sinceEpoch?: string): Promise<JsChangePage>
 ```
 
-### nodeHistorySince()
+The entity index skips unrelated entities. Graph-local ID collisions remain
+aggregated across authorized coordinates and incarnations. Returned event
+coordinates use exact decimal strings and native errors retain `error.code`.
 
-Returns change events for a node since a given epoch.
+### changesAfter()
+
+Returns an owned bounded page with canonical cursor bytes. Both limits are
+positive safe integers. Pass `null` initially, then return the exact `next`
+Buffer. Stop only when cursor bytes are unchanged, even for an empty page.
 
 ```typescript
-async nodeHistorySince(nodeId: number, sinceEpoch: number): Promise<ChangeEvent[]>
+changesAfter(cursor: Buffer | null, maxEvents: number, maxBytes: number): Promise<JsChangePage>
+// JsChangePage: { events: [...], next: Buffer }
 ```
 
-### changesBetween()
+Page event `entity_id`, `epoch`, `timestamp` and non-null `graph_incarnation`
+are exact decimal strings; use `BigInt` for arithmetic. Native failures retain
+stable `error.code`. Pages own their data across close; reads after close fail.
+See [bounded CDC pages](../../user-guide/cdc.md#bounded-feed-pages).
 
-Returns all change events across entities in an epoch range.
-
-```typescript
-async changesBetween(startEpoch: number, endEpoch: number): Promise<ChangeEvent[]>
-```
+Whole-feed and entity pages share this event format:
 
 Each `ChangeEvent` is a JSON object:
 
 ```typescript
 {
-  entity_id: number;
-  entity_type: 'node' | 'edge';
+  entity_id: string;
+  entity_type: 'node' | 'edge' | 'triple';
   kind: 'create' | 'update' | 'delete';
-  epoch: number;
-  timestamp: number;
+  epoch: string;
+  timestamp: string;
+  graph_incarnation: string | null;
+  lpg_graph: string[] | null; // [] is LPG root; RDF is null
+  triple_graph: string | null; // RDF named graph only
+  triple_subject: string | null;
+  triple_predicate: string | null;
+  triple_object: string | null;
   before: Record<string, any> | null;
   after: Record<string, any> | null;
 }

@@ -20,6 +20,10 @@ db = grafeo.GrafeoDB()
 
 # Persistent database
 db = grafeo.GrafeoDB("my_graph.db")
+
+# RDF-only or dual-model databases must be selected at creation time
+rdf_db = grafeo.GrafeoDB(graph_model="rdf")
+mixed_db = grafeo.GrafeoDB("mixed.db", graph_model="both")
 ```
 
 ## Executing Queries
@@ -51,9 +55,14 @@ db.execute_gremlin("g.V().hasLabel('Person')")
 # GraphQL
 db.execute_graphql("{ Person { name age } }")
 
-# SPARQL (for RDF data)
-db.execute_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+# SPARQL (on an RDF or Both database)
+rdf_db.execute_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
 ```
+
+`graph_model` is `"lpg"` (the default), `"rdf"`, or `"both"`. It is a
+durable creation-time property, not a query-language switch: an LPG-only
+database rejects RDF operations, and an RDF-only database rejects LPG
+operations.
 
 ## Transactions
 
@@ -157,6 +166,13 @@ db.create_projection("people",
 print(db.list_projections())  # ['people']
 db.drop_projection("people")
 ```
+
+These are lightweight, process-local filtered views. Their registrations are
+not the durable, receipted RDF→LPG projections exposed by the RDF projection
+APIs. Dropping a named graph unregisters views owned by that exact graph
+incarnation; a Rust caller that already holds a read-only projection handle can
+continue reading the detached incarnation. `DROP SCHEMA` remains `RESTRICT`
+while any virtual view is owned by the schema's default or named graphs.
 
 ## Data Import
 

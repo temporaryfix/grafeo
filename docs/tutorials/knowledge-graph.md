@@ -26,7 +26,9 @@ This tutorial builds a knowledge graph about movies, actors, directors and genre
 ```python
 import grafeo
 
-db = grafeo.GrafeoDB()
+# This tutorial uses LPG for application data and RDF for SHACL, so select the
+# dual native model explicitly. A database's graph model is fixed at creation.
+db = grafeo.GrafeoDB(graph_model="both")
 ```
 
 ## Create the Knowledge Graph
@@ -168,7 +170,24 @@ for row in result:
 
 ## Validate with SHACL
 
-Use [SHACL](https://www.w3.org/TR/shacl/) (Shapes Constraint Language) to validate that nodes in the knowledge graph conform to expected shapes. SHACL validation requires the `rdf` persona profile.
+Use [SHACL](https://www.w3.org/TR/shacl/) (Shapes Constraint Language) to
+validate RDF data against expected shapes. SHACL validation requires the `rdf`
+persona profile. The LPG and RDF models share one database and transaction
+protocol, but LPG rows do not silently become RDF triples: project or insert
+the RDF representation you intend to validate.
+
+For this example, add an RDF representation of one movie to the default graph:
+
+```python
+db.execute_sparql("""
+    INSERT DATA {
+        <http://example.org/movie/the-matrix>
+            a <http://example.org/Movie> ;
+            <http://example.org/title> "The Matrix" ;
+            <http://example.org/year> 1999 .
+    }
+""")
+```
 
 First, load your shapes into a named graph using SPARQL:
 

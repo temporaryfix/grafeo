@@ -9,6 +9,13 @@ Welcome to the Grafeo User Guide. This section covers everything needed to use G
 
 Grafeo supports both **Labeled Property Graph (LPG)** and **RDF** data models, with multiple query languages for each.
 
+For the unreleased 0.0.1 store, begin with
+[temporal graphs and retained history](temporal.md): explicit transactions,
+commit epochs, historical reads, RDF valid time and retention limits. Then use
+the [native host guide](native-host.md) to select the right
+compile slice of the same engine. This candidate is not an upstream registry
+release; individual binding and durable-format contracts still need qualification.
+
 ## Sections
 
 <div class="grid cards" markdown>

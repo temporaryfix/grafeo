@@ -35,6 +35,17 @@ transitivity = algs.transitivity()
 print(f"Transitivity: {transitivity:.4f}")
 ```
 
+## Directed Local Clustering Coefficient
+
+`db.algorithms.clustering_coefficient(parallel=True, directed=True)` follows
+[LDBC Graphalytics section 2.3.5](https://ldbcouncil.org/ldbc_graphalytics_docs/graphalytics_spec.pdf).
+For each node, collect its unique incoming/outgoing neighbors and divide the directed
+edges among those neighbors by k(k−1). Fewer than two neighbors gives zero. Self-loops
+are ignored and parallel edges count once. `directed=False` retains the undirected metric.
+The result contains `coefficients` keyed by internal node IDs, plus unique triangle counts for the underlying undirected graph and
+an average coefficient. A reciprocal-degree fixture scores1/6, distinguishing this
+metric from Fagiolo's total directed coefficient (1/5).
+
 ## Triangle Count
 
 Count triangles for clustering analysis.

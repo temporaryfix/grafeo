@@ -70,7 +70,7 @@ db.create_graph("friends")
 use grafeo::GrafeoDB;
 
 let db = GrafeoDB::new_in_memory();
-db.create_graph("friends").unwrap();
+db.create_graph("friends")?;
 ```
 
 ## Switching Graphs
@@ -102,12 +102,62 @@ print(db.current_graph())  # "friends"
 ### Rust API
 
 ```rust
+use grafeo::GraphPath;
+
 let session = db.session();
 session.execute("CREATE GRAPH friends")?;
 session.execute("USE GRAPH friends")?;
 
-assert_eq!(session.current_graph(), Some("friends".to_string()));
+assert_eq!(session.current_graph_path(), GraphPath::from_components(&["friends"])?);
+
+// Native selection is absolute, independent of the language's current schema.
+session.use_graph_path(&GraphPath::root())?;
 ```
+
+Native paths are literal component sequences: the root `[]`, `["default"]`,
+`["a/b"]`, and `["a", "b"]` are different graphs. Selection requires an existing,
+read-authorized graph; failure leaves the current selection unchanged. Changing
+the language schema does not retarget an explicitly selected native path.
+Language graph/schema names still resolve to one root child, not nested paths.
+
+Constraints follow the selected storage path, not an unrelated language schema.
+Existing schema-qualified root children retain their schema's constraints; root
+and nested paths use the root constraint namespace.
+
+### Native recursive lifecycle (Rust)
+
+Create and drop exact paths through `GrafeoDB` or an existing `Session`:
+
+```rust
+use grafeo::{GrafeoDB, GraphPath};
+
+let db = GrafeoDB::new_in_memory();
+let mut session = db.session();
+session.begin_transaction()?;
+let parent = GraphPath::from_components(&["research"])?;
+let child = parent.child("papers/2026")?; // one literal child name
+session.create_graph_path(&parent)?;
+session.create_graph_path(&child)?;
+session.use_graph_path(&child)?;
+session.execute("INSERT (:Paper {title: 'Temporal graphs'})")?;
+session.commit()?;
+
+db.drop_graph_path(&parent)?; // drops the subtree and its index owners
+```
+
+Creation requires an existing parent, including one staged in the same
+transaction; it does not create missing ancestors. Existing paths return
+`false`. Dropping an absent path returns `false`; root and catalog schema-default
+partitions cannot be dropped. Native names are never rewritten: a registered
+schema prefix must use its canonical spelling.
+
+Graph lifecycle, data and indexes share transaction rollback, savepoints and
+durable publication. A concurrently replaced parent causes a conflict instead
+of redirecting its staged child. Explicit native operations check their target's
+grants, independently of the current selection. They do not retarget that
+selection after DROP: select another existing path before querying or writing.
+Recursive topology and nested mutations survive committed WAL recovery,
+compaction and current-format whole-database copies.
 
 ## Listing and Dropping Graphs
 
@@ -153,7 +203,7 @@ db.drop_graph("friends")
 In Rust:
 
 ```rust
-db.drop_graph("friends");
+db.drop_graph("friends")?;
 ```
 
 ## Cross-Graph Transactions
@@ -173,7 +223,10 @@ COMMIT
 -- Both inserts succeed or neither does
 ```
 
-If a conflict is detected in any graph during commit, the entire transaction is rolled back. Savepoints also span graph boundaries: rolling back to a savepoint restores the active graph that was set when the savepoint was created.
+If a conflict is detected in any graph during commit, the entire transaction is
+rolled back. Savepoints span graph boundaries and restore transaction-local
+topology and data. The current graph/schema selectors survive savepoint rollback;
+retained incarnation checks prevent them from silently selecting a replacement.
 
 ## Data Isolation
 
@@ -197,7 +250,10 @@ Internally, the query plan cache keys include the active graph name. This means 
 
 ## Persistence
 
-Named graphs are fully persisted when the database uses a persistent storage backend. `CREATE GRAPH` and `DROP GRAPH` operations are WAL-logged, so they survive crashes and are recovered on restart.
+Named graphs are fully persisted when the database uses a persistent storage
+backend. `CREATE GRAPH` and `DROP GRAPH` publish the catalog binding and the
+physical graph-partition change in one committed WAL transaction, so recovery
+cannot expose metadata without its graph (or the graph without its metadata).
 
 ```python
 import grafeo
@@ -215,17 +271,20 @@ result = db2.execute("MATCH (p:Person) RETURN p.name")
 # Returns Alix
 ```
 
-Snapshots also include named graph state. Both incremental and full snapshots capture all named graphs along with the default graph.
+Current whole-database snapshots include recursive named graphs, the default
+graph and their exact index state.
 
 ## Schema-Scoped Graphs
 
-!!! warning "Experimental"
-    Schema-scoped graph resolution is experimental and incomplete. The session schema is parsed and stored, but full catalog-level schema isolation (e.g., preventing cross-schema graph access, schema-qualified names in queries) is not yet implemented. Use this feature for forward-compatible session state only.
+Language schemas are catalog namespaces, not native path components. Create the
+schema before selecting it. Namespace-incarnation and grant checks apply to
+graph lifecycle; a schema-qualified graph name still resolves to one root child.
 
 Grafeo supports ISO/IEC 39075 session schemas. When a schema is set, graph names are resolved within that schema context. `CREATE GRAPH` creates the graph under the active schema, and `SHOW GRAPHS` only returns graphs belonging to that schema.
 
 ```sql
 -- Set the session schema
+CREATE SCHEMA analytics
 SESSION SET SCHEMA analytics
 
 -- This graph is scoped to "analytics"
@@ -235,6 +294,7 @@ CREATE GRAPH daily_metrics
 SHOW GRAPHS
 
 -- Switch schema
+CREATE SCHEMA reporting
 SESSION SET SCHEMA reporting
 CREATE GRAPH monthly_summary
 ```

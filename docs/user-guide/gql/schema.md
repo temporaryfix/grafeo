@@ -11,6 +11,11 @@ tags:
 
 GQL provides Data Definition Language (DDL) statements for managing graphs, type definitions, indexes, constraints and stored procedures.
 
+These changes can share an explicit transaction with data writes, including
+savepoint rollback and atomic durable commit. See
+[Transactional Catalog Changes](../transactions.md#transactional-catalog-changes)
+for visibility, dependency ordering and concurrent-change conflicts.
+
 ## Graph Management
 
 ### Creating Graphs
@@ -239,7 +244,7 @@ Constraints enforce data integrity rules on writes.
 Ensure a property value is unique across all nodes with a given label:
 
 ```sql
-CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE
+CREATE CONSTRAINT person_email FOR (p:Person) ON (p.email) UNIQUE
 ```
 
 ### NODE KEY
@@ -247,7 +252,8 @@ CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE
 Composite uniqueness across multiple properties:
 
 ```sql
-CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.firstName, p.lastName) IS NODE KEY
+CREATE CONSTRAINT person_name FOR (p:Person)
+    ON (p.firstName, p.lastName) NODE KEY
 ```
 
 ### NOT NULL
@@ -255,7 +261,7 @@ CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.firstName, p.lastName) IS NODE KEY
 Require a property to always have a value:
 
 ```sql
-CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS NOT NULL
+CREATE CONSTRAINT person_name_required FOR (p:Person) ON (p.name) NOT NULL
 ```
 
 ### EXISTS
@@ -263,7 +269,7 @@ CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS NOT NULL
 Require a property to exist on every node with the label:
 
 ```sql
-CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email EXISTS
+CREATE CONSTRAINT person_email_exists FOR (p:Person) ON (p.email) EXISTS
 ```
 
 ### Dropping Constraints

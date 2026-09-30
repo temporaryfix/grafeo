@@ -163,7 +163,18 @@ For multi-way joins (queries with multiple triple patterns), the planner:
 2. Sorts patterns by ascending cardinality
 3. Folds left-to-right with pairwise hash joins, building on the smallest intermediate results first
 
-When the Ring Index is available and all patterns are simple triple scans without `LANG()` / `DATATYPE()` dependencies, the planner upgrades to a leapfrog worst-case optimal join (WCOJ) that intersects sorted streams directly without materializing intermediates.
+The Ring leapfrog WCOJ implementation is selected for a proved subset of fresh,
+default-graph, plain three-or-more-pattern joins with exhaustive same-name typed
+RDF-identity metadata. It uses query-local canonical frozen tries, complete
+iterative backtracking, and streaming witness-product enumeration. Native and
+fallback paths share the stable cardinality order so representative values,
+schema order, and physical types do not change with Ring freshness.
+
+Transactions, graph/dataset scopes, stale Ring snapshots, non-plain MultiWayJoin
+input subtrees, LANG/DATATYPE companion consumers, and compatibility or mixed
+key semantics remain on the typed pairwise fallback. Outer modifiers may still
+consume an admitted native join. These are deliberate qualification boundaries,
+These qualification boundaries are covered by the in-tree RDF query tests.
 
 ### Dictionary Encoding
 

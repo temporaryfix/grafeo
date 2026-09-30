@@ -69,8 +69,14 @@ DROP SCHEMA reporting;
   types.
 - `DROP SCHEMA` fails unless the schema is empty (no user-created graphs and
   no types). The auto-created default graph is exempt.
-- Schemas and graphs round-trip through snapshot export / import and WAL
-  replay. Data isolation is preserved across reopen.
+- Schemas, graph/type bindings, type definitions, defaults, inheritance,
+  endpoint constraints, named constraints, namespaces, and procedures
+  round-trip through snapshot export/import and WAL replay. Each standalone
+  DDL statement publishes one complete catalog post-image at a database epoch,
+  so a crash cannot expose only a prefix of a multi-effect statement.
+- Named graph creation/removal is published in the same catalog WAL frame as
+  the corresponding metadata change. Data isolation is preserved across
+  reopen and point-in-time recovery selects the frame at its exact epoch.
 
 ## Naming rules
 

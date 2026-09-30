@@ -17,9 +17,9 @@ Gremlin, SQL/PGQ, storage, and regex support:
 cargo build --release -p grafeo-c --features lpg
 ```
 
-Other available profiles include `embedded` (GQL + AI + algorithms), `rdf`
-(SPARQL + GraphQL + triple store), and `full` (all languages + AI + triple
-store). See the [feature flags documentation](https://grafeo.dev/reference/features/)
+Other available profiles include `ai` (search and change tracking), `rdf`
+(SPARQL + GraphQL + triple store), and `languages` (all query language parsers).
+See the [feature flags documentation](https://grafeo.dev/reference/features/)
 for details.
 
 The output location depends on your host OS:

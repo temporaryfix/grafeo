@@ -98,7 +98,10 @@ Single-component patterns (S??, ?P?, ??O) are answered directly by wavelet tree 
 
 ## Leapfrog Joins (WCOJ)
 
-For SPARQL queries with multiple triple patterns sharing variables (star joins), the Ring Index supports leapfrog worst-case optimal joins (WCOJ). Instead of materializing intermediate results through pairwise hash joins, leapfrog iteration intersects sorted iterator streams directly.
+For qualified SPARQL queries with multiple triple patterns sharing variables,
+the Ring Index supports leapfrog worst-case optimal joins (WCOJ). Instead of
+materializing intermediate results through pairwise hash joins, the native path
+prepares query-local canonical tries and intersects their sorted domains.
 
 ### How It Works
 
@@ -111,24 +114,62 @@ SELECT ?person ?name ?friend WHERE {
 }
 ```
 
-This is a star join on `?person`. The leapfrog join:
+This is a star join on `?person`. The native join:
 
-1. Creates a `RingIterator` for each triple pattern, bound on the shared variable
-2. Advances all iterators in lockstep, seeking to the next value that satisfies all patterns simultaneously
-3. For each match, reconstructs the full variable bindings
+1. Compiles query variables to compact IDs and each Ring term to one canonical
+   RDF identity ID, while preserving the exact source term separately.
+2. Builds one immutable lexicographic trie relation per triple pattern. Repeated
+   positions are checked before insertion and every physical witness is retained
+   at its canonical leaf.
+3. Runs an iterative Leapfrog Triejoin cursor with complete backtracking.
+4. Streams the Cartesian product of leaf witnesses, preserving SPARQL bag
+   multiplicity, and materializes visible, exact, and identity values from one
+   deterministic representative owner.
 
-The time complexity is O(n * log sigma) where n is the output size, rather than O(n1 * n2) for a pairwise hash join. This is particularly beneficial for queries with high fan-out predicates or many-way star joins.
+Preparation currently canonicalizes D dictionary terms, inspects the Ring once
+per admitted pattern, and builds ordered matching leaves:
+O(D + PN + sum(Mi log Mi)) time and O(D + sum(Mi)) query-local memory for P
+patterns, N Ring rows, and Mi matches for relation i. Enumeration has the LFTJ
+worst-case-optimal bound plus the emitted witness product Z; completed rows are
+never collected eagerly.
 
 ### When the Planner Uses Leapfrog
 
-The RDF query planner (`plan_multi_way_join`) attempts the leapfrog path when:
+Native selection is restored for a deliberately narrow, proved subset:
 
-1. The `ring-index` feature is enabled
-2. A Ring Index has been built for the store
-3. All inputs to the multi-way join are simple `TripleScan` operators (no chained inputs, no named graph context)
-4. The query does not use `LANG()`, `LANGMATCHES()`, or `DATATYPE()` functions
+1. The `ring-index` feature is enabled and the store has a fresh Ring snapshot.
+2. The multi-way join has at least three plain default-graph `TripleScan` inputs,
+   with no chained input or transactional overlay.
+3. Typed join metadata is non-empty, unique, exhaustive for the actual public
+   overlaps, and consists only of same-name `RdfTermIdentity` conditions.
+4. The query does not require the separate `LANG()`, `LANGMATCHES()`, or
+   `DATATYPE()` companion columns.
 
-The fourth condition exists because the leapfrog operator emits raw variable columns only. Queries needing language or datatype companion columns fall back to cascading pairwise hash joins with cardinality-based ordering.
+The fourth condition exists because the leapfrog operator can emit visible,
+lossless exact-term, and canonical identity-key columns, but it does not emit
+the separate `LANG()`/`DATATYPE()` companion columns. Queries needing those
+companions fall back to cascading pairwise hash joins with cardinality-based
+ordering.
+
+Graph/dataset scopes, transactions, stale or absent Ring snapshots, non-plain
+MultiWayJoin input subtrees (including owned-normalization Filter/Project
+wrappers), compatibility or mixed key semantics, and other unproved shapes
+deliberately retain the typed cardinality-ordered hash fallback. Outer
+row-preserving Project/Return operators may still consume a native join.
+The core enumerator enforces repeated positions, but translated shapes that need
+an owned normalization wrapper also remain on that fallback until it can be
+fused without changing semantics.
+
+A hand-built raw `TripleScan` that repeats one variable across scan positions is rejected
+before planning; it must first be normalized to distinct internal positions
+plus Filter/Project. Translated repeated-variable patterns already use that
+correct wrapper form.
+
+The admitted subset is covered by adversarial native-versus-fallback parity for
+dead continuations, every closing continuation, witness-product bags, repeated
+positions, language identity, xsd:string identity, IRI/literal collisions,
+dictionary and pattern orders, LIMIT, OFFSET/ORDER BY, COUNT, and stale-Ring
+fallback. See the in-tree Ring and RDF query tests for executable cases.
 
 ## Planner Integration
 
@@ -136,7 +177,10 @@ The Ring Index integrates with the query planner at two levels:
 
 ### Fast COUNT Paths
 
-For partially-bound triple patterns, the planner calls `ring.count(&pattern)` to get exact cardinality in O(log sigma) time. This replaces the statistical estimation used by hash-based indexes and gives the cost model precise input for join ordering decisions.
+For ordinary single-symbol partially-bound triple patterns, the planner calls
+`ring.count(&pattern)` to get exact cardinality in O(log sigma) time. Canonical
+language-tag matching may inspect matching witnesses because the dictionary
+also preserves the lossless source spelling.
 
 ```text
 // Without Ring: estimate from RdfStatistics
@@ -151,6 +195,27 @@ cardinality = ring.count(&TriplePattern::new(Some(person), Some(knows), None))
 ### Cost-Based Join Fallback
 
 When leapfrog is not applicable, the planner still benefits from Ring-derived cardinalities. It sorts inputs by ascending cardinality and folds them left-to-right with pairwise hash joins, ensuring the smallest intermediate results build first.
+
+Native and fallback execution share that same stable cardinality order for
+representative ownership, output schema, and physical types. Rebuilding or
+invalidating the Ring therefore cannot change which canonical-equivalent source
+term is exposed.
+
+Canonical-equivalent physical statements remain distinct witnesses until RDF
+graph membership/statement incarnation performs set normalization. Ring
+enumeration intentionally does not discard those lossless physical witnesses.
+
+The core API accepts a cooperative work guard, checks it through preparation
+and enumeration, and makes a cancelled state terminal (restart with a fresh
+state). The RDF physical operator currently supplies an unbounded guard;
+production query-deadline cancellation during a first-pull Ring preparation is
+not yet wired and is not claimed here.
+
+Because native inputs are fused into the query-local tries rather than separate
+physical scan operators, EXPLAIN ANALYZE shows structural `RdfRingTrieInput`
+children explicitly labelled `stats unavailable, time in parent`. Preparation
+time is charged to the parent `RdfLeapfrog` entry; scanned/matched input-row
+counts are not currently exposed, so the structural children remain at zero.
 
 ## Persistence
 

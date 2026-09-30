@@ -167,7 +167,7 @@ bool deleted = db.DeleteNode(nodeId);
 | `CreateNode(IEnumerable<string> labels, Dictionary<string, object?>? properties = null)` | `long` | Create a node, returns the new node ID |
 | `GetNode(long id)` | `Node?` | Get a node by ID, or `null` if not found |
 | `DeleteNode(long id)` | `bool` | Delete a node, returns `true` if deleted |
-| `SetNodeProperty(long id, string key, object? value)` | `void` | Set a property on a node |
+| `SetNodeProperty(long id, string key, object? value)` | `void` | Set a property on an existing node; throws `GrafeoException` on a missing/deleted node or engine rejection |
 | `RemoveNodeProperty(long id, string key)` | `bool` | Remove a property, returns `true` if removed |
 | `AddNodeLabel(long id, string label)` | `bool` | Add a label, returns `true` if added |
 | `RemoveNodeLabel(long id, string label)` | `bool` | Remove a label, returns `true` if removed |
@@ -198,7 +198,7 @@ bool deleted = db.DeleteEdge(edgeId);
 | `CreateEdge(long sourceId, long targetId, string edgeType, Dictionary<string, object?>? properties = null)` | `long` | Create an edge, returns the new edge ID |
 | `GetEdge(long id)` | `Edge?` | Get an edge by ID, or `null` if not found |
 | `DeleteEdge(long id)` | `bool` | Delete an edge, returns `true` if deleted |
-| `SetEdgeProperty(long id, string key, object? value)` | `void` | Set a property on an edge |
+| `SetEdgeProperty(long id, string key, object? value)` | `void` | Set a property on an existing edge; throws `GrafeoException` on a missing/deleted edge or engine rejection |
 | `RemoveEdgeProperty(long id, string key)` | `bool` | Remove a property, returns `true` if removed |
 
 ### Stats and Info
@@ -227,11 +227,29 @@ db.Save("/path/to/backup.grafeo");
 |--------|---------|-------------|
 | `Save(string path)` | `void` | Save the database to a file |
 
+### Index Owners
+
+Creation returns a committed unsigned 32-bit owner ID. Duplicate names or physical targets are errors. Graph paths are component arrays: `[]` selects root, `[""]` an empty-named child, and `["a/b"]` differs from `["a", "b"]`. Property/BTree indexes forbid a label; Text/Vector require one. Rebuild atomically preserves the owner and its full resolved configuration; it does not recreate a dropped index. Drop returns false only for an absent owner. Engine failures propagate through the binding's error channel.
+
+`CreateIndex(CreateIndexRequest)` returns `uint`;
+`DropIndex(uint)` returns `bool`; `RebuildIndex(uint)` returns
+`void`. Calls are synchronous and engine failures throw
+`GrafeoException`. Construct requests with an `IndexKind`
+(`Property`, `BTree`, `Text`, or `Vector`) and property name.
+Optional fields are `Graph`, `Name`, `Label`, and Vector-only
+`Dimensions`, `Metric`, `M`, `EfConstruction`, and `Quantization`.
+Numeric options are nullable `nuint`; null means omitted.
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
 ### Vector Search
 
 ```csharp
-// Create a vector index via GQL
-db.Execute("CREATE VECTOR INDEX ON Document(embedding) OPTIONS {dimensions: 384}");
+// Create a vector owner.
+uint owner = db.CreateIndex(new CreateIndexRequest(IndexKind.Vector, "embedding")
+{
+    Label = "Document", Dimensions = 384,
+});
 
 // Similarity search: returns nearest k nodes
 float[] queryVector = GetEmbedding("graph database");
@@ -249,16 +267,16 @@ IReadOnlyList<VectorResult> diverse = db.MmrSearch(
     k: 10, fetchK: 50, lambda: 0.7f, ef: 64);
 
 // Index management
-db.RebuildVectorIndex("Document", "embedding");
-db.DropVectorIndex("Document", "embedding");
+db.RebuildIndex(owner);
+bool dropped = db.DropIndex(owner);
 ```
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `VectorSearch(string label, string property, float[] query, int k, uint ef = 0)` | `IReadOnlyList<VectorResult>` | k-NN similarity search ordered by distance |
 | `MmrSearch(string label, string property, float[] query, int k, int fetchK, float lambda, int ef = 0)` | `IReadOnlyList<VectorResult>` | Maximal Marginal Relevance search for diverse results |
-| `DropVectorIndex(string label, string property)` | `bool` | Drop a vector index. Returns `true` if dropped, `false` if not found |
-| `RebuildVectorIndex(string label, string property)` | `void` | Rebuild a vector index |
+| `DropIndex(uint owner)` | `bool` | Drop this owner; absence returns `false`, failures throw |
+| `RebuildIndex(uint owner)` | `void` | Atomic replacement preserving owner/configuration; absence throws |
 
 ## Transaction Class
 

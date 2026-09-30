@@ -12,25 +12,26 @@ Find clusters and communities within graphs.
 
 ## Louvain Algorithm
 
-Fast modularity-based community detection.
+Runs local moving and community aggregation repeatedly, following [Blondel et al. (2008)](https://arxiv.org/abs/0803.0476). Reported modularity includes the full community degree term. The two-level ring-of-triangles control improves from Q=0.650 to Q=0.675 after aggregation.
 
 ```python
 import grafeo
 
 db = grafeo.GrafeoDB()
-algs = db.algorithms()
+algs = db.algorithms
 
-communities = algs.louvain()
-for community_id, members in communities.items():
-    print(f"Community {community_id}: {len(members)} members")
+result = algs.louvain()
+for node_id, community_id in result["communities"].items():
+    print(node_id, community_id)
+print(result["modularity"])
 ```
 
 ## Label Propagation
 
-Semi-supervised community detection.
+Uses synchronous [LDBC Graphalytics CDLP](https://ldbcouncil.org/ldbc_graphalytics_docs/graphalytics_spec.pdf) updates: each iteration reads the previous labels, ties choose the smallest label, and isolated nodes retain their label. Reciprocal edges contribute in both directions. Returned community IDs are normalized; they describe partitions rather than raw LDBC vertex labels. Bipartite labels may oscillate until the iteration limit.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 communities = algs.label_propagation()
 ```
 
@@ -39,7 +40,7 @@ communities = algs.label_propagation()
 Find disconnected subgraphs.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 components = algs.connected_components()
 
 print(f"Found {len(components)} components")
@@ -52,7 +53,7 @@ for i, comp in enumerate(components):
 For directed graphs.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 sccs = algs.strongly_connected_components()
 ```
 
@@ -61,7 +62,7 @@ sccs = algs.strongly_connected_components()
 For directed graphs, ignoring edge direction.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 wccs = algs.weakly_connected_components()
 ```
 
@@ -70,7 +71,7 @@ wccs = algs.weakly_connected_components()
 Count triangles for clustering analysis.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 triangles = algs.triangles()
 print(f"Total triangles: {triangles}")
 ```
@@ -80,7 +81,7 @@ print(f"Total triangles: {triangles}")
 Bayesian community detection using the degree-corrected stochastic block model. Minimizes the description length (MDL) of the graph under the generative model, making it more principled than modularity-based methods for graphs with heterogeneous degree distributions.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 
 # Auto-detect optimal number of blocks
 result = algs.stochastic_block_partition()

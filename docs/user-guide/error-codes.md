@@ -38,6 +38,7 @@ Categories:
 | `GRAFEO-Q004` | QueryUnsupported    | no        | Feature not implemented for this query language (e.g. a SPARQL-only function used from GQL). |
 | `GRAFEO-Q005` | QueryOptimization   | no        | Optimizer could not produce a plan. Report with the query text if you hit this. |
 | `GRAFEO-Q006` | QueryExecution      | no        | A physical operator failed at runtime. |
+| `GRAFEO-Q007` | QueryCancelled      | no        | The caller explicitly cancelled this execution. Retry only if the caller intends to run it again. |
 
 ## Transaction (T)
 
@@ -54,8 +55,8 @@ Categories:
 
 | Code          | Name                  | Retryable | Meaning                                                    |
 | ------------- | --------------------- | --------- | ---------------------------------------------------------- |
-| `GRAFEO-S001` | StorageFull           | no        | Buffer budget, disk, or memory limit reached. |
-| `GRAFEO-S002` | StorageCorrupted      | no        | WAL or section checksum mismatch. The database may need restore from backup. |
+| `GRAFEO-S001` | StorageFull           | no        | A bounded capacity is exhausted: buffer, disk, memory, or a durable epoch/WAL-sequence identity space. |
+| `GRAFEO-S002` | StorageCorrupted      | no        | A WAL/section checksum or authentication check, checkpoint-metadata invariant, or WAL semantic validation failed. Recovery stops rather than guessing; inspect and repair the retained bytes or restore from backup. |
 | `GRAFEO-S003` | StorageRecoveryFailed | no        | WAL replay failed during `GrafeoDB::open`. Inspect the logs. |
 
 ## Validation (V)

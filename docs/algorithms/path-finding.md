@@ -18,7 +18,7 @@ Find the shortest path between two nodes.
 import grafeo
 
 db = grafeo.GrafeoDB()
-algs = db.algorithms()
+algs = db.algorithms
 
 path = algs.shortest_path(source=1, target=100)
 
@@ -32,7 +32,7 @@ for node_id in path:
 Weighted shortest path using Dijkstra's algorithm.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 path = algs.dijkstra(source=1, target=100)
 ```
 
@@ -41,7 +41,7 @@ path = algs.dijkstra(source=1, target=100)
 Traverse the graph level by level.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 
 # BFS from a starting node
 visited = algs.bfs(start=1)
@@ -57,7 +57,7 @@ for distance, nodes in enumerate(layers):
 Traverse the graph depth-first.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 
 # DFS from a starting node
 visited = algs.dfs(start=1)
@@ -71,28 +71,28 @@ all_visited = algs.dfs_all()
 Precompute all pairwise distances.
 
 ```python
-algs = db.algorithms()
+algs = db.algorithms
 distances = algs.all_pairs_shortest_path()
 ```
 
 ## Single-Source Shortest Paths (SSSP)
 
 Compute shortest-path distances from a single source to all reachable nodes,
-weighted by an edge property. Compatible with LDBC Graphanalytics.
+weighted by an edge property using Dijkstra (nonnegative weights). Sources default to numeric internal IDs; pass an explicit `key` to resolve a property value. Missing or ambiguous property matches are errors. Results use internal node IDs, without an implicit `name` lookup.
 
 ### Python API
 
 ```python
-algs = db.algorithms()
-results = algs.sssp(source="Alix", weight_attr="cost")
-for node_id, distance in results:
+algs = db.algorithms
+results = algs.sssp(source="Alix", weight_attr="cost", key="name")
+for node_id, distance in results.items():
     print(f"Node {node_id}: distance {distance}")
 ```
 
 ### GQL / Cypher / SQL/PGQ
 
 ```sql
-CALL grafeo.sssp('Alix', 'cost') YIELD node_id, distance
+CALL grafeo.sssp('Alix', 'cost', 'name') YIELD node_id, distance
 ```
 
 ## Algorithm Complexity

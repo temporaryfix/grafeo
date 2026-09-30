@@ -148,7 +148,10 @@ WHERE {
 
 ## Named Graph Operations
 
-Grafeo supports the full set of SPARQL 1.1 graph management operations.
+Grafeo supports the embedded graph-management operations documented below:
+`CREATE`, `DROP`, `CLEAR`, `COPY`, `MOVE`, and `ADD`. Remote `LOAD` is not yet
+implemented; it returns a structured unsupported-operation error instead of
+pretending to succeed. `LOAD` remains part of the SPARQL 1.1 target contract.
 
 ### CREATE GRAPH
 
@@ -259,7 +262,7 @@ ADD SILENT <http://ex.org/extra> TO <http://ex.org/main>
     ```python
     import grafeo
 
-    db = grafeo.GrafeoDB()
+    db = grafeo.GrafeoDB(graph_model="rdf")
 
     # Insert initial data
     db.execute_sparql("""
@@ -313,9 +316,11 @@ ADD SILENT <http://ex.org/extra> TO <http://ex.org/main>
 === "Rust"
 
     ```rust
-    use grafeo_engine::GrafeoDB;
+    use grafeo_engine::{Config, GrafeoDB, GraphModel};
 
-    let db = GrafeoDB::new_in_memory();
+    let db = GrafeoDB::with_config(
+        Config::in_memory().with_graph_model(GraphModel::Rdf),
+    )?;
     let session = db.session();
 
     session.execute_sparql(r#"

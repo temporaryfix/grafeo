@@ -61,7 +61,7 @@ The result includes both the plan structure and actual runtime statistics: wall-
     ```python
     import grafeo
 
-    db = grafeo.GrafeoDB()
+    db = grafeo.GrafeoDB(graph_model="rdf")
 
     # Insert some data first
     db.execute_sparql("""
@@ -101,9 +101,11 @@ The `explain_sparql(query)` helper is equivalent to `execute_sparql("EXPLAIN " +
 === "Rust"
 
     ```rust
-    use grafeo_engine::GrafeoDB;
+    use grafeo_engine::{Config, GrafeoDB, GraphModel};
 
-    let db = GrafeoDB::new_in_memory();
+    let db = GrafeoDB::with_config(
+        Config::in_memory().with_graph_model(GraphModel::Rdf),
+    )?;
     let session = db.session();
 
     // EXPLAIN (plan only)

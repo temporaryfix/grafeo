@@ -12,6 +12,13 @@ tags:
 
 All query methods are async and return `Promise<QueryResult>`.
 
+The examples below use both native models. Select that model when the database
+is created; it is not enabled implicitly by calling a query method:
+
+```typescript
+const db = GrafeoDB.create(undefined, 'both');
+```
+
 ## GQL (Default)
 
 ```typescript
@@ -106,6 +113,6 @@ CRUD operations (`createNode`, `deleteNode`, etc.) and transaction control (`com
 | `beginTransaction`, `commit`, `rollback` | Sync |
 | `save`, `walCheckpoint`, `backupFull`, `backupIncremental` | Sync |
 | `execute`, `executeCypher`, `executeSql`, etc. | **Async** |
-| `createVectorIndex`, `vectorSearch` | **Async** |
+| `createIndex`, `dropIndex`, `rebuildIndex`, `vectorSearch` | **Async** |
 | `batchCreateNodes`, `batchVectorSearch` | **Async** |
 | `importCsv`, `importJsonl` | **Async** |

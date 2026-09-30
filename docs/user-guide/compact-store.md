@@ -1,217 +1,218 @@
 ---
 title: Compact Store
-description: Convert a database to a layered columnar format for faster queries and lower memory usage; remains writable through an overlay.
+description: Explicit, repeatable compaction of retained LPG history into a columnar base with a writable overlay.
 tags:
   - performance
   - storage
   - compact-store
+  - temporal
   - wasm
 ---
 
 # Compact Store
 
-CompactStore is a columnar graph format that trades some write performance for large
-memory and query wins. After ingesting data, call `compact()` to switch the database
-to a columnar layout with CSR adjacency. From 0.5.39, `compact()` is **non-destructive
-and writable**: it produces a layered store with an immutable columnar base plus a
-mutable overlay. Inserts and property updates after `compact()` land in the overlay;
-`recompact()` merges the overlay back into a fresh base.
+`compact()` changes the physical layout of Grafeo's managed property graph,
+not its role as a writable temporal store. It folds retained committed data
+into a columnar base and leaves a mutable overlay for subsequent writes.
+Call the same `compact()` operation again to fold later changes into the base.
 
-Queries keep working across all supported languages, indexes (vector, text, hybrid)
-can be created and searched post-compact, and named graphs are preserved across
-`compact()` / `recompact()`.
+This page describes the **unreleased 0.0.1 candidate**. Compaction is not a
+release-readiness, durability or performance guarantee. LPG and RDF remain
+native models in the same engine; this operation organizes the LPG storage
+layout, not the RDF dataset into an LPG projection.
 
-**When to use it:** workloads that ingest once and query many times, or read-heavy
-workloads with occasional updates. Code analysis tools, static knowledge graphs,
-pre-built datasets for WASM or edge deployments.
+## Compact, write, compact again
 
-## Performance
+For the local `grafeo` dependency, use
+`default-features = false, features = ["native", "compact-store"]`.
+This example needs no query parser. Automatic garbage collection is disabled
+only to keep the demonstrated revision available.
 
-Measured on the same data, CompactStore vs the standard mutable LpgStore:
+```rust
+use grafeo::{Config, GrafeoDB, Result, Value};
 
-| Metric | LpgStore | CompactStore | Improvement |
-|--------|----------|--------------|-------------|
-| Memory per node (degree 5) | ~3,200 bytes | ~51 bytes | **63x** |
-| Edge traversal (10K lookups) | 619 us | 5.3 us | **116x** |
-| Property random access (10K) | 123 us | 10 us | **12x** |
-
-The gains come from eliminating MVCC version chains, read locks, hash lookups, and
-chunk decompression. CompactStore replaces those with array indexing and contiguous
-memory reads.
-
-## Quick Start
-
-=== "Python"
-
-    ```python
-    import grafeo
-
-    db = grafeo.GrafeoDB()
-
-    # Ingest data (read-write phase)
-    db.execute("INSERT (:Person {name: 'Alix', age: 30})")
-    db.execute("INSERT (:Person {name: 'Gus', age: 25})")
-    db.execute("INSERT (:City {name: 'Amsterdam'})")
-    db.execute("""
-        MATCH (p:Person {name: 'Alix'}), (c:City {name: 'Amsterdam'})
-        INSERT (p)-[:LIVES_IN]->(c)
-    """)
-
-    # Switch to compact mode (subsequent writes go to a mutable overlay)
-    db.compact()
-
-    # Queries work as before, but faster
-    result = db.execute("MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name")
-    ```
-
-=== "Node.js"
-
-    ```typescript
-    import { GrafeoDB } from '@grafeo-db/node';
-
-    const db = GrafeoDB.create();
-
-    await db.execute("INSERT (:Person {name: 'Alix', age: 30})");
-    await db.execute("INSERT (:City {name: 'Amsterdam'})");
-    await db.execute(`
-        MATCH (p:Person {name: 'Alix'}), (c:City {name: 'Amsterdam'})
-        INSERT (p)-[:LIVES_IN]->(c)
-    `);
-
-    db.compact();
-
-    const result = await db.execute(
-        "MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name"
-    );
-    ```
-
-=== "WASM"
-
-    ```javascript
-    import init, { Database } from '@grafeo-db/wasm';
-    await init();
-
-    const db = new Database();
-    db.execute("INSERT (:Person {name: 'Alix', age: 30})");
-    db.execute("INSERT (:City {name: 'Amsterdam'})");
-
-    db.compact();
-
-    const result = db.execute(
-        "MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name"
-    );
-    ```
-
-=== "C"
-
-    ```c
-    #include "grafeo.h"
-
-    GrafeoDatabase *db = grafeo_open_memory();
-
-    grafeo_execute(db, "INSERT (:Person {name: 'Alix', age: 30})");
-    grafeo_execute(db, "INSERT (:City {name: 'Amsterdam'})");
-
-    grafeo_compact(db);
-
-    GrafeoResult *r = grafeo_execute(db,
-        "MATCH (p:Person) RETURN p.name");
-    ```
-
-=== "Rust"
-
-    ```rust
-    use grafeo::GrafeoDB;
-
-    let mut db = GrafeoDB::new_in_memory();
-
-    db.execute("INSERT (:Person {name: 'Alix', age: 30})")?;
-    db.execute("INSERT (:City {name: 'Amsterdam'})")?;
+fn main() -> Result<()> {
+    let mut db = GrafeoDB::with_config(Config::in_memory().with_gc_interval(0))?;
+    let (id, recorded) = {
+        let mut session = db.session();
+        session.begin_transaction()?;
+        let id = session.create_node_with_props(
+            &["Person", "Researcher"],
+            [("name", Value::from("Alix")), ("age", Value::Int64(30))],
+        )?;
+        let recorded = session.commit()?;
+        (id, recorded)
+    }; // Drop the Session before maintenance.
 
     db.compact()?;
+    db.set_node_property(id, "age", Value::Int64(31))?;
+    db.compact()?;
 
-    let result = db.execute(
-        "MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name"
-    )?;
-    ```
+    assert_eq!(
+        db.get_node_property_at_epoch(id, "age", recorded),
+        Some(Value::Int64(30)),
+    );
+    assert_eq!(
+        db.get_node_property_at_epoch(id, "age", db.current_epoch()),
+        Some(Value::Int64(31)),
+    );
+    Ok(())
+}
+```
 
-## How It Works
+Both calls preserve the managed graph's retained node/edge lifetimes, label
+history and property values. Node and edge IDs stay stable. Multiple labels
+remain independent logical labels: a `Person`/`Researcher` node does not
+require querying an internal compound table name.
 
-`compact()` performs four steps:
+Use the database or Session read APIs to see the merged base and overlay.
+Raw overlay access is not a whole-graph read interface.
 
-1. **Scans** all nodes from the current store, grouped by label
-2. **Infers** column types from property values and builds per-label columnar tables
-3. **Builds** forward and backward CSR adjacency for each edge type
-4. **Swaps** the database to a layered store: the new columnar tables become the
-   immutable base and a mutable overlay is attached on top to absorb subsequent
-   writes. `recompact()` later folds the overlay back into a fresh base.
+## When maintenance may run
 
-The result is a `CompactStore` backed by:
+Explicit `compact()` requires an open, non-poisoned database, no active
+transactions and **no live Session handles**, including idle or historical
+Sessions. Commit or roll back transactions, finish queries and streams, then
+drop their Sessions before calling it. In Rust it also requires `&mut GrafeoDB`.
+A violation returns an error; maintenance does not discard an active
+transaction to make progress.
 
-- **Per-label columnar tables** with typed codecs (bit-packed integers, dictionary-encoded
-  strings, boolean bitmaps)
-- **Double-indexed CSR** (Compressed Sparse Row) for O(degree) forward and backward traversal
-- **Zone maps** (min/max statistics per column) for predicate pushdown
+Compaction is an explicit whole-store maintenance operation, not a per-commit
+background task. Preparation may need memory for both the old generation and
+its successor. Retained low-level views can keep an old generation alive
+after a successful transfer, so do not expect immediate reclamation of every
+old allocation.
 
-## Type Mapping
+For managed data, repeated calls keep the same Layered store owner while
+replacing its base/overlay generation. Named graph topology, property-index
+definitions and existing Text/Vector index objects are transferred through
+the managed representation boundary; compaction does not create a second
+index registry or require callers to rebuild those indexes. Search and query
+capabilities still depend on the features and operations supported by the
+selected build.
 
-Property values are automatically mapped to the most efficient columnar codec:
+## Optional threshold policy
 
-| Value type | Codec | Notes |
-|------------|-------|-------|
-| `Int64` (non-negative) | BitPacked | Auto-determined bit width |
-| `Bool` | Bitmap | 1 bit per value |
-| `String` | Dictionary | Deduplicated string table |
-| `Float64` | Float64 (native) | 8 bytes per value, since 0.5.40 |
-| `Vector` (f32) | Float32Vector (native) | Contiguous float32 storage, since 0.5.40 |
-| Mixed `Int64 + Float64` | Float64 (native) | Columns coalesce to `Float64` when both types appear |
-| Negative `Int64` | Dictionary | Serialized as string |
-| `List`, `Map`, `Timestamp`, etc. | Dictionary | Serialized as string |
+Rust exposes `compact_if_needed() -> Result<bool>` as an application-invoked
+maintenance checkpoint. Configure it with
+`Config::compaction_overlay_threshold: Option<usize>`, or
+`with_compaction_overlay_threshold(threshold)`. The default `None` disables
+the policy; it does not disable explicit `compact()`.
 
-!!! note
-    Before 0.5.40, `Float64` and `Vector` columns fell back to dictionary encoding,
-    which preserved data but lost typed semantics for range scans. Native codecs
-    now retain those semantics without a dictionary round-trip. Dictionary fallback
-    still applies to negative integers and complex values (`List`, `Map`, etc.).
+A call considers the managed native store before initial conversion, or the
+hot overlay once layered. Its reported node count plus edge count must
+**strictly exceed** the threshold. This is not a byte limit, number of commits,
+or number of property revisions; repeatedly editing one node need not increase
+that count.
 
-## Writes After `compact()`
+The helper returns `Ok(false)` when disabled, at/below threshold, while a
+transaction is active, or when there is no eligible managed LPG source.
+It does not automatically convert an externally supplied read store.
+When eligible, it invokes `compact()` and returns `Ok(true)` after success.
+An idle live Session still makes an attempted compaction return an error.
 
-Since 0.5.39, `compact()` returns a layered store: an immutable columnar base plus a
-mutable overlay. New inserts and property updates land in the overlay and are visible
-to subsequent queries (`get_node`, property reads, pattern matching, `list_graphs`).
+```rust
+use grafeo::{Config, GrafeoDB, Result, Value};
 
-Call `recompact()` to merge the overlay back into a fresh base:
+fn main() -> Result<()> {
+    let config = Config::in_memory().with_compaction_overlay_threshold(1);
+    let mut db = GrafeoDB::with_config(config)?;
 
-    db.compact()
-    db.execute("INSERT (:Person {name: 'Mia'})")   # lands in overlay
-    db.recompact()                                  # merges overlay into new base
+    let first = db
+        .session()
+        .create_node_with_props(&["Item"], [("value", Value::Int64(1))])?;
+    assert!(!db.compact_if_needed()?); // One node equals the threshold.
 
-Indexes (`create_vector_index`, `create_text_index`, hybrid search) work on layered
-stores: vector/text scan and search now fall through both layers.
+    let second = db
+        .session()
+        .create_node_with_props(&["Item"], [("value", Value::Int64(2))])?;
+    assert!(db.compact_if_needed()?); // Two native nodes: first conversion.
 
-## Limitations
+    db.set_node_property(first, "value", Value::Int64(3))?;
+    assert!(!db.compact_if_needed()?); // One promoted node in the overlay.
+    db.set_node_property(second, "value", Value::Int64(4))?;
+    assert!(db.compact_if_needed()?); // Fold the two overlay nodes.
+    Ok(())
+}
+```
 
-- **Overlay write path**: writes go through the overlay, which is less optimized than
-  `LpgStore`'s full MVCC path. Sustained write-heavy workloads should stay on `LpgStore`
-  or call `recompact()` periodically.
-- **Multi-label nodes**: nodes with multiple labels are stored under a compound key
-  (e.g., `"Actor|Person"`, sorted alphabetically). A query like `MATCH (n:Person)` will
-  not match nodes stored under `"Actor|Person"`. Workarounds:
-    - **Preferred:** use a single label per node before compacting.
-    - **Alternative:** query the compound label explicitly, e.g., `MATCH (n:Actor:Person)` (labels in alphabetical order).
-    - **Alternative:** assign a canonical "primary" label and store additional labels as a list property instead.
-- **No disk serialization**: `compact()` operates in memory. To persist a compacted database,
-  use snapshot export (WASM) or save before compacting.
+Schedule this checkpoint at an application maintenance boundary. Setting the
+threshold alone does not start a timer or attach a commit hook.
 
-## Feature Flag
+## Layout and value semantics
 
-CompactStore requires the `compact-store` feature flag. It is **not** included in the engine-level named profiles (`embedded`, `browser`, `server`, `full`), but it is included in the binding-level defaults:
+The base uses per-label tables, forward/backward compressed sparse row (CSR)
+adjacency, and column/epoch zone maps where applicable. Temporal rows retain
+validity intervals; compaction does not eliminate history to obtain a smaller
+current-state snapshot.
 
-| Binding | Profile | Includes `compact-store` |
-|---------|---------|--------------------------|
-| Python (`grafeo-python`) | `embedded` | Yes |
-| Node.js (`grafeo-node`) | `embedded` | Yes |
-| C (`grafeo-c`) | `embedded` | Yes |
-| WASM (`grafeo-wasm`) | `edge` | Yes |
+Homogeneous histories can use specialized value codecs: bit-packed
+non-negative integers, native signed integers and floats, boolean bitmaps,
+dictionary strings and fixed-dimension float vectors. Histories that cannot
+fit one such codec use exact typed history rows. Mixed types, changing vector
+dimensions and complex values are not a request to turn the managed graph's
+values into strings. Historical vector values still consume space.
 
-For custom Rust builds: `cargo build --features compact-store`.
+A columnar layout can benefit read-heavy workloads, but the balance depends
+on graph shape, retained history, indexes and mutation rate. Measure memory,
+query latency, write latency and compaction cost for your workload; this guide
+does not claim a fixed memory reduction or traversal speedup.
+
+## Bindings and features
+
+These existing binding operations call the same engine maintenance boundary:
+
+| Binding | Call | Failure channel |
+|---|---|---|
+| Python | `db.compact()` | Python exception |
+| Node.js | `db.compact()` | Synchronous JavaScript exception |
+| WASM | `db.compact()` | JavaScript exception |
+| C | `grafeo_compact(db)` | Non-`GRAFEO_OK` status; inspect `grafeo_last_error()` |
+| C# | `db.Compact()` | `GrafeoException` through the C binding |
+
+The calls are repeatable and leave the database writable. Finish outstanding
+asynchronous Node.js operations before maintenance. Do not invent a separate
+binding method for later folds or assume the Rust threshold policy is exposed
+in each binding.
+
+The engine method requires both `lpg` and `compact-store`. Neither the
+default engine nor the default Rust facade build includes `compact-store`;
+enable it explicitly. Current Python, Node.js and C default feature closures
+include it. The WASM default resolves to its `edge` profile, which includes
+LPG, GQL and compact storage. Custom feature builds can differ. Add query
+languages, Text/Vector search, algorithms or other capabilities explicitly
+when the chosen profile does not include them.
+
+With the separate `mmap` feature, the engine can register the compact base
+with its memory manager for disk-backed spill. Spilling a base is not an
+implicit overlay compaction, and an mmap spill file is not a database backup.
+
+## History, persistence and limits
+
+Compaction preserves **retained** committed history. It cannot recover versions
+already collected by GC and does not grant an epoch-retention lease. See
+[temporal graphs and retained history](temporal.md) for historical reads,
+retention limits and the distinction between publication epochs and RDF valid
+time.
+
+Compaction is not a WAL sync, checkpoint or backup. After successful initial
+conversion, the flat-only background checkpoint timer is stopped because it
+cannot represent the layered graph. For persistent databases, use the
+topology-aware `wal_checkpoint()` or `close()` at their required quiescent
+boundaries, handle errors, and retain the configured durability policy.
+The browser build does not acquire crash durability merely by compacting.
+
+Native container and portable snapshot routes have different exactness limits.
+In particular, portable export and `to_memory()` currently reject ordinary
+nonempty commit-born Text indexes that they cannot represent exactly; compacting
+does not remove that restriction. Recursive format and release qualification
+remain unfinished. See the [persistence guide](persistence/index.md) and
+[temporal persistence boundaries](temporal.md#snapshots-persistence-and-evidence).
+
+The retained-history guarantees above apply to engine-managed native/layered
+data. Explicit conversion from an externally supplied read store copies its
+current snapshot; it cannot reconstruct a transaction history that the external
+interface does not supply. Low-level compact builders and external snapshot
+conversion are not substitutes for the managed temporal path.
+
+An available compaction API does not by itself establish release readiness.

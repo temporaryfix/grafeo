@@ -247,7 +247,7 @@ CREATE INDEX FOR (n:Document) ON (n.embedding) USING VECTOR
 CREATE INDEX FOR (n:Article) ON (n.content) USING TEXT
 
 -- Create constraint
-CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE
+CREATE CONSTRAINT person_email FOR (p:Person) REQUIRE p.email IS UNIQUE
 
 -- List indexes and constraints
 SHOW INDEXES

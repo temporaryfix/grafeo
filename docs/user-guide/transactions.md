@@ -1,6 +1,12 @@
 # Transactions in Grafeo
 
-Grafeo provides ACID transactions with **Snapshot Isolation** semantics. This guide explains how transactions work, their guarantees and important limitations to be aware of.
+Grafeo provides **full ACID MVCC transactions**. **Snapshot Isolation** is the
+default, with opt-in Serializable isolation for invariants that must exclude
+write skew. Persistent stores default to `DurabilityMode::Sync`, the strict
+commit-acknowledgement profile: success is returned only after the durable
+commit record crosses the storage flush boundary. This guide explains those
+guarantees, the deliberately weaker durability modes, and the qualification
+gates that prove each model/profile combination.
 
 ## Quick Start
 
@@ -27,7 +33,7 @@ Grafeo supports three isolation levels, configurable per transaction:
 |-------|-------------|
 | `read_committed` | See committed data; non-repeatable reads possible |
 | `snapshot` | Default: consistent snapshot at transaction start |
-| `serializable` | Full SSI with read-write conflict detection |
+| `serializable` | Full SSI with read-write conflict detection across native LPG and RDF operations |
 
 ```python
 # Default (snapshot isolation)
@@ -40,8 +46,49 @@ tx = db.begin_transaction(isolation_level="serializable")
 ```rust
 use grafeo::IsolationLevel;
 
-let tx = session.begin_transaction_with_isolation(IsolationLevel::Serializable)?;
+session.begin_transaction_with_isolation(IsolationLevel::Serializable)?;
 ```
+
+RDF reads and writes participate in Serializable SSI through a conservative
+dataset-wide predicate key. This covers arbitrary triple patterns, named-graph
+lifecycle, property paths, direct typed-Quad reads, SPARQL, GraphQL-RDF, and
+SHACL without leaving a phantom-shaped hole. It deliberately favours soundness
+over concurrency: independent Serializable RDF writers can receive a
+conservative serialization abort. Finer graph/predicate/statement keys are a
+future concurrency optimization and must preserve the dataset-wide acceptance
+tests before replacing this guard.
+
+## Transactional Catalog Changes
+
+Schemas, node/edge/graph types, constraints and stored procedures participate in
+explicit LPG transactions alongside graph, index and data changes. A transaction
+sees its own definitions immediately; other sessions see them only after commit.
+Rollback and rollback to a savepoint discard the corresponding metadata changes.
+With WAL enabled, catalog and data recovery use the same transaction commit marker.
+
+```sql
+START TRANSACTION
+CREATE SCHEMA application
+SESSION SET SCHEMA application
+CREATE NODE TYPE Item (value INTEGER)
+CREATE GRAPH TYPE Items (NODE TYPE Item)
+CREATE GRAPH data TYPED Items
+SESSION SET GRAPH data
+INSERT (:Item {value: 7})
+COMMIT
+```
+
+Catalog definitions are pinned at transaction start, including for
+`read_committed`; that level still refreshes committed **data** between
+statements. A concurrent catalog change can therefore cause a writing
+transaction to fail at commit. Retry the whole transaction against a fresh
+catalog cut. Catalog writers conservatively conflict rather than merging
+independently allocated definitions. Read-only transactions retain their cut.
+
+Dependencies follow the transaction's changes: drop an index and its graph
+before dropping the bound graph type, then remove remaining types and other
+schema-owned objects before dropping the schema. Without an explicit
+transaction, each catalog statement commits independently.
 
 ## Read-Only Transactions
 
@@ -65,6 +112,13 @@ Grafeo's default isolation level is **Snapshot Isolation (SI)**, which provides 
 | **No Dirty Reads** | Uncommitted changes from other transactions are never visible |
 | **No Lost Updates** | Write-write conflicts are detected and one transaction is aborted |
 | **Consistent Snapshot** | All reads see the database as of transaction start time |
+
+These snapshot guarantees apply to RDF triple contents in both the default and
+named graphs, including read-your-writes. RDF named-graph creation and removal
+are staged transaction-locally, pin the exact graph incarnation and revision,
+and publish only after commit validation. A concurrent replacement, removal,
+or write therefore aborts the stale lifecycle transaction instead of producing
+an orphan graph or a lost write.
 
 ### How It Works
 
@@ -204,6 +258,13 @@ When a transaction is rolled back (either fully or to a savepoint), all mutation
 | `MERGE ... ON MATCH SET` | Yes, properties restored |
 | `INSERT` (new node/edge) | Yes, entity removed |
 | `DELETE` (remove node/edge) | Yes, entity restored |
+| LPG `CREATE GRAPH` / `DROP GRAPH` | Yes, exact graph incarnation restored |
+| LPG `TYPED` / `LIKE` graph-type binding | Yes, staged and recovered with graph lifecycle |
+| RDF triple insert/delete (default or named graph) | Yes |
+| RDF `CREATE GRAPH` / `DROP GRAPH` | Yes, publication stays transaction-local until commit |
+| Transactional index create/drop | Yes |
+
+Rollback restores logical data and lifecycle state, but deliberately retains the transaction's conflict footprint until the outer transaction ends. Tagged read/write sets, SIREAD registrations, escalation state, and SSI conflict flags may already have created edges in other active transactions; removing only one side during `ROLLBACK TO SAVEPOINT` would be unsound. A later write can therefore receive a conservative conflict even when the earlier conflicting write was logically rolled back to a savepoint. Full `COMMIT` or `ROLLBACK` releases this footprint.
 
 ## Savepoints
 
@@ -263,8 +324,9 @@ tx.commit()  # balance = 1000, no bonus property
 ### Savepoint Rules
 
 1. Names must be unique within a transaction
-2. Rolling back to a savepoint also releases all savepoints created after it
+2. Rolling back to a savepoint releases all later savepoints but retains the target, which can be reused
 3. A full `ROLLBACK` undoes everything, including changes before any savepoints
+4. Logical state rewinds exactly; the conservative conflict/lock footprint remains until the outer transaction ends
 
 ## Transaction Lifecycle
 
@@ -417,7 +479,7 @@ Grafeo automatically garbage collects old transaction metadata and version chain
 - Aborted transactions are cleaned up immediately
 - Committed transaction metadata is retained until no active transaction can see it
 - Version chains are pruned based on the oldest active transaction's start epoch
-- GC runs every N commits (default 100, configurable); manual trigger via `db.gc()` in Rust
+- GC runs every N commits (default 100, configurable); the manual Rust trigger is fallible: `db.gc()?`
 
 !!! note
     The `gc()` method is only available on the Rust `GrafeoDB` type. Python and other bindings rely on automatic GC.

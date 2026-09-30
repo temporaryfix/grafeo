@@ -8,7 +8,11 @@ tags:
 
 # Transactions
 
-Grafeo provides ACID transactions with MVCC (Multi-Version Concurrency Control).
+Grafeo provides full ACID transactions with MVCC (Multi-Version Concurrency
+Control). Snapshot Isolation is the default and Serializable isolation is
+opt-in. Persistent stores default to `Sync`; commits acknowledge only after the durable commit
+record is flushed; named model, conformance, and crash gates qualify the exact
+profile contract.
 
 ## Why MVCC with Snapshot Isolation?
 

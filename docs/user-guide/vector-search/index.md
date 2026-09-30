@@ -11,6 +11,9 @@ tags:
 
 Grafeo provides first-class support for vector similarity search, enabling semantic search, recommendation systems and AI-powered applications.
 
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
 ## Overview
 
 Vector search finds nodes based on the semantic similarity of their embeddings rather than exact property matches. This is essential for:
@@ -103,7 +106,7 @@ Create many nodes at once, each with a vector property. Returns a list of node I
 import grafeo
 
 db = grafeo.GrafeoDB()
-db.create_vector_index("Document", "embedding", dimensions=3)
+vector_owner = db.create_index("embedding", kind="vector", label="Document", dimensions=3)
 
 # Create 3 nodes, each with label "Document" and an "embedding" vector
 ids = db.batch_create_nodes("Document", "embedding", [
@@ -146,7 +149,7 @@ An optional `ef` parameter controls the search beam width (higher values improve
 Create inverted indexes for full-text keyword search with BM25 scoring:
 
 ```python
-db.create_text_index("Document", "content")
+text_owner = db.create_index("content", kind="text", label="Document")
 results = db.text_search("Document", "content", "graph database", k=10)
 for r in results:
     print(f"Node {r['node_id']}: score {r['score']:.3f}")

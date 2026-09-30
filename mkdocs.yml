@@ -1,17 +1,13 @@
 # Project Information
 site_name: Grafeo
-site_url: https://grafeo.dev
 site_author: S.T. Grond
 site_description: >-
-  A high-performance, embeddable graph database with a Rust core and no required
-  C dependencies. Python, Node.js, Go, WebAssembly, C#/.NET and Dart bindings. Supports LPG and
-  RDF data models, multiple query languages (GQL, Cypher, Gremlin, GraphQL, SPARQL, SQL/PGQ),
-  ACID transactions and extensible storage backends.
+  An embedded temporal graph store with native LPG and RDF in one Rust engine.
+  Unreleased 0.0.1 candidate: current state, retained history and explicit
+  per-profile qualification limits.
 
-# Repository
-repo_name: GrafeoDB/grafeo
-repo_url: https://github.com/GrafeoDB/grafeo
-edit_uri: edit/main/docs/
+# Publication and repository URLs await the confirmed product destination.
+# Do not send this candidate's readers to upstream package/release pages.
 
 # Copyright
 copyright: Copyright &copy; 2026 S.T. Grond - Apache-2.0 License
@@ -148,35 +144,10 @@ extra_css:
 
 extra_javascript:
   - javascripts/mathjax.js
-  - https://polyfill.io/v3/polyfill.min.js?features=es6
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 
 # Extra Configuration
 extra:
-  social:
-    - icon: fontawesome/brands/github
-      link: https://github.com/GrafeoDB/grafeo
-      name: GitHub
-    - icon: fontawesome/brands/python
-      link: https://pypi.org/project/grafeo/
-      name: PyPI
-    - icon: fontawesome/brands/npm
-      link: https://www.npmjs.com/package/@grafeo-db/js
-      name: npm
-    - icon: simple/go
-      link: https://pkg.go.dev/github.com/GrafeoDB/grafeo/crates/bindings/go
-      name: Go
-    - icon: simple/rust
-      link: https://crates.io/crates/grafeo
-      name: crates.io
-    - icon: fontawesome/brands/discord
-      link: https://discord.gg/jrgMD2Zj3
-      name: Discord
-
-  version:
-    provider: mike
-    default: latest
-
   generator: false
 
 # Navigation Structure
@@ -288,7 +259,7 @@ nav:
     - Transactions: user-guide/transactions.md
     - Named Graphs: user-guide/named-graphs.md
     - Catalog, Schemas & Graphs: user-guide/catalog-hierarchy.md
-    - Temporal Properties & Time-Travel: user-guide/temporal.md
+    - Temporal Graphs & Retained History: user-guide/temporal.md
     - Observability: user-guide/observability.md
     - Error Codes: user-guide/error-codes.md
     - Offline Sync: user-guide/offline-sync.md
@@ -412,3 +383,4 @@ nav:
       - anywidget-graph: ecosystem/anywidget-graph.md
       - Performance Baselines: ecosystem/performance.md
     - Roadmap: roadmap.md
+    - Native Host: user-guide/native-host.md

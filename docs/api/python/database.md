@@ -10,13 +10,23 @@ tags:
 
 The main database class.
 
+LPG CRUD, temporal reads, transaction mutation and LPG administration are
+available in the `lpg`, `embedded` (default), `edge`, `native`, `compact-store` and `full` builds.
+`native` retains direct LPG/RDF operations without query parsers. Storage methods
+(`save`, `open_in_memory`, backup) require a storage-capable build; `edge` omits
+them. Bare `compact-store` supplies direct LPG CRUD, temporal reads and compact
+maintenance without query parsers or storage. Backup additionally requires LPG. Shared `info`, `current_epoch`, `path`,
+`is_persistent`, `to_memory` and storage-backed `save` also serve RDF builds.
+
 ## Constructor
 
 ```python
 GrafeoDB(
     path: Optional[str] = None,
     *,
-    cdc: bool = False
+    cdc: bool = False,
+    section_tiers: Optional[Dict[str, str]] = None,
+    graph_model: Optional[Literal["lpg", "rdf", "both"]] = None,
 )
 ```
 
@@ -25,7 +35,9 @@ GrafeoDB(
 | Parameter | Type | Default | Description |
 | --------- | ---- | ------- | ----------- |
 | `path` | `str` | `None` | Database file path (None for in-memory) |
-| `cdc` | `bool` | `False` | Enable change data capture (keyword-only). When `True`, mutations are tracked and queryable via `node_history()` / `edge_history()`. |
+| `cdc` | `bool` | `False` | Enable change data capture (keyword-only). When `True`, mutations are tracked and queryable via bounded `node_history_after()` / `edge_history_after()`. |
+| `section_tiers` | `dict[str, str]` | `None` | Optional per-section storage-tier overrides. |
+| `graph_model` | `"lpg" \| "rdf" \| "both"` | `None` | Authoritative model. The default is LPG; SPARQL applications must select RDF or Both explicitly. |
 
 ### Examples
 
@@ -151,8 +163,33 @@ def execute_sql(self, query: str, params: Optional[Dict] = None) -> QueryResult
 Execute a GQL query asynchronously. Returns a Python awaitable for use with asyncio.
 
 ```python
-def execute_async(self, query: str, params: Optional[Dict] = None) -> Awaitable[AsyncQueryResult]
+def execute_async(
+    self, query: str, params: Optional[Dict] = None, *,
+    control: Optional[QueryControl] = None,
+    max_rows: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+) -> Awaitable[AsyncQueryResult]
 ```
+
+The `async-query` feature, included in the default (`embedded`) and `lpg`
+builds, can complete read-only outer `ORDER BY` queries with statically proven
+small literal inputs in memory during the initial blocking preparation.
+Eligible sorts with unknown or larger inputs, or configured spilling, use
+scheduled input/output batches and sort-finalization work on the blocking pool.
+Other query shapes, and GQL builds without `async-query`, use the existing
+execution path in one blocking call with unchanged query semantics. Every route
+remains awaitable and releases the GIL.
+
+Pass a `QueryControl` to request cooperative cancellation or set a deadline.
+For the scheduled sort path, cancelling the awaiting task also requests
+cancellation; physical work and cleanup can continue afterward. The database,
+query snapshot and resource owners remain alive until cleanup completes.
+
+The awaitable returns a materialized result. `max_rows` and `max_bytes` limit
+that result; asynchronous scheduling also respects query memory, spill and
+scheduler limits. A sort-finalization job may merge multiple records or runs
+before returning. Resource limits do not guarantee a fixed job duration or
+make every query operator or merge operation independently asynchronous.
 
 ```python
 import asyncio
@@ -235,6 +272,12 @@ Set a property on a node.
 ```python
 def set_node_property(self, node_id: int, key: str, value: Any) -> None
 ```
+
+Returns `None` only after a successful write. A missing or deleted node raises
+`GrafeoError`; the setter does not create the node. Engine rejections, including
+property-size/schema checks and closed or durability-poisoned databases, also
+raise through the existing exception channel. `GrafeoError.error_code` identifies
+the engine error.
 
 ### remove_node_property()
 
@@ -322,6 +365,10 @@ Set a property on an edge.
 ```python
 def set_edge_property(self, edge_id: int, key: str, value: Any) -> None
 ```
+
+Returns `None` only after a successful write. A missing or deleted edge raises
+`GrafeoError`; the setter does not create the edge. Other engine write failures
+also raise, with their engine code in `GrafeoError.error_code`.
 
 ### remove_edge_property()
 
@@ -605,7 +652,7 @@ for node_id, distance in results:
 
 ### text_search()
 
-BM25 full-text search. Requires the `text-index` feature and a text index created with `create_text_index()`.
+BM25 full-text search. Requires the `text-index` feature and a text index created with `create_index(..., kind="text")`.
 
 ```python
 def text_search(self, label: str, property: str, query: str, k: int) -> List[Tuple[int, float]]
@@ -614,7 +661,7 @@ def text_search(self, label: str, property: str, query: str, k: int) -> List[Tup
 Returns a list of `(node_id, score)` tuples sorted by descending relevance (higher score = more relevant). BM25 scores are unbounded positive floats; compare them only within a single query's results.
 
 ```python
-db.create_text_index("Article", "title")
+text_owner = db.create_index("title", kind="text", label="Article")
 results = db.text_search("Article", "title", "graph database", k=10)
 for node_id, score in results:
     print(f"Node {node_id}: score={score:.4f}")
@@ -622,7 +669,7 @@ for node_id, score in results:
 
 ### hybrid_search()
 
-Combined text and vector search using Reciprocal Rank Fusion (RRF) or weighted fusion. Requires the `hybrid-search` feature. For best results, create both a text index (`create_text_index()`) and a vector index (`create_vector_index()`). If either index is missing, that source is silently omitted from fusion.
+Combined text and vector search using Reciprocal Rank Fusion (RRF) or weighted fusion. Requires the `hybrid-search` feature. For best results, create both a text index (`create_index(..., kind="text")`) and a vector index (`create_index(..., kind="vector")`). If either index is missing, that source is silently omitted from fusion.
 
 ```python
 def hybrid_search(
@@ -654,23 +701,46 @@ results = db.hybrid_search(
 )
 ```
 
-## Property Indexes
-
-### create_property_index()
-
-Create an index on a node property for O(1) lookups.
+## Index Owners
 
 ```python
-def create_property_index(self, property: str) -> None
+def create_index(
+    self, property: str, *, kind: str = "property",
+    graph: Optional[List[str]] = None, name: Optional[str] = None,
+    label: Optional[str] = None, **options
+) -> int
+
+def drop_index(self, owner: int) -> bool
+def rebuild_index(self, owner: int) -> None
 ```
 
-### drop_property_index()
+Creation returns a committed unsigned 32-bit owner ID. Duplicate names or physical targets are errors. Graph paths are component arrays: `[]` selects root, `[""]` an empty-named child, and `["a/b"]` differs from `["a", "b"]`. Property/BTree indexes forbid a label; Text/Vector require one. Rebuild atomically preserves the owner and its full resolved configuration; it does not recreate a dropped index. Drop returns false only for an absent owner. Engine failures propagate through the binding's error channel.
 
-Remove a property index. Returns `True` if the index existed and was removed.
+These methods are synchronous. Valid kinds are `"property"`, `"btree"`,
+`"text"`, and `"vector"`. Only Vector accepts `dimensions`, `metric`,
+`m`, `ef_construction`, `ef`, and `quantization` keyword options. `ef` must be a
+positive integer and sets the persisted default search depth (50 when omitted).
+A per-query `vector_search(..., ef=...)` overrides it for that call. Omitted values
+use engine defaults; unavailable features, invalid options, and duplicate
+creates raise errors.
 
 ```python
-def drop_property_index(self, property: str) -> bool
+vector_owner = db.create_index(
+    "embedding", kind="vector", label="Document",
+    dimensions=384, metric="cosine", quantization="scalar"
+)
+text_owner = db.create_index("content", kind="text", label="Document")
+db.rebuild_index(vector_owner)
+assert db.drop_index(text_owner)
+# db.rebuild_index(text_owner) now raises; recreate explicitly for a new owner.
 ```
+
+Normal writes maintain indexes automatically; rebuild is optional maintenance,
+not a repair requirement for supported writes or imports.
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
+## Property Index Reads
 
 ### has_property_index()
 
@@ -689,74 +759,33 @@ def find_nodes_by_property(self, property: str, value: Any) -> List[int]
 ```
 
 ```python
-db.create_property_index("email")
+email_owner = db.create_index("email", kind="property")
 node_ids = db.find_nodes_by_property("email", "alix@example.com")
 ```
 
-## Vector Index Management
+## Change History
 
-### create_vector_index()
+With CDC enabled, `node_history_after(id, cursor, max_events, max_bytes,
+since_epoch=0)` and `edge_history_after(...)` return owned bounded event pages.
+The optional keyword-only epoch is inclusive. Both limits are required and
+positive; use `None` initially, then the returned cursor bytes. Entity IDs remain
+exact Python integers. These calls use the same indexed retained feed and page
+contract as the whole-feed reader below.
+`changes_after(cursor, max_events, max_bytes)` returns `{"events": [...], "next": bytes}`.
+Both limits are positive and required; pass `None` initially, then resume with
+exact returned bytes. Stop only when the cursor is unchanged. Pages own their
+data across close; new reads after close fail. Native cursor errors retain
+`error_code`. See [bounded CDC pages](../../user-guide/cdc.md#bounded-feed-pages).
+Event IDs, epochs, timestamps and non-null `graph_incarnation` are exact Python integers.
+ `lpg_graph` is the exact LPG component array: `[]`
+means root, while `[""]`, `["default"]`, `["a/b"]`, and `["a", "b"]` are distinct.
+For RDF events `lpg_graph` is `None`; `triple_graph` holds the RDF graph name
+or `None` for RDF default. RDF term fields are `triple_subject`,
+`triple_predicate`, and `triple_object`, and `entity_type` is `"triple"`.
 
-Create an HNSW vector similarity index on a node property.
-
-```python
-def create_vector_index(
-    self,
-    label: str,
-    property: str,
-    dimensions: Optional[int] = None,
-    metric: Optional[str] = None,       # "cosine" (default), "euclidean", "dot_product", "manhattan"
-    m: Optional[int] = None,            # HNSW links per node, default 16
-    ef_construction: Optional[int] = None  # build beam width, default 128
-) -> None
-```
-
-### drop_vector_index()
-
-Drop a vector index. Returns `True` if the index existed and was removed.
-
-```python
-def drop_vector_index(self, label: str, property: str) -> bool
-```
-
-### rebuild_vector_index()
-
-Rebuild a vector index from scratch, preserving its configuration (dimensions, metric, M, ef_construction).
-
-!!! note "Auto-sync: rebuild is rarely needed"
-    Vector indexes auto-sync when you call `set_node_property()`, `batch_create_nodes()`, or `batch_create_nodes_with_props()` with vector data. You only need `rebuild_vector_index()` after importing data through non-standard paths or to compact the index after many deletions.
-
-```python
-def rebuild_vector_index(self, label: str, property: str) -> None
-```
-
-## Text Index Management
-
-Requires the `text-index` feature.
-
-### create_text_index()
-
-Create a BM25 text index on a node property. The index is automatically kept in sync as nodes are created, updated, or deleted. You do not need to call `rebuild_text_index()` after normal write operations.
-
-```python
-def create_text_index(self, label: str, property: str) -> None
-```
-
-### drop_text_index()
-
-Drop a text index. Returns `True` if the index existed and was removed.
-
-```python
-def drop_text_index(self, label: str, property: str) -> bool
-```
-
-### rebuild_text_index()
-
-Rebuild a text index from scratch. Text indexes auto-sync on normal writes; you only need this after importing data through non-standard paths.
-
-```python
-def rebuild_text_index(self, label: str, property: str) -> None
-```
+Entity-only history aggregates colliding LPG IDs across graph paths and graph
+incarnations. WAL-backed feeds and current native container checkpoints restore
+retained event images at reopen. Disabling capture affects future writes only.
 
 ## Transaction Methods
 
@@ -796,7 +825,7 @@ def begin_transaction_with_cdc(
 with db.begin_transaction_with_cdc(True) as tx:
     tx.execute("INSERT (:Person {name: 'Alix'})")
     tx.commit()
-# This transaction's changes appear in node_history()
+# Read this transaction's changes with bounded node_history_after() pages
 ```
 
 ## Schema Context
@@ -832,11 +861,12 @@ def current_schema(self) -> Optional[str]
 
 ## SHACL Validation
 
-Validate graph data against [SHACL](https://www.w3.org/TR/shacl/) (Shapes Constraint Language) shapes. Requires the `triple-store` feature.
+Validate graph data against [SHACL](https://www.w3.org/TR/shacl/) (Shapes Constraint Language) shapes. Requires the `shacl` feature; the published `full` wheel includes it.
 
 ### validate_shacl()
 
-Validate the current graph against a SHACL shapes graph provided as a Turtle string. Returns a dict with the validation report.
+Validate the default RDF graph against shapes already stored in the named graph
+identified by `shapes_graph`. Returns a dict with the validation report.
 
 ```python
 def validate_shacl(self, shapes_graph: str) -> Dict[str, Any]
@@ -862,20 +892,17 @@ def validate_shacl(self, shapes_graph: str) -> Dict[str, Any]
 | `message` | `str` (optional) | A human-readable description of the violation |
 
 ```python
-shapes = """
-@prefix sh: <http://www.w3.org/ns/shacl#> .
-@prefix ex: <http://example.org/> .
+db.execute_sparql("""
+    INSERT DATA {
+        GRAPH <http://example.org/shapes> {
+            <http://example.org/PersonShape>
+                a <http://www.w3.org/ns/shacl#NodeShape> ;
+                <http://www.w3.org/ns/shacl#targetClass> <http://example.org/Person> .
+        }
+    }
+""")
 
-ex:PersonShape a sh:NodeShape ;
-    sh:targetClass ex:Person ;
-    sh:property [
-        sh:path ex:name ;
-        sh:minCount 1 ;
-        sh:datatype xsd:string ;
-    ] .
-"""
-
-report = db.validate_shacl(shapes)
+report = db.validate_shacl("http://example.org/shapes")
 if report["conforms"]:
     print("All data is valid")
 else:
@@ -1094,7 +1121,10 @@ def get_all_node_property_history(self, id: int) -> Dict[str, List[Tuple[int, An
 
 ### current_epoch()
 
-Returns the current epoch of the database. The epoch increments with each committed transaction.
+Returns the database's current committed publication epoch. Transactions and
+standalone metadata publications, including catalog and projection
+declarations, share this ordered identity space. Failed durable publications may
+leave intentional gaps, so the value is not a count of committed transactions.
 
 ```python
 def current_epoch(self) -> int

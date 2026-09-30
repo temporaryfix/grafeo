@@ -394,6 +394,10 @@ Set a property on a node.
 void setNodeProperty(int id, String key, dynamic value)
 ```
 
+Returns normally only after a successful write. A missing or deleted node throws
+`DatabaseException`; the setter does not create the node. Other engine failures
+propagate through the existing `GrafeoException` hierarchy.
+
 ```dart
 db.setNodeProperty(0, 'email', 'alix@example.com');
 ```
@@ -471,6 +475,10 @@ Set a property on an edge.
 void setEdgeProperty(int id, String key, dynamic value)
 ```
 
+Returns normally only after a successful write. A missing or deleted edge throws
+`DatabaseException`; the setter does not create the edge. Other engine failures
+propagate through the existing `GrafeoException` hierarchy.
+
 #### removeEdgeProperty()
 
 Remove a property from an edge.
@@ -479,27 +487,36 @@ Remove a property from an edge.
 void removeEdgeProperty(int id, String key)
 ```
 
-### Property Indexes
-
-#### createPropertyIndex()
-
-Create a property index for fast point-lookup queries.
+### Index Owners
 
 ```dart
-void createPropertyIndex(String propertyKey)
+int createIndex(CreateIndexRequest request)
+bool dropIndex(int owner)
+void rebuildIndex(int owner)
 ```
+
+Creation returns a committed unsigned 32-bit owner ID. Duplicate names or physical targets are errors. Graph paths are component arrays: `[]` selects root, `[""]` an empty-named child, and `["a/b"]` differs from `["a", "b"]`. Property/BTree indexes forbid a label; Text/Vector require one. Rebuild atomically preserves the owner and its full resolved configuration; it does not recreate a dropped index. Drop returns false only for an absent owner. Engine failures propagate through the binding's error channel.
+
+These methods are synchronous and throw on failure. Construct
+`CreateIndexRequest` with required `kind: IndexKind.property`,
+`IndexKind.btree`, `IndexKind.text`, or `IndexKind.vector`, plus
+`property`. Optional fields are `graph`, `name`, `label`, and the
+Vector-only `dimensions`, `metric`, `m`, `efConstruction`, and
+`quantization`. Invalid numbers, malformed strings, and unavailable features
+are rejected rather than silently defaulted.
 
 ```dart
-db.createPropertyIndex('name');
+final owner = db.createIndex(const CreateIndexRequest(
+  kind: IndexKind.vector, label: 'Document', property: 'embedding',
+  dimensions: 384, metric: 'cosine',
+));
+db.rebuildIndex(owner);
+final dropped = db.dropIndex(owner);
 ```
 
-#### dropPropertyIndex()
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
 
-Drop a property index. Returns `true` if it existed.
-
-```dart
-bool dropPropertyIndex(String propertyKey)
-```
+### Property Index Reads
 
 #### hasPropertyIndex()
 
@@ -518,7 +535,7 @@ List<int> findNodesByProperty(String propertyKey, dynamic value)
 ```
 
 ```dart
-db.createPropertyIndex('name');
+final owner = db.createIndex(const CreateIndexRequest(kind: IndexKind.property, property: 'name'));
 final ids = db.findNodesByProperty('name', 'Alix');
 for (final id in ids) {
   final node = db.getNode(id);
@@ -528,33 +545,7 @@ for (final id in ids) {
 
 ### Vector Search
 
-#### createVectorIndex()
-
-Create an HNSW vector index on nodes with the given label.
-
-```dart
-void createVectorIndex(
-  String label,
-  String property,
-  int dimensions,
-  String metric, {
-  int m = 16,
-  int efConstruction = 200,
-})
-```
-
-| Parameter | Description |
-|-----------|-------------|
-| `label` | Node label to index |
-| `property` | Property name containing the float vector |
-| `dimensions` | Vector dimensions (e.g. 384, 768, 1536) |
-| `metric` | Distance metric: `"cosine"`, `"euclidean"`, or `"dot"` |
-| `m` | Bidirectional links per HNSW node (default: 16) |
-| `efConstruction` | Index build quality (default: 200) |
-
-```dart
-db.createVectorIndex('Document', 'embedding', 384, 'cosine');
-```
+Create vector indexes through `createIndex()` as shown above.
 
 #### vectorSearch()
 
@@ -636,22 +627,6 @@ final results = db.mmrSearch('Document', 'embedding', queryVec,
 for (final r in results) {
   print('Node ${r.nodeId}: distance ${r.distance}');
 }
-```
-
-#### dropVectorIndex()
-
-Drop a vector index. Returns `true` if the index existed.
-
-```dart
-bool dropVectorIndex(String label, String property)
-```
-
-#### rebuildVectorIndex()
-
-Rebuild a vector index by rescanning all matching nodes.
-
-```dart
-void rebuildVectorIndex(String label, String property)
 ```
 
 ### Admin

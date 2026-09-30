@@ -57,17 +57,36 @@ db.schema();      // database schema as JSON
 Database.version(); // Grafeo version string
 ```
 
+## Index Owners
+
+```typescript
+createIndex(request: CreateIndexRequest): number
+dropIndex(owner: number): boolean
+rebuildIndex(owner: number): void
+```
+
+Creation returns a committed unsigned 32-bit owner ID. Duplicate names or physical targets are errors. Graph paths are component arrays: `[]` selects root, `[""]` an empty-named child, and `["a/b"]` differs from `["a", "b"]`. Property/BTree indexes forbid a label; Text/Vector require one. Rebuild atomically preserves the owner and its full resolved configuration; it does not recreate a dropped index. Drop returns false only for an absent owner. Engine failures propagate through the binding's error channel.
+
+These methods are **synchronous**, unlike the Node binding. Requests contain
+`property`, optional `kind` (`"property"`, `"btree"`, `"text"`,
+or `"vector"`; default `"property"`), `graph`, `name`, and
+`label`. Vector-only options are `dimensions`, `metric`, `m`,
+`efConstruction`, and `quantization`. Invalid fields and unavailable
+features throw errors.
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
 ## Text Search
 
 Create BM25 text indexes and run full-text queries:
 
 ```javascript
-db.createTextIndex("Document", "content");
+const owner = db.createIndex({kind: "text", label: "Document", property: "content"});
 const results = db.textSearch("Document", "content", "graph database", 10);
 // [{nodeId, score}, ...]
 
-db.rebuildTextIndex("Document", "content");
-db.dropTextIndex("Document", "content");
+db.rebuildIndex(owner);
+db.dropIndex(owner);
 ```
 
 ## Hybrid Search
@@ -75,9 +94,9 @@ db.dropTextIndex("Document", "content");
 Combine BM25 text scores with HNSW vector similarity:
 
 ```javascript
-// Create indexes via GQL queries
-db.execute("CREATE TEXT INDEX ON Document(content)");
-db.execute("CREATE VECTOR INDEX ON Document(embedding) OPTIONS {dimensions: 384}");
+// Create both owners in memory.
+const textOwner = db.createIndex({kind: "text", label: "Document", property: "content"});
+const vectorOwner = db.createIndex({kind: "vector", label: "Document", property: "embedding", dimensions: 384});
 
 const results = db.hybridSearch(
     "Document",
@@ -88,7 +107,7 @@ const results = db.hybridSearch(
 ```
 
 !!! tip "Vector Index Creation"
-    Both `createVectorIndex()` and GQL `CREATE VECTOR INDEX` queries via `db.execute()` are supported in WASM.
+    Use `db.createIndex({kind: "vector", label: "Document", property: "embedding", dimensions: 384})` for an explicit owner ID. GQL index DDL remains available through `db.execute()`.
 
 ## Batch Import
 

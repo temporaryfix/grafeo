@@ -217,6 +217,11 @@ int32_t      grafeo_remove_node_label(GrafeoDatabase* db, uint64_t id, const cha
 char*        grafeo_get_node_labels(GrafeoDatabase* db, uint64_t id);  /* free with grafeo_free_string */
 ```
 
+`grafeo_set_node_property` returns `GRAFEO_OK` only after a successful write.
+A missing or deleted node returns `GRAFEO_ERROR_DATABASE`; the setter does not
+create the node. Other engine failures retain their status category. Check the
+returned status and call `grafeo_last_error()` on failure.
+
 ## Edge CRUD
 
 ### Create and Delete Edges
@@ -252,6 +257,11 @@ void        grafeo_free_edge(GrafeoEdge* edge);
 GrafeoStatus grafeo_set_edge_property(GrafeoDatabase* db, uint64_t id, const char* key, const char* value_json);
 int32_t      grafeo_remove_edge_property(GrafeoDatabase* db, uint64_t id, const char* key);
 ```
+
+`grafeo_set_edge_property` returns `GRAFEO_OK` only after a successful write.
+A missing or deleted edge returns `GRAFEO_ERROR_DATABASE`; the setter does not
+create the edge. Other engine failures retain their status category. Check the
+returned status and call `grafeo_last_error()` on failure.
 
 ## Transactions
 
@@ -308,12 +318,37 @@ const char*  grafeo_current_schema(const GrafeoDatabase* db);  /* NULL if no sch
 
 The pointer from `grafeo_current_schema` is valid until the next call to `grafeo_current_schema`, `grafeo_set_schema`, or `grafeo_reset_schema` on the same thread.
 
-## Property Indexes
+## Index Owners
 
 ```c
-GrafeoStatus grafeo_create_property_index(GrafeoDatabase* db, const char* property);
-int32_t      grafeo_drop_property_index(GrafeoDatabase* db, const char* property);
-int32_t      grafeo_has_property_index(GrafeoDatabase* db, const char* property);
+GrafeoStatus grafeo_create_index(GrafeoDatabase* db, const GrafeoIndexRequest* request, uint32_t* out_id);
+GrafeoStatus grafeo_drop_index(GrafeoDatabase* db, uint32_t id, int32_t* out_dropped);
+GrafeoStatus grafeo_rebuild_index(GrafeoDatabase* db, uint32_t id);
+```
+
+Creation returns a committed unsigned 32-bit owner ID. Duplicate names or physical targets are errors. Graph paths are component arrays: `[]` selects root, `[""]` an empty-named child, and `["a/b"]` differs from `["a", "b"]`. Property/BTree indexes forbid a label; Text/Vector require one. Rebuild atomically preserves the owner and its full resolved configuration; it does not recreate a dropped index. Drop returns false only for an absent owner. Engine failures propagate through the binding's error channel.
+
+Calls are synchronous. Check `GrafeoStatus` before reading outputs; outputs
+are written only on success. `grafeo_drop_index` writes 0 for absence and 1
+for a successful drop. Read `grafeo_last_error()` on the same thread after an
+error.
+
+`GrafeoIndexRequest` is defined in `grafeo.h`. Its `kind` is
+`GRAFEO_INDEX_PROPERTY`, `GRAFEO_INDEX_BTREE`, `GRAFEO_INDEX_TEXT`, or
+`GRAFEO_INDEX_VECTOR`. Strings use `GrafeoUtf8 {data, len}` byte spans,
+not NUL-terminated selectors; the caller retains the memory through the call.
+The `graph` pointer and `graph_count` describe a component array.
+Set `options` using the corresponding `GRAFEO_INDEX_*_PRESENT` macros
+for name, label, dimensions, metric, m, ef_construction, and quantization.
+Presence bits preserve explicit zero/empty values; omission selects defaults.
+Vector configuration bits are invalid for other kinds.
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
+## Property Index Reads
+
+```c
+int32_t grafeo_has_property_index(GrafeoDatabase* db, const char* property);
 ```
 
 ### Find Nodes by Property
@@ -339,16 +374,6 @@ if (grafeo_find_nodes_by_property(db, "name", "\"Alix\"", &ids, &count) == GRAFE
 ## Vector Search
 
 Requires the `vector-index` feature.
-
-### Index Management
-
-```c
-GrafeoStatus grafeo_create_vector_index(GrafeoDatabase* db, const char* label, const char* property, int32_t dimensions, const char* metric, int32_t m, int32_t ef_construction);
-int32_t      grafeo_drop_vector_index(GrafeoDatabase* db, const char* label, const char* property);
-GrafeoStatus grafeo_rebuild_vector_index(GrafeoDatabase* db, const char* label, const char* property);
-```
-
-Pass `-1` for `dimensions`, `m`, or `ef_construction` to use defaults. Pass `NULL` for `metric` to default to cosine similarity.
 
 ### Nearest Neighbor Search
 
@@ -378,8 +403,20 @@ void grafeo_free_node_ids(uint64_t* ids, size_t count);  /* for batch_create_nod
 ### Vector Search Example
 
 ```c
-/* Create a vector index */
-grafeo_create_vector_index(db, "Document", "embedding", 384, "cosine", 16, 200);
+/* Create a vector owner. String spans exclude the terminator. */
+GrafeoIndexRequest request = {0};
+request.kind = GRAFEO_INDEX_VECTOR;
+request.options = GRAFEO_INDEX_LABEL_PRESENT | GRAFEO_INDEX_DIMENSIONS_PRESENT
+    | GRAFEO_INDEX_METRIC_PRESENT;
+request.label = (GrafeoUtf8){(const uint8_t*)"Document", sizeof("Document") - 1};
+request.property = (GrafeoUtf8){(const uint8_t*)"embedding", sizeof("embedding") - 1};
+request.metric = (GrafeoUtf8){(const uint8_t*)"cosine", sizeof("cosine") - 1};
+request.dimensions = 384;
+uint32_t owner;
+if (grafeo_create_index(db, &request, &owner) != GRAFEO_OK) {
+    fprintf(stderr, "%s\n", grafeo_last_error());
+    return;
+}
 
 /* Search for 5 nearest neighbors */
 float query_vec[384] = { /* ... */ };

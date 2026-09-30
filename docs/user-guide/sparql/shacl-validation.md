@@ -29,7 +29,7 @@ Shapes can be **node shapes** (constraints on focus nodes directly) or **propert
     ```python
     import grafeo
 
-    db = grafeo.GrafeoDB()
+    db = grafeo.GrafeoDB(graph_model="rdf")
 
     # Load data into the default graph
     db.execute_sparql("""
@@ -64,9 +64,11 @@ Shapes can be **node shapes** (constraints on focus nodes directly) or **propert
 === "Rust"
 
     ```rust
-    use grafeo_engine::GrafeoDB;
+    use grafeo_engine::{Config, GrafeoDB, GraphModel};
 
-    let db = GrafeoDB::new_in_memory();
+    let db = GrafeoDB::with_config(
+        Config::in_memory().with_graph_model(GraphModel::Rdf),
+    )?;
     let session = db.session();
 
     // Insert data and shapes (omitted for brevity)

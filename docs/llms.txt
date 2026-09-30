@@ -75,7 +75,9 @@ cargo install grafeo-cli
 
 | Group | Contents | Description |
 |-------|----------|-------------|
-| `full` | languages + ai | Everything (default) |
+| `languages` | gql, cypher, sparql, gremlin, graphql, sql-pgq | All query language parsers |
+| `ai` | vector-index, text-index, hybrid-search, cdc | AI/RAG search + change tracking |
+| `enterprise` | metrics, tracing, async-storage | Operational capabilities |
 | `languages` | gql, cypher, sparql, gremlin, graphql, sql-pgq | All query language parsers |
 | `ai` | vector-index, text-index, hybrid-search, cdc | AI/RAG search + change tracking |
 | `embed` | ort, tokenizers | ONNX embedding generation (opt-in, ~17MB) |

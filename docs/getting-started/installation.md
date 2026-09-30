@@ -125,7 +125,7 @@ Add to `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  grafeo: ^0.5.42
+  grafeo: ^0.5.43
 ```
 
 ### Verify Installation
@@ -175,8 +175,17 @@ grafeo = { version = "0.5", features = ["analytics"] }
 # Full feature set
 grafeo = { version = "0.5", default-features = false, features = ["enterprise"] }
 
-# Minimal: GQL only
-grafeo = { version = "0.5", default-features = false, features = ["gql"] }
+# Minimal: LPG + GQL
+grafeo = { version = "0.5", default-features = false, features = ["edge"] }
+
+# Embedded temporal host (as-of compact store + statements)
+grafeo = { version = "0.5", default-features = false, features = ["temporal-host"] }
+
+# Parser-free LPG + RDF (no query languages)
+grafeo = { version = "0.5", default-features = false, features = ["native"] }
+
+# Dual-model database (triples + SPARQL + LPG)
+grafeo = { version = "0.5", features = ["lpg", "rdf"] }
 
 # With ONNX embedding generation (opt-in, ~17MB)
 grafeo = { version = "0.5", features = ["embed"] }
@@ -186,15 +195,17 @@ grafeo = { version = "0.5", features = ["embed"] }
 
 | Profile | Contents | Use case |
 |---------|----------|----------|
-| `lpg` | GQL, AI, algorithms, parallel | Default for libraries and apps |
-| `rdf` | SPARQL, triple-store, ring-index | Knowledge graphs, linked data |
-| `analytics` | Algorithms, parallel | Graph analytics pipelines |
-| `ai` | Vector, text, hybrid search, CDC | RAG, semantic search |
-| `edge` | GQL, compact, regex-lite | WASM, resource-constrained |
-| `enterprise` | All features | Full-featured deployments |
+| `lpg` | GQL, Cypher, Gremlin, SQL/PGQ, storage, regex | Graph applications |
+| `rdf` | SPARQL, GraphQL, triple-store, ring index, SHACL, storage, regex | Knowledge graphs, linked data |
+| `analytics` | Algorithms, vector/text/hybrid search, JSONL/Parquet import | Graph analytics pipelines |
+| `ai` | Native temporal/as-of history, vector/text/hybrid search, CDC | RAG, semantic search |
+| `temporal-host` | LPG + compact-store + statements + WAL + text-index | Embedded temporal host (same engine) |
+| `native` | LPG + RDF quads + WAL + `.grafeo` (no parsers) | Parser-free dual model |
+| `edge` | LPG, GQL, compact store, regex-lite | WASM, resource-constrained |
+| `enterprise` | Metrics, tracing, async storage | Platform operators, observability |
 
 !!! note "Deprecated profiles"
-    The old deployment-target profiles (`embedded`, `browser`, `server`, `full`) still work as aliases but are deprecated and scheduled for removal in 0.7.0. Migrate to persona profiles when convenient.
+    Use the persona profiles (`lpg`, `rdf`, `analytics`, `ai`, `edge`, `enterprise`). The old facade aliases and the WASM `browser` alias have been removed; binding-specific convenience groups remain available where documented.
 
 #### Convenience Groups
 

@@ -7,6 +7,7 @@ description: Grafeo system architecture and internals.
 
 Understand how Grafeo is designed and implemented.
 
+
 ## Overview
 
 Grafeo is built as a modular system with clear separation of concerns:

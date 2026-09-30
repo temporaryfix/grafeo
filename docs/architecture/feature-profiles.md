@@ -11,40 +11,41 @@ There are two layers:
 
 ## Current Profiles
 
-The current system uses deployment-target names:
+The current system uses persona names:
 
 | Profile | Contents | Use case |
 | --- | --- | --- |
-| `embedded` | lpg, gql, ai, algos, parallel, regex, jsonl-import, grafeo-file, arrow-export | Python, Node.js, C, MCP, in-process |
-| `browser` | lpg, gql, regex-lite | WASM, grafeo-web |
-| `server` | full, async-storage, metrics, tracing | grafeo-server |
-| `full` | lpg, languages, ai, triple-store, parallel, algos, storage, jsonl-import, parquet-import | Everything (except embed) |
+| `lpg` | LPG and LPG query languages with storage | Graph applications |
+| `rdf` | RDF, SPARQL, GraphQL, ring index, storage, regex, SHACL | Knowledge applications |
+| `analytics` | Algorithms, search, and bulk import | Data science |
+| `ai` | Vector/text/hybrid search and CDC | AI and agent applications |
+| `edge` | LPG, GQL, compact store, regex-lite | WASM and resource-constrained applications |
+| `enterprise` | Metrics, tracing, and async storage | Platform operations |
 
-**Defaults**: grafeo facade and bindings use `embedded`. WASM uses `browser`. CLI uses `gql` + storage.
+**Defaults**: the grafeo facade uses its explicit embedded capability expansion; native bindings retain their `embedded` default; WASM uses `edge`; CLI uses `gql` + storage.
 
 ---
 
-## Proposed Profiles
+## Persona profiles
 
-!!! warning "Not yet implemented"
-    The profiles below are **proposals for a future release**. They do not exist in version 0.5.39. The active profile system is described in "Current Profiles" above.
-
-The proposed system replaces deployment-target names with persona-driven names that describe *what you're building*, not *where it runs*.
+The facade's deployment-target aliases have been removed. WASM uses `edge`; its `full` convenience group remains available. Native binding aliases remain until their own compatibility migration. `temporal-host` is a **compile slice** for an embedded temporal host — the engine is still LPG+RDF; add `triple-store`/`sparql` for RDF engine builds.
 
 | Profile | Persona | What it enables |
 | --- | --- | --- |
 | **LPG** | Graph App Developer | GQL, Cypher, Gremlin, SQL/PGQ, storage |
-| **RDF** | Knowledge Engineer | SPARQL, GraphQL, RDF store, ring-index, storage |
+| **RDF** | Knowledge Engineer | SPARQL, GraphQL, RDF store, ring index, SHACL, storage, regex |
 | **Analytics** | Data Scientist | Algorithms, vector/text/hybrid search, parquet + jsonl import |
-| **AI** | AI Memory / Agent Developer | Temporal, CDC, vector/text/hybrid search |
-| **Edge** | Frontend / Edge Developer | GQL only, compact-store, regex-lite (standalone, minimal) |
-| **Enterprise** | Platform Operator | Auth, TLS, metrics, tracing, sync, replication, push-changefeed (grafeo-server only) |
+| **AI** | AI Memory / Agent Developer | Native temporal/as-of history, CDC, vector/text/hybrid search |
+| **Edge** | Frontend / Edge Developer | LPG, GQL, compact store, regex-lite |
+| **Temporal-host** | Embedded temporal host | LPG + compact-store + statement-table + WAL + text-index. Add `sparql`/`gql` when the host wants languages. |
+| **Native** | Parser-free dual model | LPG CRUD + RDF quads + WAL + `.grafeo`. No GQL/SPARQL/Cypher/Gremlin/GraphQL/SQL-PGQ. |
+| **Enterprise** | Platform Operator | Facade atoms: metrics, tracing, async storage. Server product: auth, TLS, sync, replication, push changefeeds, and transports. |
 
 ### Composition Rules
 
 - **Model profiles** (LPG, RDF): pick one or both. These are the foundation.
 - **Capability profiles** (Analytics, AI, Enterprise): stack on top of a model profile.
-- **Constrained profile** (Edge): minimal by default, composable with constraints. Users can add atoms like `algos` if they accept the size increase.
+- **Constrained profile** (Edge, Temporal-host): minimal by default, composable with constraints. Users can add atoms like `algos` if they accept the size increase.
 
 Examples:
 
@@ -55,8 +56,14 @@ grafeo = { features = ["lpg", "ai"] }
 # Semantic data scientist
 grafeo = { features = ["rdf", "analytics"] }
 
-# Full production stack (grafeo-server only, enterprise is server-scoped)
-# grafeo-server = { features = ["lpg", "rdf", "ai", "enterprise"] }
+# Full production stack
+# grafeo-server = { features = ["lpg", "rdf", "analytics", "ai", "languages", "parallel", "arrow-export", "enterprise"] }
+
+# Embedded temporal host (add sparql / gql for an RDF or LPG query session)
+grafeo = { default-features = false, features = ["temporal-host"] }
+
+# Parser-free LPG + RDF (insert_rdf_quads / create_node, no query languages)
+grafeo = { default-features = false, features = ["native"] }
 
 # Browser app
 grafeo = { features = ["edge"] }
@@ -78,10 +85,14 @@ All Labeled Property Graph query languages plus persistence. The default choice 
 ### RDF
 
 ```toml
-rdf = ["sparql", "graphql", "triple-store", "ring-index", "storage", "regex"]
+rdf = ["triple-store", "sparql", "graphql", "ring-index", "storage", "regex", "shacl"]
 ```
 
-Full RDF triple store with SPARQL, space-efficient indexing, and persistence. For knowledge engineers working with ontologies and linked data. The `triple-store` atom enables the storage layer, and `ring-index` adds compact indexing (which pulls in `succinct-indexes` automatically).
+The comprehensive knowledge-engineering profile: RDF storage, SPARQL and
+GraphQL query surfaces, compact ring indexing, SHACL validation, persistence,
+and full regex support. It does not enable the LPG model or LPG query
+languages. For a smaller parser-free or SPARQL-only host, compose the
+`triple-store`, `sparql`, `wal`, and `grafeo-file` atoms directly.
 
 > **Note:** `owl-schema` and `rdfs-schema` currently only exist in grafeo-server. Promoting them to the engine level for this profile is an open question.
 
@@ -96,50 +107,68 @@ analytics = ["algos", "vector-index", "text-index", "hybrid-search", "jsonl-impo
 ### AI
 
 ```toml
-ai = ["temporal", "cdc", "vector-index", "text-index", "hybrid-search"]
+ai = ["vector-index", "text-index", "hybrid-search", "cdc"]
 ```
 
-Structured memory for LLMs, agents, and RAG pipelines. Temporal history tracks how the graph evolves, CDC enables change feeds, and search indexes support vector/text retrieval.
+Structured memory for LLMs, agents, and RAG pipelines. Native transaction-time
+and as-of history is part of the store rather than a removable Cargo feature;
+CDC enables change feeds, and the search indexes support vector/text retrieval.
 
 > **Note:** `embed` (ONNX embedding generation, ~17 MB) is deliberately excluded from this profile. Most AI memory use cases (grafeo-memory, MCP, LangChain) bring embeddings via API calls. Opt in explicitly with `features = ["ai", "embed"]` if you need in-process embedding.
->
-> This would redefine the current `ai` group. In 0.5.39, `ai` = `["vector-index", "text-index", "hybrid-search", "cdc"]` at the engine level (without `temporal`). The proposed definition adds `temporal` and removes `cdc`'s implicit inclusion (it becomes explicit). This change has not been made yet.
+
+### Temporal-host
+
+```toml
+temporal-host = ["lpg", "compact-store", "statement-table", "wal", "text-index"]
+```
+
+Embedded host slice: CompactStore as-of hops (`fill_neighbors_at_epoch` / `fill_neighbors_of_types_at_epoch`) and opaque statement rows. Default compile set omits `gql`/`gremlin`/`graphql`/`cdc`/`algos` so a small host binary stays small. RDF and SPARQL remain first-class features in the same engine. Add language atoms when the host wants them. Host test: `temporal_host`.
+
+### Native
+
+```toml
+native = ["lpg", "triple-store", "wal", "grafeo-file"]
+```
+
+Parser-free dual native model: LPG `create_node` / `create_edge` and RDF `insert_rdf_quads` / `contains_rdf_quad` on `GraphModel::Both`, with WAL and `.grafeo`. Does not compile GQL, SPARQL, Cypher, Gremlin, GraphQL, or SQL/PGQ. Bindings (`grafeo-c`, Python, Node, WASM) take `grafeo-engine` with `default-features = false` so `--features native` does not smuggle engine `gql`. Engine test: `native_no_parsers`. Binding check: `cargo check -p grafeo-c --no-default-features --features native`.
 
 ### Edge
 
 ```toml
-edge = ["gql", "compact-store", "regex-lite"]
+edge = ["lpg", "gql", "compact-store", "regex-lite"]
 ```
 
-Minimal profile for browser, mobile, and resource-constrained environments. Compact store for pre-built read-only datasets, lightweight regex, smallest possible binary (~500 KB gzipped for WASM).
+Compact facade profile for browser, mobile, and resource-constrained
+environments. It includes the columnar compact store and lightweight regex;
+the WASM build additionally enforces its gzip budget.
 
 ### Enterprise
 
 ```toml
-enterprise = ["auth", "tls", "metrics", "tracing", "sync", "replication", "push-changefeed"]
+enterprise = ["metrics", "tracing", "async-storage"]
 ```
 
-Production operations: authentication, encryption in transit, observability, and data replication.
+Embedded operational capabilities: metrics, tracing, and asynchronous storage.
+Authentication, TLS, replication, push changefeeds, and server transports are
+not enabled by this facade profile; they remain server-level product
+capabilities rather than being retired by this feature-map correction.
 
-> **Important:** This profile only applies to **grafeo-server**. Auth, TLS, sync, replication, and push-changefeed are defined exclusively in the grafeo-server workspace. `metrics` and `tracing` are available as individual atoms in the engine, but the `enterprise` umbrella is server-scoped. On grafeo-server, this additionally enables all transport layers (HTTP, GWP, Bolt, Studio).
+Cargo packaging is not a capability-retirement mechanism. The facade feature
+only selects code present in this workspace; the server product's stronger
+operational contract remains a target contract. Removing any of those
+capabilities, or narrowing an existing profile rather than moving a capability
+to an explicitly composable atom, requires a separate compatibility decision.
 
 ## Migration from Current Profiles
 
 | Old Profile | New Equivalent | Notes |
 | --- | --- | --- |
-| `embedded` | `lpg` + `ai` + `algos` + `parallel` | Current default for Python/Node/C |
-| `browser` | `edge` | Current default for WASM |
-| `server` | `lpg` + `rdf` + `ai` + `enterprise` | Approximate |
-| `full` | `lpg` + `rdf` + `analytics` + `ai` | Everything except enterprise/embed |
+| Facade default | `lpg-model` + `gql` + `ai` + `algos` + `parallel` + `regex` + JSONL/Arrow I/O | Grafeo facade capability expansion |
+| Native binding default | `embedded` | Python/Node/C binding default |
+| `edge` | `edge` | Current default for WASM |
+| Production stack | `lpg` + `rdf` + `analytics` + `ai` + `languages` + `parallel` + `arrow-export` + `enterprise` | Full facade capability expansion; heavyweight `embed` remains opt-in |
 
-**Deprecation path:**
-
-1. Add new profile names as aliases alongside old names
-2. Emit `cfg` deprecation warnings for old names
-3. Update all binding defaults to use new names
-4. Remove old names after one major version
-
-**Default feature question:** What should `grafeo = { version = "..." }` give you? Currently it maps to `embedded`. Under the new system, the default needs to be decided (likely `lpg`).
+The facade default uses its explicit embedded capability expansion. Native binding defaults retain `embedded`; persona names do not silently alter that default.
 
 ## Ecosystem Matrix
 
@@ -149,18 +178,18 @@ The profile names are consistent across every project. The table below shows whi
 
 | Project | LPG | RDF | Analytics | AI | Edge | Enterprise | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **grafeo** (engine) | flag | flag | flag | flag | flag | n/a | All profiles except Enterprise |
-| **grafeo-server** | flag | flag | flag | flag | n/a | flag | Enterprise is server-only |
+| **grafeo** (facade) | flag | flag | flag | flag | flag | flag | Enterprise atom means metrics + tracing + async storage |
+| **grafeo-server** | flag | flag | flag | flag | n/a | flag | Product profile adds auth, TLS, sync, replication, push changefeeds, and transports |
 | **grafeo-cli** | flag | flag | flag | flag | n/a | n/a | Interactive REPL and CLI tooling |
 
 ### Language Bindings
 
 | Project | LPG | RDF | Analytics | AI | Edge | Enterprise | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Python** (grafeo-py) | flag | flag | flag | flag | n/a | n/a | Default: `lpg` |
-| **Node.js** (grafeo-node) | flag | flag | flag | flag | n/a | n/a | Default: `lpg` |
+| **Python** (grafeo-py) | flag | flag | flag | flag | n/a | n/a | Default: `embedded` |
+| **Node.js** (grafeo-node) | flag | flag | flag | flag | n/a | n/a | Default: `embedded` |
 | **WASM** (grafeo-wasm) | flag | flag | flag | n/a | flag (default) | n/a | Edge is default |
-| **C** (grafeo-c) | flag | flag | flag | flag | n/a | n/a | Bridge for C#, Dart, Go |
+| **C** (grafeo-c) | flag | flag | flag | flag | n/a | n/a | Default: `embedded`; bridge for C#, Dart, Go |
 | **C#** | via C | via C | via C | via C | n/a | n/a | Feature selection at C build time |
 | **Dart** | via C | via C | via C | via C | n/a | n/a | Feature selection at C build time |
 | **Go** | via C | via C | via C | via C | n/a | n/a | Feature selection at C build time |
@@ -215,9 +244,9 @@ The complete list of individual feature flags (Layer 2) that profiles are compos
 | --- | --- | --- | --- |
 | `gql` | LPG, Edge | ISO/IEC GQL standard | Implemented |
 | `cypher` | LPG | openCypher 9.0 | Implemented |
-| `sparql` | RDF | W3C SPARQL 1.1 | Implemented |
+| `sparql` | RDF | SPARQL 1.1 target; unsupported cases fail closed until the official matrix is green | Qualification in progress |
 | `gremlin` | LPG | Apache TinkerPop | Implemented |
-| `graphql` | RDF | GraphQL over RDF | Implemented |
+| `graphql` | RDF / `languages` | GraphQL query parser | Implemented |
 | `sql-pgq` | LPG | SQL:2023 GRAPH_TABLE | Implemented |
 
 ### Storage
@@ -230,14 +259,14 @@ The complete list of individual feature flags (Layer 2) that profiles are compos
 | `spill` | (storage) | Out-of-core disk spilling | Implemented |
 | `mmap` | (storage) | Memory-mapped file storage | Implemented |
 | `async-storage` | (standalone) | Async WAL backend (tokio) | Implemented |
-| `compact-store` | Edge | Read-only columnar store | Implemented |
+| `compact-store` | Temporal-host, Edge | Layered columnar store | Implemented |
 
 ### Graph Model
 
 | Atom | Profile | Description | Status |
 | --- | --- | --- | --- |
-| `triple-store` | RDF | RDF triple store with 6-way indexing (currently `rdf` in Cargo.toml, renamed) | Implemented |
-| `ring-index` | RDF | Space-efficient RDF index (requires succinct-indexes) | Implemented |
+| `triple-store` | RDF | Native RDF triple/quad store | Implemented |
+| `ring-index` | RDF | Space-efficient RDF index (also available as an atom) | Implemented |
 | `succinct-indexes` | (pulled in by ring-index) | Rank/select bitvectors, Elias-Fano, wavelet trees | Implemented |
 | `owl-schema` | RDF (server only) | OWL schema loading | Server only |
 | `rdfs-schema` | RDF (server only) | RDFS schema support | Server only |

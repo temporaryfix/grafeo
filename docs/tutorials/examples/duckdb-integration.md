@@ -324,7 +324,7 @@ If you work with RDF data, you can run SPARQL queries in Grafeo and analyze the 
 ### Load RDF triples
 
 ```python
-db_rdf = grafeo.GrafeoDB()
+db_rdf = grafeo.GrafeoDB(graph_model="rdf")
 
 db_rdf.execute_sparql("""
     PREFIX ex: <http://example.org/>

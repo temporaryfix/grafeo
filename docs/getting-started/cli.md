@@ -97,7 +97,7 @@ grafeo shell ./mydb
 ```
 
 ```
-Grafeo 0.5.42 - Lpg mode, 42 nodes, 87 edges
+Grafeo 0.5.43 - Lpg mode, 42 nodes, 87 edges
 Type :help for commands, :quit to exit.
 
 grafeo> MATCH (n:Person) RETURN n.name, n.age
@@ -168,10 +168,12 @@ grafeo index stats ./mydb
 
 ### Backup & Restore
 
+Native `backup restore` requires a new destination and refuses an existing file or directory.
+
 ```bash
 # Snapshot backup (single file)
 grafeo backup create ./mydb -o backup.grafeo
-grafeo backup restore backup.grafeo ./restored --force
+grafeo backup restore backup.grafeo ./restored
 
 # Incremental backup (WAL-based, for production use)
 grafeo backup full ./mydb -o /backups/full
@@ -231,7 +233,7 @@ grafeo completions powershell >> $PROFILE
 
 ```bash
 $ grafeo version
-grafeo 0.5.42
+grafeo 0.5.43
 
 Build:
   rustc:    1.91.1

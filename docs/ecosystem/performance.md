@@ -260,13 +260,21 @@ The Ring Index (`ring-index` feature) stores RDF triples in a wavelet-tree struc
 
 | Operation | Ring Index | Hash-based indexes |
 |-----------|-----------|-------------------|
-| Single pattern lookup | O(log sigma) | O(1) amortized |
-| Star join (3 patterns) | O(k log sigma) via WCOJ | O(n) hash probe per pattern |
-| COUNT(\*) (bound pattern) | O(log sigma), no materialization | O(n) full scan |
+| Pattern `find` (current API) | O(N) scan; succinct navigation remains a target | O(1) amortized indexed lookup |
+| Qualified multi-way join | Query-local trie preparation + LFTJ enumeration | O(n) hash probe per pattern |
+| COUNT(\*) (exactly one bound component) | O(log sigma), no materialization | O(n) full scan |
 | COUNT(\*) (unbound) | O(1) via `store.len()` | O(1) via `store.len()` |
 | Memory (1M triples) | ~12 MB | ~48 MB (6 hash maps) |
 
-The SPARQL planner automatically selects Ring Index when available. Leapfrog worst-case optimal join (WCOJ) handles multi-way star joins without intermediate materialization. For patterns requiring LANG or DATATYPE columns (not stored in the ring), the planner falls back to hash join.
+The SPARQL planner selects native Ring execution only for a fresh default-graph
+snapshot with at least three plain scans and exhaustive same-name typed RDF
+identity metadata. Query-local frozen tries provide complete LFTJ backtracking
+and stream every witness-product row. Graph/dataset scopes, transactions, stale
+snapshots, non-plain MultiWayJoin input subtrees, mixed/compatibility keys, and
+LANG/DATATYPE companion consumers use the cardinality-ordered typed hash
+fallback; outer modifiers can still consume admitted native joins. A direct
+safe LIMIT can cap native output. Production deadline cancellation during
+first-pull trie preparation is not yet wired.
 
 ---
 

@@ -5,7 +5,13 @@ description: Learn the SPARQL query language for RDF data in Grafeo.
 
 # SPARQL Query Language
 
-SPARQL (SPARQL Protocol and RDF Query Language) is the W3C standard query language for RDF (Resource Description Framework) data. Grafeo implements SPARQL 1.1 for querying RDF graphs.
+SPARQL (SPARQL Protocol and RDF Query Language) is the W3C standard query
+language for RDF (Resource Description Framework) data. Grafeo is implementing
+SPARQL 1.1 with full supported-feature conformance as the target. The official
+W3C manifest/result matrix is still pending; until a feature is proven there,
+an unsupported operation returns a structured error rather than plausible
+empty success. This is a temporary qualification boundary, not a reduced
+language ambition.
 
 ## Overview
 
@@ -44,12 +50,12 @@ Example triples:
 
 ## Enabling SPARQL
 
-SPARQL requires the `sparql` feature flag. The default Grafeo features (`lpg`, `gql`, `parallel`) do not include SPARQL.
+SPARQL requires RDF storage plus the `sparql` feature. The default embedded LPG/GQL profile does not include it.
 
 === "Rust"
 
     ```bash
-    cargo add grafeo --features sparql
+    cargo add grafeo --features rdf
     ```
 
 === "Python"
@@ -75,7 +81,7 @@ SPARQL requires the `sparql` feature flag. The default Grafeo features (`lpg`, `
     ```python
     import grafeo
 
-    db = grafeo.GrafeoDB()
+    db = grafeo.GrafeoDB(graph_model="rdf")
 
     # Insert RDF triples
     db.execute_sparql("""
@@ -98,9 +104,11 @@ SPARQL requires the `sparql` feature flag. The default Grafeo features (`lpg`, `
 === "Rust"
 
     ```rust
-    use grafeo::GrafeoDB;
+    use grafeo::{Config, GrafeoDB, GraphModel};
 
-    let db = GrafeoDB::new_in_memory();
+    let db = GrafeoDB::with_config(
+        Config::in_memory().with_graph_model(GraphModel::Rdf),
+    )?;
     let mut session = db.session();
 
     session.execute_sparql(r#"

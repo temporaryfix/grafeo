@@ -11,6 +11,9 @@ tags:
 
 The HNSW (Hierarchical Navigable Small World) index provides O(log n) approximate nearest neighbor search, making vector queries fast even with millions of vectors.
 
+
+Current 0.0.1 limitation: index-owner mutations on WAL-backed databases are rejected. Saving or checkpointing owner-bearing state, including retained owner-ID allocation history after drops, also fails closed until the current persistence formats support those owners. The in-memory examples below are not a persistence guarantee.
+
 ## Overview
 
 HNSW builds a multi-layer graph structure where:
@@ -41,21 +44,22 @@ import grafeo
 db = grafeo.GrafeoDB()
 
 # Create index with default settings
-db.create_vector_index(
-    "Movie",             # label
+movie_owner = db.create_index(
     "embedding",         # property
+    kind="vector",
+    label="Movie",
     dimensions=384,      # optional
     metric="cosine"      # optional (default: cosine)
 )
 
 # With HNSW tuning parameters
-db.create_vector_index(
-    "Document",
-    "embedding",
+document_owner = db.create_index(
+    "embedding", kind="vector", label="Document",
     dimensions=768,
     metric="euclidean",
     m=32,                # connections per node (default: 16)
-    ef_construction=256  # build-time quality (default: 128)
+    ef_construction=256, # build-time quality (default: 128)
+    ef=128               # default search depth (default: 50)
 )
 ```
 
@@ -67,7 +71,7 @@ db.create_vector_index(
 | `metric` | `cosine` | Distance metric: `cosine`, `euclidean`, `dot_product`, `manhattan` |
 | `m` | 16 | Max connections per node (higher = better recall, more memory) |
 | `ef_construction` | 128 | Build-time beam width (higher = better index quality, slower build) |
-| `ef_search` | 50 | Search-time beam width (higher = better recall, slower search) |
+| `ef` | 50 | Search-time beam width (higher = better recall, slower search) |
 
 ## Tuning Parameters
 
@@ -79,7 +83,7 @@ Controls the graph connectivity:
 - **Default (16)**: Good balance for most use cases
 - **Higher (24-48)**: Better recall, more memory, slower build
 
-Configure via the Python/Node.js API `create_vector_index()` parameter.
+Configure with Python `create_index(..., kind="vector")` options or the Node `createIndex({kind: "vector", ...})` request.
 
 ### ef_construction (Build Quality)
 
@@ -89,21 +93,35 @@ Controls index build quality:
 - **Default (128)**: Good balance
 - **Higher (256-512)**: Best quality, slower build
 
-Configure via the Python/Node.js API `create_vector_index()` parameter.
+Configure with Python `create_index(..., kind="vector")` options or the Node `createIndex({kind: "vector", ...})` request.
 
-### ef_search (Search Quality)
+### ef (Search Quality)
 
-Controls search-time recall:
+Set a positive index-level search depth with Python `create_index(..., ef=128)`
+or GQL:
+
+```sql
+CREATE INDEX document_vectors FOR (d:Document) ON (d.embedding)
+USING VECTOR {dimensions: 768, metric: 'euclidean', ef: 128}
+```
+
+The resolved value survives rebuild and reopen. The GQL search procedure uses
+this index configuration:
+
+```sql
+CALL grafeo.search.vector('Document', 'embedding', $query, 10)
+```
+
+Python can override the depth for one call without changing the index:
 
 ```python
-# Adjust at query time
-result = db.execute("""
-    MATCH (d:Document)
-    RETURN d.title, cosine_similarity(d.embedding, $query) AS sim
-    ORDER BY sim DESC
-    LIMIT 10
-""", {"query": embedding}, ef_search=100)  # Higher ef for better recall
+results = db.vector_search("Document", "embedding", embedding, k=10, ef=200)
 ```
+
+Higher depth trades more search work for recall. The effective beam is at least
+`k`; visibility and property filtering may widen it. An ordinary scalar
+`ORDER BY` distance query can use an exact scan and does not by itself prove
+that an HNSW index was used.
 
 ## Performance Characteristics
 
@@ -165,7 +183,7 @@ for doc in documents:
                {"title": doc.title, "emb": doc.embedding})
 
 # Then create index (faster than incremental inserts)
-db.create_vector_index("Document", "embedding", dimensions=384, metric="cosine")
+vector_owner = db.create_index("embedding", kind="vector", label="Document", dimensions=384, metric="cosine")
 ```
 
 ### 3. Monitor Recall

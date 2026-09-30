@@ -219,7 +219,7 @@ grafeo = { version = "0.5", features = ["gql", "sparql"] }
     ```python
     import grafeo
 
-    db = grafeo.GrafeoDB()
+    db = grafeo.GrafeoDB(graph_model="rdf")
 
     # SPARQL query
     result = db.execute_sparql("""

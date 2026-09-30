@@ -61,15 +61,16 @@ let writer = db.session_with_identity(identity);
 
 ### Per-Graph Access Grants
 
-Identities can be restricted to specific named graphs. When grants are present, only the listed graphs are accessible. Empty grants means unrestricted access (backward compatible).
+Identities can be restricted to exact LPG graph paths. When grants are present, only the listed paths are accessible; parent grants do not cover descendants. Paths are case-sensitive: root `[]`, `["default"]`, `[""]`, `["a/b"]`, and `["a", "b"]` are distinct. Empty grants means unrestricted access subject to the identity's roles.
 
 ```rust
 use grafeo::auth::{Identity, Role, Grant};
+use grafeo::GraphPath;
 
 let identity = Identity::new("analyst", [Role::ReadWrite])
     .with_grants([
-        Grant::new("social", Role::ReadWrite),
-        Grant::new("public", Role::ReadOnly),
+        Grant::new(GraphPath::from_components(&["social"])?, Role::ReadWrite),
+        Grant::new(GraphPath::from_components(&["public"])?, Role::ReadOnly),
     ]);
 
 let session = db.session_with_identity(identity);
