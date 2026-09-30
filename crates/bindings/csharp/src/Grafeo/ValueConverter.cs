@@ -12,6 +12,7 @@ namespace Grafeo;
 /// </summary>
 internal static class ValueConverter
 {
+    private static readonly string[] TemporalMarkers = ["$date", "$time", "$duration", "$zoned_datetime"];
     /// <summary>Encode a parameter dictionary as a JSON string for grafeo-c.</summary>
     internal static string EncodeParams(Dictionary<string, object?> parameters)
     {
@@ -104,7 +105,7 @@ internal static class ValueConverter
     /// <summary>Parse a JSON array string (from grafeo_result_json) into rows.</summary>
     internal static IReadOnlyList<IReadOnlyDictionary<string, object?>> ParseRows(string json)
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 1024 });
         var rows = new List<IReadOnlyDictionary<string, object?>>();
         foreach (var element in doc.RootElement.EnumerateArray())
         {
@@ -130,7 +131,7 @@ internal static class ValueConverter
     /// <summary>Parse a JSON object string into a dictionary.</summary>
     internal static IReadOnlyDictionary<string, object?> ParseObject(string json)
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 1024 });
         var dict = new Dictionary<string, object?>();
         foreach (var prop in doc.RootElement.EnumerateObject())
         {
@@ -142,7 +143,7 @@ internal static class ValueConverter
     /// <summary>Parse a JSON array string into a list of strings.</summary>
     internal static IReadOnlyList<string> ParseStringArray(string json)
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 1024 });
         var list = new List<string>();
         foreach (var element in doc.RootElement.EnumerateArray())
         {
@@ -190,28 +191,23 @@ internal static class ValueConverter
 
     private static object? ParseJsonObject(JsonElement element)
     {
-        // Check for temporal markers from grafeo-bindings-common
-        if (element.TryGetProperty("$timestamp_us", out var tsElement))
+        // Only exact, correctly typed marker objects are temporal values.
+        // Preserve out-of-range timestamps as their exact wire map instead of
+        // failing managed conversion after a native mutation has committed.
+        var properties = element.EnumerateObject();
+        if (properties.MoveNext() && !properties.MoveNext())
         {
-            var microseconds = tsElement.GetInt64();
-            var milliseconds = microseconds / 1000;
-            return DateTimeOffset.FromUnixTimeMilliseconds(milliseconds).UtcDateTime;
-        }
-        if (element.TryGetProperty("$date", out var dateElement))
-        {
-            return dateElement.GetString() ?? "";
-        }
-        if (element.TryGetProperty("$time", out var timeElement))
-        {
-            return timeElement.GetString() ?? "";
-        }
-        if (element.TryGetProperty("$duration", out var durElement))
-        {
-            return durElement.GetString() ?? "";
-        }
-        if (element.TryGetProperty("$zoned_datetime", out var zdtElement))
-        {
-            return zdtElement.GetString() ?? "";
+            if (element.TryGetProperty("$timestamp_us", out var tsElement) &&
+                tsElement.ValueKind == JsonValueKind.Number && tsElement.TryGetInt64(out var microseconds) &&
+                microseconds >= -62135596800000000L && microseconds <= 253402300799999999L)
+            {
+                return DateTime.UnixEpoch.AddTicks(microseconds * 10);
+            }
+            foreach (var marker in TemporalMarkers)
+            {
+                if (element.TryGetProperty(marker, out var value) && value.ValueKind == JsonValueKind.String)
+                    return value.GetString();
+            }
         }
 
         // Regular object

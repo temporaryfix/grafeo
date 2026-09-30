@@ -6,10 +6,25 @@ namespace Grafeo;
 public interface IGrafeoDB : IDisposable, IAsyncDisposable
 {
     // Query execution
+    QueryResult ExecuteWithOptions(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default);
+    Task<QueryResult> ExecuteWithOptionsAsync(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default);
     QueryResult Execute(string query);
     Task<QueryResult> ExecuteAsync(string query, CancellationToken ct = default);
     QueryResult ExecuteWithParams(string query, Dictionary<string, object?> parameters);
     QueryResult ExecuteLanguage(string language, string query, Dictionary<string, object?>? parameters = null);
+
+    ResultStream ExecuteStreamWithOptions(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default);
+    Task<ResultStream> ExecuteStreamWithOptionsAsync(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default);
+
+    // Owned bounded change pages
+    bool CdcEnabled { get; set; }
+    ChangePage ChangesAfter(byte[]? cursor, int maxEvents, int maxBytes);
+    ChangePage NodeHistoryAfter(ulong id, ulong sinceEpoch, byte[]? cursor, int maxEvents, int maxBytes);
+    ChangePage EdgeHistoryAfter(ulong id, ulong sinceEpoch, byte[]? cursor, int maxEvents, int maxBytes);
 
     // Transactions
     ITransaction BeginTransaction();
@@ -30,6 +45,11 @@ public interface IGrafeoDB : IDisposable, IAsyncDisposable
     bool DeleteEdge(long id);
     void SetEdgeProperty(long id, string key, object? value);
     bool RemoveEdgeProperty(long id, string key);
+
+    // Catalog-owned index mutations
+    uint CreateIndex(CreateIndexRequest request);
+    bool DropIndex(uint owner);
+    void RebuildIndex(uint owner);
 
     // Admin
     long NodeCount { get; }

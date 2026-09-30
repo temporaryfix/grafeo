@@ -15,6 +15,7 @@ import 'ffi/bindings.dart';
 ///   Ok=0, ErrorDatabase=1, ErrorQuery=2, ErrorTransaction=3, ErrorStorage=4,
 ///   ErrorIo=5, ErrorSerialization=6, ErrorInternal=7, ErrorNullPointer=8,
 ///   ErrorInvalidUtf8=9.
+///   ErrorCancelled=10, ErrorDeadline=11, ErrorResourceLimit=12.
 enum GrafeoStatus {
   ok(0),
   database(1),
@@ -25,7 +26,10 @@ enum GrafeoStatus {
   serialization(6),
   internal(7),
   nullPointer(8),
-  invalidUtf8(9);
+  invalidUtf8(9),
+  cancelled(10),
+  deadline(11),
+  resourceLimit(12);
 
   final int code;
   const GrafeoStatus(this.code);
@@ -38,7 +42,9 @@ enum GrafeoStatus {
 sealed class GrafeoException implements Exception {
   final String message;
   final GrafeoStatus status;
-  const GrafeoException(this.message, this.status);
+  final String? code;
+  final GrafeoException? cleanup;
+  const GrafeoException(this.message, this.status, {this.code, this.cleanup});
 
   @override
   String toString() => '$runtimeType(${status.name}): $message';
@@ -46,43 +52,60 @@ sealed class GrafeoException implements Exception {
 
 /// A query parsing or execution error (status 2).
 class QueryException extends GrafeoException {
-  const QueryException(super.message, super.status);
+  const QueryException(super.message, super.status,
+      {super.code, super.cleanup});
 }
 
 /// A transaction error such as conflict or invalid state (status 3).
 class TransactionException extends GrafeoException {
-  const TransactionException(super.message, super.status);
+  const TransactionException(super.message, super.status,
+      {super.code, super.cleanup});
 }
 
 /// A storage or IO error (status 4, 5).
 class StorageException extends GrafeoException {
-  const StorageException(super.message, super.status);
+  const StorageException(super.message, super.status,
+      {super.code, super.cleanup});
 }
 
 /// A serialization error (status 6).
 class SerializationException extends GrafeoException {
-  const SerializationException(super.message, super.status);
+  const SerializationException(super.message, super.status,
+      {super.code, super.cleanup});
 }
 
 /// A generic database error (status 1, 7, 8, 9, or unknown).
 class DatabaseException extends GrafeoException {
   /// Creates a [DatabaseException] with [message] and [status].
-  const DatabaseException(super.message, super.status);
+  const DatabaseException(super.message, super.status,
+      {super.code, super.cleanup});
 }
 
 /// Map a C status code and error message to a typed Dart exception.
 ///
 /// Mirrors `grafeo-bindings-common::error::classify_error`.
-GrafeoException classifyError(int statusCode, String message) {
-  final status = GrafeoStatus.fromCode(statusCode);
+GrafeoException classifyError(int statusCode, String message,
+    {String? code, GrafeoException? cleanup}) {
+  final status = switch (code) {
+    'GRAFEO-Q007' => GrafeoStatus.cancelled,
+    'GRAFEO-Q003' => GrafeoStatus.deadline,
+    'GRAFEO-S001' => GrafeoStatus.resourceLimit,
+    _ => GrafeoStatus.fromCode(statusCode),
+  };
   return switch (status) {
-    GrafeoStatus.query => QueryException(message, status),
-    GrafeoStatus.transaction => TransactionException(message, status),
+    GrafeoStatus.query ||
+    GrafeoStatus.cancelled ||
+    GrafeoStatus.deadline =>
+      QueryException(message, status, code: code, cleanup: cleanup),
+    GrafeoStatus.transaction =>
+      TransactionException(message, status, code: code, cleanup: cleanup),
+    GrafeoStatus.resourceLimit ||
     GrafeoStatus.storage ||
     GrafeoStatus.io =>
-      StorageException(message, status),
-    GrafeoStatus.serialization => SerializationException(message, status),
-    _ => DatabaseException(message, status),
+      StorageException(message, status, code: code, cleanup: cleanup),
+    GrafeoStatus.serialization =>
+      SerializationException(message, status, code: code, cleanup: cleanup),
+    _ => DatabaseException(message, status, code: code, cleanup: cleanup),
   };
 }
 
@@ -99,13 +122,23 @@ String lastError(GrafeoBindings bindings) {
 
 /// Throw a [GrafeoException] for a failed FFI call that returned a status code.
 Never throwStatus(GrafeoBindings bindings, int statusCode) {
-  throw classifyError(statusCode, lastError(bindings));
+  throw captureError(bindings, statusCode);
 }
 
 /// Throw a [GrafeoException] for a failed FFI call that returned null.
 Never throwLastError(GrafeoBindings bindings) {
-  throw DatabaseException(
-    lastError(bindings),
-    GrafeoStatus.database,
-  );
+  throw captureError(bindings);
 }
+
+/// Copies both native thread-local fields before leaving the executing isolate.
+GrafeoException captureError(GrafeoBindings bindings, [int statusCode = 1]) {
+  final message = lastError(bindings);
+  final pointer = bindings.grafeoLastErrorCode();
+  return classifyError(statusCode, message,
+      code: pointer == nullptr ? null : pointer.toDartString());
+}
+
+GrafeoException retainCleanup(
+        GrafeoException primary, GrafeoException cleanup) =>
+    classifyError(primary.status.code, primary.message,
+        code: primary.code, cleanup: cleanup);

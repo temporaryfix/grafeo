@@ -21,8 +21,11 @@
 /// ```
 library;
 
+export 'src/cdc.dart';
 export 'src/database.dart';
 export 'src/error.dart';
+export 'src/execution.dart' show ExecutionOptions, QueryControl;
+export 'src/index_request.dart';
 export 'src/stream.dart';
 export 'src/transaction.dart';
 export 'src/types.dart';

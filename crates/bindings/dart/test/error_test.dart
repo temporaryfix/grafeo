@@ -41,11 +41,13 @@ void main() {
     test('classifyError returns StorageException for status 4', () {
       final ex = classifyError(4, 'disk full');
       expect(ex, isA<StorageException>());
+      expect(ex.status, equals(GrafeoStatus.storage));
     });
 
     test('classifyError returns StorageException for IO status 5', () {
       final ex = classifyError(5, 'io error');
       expect(ex, isA<StorageException>());
+      expect(ex.status, equals(GrafeoStatus.io));
     });
 
     test('classifyError returns SerializationException for status 6', () {
@@ -56,6 +58,22 @@ void main() {
     test('classifyError returns DatabaseException for status 1', () {
       final ex = classifyError(1, 'db error');
       expect(ex, isA<DatabaseException>());
+    });
+
+    test('classifyError preserves exact new status codes', () {
+      for (final entry in {
+        10: GrafeoStatus.cancelled,
+        11: GrafeoStatus.deadline,
+        12: GrafeoStatus.resourceLimit,
+      }.entries) {
+        final ex = classifyError(entry.key, 'limit');
+        if (entry.key == 12) {
+          expect(ex, isA<StorageException>());
+        } else {
+          expect(ex, isA<QueryException>());
+        }
+        expect(ex.status, equals(entry.value));
+      }
     });
 
     test('classifyError returns DatabaseException for unknown status', () {

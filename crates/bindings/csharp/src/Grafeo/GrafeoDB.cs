@@ -32,6 +32,8 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
 {
     private readonly DatabaseHandle _handle;
     private volatile bool _disposed;
+    private readonly object _gate = new();
+    private int _active;
 
     private GrafeoDB(DatabaseHandle handle) => _handle = handle;
 
@@ -68,9 +70,17 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _handle.Dispose();
+        if (!Monitor.TryEnter(_gate)) throw Busy();
+        try
+        {
+            if (_disposed) return;
+            if (_active != 0) throw Busy();
+            GrafeoException.ThrowIfFailed(NativeMethods.grafeo_close(_handle.DangerousGetHandle()));
+            _handle.Closed = true;
+            _disposed = true;
+            _handle.Dispose();
+        }
+        finally { Monitor.Exit(_gate); }
     }
 
     /// <inheritdoc/>
@@ -84,205 +94,123 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     // Query Execution
     // =========================================================================
 
-    /// <summary>Execute a GQL query synchronously.</summary>
-    public QueryResult Execute(string query)
+    /// <summary>Execute a query with cancellation, a single-use owner, and result limits.</summary>
+    public QueryResult ExecuteWithOptions(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        var resultPtr = NativeMethods.grafeo_execute(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
+        using var prepared = Prepare(query, options, parameters, cancellationToken);
+        return prepared.Execute(false);
     }
 
-    /// <summary>
-    /// Open a lazy cursor over a read-only GQL query. Memory is bounded to
-    /// one chunk at a time regardless of total result size.
-    /// Rejects mutations, EXPLAIN / PROFILE, session/schema commands, and
-    /// queries that compile to push-based pipelines (ORDER BY, aggregate,
-    /// DISTINCT). Use <see cref="Execute(string)"/> for those.
-    /// Experimental (0.5.40+): signature may change before Beta.
-    /// </summary>
-    public ResultStream ExecuteStream(string query)
+    /// <summary>Reserve the database and query owner before scheduling native execution.</summary>
+    public Task<QueryResult> ExecuteWithOptionsAsync(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        var streamPtr = NativeMethods.grafeo_stream_open(Handle, query);
-        if (streamPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-
-        // Read columns once; the JSON string is heap-allocated and must be freed.
-        // Any failure past this point must free streamPtr before propagating.
+        var prepared = Prepare(query, options, parameters, cancellationToken);
         try
         {
-            var colsPtr = NativeMethods.grafeo_stream_columns_json(streamPtr);
-            if (colsPtr == nint.Zero)
-            {
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            }
-            IReadOnlyList<string> columns;
-            try
-            {
-                var json = Marshal.PtrToStringUTF8(colsPtr) ?? "[]";
-                columns = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json)
-                    ?? new List<string>();
-            }
-            finally
-            {
-                NativeMethods.grafeo_free_string(colsPtr);
-            }
-            return new ResultStream(streamPtr, columns);
+            return Task.Run(() => { using (prepared) return prepared.Execute(false); }, CancellationToken.None);
         }
-        catch
-        {
-            NativeMethods.grafeo_stream_free(streamPtr);
-            throw;
-        }
+        catch { prepared.Dispose(); throw; }
     }
 
-    /// <summary>Execute a GQL query on the thread pool.</summary>
-    public Task<QueryResult> ExecuteAsync(string query, CancellationToken ct = default)
+    private PreparedQuery Prepare(string query, ExecutionOptions? options,
+        Dictionary<string, object?>? parameters, CancellationToken token, bool streaming = false)
     {
-        ThrowIfDisposed();
-        var h = Handle;
-        return Task.Run(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-            var resultPtr = NativeMethods.grafeo_execute(h, query);
-            if (resultPtr == nint.Zero)
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            return BuildResult(resultPtr);
-        }, ct);
+        var lease = Acquire();
+        return PreparedQuery.Create(lease, lease.Pointer, query,
+            () => parameters is null ? null : ValueConverter.EncodeParams(parameters), options, token, streaming);
     }
+
+    /// <summary>Execute a GQL query synchronously.</summary>
+    public QueryResult Execute(string query) => ExecuteWithOptions(query);
+
+    /// <summary>Execute a GQL query on the thread pool with native cancellation.</summary>
+    public Task<QueryResult> ExecuteAsync(string query, CancellationToken ct = default)
+        => ExecuteWithOptionsAsync(query, cancellationToken: ct);
 
     /// <summary>Execute a GQL query with parameters.</summary>
     public QueryResult ExecuteWithParams(string query, Dictionary<string, object?> parameters)
+        => ExecuteWithOptions(query, parameters: parameters);
+
+    /// <summary>Execute a parameterized query on the thread pool.</summary>
+    public Task<QueryResult> ExecuteWithParamsAsync(string query,
+        Dictionary<string, object?> parameters, CancellationToken ct = default)
+        => ExecuteWithOptionsAsync(query, parameters: parameters, cancellationToken: ct);
+
+    /// <summary>Execute a query in the given language with optional typed parameters.</summary>
+    public QueryResult ExecuteLanguage(string language, string query, Dictionary<string, object?>? parameters = null)
+        => ExecuteWithOptions(query, new ExecutionOptions { Language = language }, parameters);
+
+    /// <summary>Execute a query in the given language on the thread pool.</summary>
+    public Task<QueryResult> ExecuteLanguageAsync(string language, string query,
+        Dictionary<string, object?>? parameters = null, CancellationToken ct = default)
+        => ExecuteWithOptionsAsync(query, new ExecutionOptions { Language = language }, parameters, ct);
+
+    /// <summary>Open a bounded lazy cursor over a read-only query.</summary>
+    public ResultStream ExecuteStream(string query) => ExecuteStreamWithOptions(query);
+
+    /// <summary>Open a bounded lazy cursor with cancellation and execution limits.</summary>
+    public ResultStream ExecuteStreamWithOptions(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        var paramsJson = ValueConverter.EncodeParams(parameters);
-        var resultPtr = NativeMethods.grafeo_execute_with_params(Handle, query, paramsJson);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
+        using var prepared = Prepare(query, options, parameters, cancellationToken, true);
+        return prepared.OpenStream();
     }
 
-    /// <summary>Execute a GQL query with parameters on the thread pool.</summary>
-    public Task<QueryResult> ExecuteWithParamsAsync(
-        string query,
-        Dictionary<string, object?> parameters,
-        CancellationToken ct = default)
+    /// <summary>Reserve the query owner before scheduling a lazy cursor opener.</summary>
+    public Task<ResultStream> ExecuteStreamWithOptionsAsync(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        var paramsJson = ValueConverter.EncodeParams(parameters);
-        var h = Handle;
-        return Task.Run(() =>
+        var prepared = Prepare(query, options, parameters, cancellationToken, true);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var resultPtr = NativeMethods.grafeo_execute_with_params(h, query, paramsJson);
-            if (resultPtr == nint.Zero)
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            return BuildResult(resultPtr);
-        }, ct);
+            return Task.Run(() => { using (prepared) return prepared.OpenStream(); }, CancellationToken.None);
+        }
+        catch { prepared.Dispose(); throw; }
     }
 
     /// <summary>Execute a Cypher query.</summary>
-    public QueryResult ExecuteCypher(string query)
-    {
-        ThrowIfDisposed();
-        var resultPtr = NativeMethods.grafeo_execute_cypher(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+    public QueryResult ExecuteCypher(string query) => ExecuteLanguage("cypher", query);
 
     /// <summary>Execute a Cypher query on the thread pool.</summary>
     public Task<QueryResult> ExecuteCypherAsync(string query, CancellationToken ct = default)
-        => ExecuteLanguageAsync(NativeMethods.grafeo_execute_cypher, query, ct);
+        => ExecuteLanguageAsync("cypher", query, ct: ct);
 
-    /// <summary>Execute a SPARQL query.</summary>
-    public QueryResult ExecuteSparql(string query)
-    {
-        ThrowIfDisposed();
-        var resultPtr = NativeMethods.grafeo_execute_sparql(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+    /// <summary>Execute a Sparql query.</summary>
+    public QueryResult ExecuteSparql(string query) => ExecuteLanguage("sparql", query);
 
-    /// <summary>Execute a SPARQL query on the thread pool.</summary>
+    /// <summary>Execute a Sparql query on the thread pool.</summary>
     public Task<QueryResult> ExecuteSparqlAsync(string query, CancellationToken ct = default)
-        => ExecuteLanguageAsync(NativeMethods.grafeo_execute_sparql, query, ct);
+        => ExecuteLanguageAsync("sparql", query, ct: ct);
 
     /// <summary>Execute a Gremlin query.</summary>
-    public QueryResult ExecuteGremlin(string query)
-    {
-        ThrowIfDisposed();
-        var resultPtr = NativeMethods.grafeo_execute_gremlin(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+    public QueryResult ExecuteGremlin(string query) => ExecuteLanguage("gremlin", query);
 
     /// <summary>Execute a Gremlin query on the thread pool.</summary>
     public Task<QueryResult> ExecuteGremlinAsync(string query, CancellationToken ct = default)
-        => ExecuteLanguageAsync(NativeMethods.grafeo_execute_gremlin, query, ct);
+        => ExecuteLanguageAsync("gremlin", query, ct: ct);
 
-    /// <summary>Execute a GraphQL query.</summary>
-    public QueryResult ExecuteGraphql(string query)
-    {
-        ThrowIfDisposed();
-        var resultPtr = NativeMethods.grafeo_execute_graphql(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+    /// <summary>Execute a Graphql query.</summary>
+    public QueryResult ExecuteGraphql(string query) => ExecuteLanguage("graphql", query);
 
-    /// <summary>Execute a GraphQL query on the thread pool.</summary>
+    /// <summary>Execute a Graphql query on the thread pool.</summary>
     public Task<QueryResult> ExecuteGraphqlAsync(string query, CancellationToken ct = default)
-        => ExecuteLanguageAsync(NativeMethods.grafeo_execute_graphql, query, ct);
+        => ExecuteLanguageAsync("graphql", query, ct: ct);
 
-    /// <summary>Execute a SQL/PGQ query.</summary>
-    public QueryResult ExecuteSql(string query)
-    {
-        ThrowIfDisposed();
-        var resultPtr = NativeMethods.grafeo_execute_sql(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+    /// <summary>Execute a Sql query.</summary>
+    public QueryResult ExecuteSql(string query) => ExecuteLanguage("sql", query);
 
-    /// <summary>Execute a SQL/PGQ query on the thread pool.</summary>
+    /// <summary>Execute a Sql query on the thread pool.</summary>
     public Task<QueryResult> ExecuteSqlAsync(string query, CancellationToken ct = default)
-        => ExecuteLanguageAsync(NativeMethods.grafeo_execute_sql, query, ct);
-
-    /// <summary>
-    /// Execute a query in any supported language, optionally with parameters.
-    /// </summary>
-    /// <param name="language">Query language: "gql", "cypher", "gremlin", "graphql", "sparql", "sql", etc.</param>
-    /// <param name="query">The query string.</param>
-    /// <param name="parameters">Optional typed parameters to bind.</param>
-    public QueryResult ExecuteLanguage(
-        string language, string query, Dictionary<string, object?>? parameters = null)
-    {
-        ThrowIfDisposed();
-        string? paramsJson = parameters is not null ? ValueConverter.EncodeParams(parameters) : null;
-        var resultPtr = NativeMethods.grafeo_execute_language(Handle, language, query, paramsJson);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+        => ExecuteLanguageAsync("sql", query, ct: ct);
 
     // =========================================================================
     // Transactions
     // =========================================================================
 
     /// <summary>Begin a new ACID transaction with the default isolation level.</summary>
-    public Transaction BeginTransaction()
-    {
-        ThrowIfDisposed();
-        var txPtr = NativeMethods.grafeo_begin_transaction(Handle);
-        if (txPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
-        return new Transaction(txPtr);
-    }
+    public Transaction BeginTransaction() => BeginTransactionCore(NativeMethods.grafeo_begin_transaction);
 
     /// <summary>Begin a transaction with a specific isolation level.</summary>
     /// <param name="isolationLevel">
@@ -292,22 +220,30 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// </param>
     public Transaction BeginTransaction(string isolationLevel)
     {
-        ThrowIfDisposed();
         var level = ParseIsolationLevel(isolationLevel);
-        var txPtr = NativeMethods.grafeo_begin_transaction_with_isolation(Handle, level);
-        if (txPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
-        return new Transaction(txPtr);
+        return BeginTransactionCore(pointer => NativeMethods.grafeo_begin_transaction_with_isolation(pointer, level));
     }
 
     /// <summary>Begin a transaction with a specific isolation level.</summary>
     public Transaction BeginTransaction(IsolationLevel isolationLevel)
+        => BeginTransactionCore(pointer => NativeMethods.grafeo_begin_transaction_with_isolation(pointer, (int)isolationLevel));
+
+    private Transaction BeginTransactionCore(Func<nint, nint> begin)
     {
-        ThrowIfDisposed();
-        var txPtr = NativeMethods.grafeo_begin_transaction_with_isolation(Handle, (int)isolationLevel);
-        if (txPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
-        return new Transaction(txPtr);
+        var lease = Acquire();
+        nint pointer = nint.Zero;
+        try
+        {
+            pointer = begin(lease.Pointer);
+            if (pointer == nint.Zero) throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
+            return new Transaction(pointer, lease);
+        }
+        catch
+        {
+            if (pointer != nint.Zero) NativeMethods.grafeo_free_transaction(pointer);
+            lease.Dispose();
+            throw;
+        }
     }
 
     // Explicit interface implementations for ITransaction return type
@@ -321,10 +257,10 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Create a node with labels and optional properties. Returns the new node ID.</summary>
     public long CreateNode(IEnumerable<string> labels, Dictionary<string, object?>? properties = null)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         var labelsJson = System.Text.Json.JsonSerializer.Serialize(labels);
         var propsJson = properties is not null ? ValueConverter.EncodeParams(properties) : null;
-        var id = NativeMethods.grafeo_create_node(Handle, labelsJson, propsJson);
+        var id = NativeMethods.grafeo_create_node(lease.Pointer, labelsJson, propsJson);
         if (id == ulong.MaxValue)
             throw GrafeoException.FromLastError();
         return (long)id;
@@ -333,8 +269,8 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Get a node by ID. Returns null if not found.</summary>
     public Node? GetNode(long id)
     {
-        ThrowIfDisposed();
-        var status = NativeMethods.grafeo_get_node(Handle, (ulong)id, out var nodePtr);
+        using var lease = Acquire();
+        var status = NativeMethods.grafeo_get_node(lease.Pointer, (ulong)id, out var nodePtr);
         if (status != (int)GrafeoStatus.Ok)
             return null;
         try
@@ -350,38 +286,38 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Delete a node by ID. Returns true if deleted.</summary>
     public bool DeleteNode(long id)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_delete_node(Handle, (ulong)id) == 1;
+        using var lease = Acquire();
+        return NativeMethods.grafeo_delete_node(lease.Pointer, (ulong)id) == 1;
     }
 
     /// <summary>Set a property on a node.</summary>
     public void SetNodeProperty(long id, string key, object? value)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         var valueJson = ValueConverter.EncodeValue(value);
         GrafeoException.ThrowIfFailed(
-            NativeMethods.grafeo_set_node_property(Handle, (ulong)id, key, valueJson));
+            NativeMethods.grafeo_set_node_property(lease.Pointer, (ulong)id, key, valueJson));
     }
 
     /// <summary>Remove a property from a node. Returns true if removed.</summary>
     public bool RemoveNodeProperty(long id, string key)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_remove_node_property(Handle, (ulong)id, key) == 1;
+        using var lease = Acquire();
+        return NativeMethods.grafeo_remove_node_property(lease.Pointer, (ulong)id, key) == 1;
     }
 
     /// <summary>Add a label to a node. Returns true if added.</summary>
     public bool AddNodeLabel(long id, string label)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_add_node_label(Handle, (ulong)id, label) == 1;
+        using var lease = Acquire();
+        return NativeMethods.grafeo_add_node_label(lease.Pointer, (ulong)id, label) == 1;
     }
 
     /// <summary>Remove a label from a node. Returns true if removed.</summary>
     public bool RemoveNodeLabel(long id, string label)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_remove_node_label(Handle, (ulong)id, label) == 1;
+        using var lease = Acquire();
+        return NativeMethods.grafeo_remove_node_label(lease.Pointer, (ulong)id, label) == 1;
     }
 
     // =========================================================================
@@ -395,10 +331,10 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
         string edgeType,
         Dictionary<string, object?>? properties = null)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         var propsJson = properties is not null ? ValueConverter.EncodeParams(properties) : null;
         var id = NativeMethods.grafeo_create_edge(
-            Handle, (ulong)sourceId, (ulong)targetId, edgeType, propsJson);
+            lease.Pointer, (ulong)sourceId, (ulong)targetId, edgeType, propsJson);
         if (id == ulong.MaxValue)
             throw GrafeoException.FromLastError();
         return (long)id;
@@ -407,8 +343,8 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Get an edge by ID. Returns null if not found.</summary>
     public Edge? GetEdge(long id)
     {
-        ThrowIfDisposed();
-        var status = NativeMethods.grafeo_get_edge(Handle, (ulong)id, out var edgePtr);
+        using var lease = Acquire();
+        var status = NativeMethods.grafeo_get_edge(lease.Pointer, (ulong)id, out var edgePtr);
         if (status != (int)GrafeoStatus.Ok)
             return null;
         try
@@ -424,24 +360,24 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Delete an edge by ID. Returns true if deleted.</summary>
     public bool DeleteEdge(long id)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_delete_edge(Handle, (ulong)id) == 1;
+        using var lease = Acquire();
+        return NativeMethods.grafeo_delete_edge(lease.Pointer, (ulong)id) == 1;
     }
 
     /// <summary>Set a property on an edge.</summary>
     public void SetEdgeProperty(long id, string key, object? value)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         var valueJson = ValueConverter.EncodeValue(value);
         GrafeoException.ThrowIfFailed(
-            NativeMethods.grafeo_set_edge_property(Handle, (ulong)id, key, valueJson));
+            NativeMethods.grafeo_set_edge_property(lease.Pointer, (ulong)id, key, valueJson));
     }
 
     /// <summary>Remove a property from an edge. Returns true if removed.</summary>
     public bool RemoveEdgeProperty(long id, string key)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_remove_edge_property(Handle, (ulong)id, key) == 1;
+        using var lease = Acquire();
+        return NativeMethods.grafeo_remove_edge_property(lease.Pointer, (ulong)id, key) == 1;
     }
 
     // =========================================================================
@@ -453,8 +389,8 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     {
         get
         {
-            ThrowIfDisposed();
-            return (long)NativeMethods.grafeo_node_count(Handle);
+            using var lease = Acquire();
+            return (long)NativeMethods.grafeo_node_count(lease.Pointer);
         }
     }
 
@@ -463,16 +399,16 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     {
         get
         {
-            ThrowIfDisposed();
-            return (long)NativeMethods.grafeo_edge_count(Handle);
+            using var lease = Acquire();
+            return (long)NativeMethods.grafeo_edge_count(lease.Pointer);
         }
     }
 
     /// <summary>Get database info as a dictionary (version, node count, edge count, etc.).</summary>
     public IReadOnlyDictionary<string, object?> Info()
     {
-        ThrowIfDisposed();
-        var ptr = NativeMethods.grafeo_info(Handle);
+        using var lease = Acquire();
+        var ptr = NativeMethods.grafeo_info(lease.Pointer);
         if (ptr == nint.Zero)
             throw GrafeoException.FromLastError();
         try
@@ -499,15 +435,15 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Save the database to a file path.</summary>
     public void Save(string path)
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_save(Handle, path));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_save(lease.Pointer, path));
     }
 
     /// <summary>Clear all cached query plans, forcing re-parsing on next execution.</summary>
     public void ClearPlanCache()
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_clear_plan_cache(Handle));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_clear_plan_cache(lease.Pointer));
     }
 
     // =========================================================================
@@ -517,22 +453,22 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Set the current schema for subsequent queries.</summary>
     public void SetSchema(string name)
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_set_schema(Handle, name));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_set_schema(lease.Pointer, name));
     }
 
     /// <summary>Clear the current schema context.</summary>
     public void ResetSchema()
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_reset_schema(Handle));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_reset_schema(lease.Pointer));
     }
 
     /// <summary>Get the current schema name, or <c>null</c> if none is set.</summary>
     public string? CurrentSchema()
     {
-        ThrowIfDisposed();
-        var ptr = NativeMethods.grafeo_current_schema(Handle);
+        using var lease = Acquire();
+        var ptr = NativeMethods.grafeo_current_schema(lease.Pointer);
         return ptr == nint.Zero ? null : Marshal.PtrToStringUTF8(ptr);
     }
 
@@ -543,15 +479,15 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <summary>Create a full backup at the given directory path.</summary>
     public void BackupFull(string path)
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_backup_full(Handle, path));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_backup_full(lease.Pointer, path));
     }
 
     /// <summary>Create an incremental backup at the given directory path.</summary>
     public void BackupIncremental(string path)
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_backup_incremental(Handle, path));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_backup_incremental(lease.Pointer, path));
     }
 
     /// <summary>Restore database to a specific epoch from a backup directory.</summary>
@@ -568,11 +504,15 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     // Maintenance
     // =========================================================================
 
-    /// <summary>Compact the database, reclaiming storage from deleted data.</summary>
+    /// <summary>Fold retained committed LPG history into a columnar base with a writable overlay.</summary>
+    /// <remarks>
+    /// Call again to fold later writes. Requires no active transactions or live Sessions.
+    /// This is not a durability checkpoint or a history-retention lease.
+    /// </remarks>
     public void Compact()
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_compact(Handle));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_compact(lease.Pointer));
     }
 
     // =========================================================================
@@ -586,7 +526,7 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <returns><c>true</c> if the projection was created.</returns>
     public bool CreateProjection(string name, IEnumerable<string>? nodeLabels = null, IEnumerable<string>? edgeTypes = null)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         var labels = nodeLabels?.ToArray() ?? [];
         var types = edgeTypes?.ToArray() ?? [];
 
@@ -604,7 +544,7 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
                 fixed (nint* tp = typePtrs.Length > 0 ? typePtrs : null)
                 {
                     return NativeMethods.grafeo_create_projection(
-                        Handle, namePtr,
+                        lease.Pointer, namePtr,
                         (nint)lp, (nuint)labels.Length,
                         (nint)tp, (nuint)types.Length);
                 }
@@ -622,15 +562,15 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     /// <returns><c>true</c> if the projection existed, <c>false</c> otherwise.</returns>
     public bool DropProjection(string name)
     {
-        ThrowIfDisposed();
-        return NativeMethods.grafeo_drop_projection(Handle, name);
+        using var lease = Acquire();
+        return NativeMethods.grafeo_drop_projection(lease.Pointer, name);
     }
 
     /// <summary>List all named graph projections as a JSON array.</summary>
     public string ListProjections()
     {
-        ThrowIfDisposed();
-        var ptr = NativeMethods.grafeo_list_projections(Handle);
+        using var lease = Acquire();
+        var ptr = NativeMethods.grafeo_list_projections(lease.Pointer);
         if (ptr == nint.Zero) return "[]";
         try
         {
@@ -651,37 +591,125 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     {
         get
         {
-            ThrowIfDisposed();
-            return NativeMethods.grafeo_is_cdc_enabled(Handle);
+            using var lease = Acquire();
+            return NativeMethods.grafeo_is_cdc_enabled(lease.Pointer);
         }
         set
         {
-            ThrowIfDisposed();
-            NativeMethods.grafeo_set_cdc_enabled(Handle, value);
+            using var lease = Acquire();
+            NativeMethods.grafeo_set_cdc_enabled(lease.Pointer, value);
         }
+    }
+
+    /// <summary>Read an owned bounded page. Null starts at the retained floor; other cursors
+    /// must contain 97 bytes. Both limits are positive. Bytes count native event encodings,
+    /// excluding JSON/page envelopes. An unchanged cursor means EOF.</summary>
+    public ChangePage ChangesAfter(byte[]? cursor, int maxEvents, int maxBytes) =>
+        ReadChangePage(cursor, maxEvents, maxBytes, NativeMethods.grafeo_changes_after);
+
+    /// <summary>Read node history at or after the inclusive epoch, with ChangesAfter bounds/ownership.</summary>
+    public ChangePage NodeHistoryAfter(ulong id, ulong sinceEpoch, byte[]? cursor, int maxEvents, int maxBytes) =>
+        ReadChangePage(cursor, maxEvents, maxBytes, (db, ptr, len, rows, bytes) =>
+            NativeMethods.grafeo_node_history_after(db, id, sinceEpoch, ptr, len, rows, bytes));
+
+    /// <summary>Read edge history at or after the inclusive epoch, with ChangesAfter bounds/ownership.</summary>
+    public ChangePage EdgeHistoryAfter(ulong id, ulong sinceEpoch, byte[]? cursor, int maxEvents, int maxBytes) =>
+        ReadChangePage(cursor, maxEvents, maxBytes, (db, ptr, len, rows, bytes) =>
+            NativeMethods.grafeo_edge_history_after(db, id, sinceEpoch, ptr, len, rows, bytes));
+
+    private ChangePage ReadChangePage(byte[]? cursor, int maxEvents, int maxBytes,
+        Func<nint, nint, nuint, nuint, nuint, nint> read)
+    {
+        using var lease = Acquire();
+        // Keep null distinct from an invalid empty cursor. Copy only canonical
+        // length input: native length validation runs before any pointer read.
+        var input = cursor is null ? nint.Zero : Marshal.AllocHGlobal(97);
+        try
+        {
+            if (cursor?.Length == 97) Marshal.Copy(cursor, 0, input, 97);
+            var page = read(lease.Pointer, input, (nuint)(cursor?.Length ?? 0),
+                (nuint)Math.Max(0, maxEvents), (nuint)Math.Max(0, maxBytes));
+            if (page == nint.Zero) throw GrafeoException.FromLastError();
+            try
+            {
+                var next = new byte[97];
+                Marshal.Copy(NativeMethods.grafeo_change_page_cursor(page), next, 0, next.Length);
+                var json = Marshal.PtrToStringUTF8(NativeMethods.grafeo_change_page_events_json(page))
+                    ?? throw new InvalidDataException("Native CDC page has no event JSON");
+                return new ChangePage(json, next);
+            }
+            finally { NativeMethods.grafeo_free_change_page(page); }
+        }
+        finally { if (input != nint.Zero) Marshal.FreeHGlobal(input); }
     }
 
     // =========================================================================
     // Vector Search
     // =========================================================================
 
-    /// <summary>Drop a vector index on the given label and property.</summary>
-    /// <returns><c>true</c> if the index was dropped, <c>false</c> if no such index existed.</returns>
-    public bool DropVectorIndex(string label, string property)
+    /// <summary>Create one graph-qualified catalog owner.</summary>
+    public uint CreateIndex(CreateIndexRequest request)
     {
-        ThrowIfDisposed();
-        var result = NativeMethods.grafeo_drop_vector_index(Handle, label, property);
-        if (result < 0)
-            throw GrafeoException.FromLastError();
-        return result == 1;
+        using var lease = Acquire();
+        ArgumentNullException.ThrowIfNull(request);
+        var allocations = new List<nint>();
+        try
+        {
+            var encoding = new System.Text.UTF8Encoding(false, true);
+            NativeUtf8 Span(string value)
+            {
+                ArgumentNullException.ThrowIfNull(value);
+                var bytes = encoding.GetBytes(value);
+                if (bytes.Length == 0) return default;
+                var pointer = Marshal.AllocHGlobal(bytes.Length);
+                allocations.Add(pointer);
+                Marshal.Copy(bytes, 0, pointer, bytes.Length);
+                return new NativeUtf8 { Data = pointer, Length = (nuint)bytes.Length };
+            }
+            var native = new NativeIndexRequest
+            {
+                Kind = (uint)request.Kind,
+                Property = Span(request.Property),
+                GraphCount = (nuint)request.Graph.Count,
+            };
+            if (request.Graph.Count != 0)
+            {
+                var stride = Marshal.SizeOf<NativeUtf8>();
+                native.Graph = Marshal.AllocHGlobal(checked(stride * request.Graph.Count));
+                allocations.Add(native.Graph);
+                for (var i = 0; i < request.Graph.Count; i++)
+                    Marshal.StructureToPtr(Span(request.Graph[i]), native.Graph + checked(i * stride), false);
+            }
+            if (request.Name is { } name) { native.Options |= 1; native.Name = Span(name); }
+            if (request.Label is { } label) { native.Options |= 2; native.Label = Span(label); }
+            if (request.Dimensions is { } dimensions) { native.Options |= 4; native.Dimensions = dimensions; }
+            if (request.Metric is { } metric) { native.Options |= 8; native.Metric = Span(metric); }
+            if (request.M is { } m) { native.Options |= 16; native.M = m; }
+            if (request.EfConstruction is { } ef) { native.Options |= 32; native.EfConstruction = ef; }
+            if (request.MinTokenLength is { } minimum) { native.Options |= 128; native.MinTokenLength = minimum; }
+            if (request.Quantization is { } quantization) { native.Options |= 64; native.Quantization = Span(quantization); }
+            GrafeoException.ThrowIfFailed(NativeMethods.grafeo_create_index(lease.Pointer, in native, out var owner));
+            return owner;
+        }
+        finally
+        {
+            foreach (var pointer in allocations) Marshal.FreeHGlobal(pointer);
+        }
     }
 
-    /// <summary>Rebuild a vector index on the given label and property.</summary>
-    public void RebuildVectorIndex(string label, string property)
+    /// <summary>Drop exactly this owner; absent owners return false.</summary>
+    public bool DropIndex(uint owner)
     {
-        ThrowIfDisposed();
-        GrafeoException.ThrowIfFailed(
-            NativeMethods.grafeo_rebuild_vector_index(Handle, label, property));
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_drop_index(lease.Pointer, owner, out var dropped));
+        return dropped != 0;
+    }
+
+    /// <summary>Rebuild this owner with its resolved configuration. Absence is an error.</summary>
+    public void RebuildIndex(uint owner)
+    {
+        using var lease = Acquire();
+        GrafeoException.ThrowIfFailed(NativeMethods.grafeo_rebuild_index(lease.Pointer, owner));
     }
 
     /// <summary>Perform a vector similarity search.</summary>
@@ -689,13 +717,13 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     public IReadOnlyList<VectorResult> VectorSearch(
         string label, string property, float[] query, int k, uint ef = 0)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         unsafe
         {
             fixed (float* queryPtr = query)
             {
                 var status = NativeMethods.grafeo_vector_search(
-                    Handle, label, property,
+                    lease.Pointer, label, property,
                     queryPtr, (nuint)query.Length, (nuint)k, ef,
                     out var idsPtr, out var distsPtr, out var count);
 
@@ -710,13 +738,13 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
         string label, string property, float[] query,
         int k, int fetchK, float lambda, int ef = 0)
     {
-        ThrowIfDisposed();
+        using var lease = Acquire();
         unsafe
         {
             fixed (float* queryPtr = query)
             {
                 var status = NativeMethods.grafeo_mmr_search(
-                    Handle, label, property,
+                    lease.Pointer, label, property,
                     queryPtr, (nuint)query.Length, (nuint)k,
                     fetchK, lambda, ef,
                     out var idsPtr, out var distsPtr, out var count);
@@ -731,36 +759,50 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     // Internals
     // =========================================================================
 
-    private Task<QueryResult> ExecuteLanguageAsync(
-        Func<nint, string, nint> nativeMethod,
-        string query,
-        CancellationToken ct)
-    {
-        ThrowIfDisposed();
-        var h = Handle;
-        return Task.Run(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-            var resultPtr = nativeMethod(h, query);
-            if (resultPtr == nint.Zero)
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            return BuildResult(resultPtr);
-        }, ct);
-    }
+    internal static GrafeoException Busy() => new("Native owner is busy", GrafeoStatus.Database);
 
-    /// <summary>Get the raw handle, checking for disposal first.</summary>
-    private nint Handle
+    internal NativeLease Acquire()
     {
-        get
+        if (!Monitor.TryEnter(_gate)) throw Busy();
+        try
         {
-            ThrowIfDisposed();
-            return _handle.DangerousGetHandle();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var lease = new NativeLease(this);
+            var retained = false;
+            try
+            {
+                _handle.DangerousAddRef(ref retained);
+                _active++;
+                return lease;
+            }
+            catch
+            {
+                if (retained) _handle.DangerousRelease();
+                throw;
+            }
         }
+        finally { Monitor.Exit(_gate); }
     }
 
-    private void ThrowIfDisposed()
+    internal sealed class NativeLease : IDisposable
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        private GrafeoDB? _owner;
+        internal nint Pointer { get; }
+        internal NativeLease(GrafeoDB owner)
+        {
+            _owner = owner;
+            Pointer = owner._handle.DangerousGetHandle();
+        }
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref _owner, null);
+            if (owner is null) return;
+            lock (owner._gate)
+            {
+                owner._handle.DangerousRelease();
+                owner._active--;
+            }
+        }
     }
 
     /// <summary>Parse a string isolation level name to the integer value expected by the C API.</summary>
@@ -775,28 +817,6 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
                 "Use \"read_committed\", \"snapshot\", or \"serializable\".",
                 nameof(isolationLevel)),
         };
-
-    /// <summary>Parse a native result pointer into a QueryResult, then free the native result.</summary>
-    private static QueryResult BuildResult(nint resultPtr)
-    {
-        try
-        {
-            var jsonPtr = NativeMethods.grafeo_result_json(resultPtr);
-            var json = Marshal.PtrToStringUTF8(jsonPtr) ?? "[]";
-            var executionTimeMs = NativeMethods.grafeo_result_execution_time_ms(resultPtr);
-            var rowsScanned = (long)NativeMethods.grafeo_result_rows_scanned(resultPtr);
-
-            var rows = ValueConverter.ParseRows(json);
-            var columns = ValueConverter.ExtractColumns(rows);
-            var (nodes, edges) = ValueConverter.ExtractEntities(rows);
-
-            return new QueryResult(columns, rows, nodes, edges, executionTimeMs, rowsScanned);
-        }
-        finally
-        {
-            NativeMethods.grafeo_free_result(resultPtr);
-        }
-    }
 
     /// <summary>Read a node from a native GrafeoNode pointer.</summary>
     private static Node ReadNode(nint nodePtr)
@@ -833,20 +853,94 @@ public sealed class GrafeoDB : IGrafeoDB, IDisposable, IAsyncDisposable
     private static IReadOnlyList<VectorResult> ReadVectorResults(
         nint idsPtr, nint distsPtr, nuint count)
     {
-        if (count == 0)
-            return Array.Empty<VectorResult>();
-
-        var results = new VectorResult[(int)count];
-        unsafe
+        try
         {
-            var ids = (ulong*)idsPtr;
-            var dists = (float*)distsPtr;
-            for (var i = 0; i < (int)count; i++)
+            if (count == 0) return Array.Empty<VectorResult>();
+            var length = checked((int)count);
+            var results = new VectorResult[length];
+            unsafe
             {
-                results[i] = new VectorResult((long)ids[i], dists[i]);
+                var ids = (ulong*)idsPtr;
+                var dists = (float*)distsPtr;
+                for (var i = 0; i < length; i++)
+                    results[i] = new VectorResult((long)ids[i], dists[i]);
             }
+            return results;
         }
-        NativeMethods.grafeo_free_vector_results(idsPtr, distsPtr, count);
-        return results;
+        finally
+        {
+            NativeMethods.grafeo_free_vector_results(idsPtr, distsPtr, count);
+        }
+    }
+}
+
+// Owns the handle reservation before serialization can invoke user code, and before
+// thread-pool scheduling. A stream takes over the invocation when its opener runs.
+internal sealed class PreparedQuery : IDisposable
+{
+    private readonly IDisposable _lease;
+    private readonly nint _pointer;
+    private readonly string _query;
+    private readonly string? _paramsJson;
+    private NativeInvocation? _invocation;
+
+    private PreparedQuery(IDisposable lease, nint pointer, string query, string? paramsJson, NativeInvocation invocation)
+    {
+        _lease = lease; _pointer = pointer; _query = query; _paramsJson = paramsJson; _invocation = invocation;
+    }
+
+    internal static PreparedQuery Create(IDisposable lease, nint pointer, string query,
+        Func<string?> encodeParams, ExecutionOptions? options, CancellationToken token, bool streaming = false)
+    {
+        NativeInvocation? invocation = null;
+        try
+        {
+            ValidateText(query, nameof(query));
+            var paramsJson = encodeParams();
+            if (paramsJson is not null)
+            {
+                ValidateText(paramsJson, nameof(paramsJson));
+                using var document = System.Text.Json.JsonDocument.Parse(paramsJson);
+                if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    throw new ArgumentException("Parameters must be a JSON object", nameof(paramsJson));
+            }
+            invocation = NativeInvocation.Create(options, token, streaming);
+            return new PreparedQuery(lease, pointer, query, paramsJson, invocation);
+        }
+        catch { invocation?.Dispose(); lease.Dispose(); throw; }
+    }
+
+    private static void ValidateText(string text, string name)
+    {
+        ArgumentNullException.ThrowIfNull(text, name);
+        if (text.Contains('\0')) throw new ArgumentException("Embedded NUL is not supported", name);
+        _ = new System.Text.UTF8Encoding(false, true).GetByteCount(text);
+    }
+
+    internal unsafe QueryResult Execute(bool transaction)
+    {
+        var invocation = _invocation!;
+        nint result;
+        fixed (QueryOptions* options = &invocation.Options)
+        {
+            result = transaction
+                ? NativeMethods.grafeo_transaction_execute_with_options(_pointer, _query, _paramsJson, (nint)options)
+                : NativeMethods.grafeo_execute_with_options(_pointer, _query, _paramsJson, (nint)options);
+            if (result == nint.Zero) throw invocation.CaptureError(GrafeoStatus.Query);
+        }
+        return QueryResultDecoder.Decode(result, invocation.CopyBytes);
+    }
+
+    internal ResultStream OpenStream()
+    {
+        var invocation = _invocation!;
+        _invocation = null;
+        return ResultStream.Open(_pointer, _query, _paramsJson, invocation);
+    }
+
+    public void Dispose()
+    {
+        try { Interlocked.Exchange(ref _invocation, null)?.Dispose(); }
+        finally { _lease.Dispose(); }
     }
 }

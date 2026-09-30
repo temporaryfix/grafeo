@@ -13,6 +13,10 @@ import (
 
 // CreateNode creates a node with the given labels and optional properties.
 func (db *Database) CreateNode(labels []string, properties map[string]any) (*Node, error) {
+	if err := db.acquire(); err != nil {
+		return nil, err
+	}
+	defer db.release()
 	labelsJSON, err := json.Marshal(labels)
 	if err != nil {
 		return nil, err
@@ -47,6 +51,10 @@ func (db *Database) CreateNode(labels []string, properties map[string]any) (*Nod
 
 // GetNode retrieves a node by ID. Returns nil if not found.
 func (db *Database) GetNode(id uint64) (*Node, error) {
+	if err := db.acquire(); err != nil {
+		return nil, err
+	}
+	defer db.release()
 	var cNode *C.GrafeoNode
 	runtime.LockOSThread()
 	status := C.grafeo_get_node(db.handle, C.uint64_t(id), &cNode)
@@ -80,6 +88,10 @@ func (db *Database) GetNode(id uint64) (*Node, error) {
 
 // DeleteNode deletes a node by ID. Returns true if the node existed.
 func (db *Database) DeleteNode(id uint64) (bool, error) {
+	if err := db.acquire(); err != nil {
+		return false, err
+	}
+	defer db.release()
 	runtime.LockOSThread()
 	result := int(C.grafeo_delete_node(db.handle, C.uint64_t(id)))
 	if result < 0 {
@@ -93,6 +105,10 @@ func (db *Database) DeleteNode(id uint64) (bool, error) {
 
 // SetNodeProperty sets a property on a node.
 func (db *Database) SetNodeProperty(id uint64, key string, value any) error {
+	if err := db.acquire(); err != nil {
+		return err
+	}
+	defer db.release()
 	cKey := C.CString(key)
 	defer C.free(unsafe.Pointer(cKey))
 	valueJSON, err := json.Marshal(value)
@@ -108,6 +124,10 @@ func (db *Database) SetNodeProperty(id uint64, key string, value any) error {
 
 // RemoveNodeProperty removes a property from a node.
 func (db *Database) RemoveNodeProperty(id uint64, key string) (bool, error) {
+	if err := db.acquire(); err != nil {
+		return false, err
+	}
+	defer db.release()
 	cKey := C.CString(key)
 	defer C.free(unsafe.Pointer(cKey))
 	runtime.LockOSThread()
@@ -123,6 +143,10 @@ func (db *Database) RemoveNodeProperty(id uint64, key string) (bool, error) {
 
 // AddNodeLabel adds a label to a node. Returns true if the label was newly added.
 func (db *Database) AddNodeLabel(id uint64, label string) (bool, error) {
+	if err := db.acquire(); err != nil {
+		return false, err
+	}
+	defer db.release()
 	cLabel := C.CString(label)
 	defer C.free(unsafe.Pointer(cLabel))
 	runtime.LockOSThread()
@@ -138,6 +162,10 @@ func (db *Database) AddNodeLabel(id uint64, label string) (bool, error) {
 
 // RemoveNodeLabel removes a label from a node. Returns true if the label was present.
 func (db *Database) RemoveNodeLabel(id uint64, label string) (bool, error) {
+	if err := db.acquire(); err != nil {
+		return false, err
+	}
+	defer db.release()
 	cLabel := C.CString(label)
 	defer C.free(unsafe.Pointer(cLabel))
 	runtime.LockOSThread()
@@ -154,6 +182,10 @@ func (db *Database) RemoveNodeLabel(id uint64, label string) (bool, error) {
 // GetNodeLabels returns all labels for a node. Returns (nil, nil) if the node
 // does not exist.
 func (db *Database) GetNodeLabels(id uint64) ([]string, error) {
+	if err := db.acquire(); err != nil {
+		return nil, err
+	}
+	defer db.release()
 	runtime.LockOSThread()
 	C.grafeo_clear_error()
 	cLabels := C.grafeo_get_node_labels(db.handle, C.uint64_t(id))

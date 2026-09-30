@@ -22,6 +22,9 @@ public enum GrafeoStatus
     Internal = 7,
     NullPointer = 8,
     InvalidUtf8 = 9,
+    Cancelled = 10,
+    Deadline = 11,
+    ResourceLimit = 12,
 }
 
 /// <summary>Base exception for all Grafeo errors.</summary>
@@ -29,6 +32,9 @@ public class GrafeoException : Exception
 {
     /// <summary>The native status code that produced this error.</summary>
     public GrafeoStatus Status { get; }
+
+    /// <summary>Stable native error code, when the native layer supplied one.</summary>
+    public string? Code { get; internal set; }
 
     public GrafeoException(string message, GrafeoStatus status)
         : base(message) => Status = status;
@@ -47,7 +53,18 @@ public class GrafeoException : Exception
         var message = errorPtr != nint.Zero
             ? Marshal.PtrToStringUTF8(errorPtr) ?? "Unknown error"
             : "Unknown error";
-        return Classify(fallbackStatus, message);
+        var codePtr = NativeMethods.grafeo_last_error_code();
+        var code = codePtr != nint.Zero ? Marshal.PtrToStringUTF8(codePtr) : null;
+        var status = code switch
+        {
+            "GRAFEO-Q007" => GrafeoStatus.Cancelled,
+            "GRAFEO-Q003" => GrafeoStatus.Deadline,
+            "GRAFEO-S001" => GrafeoStatus.ResourceLimit,
+            _ => fallbackStatus,
+        };
+        var error = Classify(status, message);
+        error.Code = code;
+        return error;
     }
 
     /// <summary>
@@ -60,9 +77,9 @@ public class GrafeoException : Exception
     internal static GrafeoException Classify(GrafeoStatus status, string message) =>
         status switch
         {
-            GrafeoStatus.Query => new QueryException(message),
+            GrafeoStatus.Query or GrafeoStatus.Cancelled or GrafeoStatus.Deadline => new QueryException(message, status),
             GrafeoStatus.Transaction => new TransactionException(message),
-            GrafeoStatus.Storage or GrafeoStatus.Io => new StorageException(message),
+            GrafeoStatus.Storage or GrafeoStatus.Io or GrafeoStatus.ResourceLimit => new StorageException(message, status),
             GrafeoStatus.Serialization => new SerializationException(message),
             _ => new GrafeoException(message, status),
         };
@@ -78,17 +95,32 @@ public class GrafeoException : Exception
 }
 
 /// <summary>Query parsing or execution error.</summary>
-public sealed class QueryException(string message)
-    : GrafeoException(message, GrafeoStatus.Query);
+public sealed class QueryException(string message, GrafeoStatus status = GrafeoStatus.Query)
+    : GrafeoException(message, status);
 
 /// <summary>Transaction lifecycle error (commit, rollback, isolation).</summary>
 public sealed class TransactionException(string message)
     : GrafeoException(message, GrafeoStatus.Transaction);
 
 /// <summary>Storage or I/O error (WAL, persistence, disk).</summary>
-public sealed class StorageException(string message)
-    : GrafeoException(message, GrafeoStatus.Storage);
+public sealed class StorageException(string message, GrafeoStatus status = GrafeoStatus.Storage)
+    : GrafeoException(message, status);
 
 /// <summary>JSON or value serialization error.</summary>
 public sealed class SerializationException(string message)
     : GrafeoException(message, GrafeoStatus.Serialization);
+
+/// <summary>A cancelled native execution, retaining its structured error code.</summary>
+public sealed class QueryCanceledException : OperationCanceledException
+{
+    public string? Code { get; }
+    public GrafeoStatus Status { get; }
+
+    public QueryCanceledException(string message, string? code,
+        CancellationToken cancellationToken = default, Exception? innerException = null)
+        : base(message, innerException, cancellationToken)
+    {
+        Code = code;
+        Status = GrafeoStatus.Cancelled;
+    }
+}

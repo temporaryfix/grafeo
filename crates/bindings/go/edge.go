@@ -13,6 +13,10 @@ import (
 
 // CreateEdge creates an edge between two nodes.
 func (db *Database) CreateEdge(sourceID, targetID uint64, edgeType string, properties map[string]any) (*Edge, error) {
+	if err := db.acquire(); err != nil {
+		return nil, err
+	}
+	defer db.release()
 	cType := C.CString(edgeType)
 	defer C.free(unsafe.Pointer(cType))
 
@@ -49,6 +53,10 @@ func (db *Database) CreateEdge(sourceID, targetID uint64, edgeType string, prope
 
 // GetEdge retrieves an edge by ID. Returns nil if not found.
 func (db *Database) GetEdge(id uint64) (*Edge, error) {
+	if err := db.acquire(); err != nil {
+		return nil, err
+	}
+	defer db.release()
 	var cEdge *C.GrafeoEdge
 	runtime.LockOSThread()
 	status := C.grafeo_get_edge(db.handle, C.uint64_t(id), &cEdge)
@@ -85,6 +93,10 @@ func (db *Database) GetEdge(id uint64) (*Edge, error) {
 
 // DeleteEdge deletes an edge by ID. Returns true if the edge existed.
 func (db *Database) DeleteEdge(id uint64) (bool, error) {
+	if err := db.acquire(); err != nil {
+		return false, err
+	}
+	defer db.release()
 	runtime.LockOSThread()
 	result := int(C.grafeo_delete_edge(db.handle, C.uint64_t(id)))
 	if result < 0 {
@@ -98,6 +110,10 @@ func (db *Database) DeleteEdge(id uint64) (bool, error) {
 
 // SetEdgeProperty sets a property on an edge.
 func (db *Database) SetEdgeProperty(id uint64, key string, value any) error {
+	if err := db.acquire(); err != nil {
+		return err
+	}
+	defer db.release()
 	cKey := C.CString(key)
 	defer C.free(unsafe.Pointer(cKey))
 	valueJSON, err := json.Marshal(value)
@@ -113,6 +129,10 @@ func (db *Database) SetEdgeProperty(id uint64, key string, value any) error {
 
 // RemoveEdgeProperty removes a property from an edge.
 func (db *Database) RemoveEdgeProperty(id uint64, key string) (bool, error) {
+	if err := db.acquire(); err != nil {
+		return false, err
+	}
+	defer db.release()
 	cKey := C.CString(key)
 	defer C.free(unsafe.Pointer(cKey))
 	runtime.LockOSThread()

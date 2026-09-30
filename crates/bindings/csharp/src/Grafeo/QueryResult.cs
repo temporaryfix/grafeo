@@ -43,3 +43,23 @@ public sealed record QueryResult(
 /// <param name="NodeId">The matching node's ID.</param>
 /// <param name="Distance">Distance from the query vector.</param>
 public sealed record VectorResult(long NodeId, double Distance);
+
+// One decoder owns and frees the complete native result, including on failure.
+internal static class QueryResultDecoder
+{
+    internal static QueryResult Decode(nint resultPtr, ulong maxBytes)
+    {
+        try
+        {
+            var remaining = maxBytes;
+            var json = Native.ManagedCopyBudget.ReadUtf8(Native.NativeMethods.grafeo_result_json(resultPtr), ref remaining);
+            var executionTime = Native.NativeMethods.grafeo_result_execution_time_ms(resultPtr);
+            var scanned = checked((long)Native.NativeMethods.grafeo_result_rows_scanned(resultPtr));
+            var rows = ValueConverter.ParseRows(json);
+            var columns = ValueConverter.ExtractColumns(rows);
+            var (nodes, edges) = ValueConverter.ExtractEntities(rows);
+            return new QueryResult(columns, rows, nodes, edges, executionTime, scanned);
+        }
+        finally { Native.NativeMethods.grafeo_free_result(resultPtr); }
+    }
+}

@@ -20,14 +20,12 @@ grafeo_compact
 grafeo_create_edge
 grafeo_create_node
 grafeo_create_projection
-grafeo_create_property_index
-grafeo_create_vector_index
+grafeo_create_index
 grafeo_current_schema
 grafeo_delete_edge
 grafeo_delete_node
 grafeo_drop_projection
-grafeo_drop_property_index
-grafeo_drop_vector_index
+grafeo_drop_index
 grafeo_edge_count
 grafeo_edge_id
 grafeo_edge_properties_json
@@ -73,7 +71,7 @@ grafeo_open
 grafeo_open_memory
 grafeo_open_read_only
 grafeo_open_single_file
-grafeo_rebuild_vector_index
+grafeo_rebuild_index
 grafeo_remove_edge_property
 grafeo_remove_node_label
 grafeo_remove_node_property
@@ -101,3 +99,10 @@ grafeo_transaction_execute_with_params
 grafeo_vector_search
 grafeo_version
 grafeo_wal_checkpoint
+grafeo_changes_after
+grafeo_node_history_after
+grafeo_edge_history_after
+grafeo_change_page_events_json
+grafeo_change_page_cursor
+grafeo_change_page_event_count
+grafeo_free_change_page

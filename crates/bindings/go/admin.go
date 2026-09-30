@@ -24,6 +24,10 @@ type DatabaseInfo struct {
 
 // Info returns high-level database information.
 func (db *Database) Info() (*DatabaseInfo, error) {
+	if err := db.acquire(); err != nil {
+		return nil, err
+	}
+	defer db.release()
 	runtime.LockOSThread()
 	cInfo := C.grafeo_info(db.handle)
 	if cInfo == nil {
@@ -43,6 +47,10 @@ func (db *Database) Info() (*DatabaseInfo, error) {
 
 // Save persists the database to the given path.
 func (db *Database) Save(path string) error {
+	if err := db.acquire(); err != nil {
+		return err
+	}
+	defer db.release()
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 	return lockAndCheckStatus(func() C.GrafeoStatus {
@@ -52,6 +60,10 @@ func (db *Database) Save(path string) error {
 
 // WalCheckpoint triggers a WAL checkpoint.
 func (db *Database) WalCheckpoint() error {
+	if err := db.acquire(); err != nil {
+		return err
+	}
+	defer db.release()
 	return lockAndCheckStatus(func() C.GrafeoStatus {
 		return C.grafeo_wal_checkpoint(db.handle)
 	})

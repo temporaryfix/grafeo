@@ -42,6 +42,28 @@ internal static partial class NativeMethods
     internal static partial nint grafeo_version();
 
     // =========================================================================
+    // Query control
+    // =========================================================================
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_query_control_create(long timeoutMs);
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_query_control_cancel_handle(nint control);
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_cancel_handle_clone(nint handle);
+
+    [LibraryImport(LibName)]
+    internal static partial int grafeo_cancel(nint handle);
+
+    [LibraryImport(LibName)]
+    internal static partial void grafeo_cancel_handle_free(nint handle);
+
+    [LibraryImport(LibName)]
+    internal static partial void grafeo_query_control_free(nint control);
+
+    // =========================================================================
     // Query Execution
     // =========================================================================
 
@@ -52,6 +74,14 @@ internal static partial class NativeMethods
     /// <summary>Execute a GQL query with JSON-encoded parameters.</summary>
     [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint grafeo_execute_with_params(nint db, string query, string paramsJson);
+
+    /// Execute with JSON parameters and an optional query-options struct.
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint grafeo_execute_with_options(nint db, string query, string? paramsJson, nint options);
+
+    /// Execute a transaction query with JSON parameters and optional options.
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint grafeo_transaction_execute_with_options(nint tx, string query, string? paramsJson, nint options);
 
     /// <summary>Execute a Cypher query.</summary>
     [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
@@ -133,6 +163,9 @@ internal static partial class NativeMethods
     [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint grafeo_stream_open(nint db, string query);
 
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint grafeo_stream_open_with_options(nint db, string query, string? paramsJson, nint options);
+
     /// <summary>Returns the column names as a JSON array. Caller must free with grafeo_free_string.</summary>
     [LibraryImport(LibName)]
     internal static partial nint grafeo_stream_columns_json(nint stream);
@@ -143,6 +176,12 @@ internal static partial class NativeMethods
     /// Returns non-zero: error (call grafeo_last_error).</summary>
     [LibraryImport(LibName)]
     internal static partial int grafeo_stream_next_row_json(nint stream, out nint outJson);
+
+    [LibraryImport(LibName)]
+    internal static partial int grafeo_stream_close(nint stream);
+
+    [LibraryImport(LibName)]
+    internal static partial int grafeo_stream_next_chunk(nint stream, nuint maxRows, out nint result);
 
     /// <summary>Frees a stream handle.</summary>
     [LibraryImport(LibName)]
@@ -264,13 +303,17 @@ internal static partial class NativeMethods
     // Indexes
     // =========================================================================
 
-    /// <summary>Create a property index on a property key.</summary>
-    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int grafeo_create_property_index(nint db, string property);
+    /// <summary>Create one catalog-owned index.</summary>
+    [LibraryImport(LibName)]
+    internal static partial int grafeo_create_index(nint db, in NativeIndexRequest request, out uint owner);
 
-    /// <summary>Drop a property index.</summary>
-    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int grafeo_drop_property_index(nint db, string property);
+    /// <summary>Drop an exact owner; writes 1 if removed, 0 if absent.</summary>
+    [LibraryImport(LibName)]
+    internal static partial int grafeo_drop_index(nint db, uint owner, out int dropped);
+
+    /// <summary>Rebuild an exact owner; a missing owner is an error.</summary>
+    [LibraryImport(LibName)]
+    internal static partial int grafeo_rebuild_index(nint db, uint owner);
 
     /// <summary>Check if a property index exists. Returns 1 if exists, 0 if not.</summary>
     [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
@@ -289,20 +332,6 @@ internal static partial class NativeMethods
     // =========================================================================
     // Vector Search
     // =========================================================================
-
-    /// <summary>Create a vector index.</summary>
-    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int grafeo_create_vector_index(
-        nint db, string label, string property,
-        int dimensions, string metric, int m, int efConstruction);
-
-    /// <summary>Drop a vector index.</summary>
-    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int grafeo_drop_vector_index(nint db, string label, string property);
-
-    /// <summary>Rebuild a vector index.</summary>
-    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int grafeo_rebuild_vector_index(nint db, string label, string property);
 
     /// <summary>Perform a vector search.</summary>
     [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
@@ -422,6 +451,27 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.U1)]
     internal static partial bool grafeo_is_cdc_enabled(nint db);
 
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_changes_after(nint db, nint cursor, nuint cursorLen,
+        nuint maxEvents, nuint maxBytes);
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_node_history_after(nint db, ulong id, ulong sinceEpoch,
+        nint cursor, nuint cursorLen, nuint maxEvents, nuint maxBytes);
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_edge_history_after(nint db, ulong id, ulong sinceEpoch,
+        nint cursor, nuint cursorLen, nuint maxEvents, nuint maxBytes);
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_change_page_events_json(nint page);
+
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_change_page_cursor(nint page);
+
+    [LibraryImport(LibName)]
+    internal static partial void grafeo_free_change_page(nint page);
+
     // =========================================================================
     // Transactions
     // =========================================================================
@@ -469,6 +519,10 @@ internal static partial class NativeMethods
     /// <summary>Clear the last error.</summary>
     [LibraryImport(LibName)]
     internal static partial void grafeo_clear_error();
+
+    /// Get the last structured error code. Pointer is static; do NOT free.
+    [LibraryImport(LibName)]
+    internal static partial nint grafeo_last_error_code();
 
     /// <summary>Free a string returned by the API (info, labels, etc.).</summary>
     [LibraryImport(LibName)]

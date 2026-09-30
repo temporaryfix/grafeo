@@ -1,177 +1,130 @@
-// ACID transaction handle with auto-rollback on dispose.
-
+// ACID transaction owner: one reserved native operation at a time.
 using System.Runtime.InteropServices;
-
 using Grafeo.Native;
 
 namespace Grafeo;
 
-/// <summary>
-/// An ACID transaction. Auto-rolls back on <see cref="Dispose"/> if
-/// <see cref="Commit"/> was not called, making it exception-safe:
-/// <code>
-/// using var tx = db.BeginTransaction();
-/// tx.Execute("INSERT (:Person {name: 'Alix'})");
-/// tx.Commit(); // if this line is not reached, the transaction rolls back
-/// </code>
-/// </summary>
+/// <summary>An ACID transaction, automatically rolled back when disposed unfinished.</summary>
 public sealed class Transaction : ITransaction, IDisposable, IAsyncDisposable
 {
     private readonly TransactionHandle _handle;
-    private volatile bool _finished;
-    private volatile bool _disposed;
+    private readonly object _gate = new();
+    private bool _active;
+    private bool _finished;
+    private bool _disposed;
 
-    internal Transaction(nint ptr)
+    internal Transaction(nint ptr, GrafeoDB.NativeLease parentLease)
     {
-        _handle = new TransactionHandle();
+        _handle = new TransactionHandle { ParentLease = parentLease };
         Marshal.InitHandle(_handle, ptr);
     }
 
-    // =========================================================================
-    // Query Execution
-    // =========================================================================
+    /// <summary>Execute a query with cancellation and bounded eager output.</summary>
+    public QueryResult ExecuteWithOptions(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
+    {
+        using var prepared = Prepare(query, () => parameters is null ? null : ValueConverter.EncodeParams(parameters),
+            options, cancellationToken);
+        return prepared.Execute(true);
+    }
+
+    /// <summary>Reserve transaction and query owners before scheduling native execution.</summary>
+    public Task<QueryResult> ExecuteWithOptionsAsync(string query, ExecutionOptions? options = null,
+        Dictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
+    {
+        var prepared = Prepare(query, () => parameters is null ? null : ValueConverter.EncodeParams(parameters),
+            options, cancellationToken);
+        return Schedule(prepared);
+    }
+
+    private PreparedQuery Prepare(string query, Func<string?> encodeParams,
+        ExecutionOptions? options, CancellationToken token)
+    {
+        var lease = Acquire();
+        return PreparedQuery.Create(lease, lease.Pointer, query, encodeParams, options, token);
+    }
+
+    private static Task<QueryResult> Schedule(PreparedQuery prepared)
+    {
+        try
+        {
+            return Task.Run(() => { using (prepared) return prepared.Execute(true); }, CancellationToken.None);
+        }
+        catch { prepared.Dispose(); throw; }
+    }
 
     /// <summary>Execute a GQL query within this transaction.</summary>
-    public QueryResult Execute(string query)
-    {
-        ThrowIfFinished();
-        var resultPtr = NativeMethods.grafeo_transaction_execute(Handle, query);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+    public QueryResult Execute(string query) => ExecuteWithOptions(query);
 
-    /// <summary>Execute a GQL query within this transaction on the thread pool.</summary>
+    /// <summary>Execute a GQL query on the thread pool with native cancellation.</summary>
     public Task<QueryResult> ExecuteAsync(string query, CancellationToken ct = default)
-    {
-        ThrowIfFinished();
-        var h = Handle;
-        return Task.Run(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-            var resultPtr = NativeMethods.grafeo_transaction_execute(h, query);
-            if (resultPtr == nint.Zero)
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            return BuildResult(resultPtr);
-        }, ct);
-    }
+        => ExecuteWithOptionsAsync(query, cancellationToken: ct);
 
-    /// <summary>Execute a GQL query with parameters within this transaction.</summary>
+    /// <summary>Execute a query with typed parameters.</summary>
     public QueryResult ExecuteWithParams(string query, Dictionary<string, object?> parameters)
-    {
-        ThrowIfFinished();
-        var paramsJson = ValueConverter.EncodeParams(parameters);
-        var resultPtr = NativeMethods.grafeo_transaction_execute_with_params(Handle, query, paramsJson);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
-    }
+        => ExecuteWithOptions(query, parameters: parameters);
 
-    /// <summary>Execute a GQL query with parameters within this transaction on the thread pool.</summary>
-    public Task<QueryResult> ExecuteWithParamsAsync(
-        string query,
-        Dictionary<string, object?> parameters,
-        CancellationToken ct = default)
-    {
-        ThrowIfFinished();
-        var paramsJson = ValueConverter.EncodeParams(parameters);
-        var h = Handle;
-        return Task.Run(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-            var resultPtr = NativeMethods.grafeo_transaction_execute_with_params(h, query, paramsJson);
-            if (resultPtr == nint.Zero)
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            return BuildResult(resultPtr);
-        }, ct);
-    }
+    /// <summary>Execute a parameterized query on the thread pool.</summary>
+    public Task<QueryResult> ExecuteWithParamsAsync(string query,
+        Dictionary<string, object?> parameters, CancellationToken ct = default)
+        => ExecuteWithOptionsAsync(query, parameters: parameters, cancellationToken: ct);
 
-    /// <summary>
-    /// Execute a query in the specified language within this transaction.
-    /// </summary>
-    /// <param name="language">Query language: "gql", "cypher", "gremlin", "graphql", "sparql", or "sql".</param>
-    /// <param name="query">The query string.</param>
-    /// <param name="paramsJson">Optional JSON-encoded parameters (null for none).</param>
+    /// <summary>Execute a query in the given language with optional JSON object parameters.</summary>
     public QueryResult ExecuteLanguage(string language, string query, string? paramsJson = null)
     {
-        ThrowIfFinished();
-        var resultPtr = NativeMethods.grafeo_transaction_execute_language(Handle, language, query, paramsJson);
-        if (resultPtr == nint.Zero)
-            throw GrafeoException.FromLastError(GrafeoStatus.Query);
-        return BuildResult(resultPtr);
+        using var prepared = Prepare(query, () => paramsJson, new ExecutionOptions { Language = language }, default);
+        return prepared.Execute(true);
     }
 
-    /// <summary>
-    /// Execute a query in the specified language within this transaction on the thread pool.
-    /// </summary>
-    /// <param name="language">Query language: "gql", "cypher", "gremlin", "graphql", "sparql", or "sql".</param>
-    /// <param name="query">The query string.</param>
-    /// <param name="paramsJson">Optional JSON-encoded parameters (null for none).</param>
-    /// <param name="ct">Cancellation token.</param>
-    public Task<QueryResult> ExecuteLanguageAsync(
-        string language,
-        string query,
-        string? paramsJson = null,
-        CancellationToken ct = default)
-    {
-        ThrowIfFinished();
-        var h = Handle;
-        return Task.Run(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-            var resultPtr = NativeMethods.grafeo_transaction_execute_language(h, language, query, paramsJson);
-            if (resultPtr == nint.Zero)
-                throw GrafeoException.FromLastError(GrafeoStatus.Query);
-            return BuildResult(resultPtr);
-        }, ct);
-    }
+    /// <summary>Execute a query in the given language on the thread pool.</summary>
+    public Task<QueryResult> ExecuteLanguageAsync(string language, string query,
+        string? paramsJson = null, CancellationToken ct = default)
+        => Schedule(Prepare(query, () => paramsJson, new ExecutionOptions { Language = language }, ct));
 
-    // =========================================================================
-    // Commit / Rollback
-    // =========================================================================
+    /// <summary>Commit the transaction and release its native owner on success.</summary>
+    public void Commit() => Complete(true);
 
-    /// <summary>Commit the transaction, making all changes permanent.</summary>
-    public void Commit()
-    {
-        ThrowIfFinished();
-        var h = Handle;
-        _finished = true;
-        var status = NativeMethods.grafeo_commit(h);
-        if (status != (int)GrafeoStatus.Ok)
-            throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
-        _handle.Committed = true;
-    }
-
-    /// <summary>Roll back the transaction, discarding all changes.</summary>
+    /// <summary>Roll back the transaction and release its native owner on success.</summary>
     public void Rollback()
     {
-        if (_finished) return;
-        var h = Handle;
-        _finished = true;
-        var status = NativeMethods.grafeo_rollback(h);
-        if (status != (int)GrafeoStatus.Ok)
-            throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
+        if (!Monitor.TryEnter(_gate)) throw GrafeoDB.Busy();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_active) throw GrafeoDB.Busy();
+            if (_finished) return;
+        }
+        finally { Monitor.Exit(_gate); }
+        Complete(false);
     }
 
-    // =========================================================================
-    // Dispose
-    // =========================================================================
+    private void Complete(bool commit)
+    {
+        using var lease = Acquire();
+        var status = commit ? NativeMethods.grafeo_commit(lease.Pointer) : NativeMethods.grafeo_rollback(lease.Pointer);
+        if (status != (int)GrafeoStatus.Ok)
+            throw GrafeoException.FromLastError(GrafeoStatus.Transaction);
+        lock (_gate)
+        {
+            _finished = true;
+            _handle.Committed = true; // Neither completed branch needs another rollback.
+            _handle.Dispose(); // The operation lease releases the final reference.
+        }
+    }
 
-    /// <summary>
-    /// Dispose the transaction. If <see cref="Commit"/> was not called,
-    /// the transaction is automatically rolled back.
-    /// </summary>
+    /// <summary>Roll back unfinished work. Reject disposal while a call is reserved.</summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        if (!_finished)
+        if (!Monitor.TryEnter(_gate)) throw GrafeoDB.Busy();
+        try
         {
-            // Best-effort rollback; swallow errors during dispose.
+            if (_disposed) return;
+            if (_active) throw GrafeoDB.Busy();
+            _disposed = true;
             _finished = true;
-            NativeMethods.grafeo_rollback(_handle.DangerousGetHandle());
+            _handle.Dispose();
         }
-        _handle.Dispose();
+        finally { Monitor.Exit(_gate); }
     }
 
     /// <inheritdoc/>
@@ -181,44 +134,49 @@ public sealed class Transaction : ITransaction, IDisposable, IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
-    // =========================================================================
-    // Internals
-    // =========================================================================
-
-    private nint Handle
+    private OperationLease Acquire()
     {
-        get
-        {
-            ThrowIfFinished();
-            return _handle.DangerousGetHandle();
-        }
-    }
-
-    private void ThrowIfFinished()
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_finished)
-            throw new TransactionException("Transaction is already committed or rolled back");
-    }
-
-    private static QueryResult BuildResult(nint resultPtr)
-    {
+        if (!Monitor.TryEnter(_gate)) throw GrafeoDB.Busy();
         try
         {
-            var jsonPtr = NativeMethods.grafeo_result_json(resultPtr);
-            var json = Marshal.PtrToStringUTF8(jsonPtr) ?? "[]";
-            var executionTimeMs = NativeMethods.grafeo_result_execution_time_ms(resultPtr);
-            var rowsScanned = (long)NativeMethods.grafeo_result_rows_scanned(resultPtr);
-
-            var rows = ValueConverter.ParseRows(json);
-            var columns = ValueConverter.ExtractColumns(rows);
-            var (nodes, edges) = ValueConverter.ExtractEntities(rows);
-
-            return new QueryResult(columns, rows, nodes, edges, executionTimeMs, rowsScanned);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_active) throw GrafeoDB.Busy();
+            if (_finished) throw new TransactionException("Transaction is already committed or rolled back");
+            var lease = new OperationLease(this);
+            var retained = false;
+            try
+            {
+                _handle.DangerousAddRef(ref retained);
+                _active = true;
+                return lease;
+            }
+            catch
+            {
+                if (retained) _handle.DangerousRelease();
+                throw;
+            }
         }
-        finally
+        finally { Monitor.Exit(_gate); }
+    }
+
+    private sealed class OperationLease : IDisposable
+    {
+        private Transaction? _owner;
+        internal nint Pointer { get; }
+        internal OperationLease(Transaction owner)
         {
-            NativeMethods.grafeo_free_result(resultPtr);
+            _owner = owner;
+            Pointer = owner._handle.DangerousGetHandle();
+        }
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref _owner, null);
+            if (owner is null) return;
+            lock (owner._gate)
+            {
+                owner._handle.DangerousRelease();
+                owner._active = false;
+            }
         }
     }
 }

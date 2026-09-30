@@ -3,6 +3,7 @@ package grafeo
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -374,7 +375,8 @@ func TestPropertyIndex(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.CreatePropertyIndex("name"); err != nil {
+	owner, err := db.CreateIndex(CreateIndexRequest{Kind: PropertyIndex, Property: "name"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if !db.HasPropertyIndex("name") {
@@ -392,7 +394,10 @@ func TestPropertyIndex(t *testing.T) {
 		t.Errorf("expected 1 result, got %d", len(ids))
 	}
 
-	dropped, _ := db.DropPropertyIndex("name")
+	dropped, err := db.DropIndex(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !dropped {
 		t.Error("expected index to be dropped")
 	}
@@ -402,6 +407,124 @@ func TestPropertyIndex(t *testing.T) {
 }
 
 // --- Vector Operations ---
+
+func TestIndexOwnerGraphQualificationAndErrors(t *testing.T) {
+	db, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Execute("CREATE GRAPH scoped"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := db.CreateIndex(CreateIndexRequest{Kind: PropertyIndex, Property: "name"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := db.CreateIndex(CreateIndexRequest{Kind: PropertyIndex, Property: "name", Graph: []string{"scoped"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == scoped {
+		t.Fatal("graph owners must be distinct")
+	}
+	if dropped, err := db.DropIndex(scoped); err != nil || !dropped {
+		t.Fatalf("drop: %v %v", dropped, err)
+	}
+	if err := db.RebuildIndex(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateIndex(CreateIndexRequest{Kind: PropertyIndex, Property: "unique", Graph: []string{"scoped\x00other"}}); err == nil {
+		t.Fatal("graph component must not truncate at NUL")
+	}
+	zero := uint(0)
+	if _, err := db.CreateIndex(CreateIndexRequest{Kind: PropertyIndex, Property: "bad", Dimensions: &zero}); err == nil {
+		t.Fatal("explicit zero vector option must not be silently discarded")
+	}
+}
+
+func TestTextIndexMinTokenLengthPresenceRebuildAndReopen(t *testing.T) {
+	db, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Execute("INSERT (:Doc {body: 'x ox fox lengthy', default_body: 'x ox fox lengthy', zero_body: 'x ox fox lengthy'})"); err != nil {
+		t.Fatal(err)
+	}
+	label := "Doc"
+	minimum, zero := uint(7), uint(0)
+	request := CreateIndexRequest{Kind: TextIndex, Label: &label, Property: "body", MinTokenLength: &minimum}
+	owner, err := db.CreateIndex(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []IndexKind{PropertyIndex, BTreeIndex, VectorIndex} {
+		invalid := CreateIndexRequest{Kind: kind, Property: "bad", MinTokenLength: &zero}
+		if kind == VectorIndex {
+			dimensions := uint(3)
+			invalid.Label, invalid.Dimensions = &label, &dimensions
+		}
+		if _, err := db.CreateIndex(invalid); err == nil {
+			t.Fatalf("kind %v silently accepted Text-only option", kind)
+		}
+	}
+	if _, err := db.CreateIndex(request); err == nil {
+		t.Fatal("duplicate Text owner must fail")
+	}
+	defaultOwner, err := db.CreateIndex(CreateIndexRequest{Kind: TextIndex, Label: &label, Property: "default_body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultOwner != owner+1 {
+		t.Fatal("rejected requests consumed owner IDs")
+	}
+	zeroOwner, err := db.CreateIndex(CreateIndexRequest{Kind: TextIndex, Label: &label, Property: "zero_body", MinTokenLength: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(candidate *Database) {
+		t.Helper()
+		for _, test := range []struct {
+			property, token string
+			count           int
+		}{
+			{"body", "fox", 0}, {"body", "lengthy", 1},
+			{"default_body", "x", 0}, {"default_body", "ox", 1}, {"zero_body", "x", 1},
+		} {
+			result, err := candidate.Execute(fmt.Sprintf("CALL grafeo.search.text('Doc', '%s', '%s', 10)", test.property, test.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Rows) != test.count {
+				t.Fatalf("%s/%s: expected %d matches, got %d", test.property, test.token, test.count, len(result.Rows))
+			}
+		}
+	}
+	check(db)
+	for _, id := range []IndexID{owner, defaultOwner, zeroOwner} {
+		if err := db.RebuildIndex(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(db)
+	path := filepath.Join(t.TempDir(), "text-options.grafeo")
+	if err := db.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	check(reopened)
+	for _, id := range []IndexID{owner, defaultOwner, zeroOwner} {
+		if err := reopened.RebuildIndex(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(reopened)
+}
 
 func TestVectorIndex(t *testing.T) {
 	db, err := OpenInMemory()
@@ -425,7 +548,8 @@ func TestVectorIndex(t *testing.T) {
 	}
 
 	// Create index.
-	if err := db.CreateVectorIndex("Doc", "embedding", WithDimensions(3)); err != nil {
+	label, dimensions := "Doc", uint(3)
+	if _, err := db.CreateIndex(CreateIndexRequest{Kind: VectorIndex, Label: &label, Property: "embedding", Dimensions: &dimensions}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -594,7 +718,11 @@ func TestVectorDropAndRebuild(t *testing.T) {
 		{1.0, 0.0, 0.0},
 		{0.0, 1.0, 0.0},
 	})
-	db.CreateVectorIndex("Doc", "emb", WithDimensions(3))
+	label, dimensions := "Doc", uint(3)
+	owner, err := db.CreateIndex(CreateIndexRequest{Kind: VectorIndex, Label: &label, Property: "emb", Dimensions: &dimensions})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Search works
 	results, err := db.VectorSearch("Doc", "emb", []float32{1.0, 0.0, 0.0}, 2)
@@ -605,14 +733,8 @@ func TestVectorDropAndRebuild(t *testing.T) {
 		t.Errorf("expected 2 results, got %d", len(results))
 	}
 
-	// Drop index
-	dropped := db.DropVectorIndex("Doc", "emb")
-	if !dropped {
-		t.Error("expected index to be dropped")
-	}
-
 	// Rebuild index
-	if err := db.RebuildVectorIndex("Doc", "emb"); err != nil {
+	if err := db.RebuildIndex(owner); err != nil {
 		t.Fatal(err)
 	}
 
@@ -623,6 +745,17 @@ func TestVectorDropAndRebuild(t *testing.T) {
 	}
 	if len(results2) != 2 {
 		t.Errorf("expected 2 results after rebuild, got %d", len(results2))
+	}
+	dropped, err := db.DropIndex(owner)
+	if err != nil || !dropped {
+		t.Fatalf("drop: %v, %v", dropped, err)
+	}
+	dropped, err = db.DropIndex(owner)
+	if err != nil || dropped {
+		t.Fatalf("missing drop: %v, %v", dropped, err)
+	}
+	if err := db.RebuildIndex(owner); err == nil {
+		t.Fatal("missing owner rebuild must fail")
 	}
 }
 

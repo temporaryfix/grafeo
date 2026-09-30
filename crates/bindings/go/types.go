@@ -2,11 +2,13 @@ package grafeo
 
 /*
 #include "grafeo.h"
+#include <string.h>
 */
 import "C"
 import (
 	"encoding/json"
 	"strings"
+	"unsafe"
 )
 
 // QueryResult holds the result of a query execution.
@@ -57,34 +59,35 @@ type VectorResult struct {
 	Distance float32
 }
 
-// VectorIndexOption configures vector index creation.
-type VectorIndexOption func(*vectorIndexConfig)
+// IndexID is the committed catalog owner returned by CreateIndex.
+type IndexID uint32
 
-type vectorIndexConfig struct {
-	dimensions     int32
-	metric         string
-	m              int32
-	efConstruction int32
-}
+// IndexKind identifies the requested index family.
+type IndexKind uint32
 
-// WithDimensions sets the vector dimensions.
-func WithDimensions(d int) VectorIndexOption {
-	return func(c *vectorIndexConfig) { c.dimensions = int32(d) }
-}
+const (
+	PropertyIndex IndexKind = iota
+	BTreeIndex
+	TextIndex
+	VectorIndex
+)
 
-// WithMetric sets the distance metric ("cosine", "euclidean", "dot_product", "manhattan").
-func WithMetric(m string) VectorIndexOption {
-	return func(c *vectorIndexConfig) { c.metric = m }
-}
-
-// WithM sets the HNSW M parameter (max connections per node).
-func WithM(m int) VectorIndexOption {
-	return func(c *vectorIndexConfig) { c.m = int32(m) }
-}
-
-// WithEfConstruction sets the HNSW ef_construction parameter.
-func WithEfConstruction(ef int) VectorIndexOption {
-	return func(c *vectorIndexConfig) { c.efConstruction = int32(ef) }
+// CreateIndexRequest selects an exact graph path and preserves option presence.
+// Label is required for Text/Vector and absent for Property/BTree.
+// Numeric pointers distinguish a supplied zero (validated by the engine) from absence.
+type CreateIndexRequest struct {
+	Graph          []string
+	Name           *string
+	Label          *string
+	Property       string
+	Kind           IndexKind
+	Dimensions     *uint
+	Metric         *string
+	M              *uint
+	EfConstruction *uint
+	// MinTokenLength is Text-only; nil selects the default (2), zero is valid.
+	MinTokenLength *uint
+	Quantization   *string
 }
 
 // SearchOption configures vector search.
@@ -101,11 +104,21 @@ func WithEf(ef int) SearchOption {
 
 // parseResult converts a C GrafeoResult into a Go QueryResult.
 func parseResult(r *C.GrafeoResult) (*QueryResult, error) {
+	return parseResultBounded(r, 64<<20)
+}
+
+func parseResultBounded(r *C.GrafeoResult, maxBytes uint64) (*QueryResult, error) {
 	jsonPtr := C.grafeo_result_json(r)
 	if jsonPtr == nil {
 		return &QueryResult{}, nil
 	}
-	jsonStr := C.GoString(jsonPtr)
+	if _, err := nativeJSONCopyCost(jsonPtr, maxBytes); err != nil {
+		return nil, err
+	}
+	jsonStr, err := boundedNativeString(jsonPtr, maxBytes)
+	if err != nil {
+		return nil, err
+	}
 
 	var rawRows []map[string]any
 	dec := json.NewDecoder(strings.NewReader(jsonStr))
@@ -168,4 +181,83 @@ func extractOrderedKeys(data []byte) []string {
 		}
 	}
 	return keys
+}
+
+// C's precommit admission includes conservative JSON/decoded container costs.
+// Check its serialized extent before copying a native allocation into Go.
+func boundedNativeString(ptr *C.char, maxBytes uint64) (string, error) {
+	if ptr == nil {
+		return "", invalidExecution("null native JSON")
+	}
+	size := uint64(C.strlen(ptr))
+	if size > maxBytes || size > uint64(^uint(0)>>1) {
+		return "", copyLimitError("native JSON exceeds byte limit")
+	}
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(size))), nil
+}
+
+func copyLimitError(message string) error { return &Error{Code: "GRAFEO-S001", Message: message} }
+
+// Inspect borrowed, trusted native JSON before any Go string/decoder allocation.
+// The envelope covers serialized copies, decoder buffers, map/slice spare slots,
+// strings and number containers. C admission reserves a separate quarter budget.
+func nativeJSONCopyCost(ptr *C.char, limit uint64) (uint64, error) {
+	if ptr == nil {
+		return 0, invalidExecution("null native JSON")
+	}
+	size := uint64(C.strlen(ptr))
+	if size > limit || size > uint64(^uint(0)>>1) {
+		return 0, copyLimitError("JSON exceeds copy envelope")
+	}
+	cost := uint64(0)
+	charge := func(n uint64) bool {
+		if n > limit-cost {
+			return false
+		}
+		cost += n
+		return true
+	}
+	for i := 0; i < 4; i++ {
+		if !charge(size) {
+			return 0, copyLimitError("JSON buffer copies exceed envelope")
+		}
+	}
+	data := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(size))
+	inString, escaped := false, false
+	for _, b := range data {
+		if inString {
+			if escaped {
+				escaped = false
+			} else if b == '\\' {
+				escaped = true
+			} else if b == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch b {
+		case '"':
+			inString = true
+			if !charge(64) {
+				return 0, copyLimitError("JSON string slots exceed envelope")
+			}
+		case '{':
+			if !charge(576) {
+				return 0, copyLimitError("JSON object exceeds envelope")
+			}
+		case ':':
+			if !charge(320) {
+				return 0, copyLimitError("JSON map entries exceed envelope")
+			}
+		case '[':
+			if !charge(128) {
+				return 0, copyLimitError("JSON array exceeds envelope")
+			}
+		case ',':
+			if !charge(96) {
+				return 0, copyLimitError("JSON element slots exceed envelope")
+			}
+		}
+	}
+	return cost, nil
 }

@@ -154,26 +154,23 @@ dynamic _decodeValue(dynamic value) {
 }
 
 dynamic _decodeMap(Map m) {
-  // Check for temporal markers from grafeo-bindings-common
-  if (m.containsKey(r'$timestamp_us')) {
+  // Ordinary native maps can use marker-shaped keys too. Convert only an
+  // exact, correctly typed marker, and retain values Dart cannot represent.
+  if (m.length == 1) {
     final us = m[r'$timestamp_us'];
-    if (us is int) {
+    if (us is int && us >= -8640000000000000000 && us <= 8640000000000000000) {
       return DateTime.fromMicrosecondsSinceEpoch(us, isUtc: true);
     }
-  }
-  if (m.containsKey(r'$date')) {
-    return m[r'$date'] as String? ?? '';
-  }
-  if (m.containsKey(r'$time')) {
-    return m[r'$time'] as String? ?? '';
-  }
-  if (m.containsKey(r'$duration')) {
-    // Return the ISO string directly. Dart's Duration type cannot represent
-    // calendar components (years, months, days), only time-based durations.
-    return m[r'$duration'] as String? ?? 'PT0S';
-  }
-  if (m.containsKey(r'$zoned_datetime')) {
-    return m[r'$zoned_datetime'] as String? ?? '';
+    for (final marker in const [
+      r'$date',
+      r'$time',
+      r'$duration',
+      r'$zoned_datetime',
+    ]) {
+      final value = m[marker];
+      // Keep ISO strings directly: Duration cannot represent calendar units.
+      if (value is String) return value;
+    }
   }
 
   // Regular map

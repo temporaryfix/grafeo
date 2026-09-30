@@ -1,166 +1,190 @@
-/// ACID transaction support for Grafeo.
-///
-/// Uses [NativeFinalizer] to auto-rollback (via Rust Drop) if neither
-/// [commit] nor [rollback] is called.
+/// ACID transaction support with native ownership retained across worker isolates.
 library;
 
 import 'dart:ffi';
-
 import 'package:ffi/ffi.dart';
 
 import 'error.dart';
+import 'execution.dart';
 import 'ffi/bindings.dart';
 import 'types.dart';
 import 'value.dart';
 
-/// An ACID transaction on a Grafeo database.
-///
-/// Obtain via [GrafeoDB.beginTransaction]. Must be explicitly committed
-/// or rolled back. If dropped without either, the Rust Drop impl
-/// performs an automatic rollback.
+/// An ACID transaction. Unfinished native work is rolled back on finalization.
 class Transaction implements Finalizable {
   final GrafeoBindings _bindings;
+  final String? _libraryPath;
+  // Bound database methods retain the parent even between transaction calls.
+  final void Function()? _reserveParent;
+  final void Function()? _releaseParent;
   Pointer<Void> _handle;
   bool _finished = false;
+  bool _busy = false;
+  static final Map<int, NativeFinalizer> _finalizers = {};
+  late final NativeFinalizer _finalizer;
 
-  static NativeFinalizer? _finalizer;
-
-  /// Create a transaction wrapper around a native handle.
-  ///
-  /// Typically called by [GrafeoDB.beginTransaction], not directly.
-  Transaction(this._handle, this._bindings) {
-    _finalizer ??= NativeFinalizer(
-      _bindings.library.lookup<NativeFunction<Void Function(Pointer<Void>)>>(
-        'grafeo_free_transaction',
-      ),
-    );
-    _finalizer!.attach(this, _handle.cast(), detach: this);
+  /// Wrap a native transaction. Usually created through GrafeoDB.beginTransaction.
+  Transaction(
+    this._handle,
+    this._bindings, {
+    String? libraryPath,
+    void Function()? reserveParent,
+    void Function()? releaseParent,
+  })  : _libraryPath = libraryPath,
+        _reserveParent = reserveParent,
+        _releaseParent = releaseParent {
+    _finalizer = _finalizers.putIfAbsent(
+        _bindings.library.handle.address,
+        () => NativeFinalizer(
+              _bindings.library
+                  .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+                      'grafeo_free_transaction'),
+            ));
+    _finalizer.attach(this, _handle.cast(), detach: this);
   }
 
-  void _checkActive() {
+  void _reserve() {
     if (_finished) {
       throw TransactionException(
-        'Transaction already finished',
-        GrafeoStatus.transaction,
-      );
+          'Transaction already finished', GrafeoStatus.transaction);
+    }
+    if (_busy) {
+      throw TransactionException(
+          'Transaction is busy', GrafeoStatus.transaction);
+    }
+    _busy = true;
+    try {
+      _reserveParent?.call();
+    } catch (_) {
+      _busy = false;
+      rethrow;
     }
   }
 
-  /// Execute a GQL query within this transaction.
-  QueryResult execute(String query) {
-    _checkActive();
-    final queryPtr = query.toNativeUtf8(allocator: malloc);
+  void _release() {
     try {
-      final resultPtr = _bindings.grafeoTransactionExecute(_handle, queryPtr);
-      if (resultPtr == nullptr) throwLastError(_bindings);
-      return _buildResult(resultPtr);
+      _releaseParent?.call();
     } finally {
-      malloc.free(queryPtr);
+      _busy = false;
     }
   }
 
-  /// Execute a parameterized GQL query within this transaction.
-  QueryResult executeWithParams(
-    String query,
-    Map<String, dynamic> params,
-  ) {
-    _checkActive();
-    final queryPtr = query.toNativeUtf8(allocator: malloc);
-    final paramsJson = encodeParams(params);
-    final paramsPtr = paramsJson.toNativeUtf8(allocator: malloc);
+  /// Execute with explicit query ownership, cancellation authority, and limits.
+  QueryResult executeWithOptions(
+    String query, {
+    ExecutionOptions? options,
+    Map<String, dynamic>? params,
+  }) {
+    _reserve();
+    NativeInvocation? invocation;
+    Pointer<Utf8> queryPtr = nullptr;
+    Pointer<Utf8> paramsPtr = nullptr;
     try {
-      final resultPtr = _bindings.grafeoTransactionExecuteWithParams(
-        _handle,
-        queryPtr,
-        paramsPtr,
-      );
-      if (resultPtr == nullptr) throwLastError(_bindings);
-      return _buildResult(resultPtr);
+      validateNativeQueryText(query);
+      final paramsJson = params == null ? null : encodeParams(params);
+      if (paramsJson != null) validateNativeQueryText(paramsJson);
+      invocation = NativeInvocation.create(_bindings, options: options);
+      queryPtr = query.toNativeUtf8(allocator: malloc);
+      if (paramsJson != null) {
+        paramsPtr = paramsJson.toNativeUtf8(allocator: malloc);
+      }
+      final result = _bindings.grafeoTransactionExecuteWithOptions(
+          _handle, queryPtr, paramsPtr, invocation.options);
+      if (result == nullptr) throwLastError(_bindings);
+      return decodeQueryResult(_bindings, result, invocation.copyBytes);
     } finally {
       malloc.free(queryPtr);
       malloc.free(paramsPtr);
+      try {
+        invocation?.close();
+      } finally {
+        _release();
+      }
     }
   }
 
-  /// Execute a query in the given [language] within this transaction.
-  ///
-  /// [language] is one of: `"gql"`, `"cypher"`, `"gremlin"`, `"graphql"`,
-  /// `"sparql"`, `"sql"`. Omit [params] for queries without parameters.
-  QueryResult executeLanguage(
-    String language,
+  /// Execute on a worker isolate. Cancel through [ExecutionOptions.control].
+  /// Reserve this transaction and its parent before serialization or scheduling.
+  Future<QueryResult> executeWithOptionsAsync(
     String query, {
+    ExecutionOptions? options,
     Map<String, dynamic>? params,
   }) {
-    _checkActive();
-    final langPtr = language.toNativeUtf8(allocator: malloc);
-    final queryPtr = query.toNativeUtf8(allocator: malloc);
-    Pointer<Utf8>? paramsPtr;
-    if (params != null) {
-      paramsPtr = encodeParams(params).toNativeUtf8(allocator: malloc);
-    }
+    _reserve();
+    NativeInvocation? invocation;
     try {
-      final resultPtr = _bindings.grafeoTransactionExecuteLanguage(
-        _handle,
-        langPtr,
-        queryPtr,
-        paramsPtr ?? nullptr.cast<Utf8>(),
-      );
-      if (resultPtr == nullptr) throwLastError(_bindings);
-      return _buildResult(resultPtr);
-    } finally {
-      malloc.free(langPtr);
-      malloc.free(queryPtr);
-      if (paramsPtr != null) malloc.free(paramsPtr);
+      validateNativeQueryText(query);
+      final paramsJson = params == null ? null : encodeParams(params);
+      if (paramsJson != null) validateNativeQueryText(paramsJson);
+      final owner = NativeInvocation.create(_bindings, options: options);
+      invocation = owner;
+      return runNativeExecution(
+              libraryPath: _libraryPath,
+              handleAddress: _handle.address,
+              query: query,
+              paramsJson: paramsJson,
+              invocation: owner,
+              transaction: true)
+          .whenComplete(() {
+        try {
+          owner.close();
+        } finally {
+          _release();
+        }
+      });
+    } catch (_) {
+      try {
+        invocation?.close();
+      } finally {
+        _release();
+      }
+      rethrow;
     }
   }
 
-  /// Commit the transaction, making all changes permanent.
-  void commit() {
-    _checkActive();
-    _finished = true;
-    _finalizer!.detach(this);
-    final status = _bindings.grafeoCommit(_handle);
-    _bindings.grafeoFreeTransaction(_handle);
-    _handle = nullptr;
-    if (status != GrafeoStatus.ok.code) {
-      throw classifyError(status, lastError(_bindings));
-    }
-  }
+  /// Execute a GQL query.
+  QueryResult execute(String query) => executeWithOptions(query);
 
-  /// Rollback the transaction, discarding all changes.
-  void rollback() {
-    _checkActive();
-    _finished = true;
-    _finalizer!.detach(this);
-    final status = _bindings.grafeoRollback(_handle);
-    _bindings.grafeoFreeTransaction(_handle);
-    _handle = nullptr;
-    if (status != GrafeoStatus.ok.code) {
-      throw classifyError(status, lastError(_bindings));
-    }
-  }
+  /// Execute a GQL query on a worker isolate.
+  Future<QueryResult> executeAsync(String query, {ExecutionOptions? options}) =>
+      executeWithOptionsAsync(query, options: options);
 
-  QueryResult _buildResult(Pointer<Void> resultPtr) {
+  /// Execute a GQL query with typed parameters.
+  QueryResult executeWithParams(String query, Map<String, dynamic> params) =>
+      executeWithOptions(query, params: params);
+
+  /// Execute a parameterized query on a worker isolate.
+  Future<QueryResult> executeWithParamsAsync(
+          String query, Map<String, dynamic> params,
+          {ExecutionOptions? options}) =>
+      executeWithOptionsAsync(query, params: params, options: options);
+
+  /// Execute a query in the given language with optional typed parameters.
+  QueryResult executeLanguage(String language, String query,
+          {Map<String, dynamic>? params}) =>
+      executeWithOptions(query,
+          options: ExecutionOptions(language: language), params: params);
+
+  /// Commit and release the native transaction on success.
+  void commit() => _complete(true);
+
+  /// Roll back and release the native transaction on success.
+  void rollback() => _complete(false);
+
+  void _complete(bool commit) {
+    _reserve();
     try {
-      final jsonPtr = _bindings.grafeoResultJson(resultPtr);
-      final jsonString = jsonPtr.toDartString();
-      final executionTimeMs = _bindings.grafeoResultExecutionTimeMs(resultPtr);
-      final rowsScanned = _bindings.grafeoResultRowsScanned(resultPtr);
-
-      final rows = parseRows(jsonString);
-      final columns = extractColumns(rows);
-      final (nodes, edges) = extractEntities(rows);
-
-      return QueryResult(
-        columns: columns,
-        rows: rows,
-        nodes: nodes,
-        edges: edges,
-        executionTimeMs: executionTimeMs,
-        rowsScanned: rowsScanned,
-      );
+      final status = commit
+          ? _bindings.grafeoCommit(_handle)
+          : _bindings.grafeoRollback(_handle);
+      // Capture native error state before cleanup; a failed commit remains owned.
+      if (status != GrafeoStatus.ok.code) throwStatus(_bindings, status);
+      _finished = true;
+      _finalizer.detach(this);
+      _bindings.grafeoFreeTransaction(_handle);
+      _handle = nullptr;
     } finally {
-      _bindings.grafeoFreeResult(resultPtr);
+      _release();
     }
   }
 }
