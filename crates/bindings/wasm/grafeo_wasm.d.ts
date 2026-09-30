@@ -14,7 +14,88 @@ export default function init(): Promise<void>;
  * use `exportSnapshot()` / `importSnapshot()` with IndexedDB or
  * the higher-level `@grafeo-db/web` package.
  */
+/** Create one graph-qualified owner; vector options apply only to kind "vector". */
+export interface CreateIndexRequest {
+  property: string;
+  kind?: "property" | "btree" | "text" | "vector";
+  /** Component array: [] is root, [""] is an empty child; no slash splitting. */
+  graph?: string[];
+  name?: string;
+  /** Required for text/vector and omitted for property/btree. */
+  label?: string;
+  /** Text-only minimum token length; default 2, explicit 0 is valid. Must be a nonnegative safe integer fitting the WASM size range. */
+  minTokenLength?: number;
+  dimensions?: number;
+  metric?: string;
+  m?: number;
+  efConstruction?: number;
+  quantization?: string;
+}
+
+export interface ExecutionOptions {
+  /** Defaults: 1,000,000 eager/collection rows and 64 MiB copied output. Zero is a real limit. */
+  maxRows?: number;
+  maxBytes?: number;
+  language?: string;
+}
+
+/** One query owner. Omit timeoutMs; deadlines currently throw GRAFEO-Q004. */
+export class QueryControl {
+  constructor(timeoutMs?: number);
+  cancel(): void;
+  readonly consumed: boolean;
+  free(): void;
+}
+
+/** Bounded native read cursor. Explicit close retains terminal errors. */
+export class ResultStream {
+  private constructor();
+  readonly columns: string[];
+  next(): Record<string, unknown> | null;
+  nextChunk(maxRows: number): Record<string, unknown>[] | null;
+  toArray(): Record<string, unknown>[];
+  close(): void;
+  free(): void;
+}
+
+
+/** Owned JS page; next is a 97-byte exclusive cursor. No native page needs freeing. */
+export interface ChangePage {
+  events: ChangeEvent[];
+  next: Uint8Array;
+}
+/** Native coordinates are exact decimal strings. */
+export interface ChangeEvent {
+  entity_id: string; entity_type: string; kind: string;
+  epoch: string; timestamp: string; graph_incarnation: string | null;
+  before: Record<string, unknown> | null; after: Record<string, unknown> | null;
+  labels: string[] | null; edge_type: string | null; src_id: string | null; dst_id: string | null;
+  lpg_graph: string[] | null;
+  triple_graph: string | null; triple_subject: string | null;
+  triple_predicate: string | null; triple_object: string | null;
+}
+
 export class Database {
+  /** Requires the cdc feature (included in full). Capture applies to future sessions. */
+  setCdcEnabled(enabled: boolean): void;
+  isCdcEnabled(): boolean;
+  /** Positive event/native-byte bounds; null/undefined starts at the retained floor. */
+  changesAfter(cursor: Uint8Array | null | undefined, maxEvents: number, maxBytes: number): ChangePage;
+  /** Exact decimal u64 ID and inclusive epoch, with the same page bounds. */
+  nodeHistoryAfter(id: string, sinceEpoch: string, cursor: Uint8Array | null | undefined, maxEvents: number, maxBytes: number): ChangePage;
+  edgeHistoryAfter(id: string, sinceEpoch: string, cursor: Uint8Array | null | undefined, maxEvents: number, maxBytes: number): ChangePage;
+  /** Controls are single-use. Native errors preserve Error.code. */
+  executeWithOptions(query: string, control: QueryControl, options: ExecutionOptions | undefined, params: Record<string, unknown> | undefined): Record<string, unknown>[];
+  executeRawWithOptions(query: string, control: QueryControl, options: ExecutionOptions | undefined, params: Record<string, unknown> | undefined): { columns: string[]; rows: unknown[][]; executionTimeMs?: number };
+  /** GQL read cursor; active explicit transactions reject. Other DB operations report busy until cursors close. */
+  executeStreamWithOptions(query: string, control: QueryControl, options: ExecutionOptions | undefined, params: Record<string, unknown> | undefined): ResultStream;
+  /** Create an index and return its committed unsigned 32-bit owner ID. */
+  createIndex(request: CreateIndexRequest): number;
+  /** Drop by owner ID; false means absent. Other failures throw. */
+  dropIndex(owner: number): boolean;
+  /** Atomic replacement preserving owner/configuration; a missing owner throws. */
+  rebuildIndex(owner: number): void;
+
   /** Creates a new in-memory database. */
   constructor();
 

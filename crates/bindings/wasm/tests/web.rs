@@ -9,19 +9,34 @@ use wasm_bindgen_test::*;
 use grafeo_wasm::Database;
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_database_creation() {
     let db = Database::new().expect("should create in-memory database");
-    assert_eq!(db.node_count(), 0);
-    assert_eq!(db.edge_count(), 0);
+    assert_eq!(db.node_count().expect("node count"), 0);
+    assert_eq!(db.edge_count().expect("edge count"), 0);
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_insert_and_query() {
     let db = Database::new().expect("create db");
 
     db.execute("CREATE (:Person {name: 'Alix', age: 30})")
         .expect("create node");
-    assert_eq!(db.node_count(), 1);
+    assert_eq!(db.node_count().expect("node count"), 1);
 
     let result = db
         .execute("MATCH (n:Person) RETURN n.name, n.age")
@@ -33,6 +48,15 @@ fn test_insert_and_query() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_execute_raw_structure() {
     let db = Database::new().expect("create db");
 
@@ -47,6 +71,15 @@ fn test_execute_raw_structure() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_execute_with_language_gql() {
     let db = Database::new().expect("create db");
 
@@ -61,6 +94,12 @@ fn test_execute_with_language_gql() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_execute_with_unknown_language_error() {
     let db = Database::new().expect("create db");
 
@@ -69,12 +108,21 @@ fn test_execute_with_unknown_language_error() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_snapshot_roundtrip() {
     let db = Database::new().expect("create db");
 
     db.execute("CREATE (:Person {name: 'Alix'})")
         .expect("create");
-    assert_eq!(db.node_count(), 1);
+    assert_eq!(db.node_count().expect("node count"), 1);
 
     // Export snapshot
     let snapshot = db.export_snapshot().expect("export");
@@ -82,10 +130,19 @@ fn test_snapshot_roundtrip() {
 
     // Import into new database
     let restored = Database::import_snapshot(&snapshot).expect("import");
-    assert_eq!(restored.node_count(), 1);
+    assert_eq!(restored.node_count().expect("node count"), 1);
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_schema() {
     let db = Database::new().expect("create db");
 
@@ -107,23 +164,54 @@ fn test_version() {
 // importLpg tests
 // ---------------------------------------------------------------------------
 
+// JSON.parse constructs the ordinary JavaScript objects used by browser callers.
+// serde-wasm-bindgen's default serializer turns serde_json maps into JS Maps,
+// which do not expose the named fields expected by the LPG import structs.
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+fn js_object_fixture(value: &serde_json::Value) -> wasm_bindgen::JsValue {
+    js_sys::JSON::parse(&value.to_string()).expect("plain JavaScript JSON fixture")
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn lpg_result_counts(result: &wasm_bindgen::JsValue) -> (u32, u32) {
     let nodes = js_sys::Reflect::get(result, &wasm_bindgen::JsValue::from_str("nodes"))
         .unwrap()
         .as_f64()
-        .unwrap() as u32;
+        .unwrap()
+        .to_string()
+        .parse::<u32>()
+        .expect("exact unsigned fixture integer");
     let edges = js_sys::Reflect::get(result, &wasm_bindgen::JsValue::from_str("edges"))
         .unwrap()
         .as_f64()
-        .unwrap() as u32;
+        .unwrap()
+        .to_string()
+        .parse::<u32>()
+        .expect("exact unsigned fixture integer");
     (nodes, edges)
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_basic() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Person"], "properties": { "name": "Alix", "age": 30 } },
             { "labels": ["Person"], "properties": { "name": "Gus", "age": 25 } }
@@ -131,45 +219,54 @@ fn test_import_lpg_basic() {
         "edges": [
             { "source": 0, "target": 1, "type": "KNOWS", "properties": { "since": 2020 } }
         ]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, edges) = lpg_result_counts(&result);
     assert_eq!(nodes, 2);
     assert_eq!(edges, 1);
-    assert_eq!(db.node_count(), 2);
-    assert_eq!(db.edge_count(), 1);
+    assert_eq!(db.node_count().expect("node count"), 2);
+    assert_eq!(db.edge_count().expect("edge count"), 1);
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_nodes_only() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Tag"], "properties": { "name": "rust" } },
             { "labels": ["Tag"], "properties": { "name": "wasm" } },
             { "labels": ["Tag"], "properties": { "name": "graph" } }
         ]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, edges) = lpg_result_counts(&result);
     assert_eq!(nodes, 3);
     assert_eq!(edges, 0);
-    assert_eq!(db.node_count(), 3);
+    assert_eq!(db.node_count().expect("node count"), 3);
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_empty() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": []
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, edges) = lpg_result_counts(&result);
@@ -178,10 +275,16 @@ fn test_import_lpg_empty() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_no_properties() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["A"] },
             { "labels": ["B"] }
@@ -189,8 +292,7 @@ fn test_import_lpg_no_properties() {
         "edges": [
             { "source": 0, "target": 1, "type": "LINKED" }
         ]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, edges) = lpg_result_counts(&result);
@@ -199,31 +301,41 @@ fn test_import_lpg_no_properties() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_multiple_labels() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Person", "Employee", "Developer"], "properties": { "name": "Alix" } }
         ]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, _) = lpg_result_counts(&result);
     assert_eq!(nodes, 1);
-    assert_eq!(db.node_count(), 1);
+    assert_eq!(db.node_count().expect("node count"), 1);
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_self_loop() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [{ "labels": ["Node"] }],
         "edges": [{ "source": 0, "target": 0, "type": "SELF" }]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, edges) = lpg_result_counts(&result);
@@ -232,10 +344,16 @@ fn test_import_lpg_self_loop() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_multiple_edges_same_pair() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Person"], "properties": { "name": "Alix" } },
             { "labels": ["Person"], "properties": { "name": "Gus" } }
@@ -245,24 +363,28 @@ fn test_import_lpg_multiple_edges_same_pair() {
             { "source": 0, "target": 1, "type": "WORKS_WITH" },
             { "source": 1, "target": 0, "type": "KNOWS" }
         ]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (_, edges) = lpg_result_counts(&result);
     assert_eq!(edges, 3);
-    assert_eq!(db.edge_count(), 3);
+    assert_eq!(db.edge_count().expect("edge count"), 3);
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_edge_source_out_of_bounds() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [{ "labels": ["A"] }],
         "edges": [{ "source": 5, "target": 0, "type": "BAD" }]
-    }))
-    .unwrap();
+    }));
 
     let err = db.import_lpg(data).unwrap_err();
     let msg = format!("{err:?}");
@@ -273,14 +395,19 @@ fn test_import_lpg_edge_source_out_of_bounds() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_edge_target_out_of_bounds() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [{ "labels": ["A"] }],
         "edges": [{ "source": 0, "target": 99, "type": "BAD" }]
-    }))
-    .unwrap();
+    }));
 
     let err = db.import_lpg(data).unwrap_err();
     let msg = format!("{err:?}");
@@ -291,14 +418,19 @@ fn test_import_lpg_edge_target_out_of_bounds() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_invalid_shape() {
     let db = Database::new().expect("create db");
 
     // Missing required 'nodes' field
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "edges": []
-    }))
-    .unwrap();
+    }));
 
     let err = db.import_lpg(data).unwrap_err();
     let msg = format!("{err:?}");
@@ -306,10 +438,19 @@ fn test_import_lpg_invalid_shape() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_import_lpg_queryable_after_import() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["City"], "properties": { "name": "Amsterdam", "population": 905234 } },
             { "labels": ["City"], "properties": { "name": "Berlin", "population": 3748148 } }
@@ -317,8 +458,7 @@ fn test_import_lpg_queryable_after_import() {
         "edges": [
             { "source": 0, "target": 1, "type": "CONNECTED_TO", "properties": { "distance_km": 577 } }
         ]
-    }))
-    .unwrap();
+    }));
 
     db.import_lpg(data).expect("import");
 
@@ -336,23 +476,28 @@ fn test_import_lpg_queryable_after_import() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_mixed_property_types() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [{
             "labels": ["Thing"],
             "properties": {
                 "str_val": "hello",
                 "int_val": 42,
-                "float_val": 3.14,
+                "float_val": 3.25,
                 "bool_val": true,
                 "null_val": null,
                 "list_val": [1, 2, 3]
             }
         }]
-    }))
-    .unwrap();
+    }));
 
     let result = db.import_lpg(data).expect("import");
     let (nodes, _) = lpg_result_counts(&result);
@@ -360,35 +505,45 @@ fn test_import_lpg_mixed_property_types() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_incremental() {
     let db = Database::new().expect("create db");
 
     // First batch
-    let data1 = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data1 = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Person"], "properties": { "name": "Alix" } }
         ]
-    }))
-    .unwrap();
+    }));
     db.import_lpg(data1).expect("import 1");
-    assert_eq!(db.node_count(), 1);
+    assert_eq!(db.node_count().expect("node count"), 1);
 
     // Second batch
-    let data2 = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data2 = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Person"], "properties": { "name": "Gus" } }
         ]
-    }))
-    .unwrap();
+    }));
     db.import_lpg(data2).expect("import 2");
-    assert_eq!(db.node_count(), 2);
+    assert_eq!(db.node_count().expect("node count"), 2);
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_import_lpg_snapshot_roundtrip() {
     let db = Database::new().expect("create db");
 
-    let data = serde_wasm_bindgen::to_value(&serde_json::json!({
+    let data = js_object_fixture(&serde_json::json!({
         "nodes": [
             { "labels": ["Person"], "properties": { "name": "Alix" } },
             { "labels": ["Person"], "properties": { "name": "Gus" } }
@@ -396,8 +551,7 @@ fn test_import_lpg_snapshot_roundtrip() {
         "edges": [
             { "source": 0, "target": 1, "type": "KNOWS" }
         ]
-    }))
-    .unwrap();
+    }));
 
     db.import_lpg(data).expect("import");
 
@@ -405,8 +559,8 @@ fn test_import_lpg_snapshot_roundtrip() {
     let snapshot = db.export_snapshot().expect("export");
     let restored = Database::import_snapshot(&snapshot).expect("restore");
 
-    assert_eq!(restored.node_count(), 2);
-    assert_eq!(restored.edge_count(), 1);
+    assert_eq!(restored.node_count().expect("node count"), 2);
+    assert_eq!(restored.edge_count().expect("edge count"), 1);
 }
 
 // ==========================================================================
@@ -414,35 +568,67 @@ fn test_import_lpg_snapshot_roundtrip() {
 // ==========================================================================
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_begin_commit_transaction_persists_writes() {
     let db = Database::new().expect("create db");
     db.begin_transaction().expect("begin");
-    assert!(db.is_transaction_active());
+    assert!(db.is_transaction_active().expect("transaction state"));
 
     db.execute("CREATE (:T {x: 1})").expect("insert in tx");
     assert_eq!(
-        db.node_count(),
+        db.node_count().expect("node count"),
         0,
         "commit not yet called: count should be 0"
     );
 
     db.commit_transaction().expect("commit");
-    assert!(!db.is_transaction_active());
-    assert_eq!(db.node_count(), 1, "writes visible after commit");
+    assert!(!db.is_transaction_active().expect("transaction state"));
+    assert_eq!(
+        db.node_count().expect("node count"),
+        1,
+        "writes visible after commit"
+    );
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_rollback_transaction_discards_writes() {
     let db = Database::new().expect("create db");
     db.begin_transaction().expect("begin");
     db.execute("CREATE (:T {x: 1})").expect("insert in tx");
 
     db.rollback_transaction().expect("rollback");
-    assert!(!db.is_transaction_active());
-    assert_eq!(db.node_count(), 0, "rollback discards writes");
+    assert!(!db.is_transaction_active().expect("transaction state"));
+    assert_eq!(
+        db.node_count().expect("node count"),
+        0,
+        "rollback discards writes"
+    );
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_double_begin_errors() {
     let db = Database::new().expect("create db");
     db.begin_transaction().expect("first begin");
@@ -451,6 +637,12 @@ fn test_double_begin_errors() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_commit_without_active_errors() {
     let db = Database::new().expect("create db");
     assert!(db.commit_transaction().is_err());
@@ -458,10 +650,19 @@ fn test_commit_without_active_errors() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_close_blocks_subsequent_operations() {
     let db = Database::new().expect("create db");
     db.execute("CREATE (:T)").expect("insert");
-    db.close();
+    db.close().expect("close");
 
     assert!(db.execute("CREATE (:T)").is_err(), "execute after close");
     assert!(db.export_snapshot().is_err(), "export after close");
@@ -469,13 +670,22 @@ fn test_close_blocks_subsequent_operations() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_close_rolls_back_active_transaction() {
     let db = Database::new().expect("create db");
     db.begin_transaction().expect("begin");
     db.execute("CREATE (:T)").expect("insert in tx");
-    db.close();
+    db.close().expect("close");
     // Second close is a no-op.
-    db.close();
+    db.close().expect("close");
 }
 
 // ==========================================================================
@@ -483,6 +693,15 @@ fn test_close_rolls_back_active_transaction() {
 // ==========================================================================
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_signed_snapshot_roundtrip() {
     let db = Database::new().expect("create db");
     db.execute("CREATE (:Doc {title: 'A'})").expect("insert");
@@ -495,10 +714,19 @@ fn test_signed_snapshot_roundtrip() {
     assert_eq!(&signed[..4], b"GSN1");
 
     let restored = Database::import_snapshot_signed(&signed, key).expect("restore");
-    assert_eq!(restored.node_count(), 2);
+    assert_eq!(restored.node_count().expect("node count"), 2);
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_wasm_import_tampered_snapshot() {
     let db = Database::new().expect("create db");
     db.execute("CREATE (:T)").expect("insert");
@@ -513,6 +741,15 @@ fn test_wasm_import_tampered_snapshot() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_wasm_import_wrong_key_rejected() {
     let db = Database::new().expect("create db");
     db.execute("CREATE (:T)").expect("insert");
@@ -525,12 +762,27 @@ fn test_wasm_import_wrong_key_rejected() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_wasm_import_empty_snapshot() {
     assert!(Database::import_snapshot(b"").is_err());
     assert!(Database::import_snapshot_signed(b"", b"k").is_err());
 }
 
 #[wasm_bindgen_test]
+#[cfg(all(
+    feature = "gql",
+    any(
+        feature = "lpg",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    )
+))]
 fn test_signed_snapshot_rejected_by_unsigned_import() {
     let db = Database::new().expect("create db");
     db.execute("CREATE (:T)").expect("insert");
@@ -540,7 +792,112 @@ fn test_signed_snapshot_rejected_by_unsigned_import() {
 }
 
 #[wasm_bindgen_test]
+#[cfg(any(
+    feature = "lpg",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn test_export_signed_requires_key() {
     let db = Database::new().expect("create db");
     assert!(db.export_snapshot_signed(b"").is_err());
+}
+
+#[cfg(feature = "rabitq-codec")]
+#[wasm_bindgen_test]
+fn rabitq_codec_encode_open_search_round_trip() {
+    use grafeo_wasm::codecs::RabitqCodec;
+
+    let dim = 32_u16;
+    let count = 40u32;
+    // Two clusters: ids 1..=20 near 0, ids 21..=40 near 10.
+    let mut ids = Vec::new();
+    let mut flat = Vec::new();
+    for i in 0..count {
+        ids.push(i + 1);
+        let base = if i < 20 { 0.0f32 } else { 10.0f32 };
+        for d in 0..dim {
+            flat.push(base + (f32::from(d) * 0.05).sin());
+        }
+    }
+
+    let blob = RabitqCodec::encode(&ids, &flat, usize::from(dim), 1.0).expect("encode");
+    assert_eq!(&blob[0..4], b"GRBQ");
+
+    let codec = RabitqCodec::open(&blob).expect("open");
+    // Query from cluster 0 -> hits should be ids 1..=20.
+    let query: Vec<f32> = (0..dim).map(|d| (f32::from(d) * 0.05).sin()).collect();
+    let hits = codec.search(&query, 5, 8).expect("search");
+    assert_eq!(hits.len(), 5);
+    for id in hits {
+        // ids cross to JS as f64 (exact below 2^53).
+        assert!(id <= 20.0, "expected cluster-0 hit, got id {id}");
+    }
+}
+
+#[cfg(feature = "rabitq-codec")]
+#[wasm_bindgen_test]
+fn rabitq_codec_rejects_overflow_and_mismatched_dimensions() {
+    use grafeo_wasm::codecs::RabitqCodec;
+
+    for dim in [usize::MAX / 2 + 1, usize::MAX] {
+        assert!(RabitqCodec::encode(&[1, 2], &[], dim, 1.0).is_err());
+    }
+    assert!(RabitqCodec::encode(&[1, 2], &[0.0; 32], 32, 1.0).is_err());
+    assert!(RabitqCodec::encode(&[1], &[], 0, 1.0).is_err());
+    assert!(RabitqCodec::encode(&[], &[], 32, 1.0).is_err());
+}
+
+#[cfg(feature = "fsst-codec")]
+#[wasm_bindgen_test]
+fn fsst_codec_encode_open_get_round_trip() {
+    use grafeo_wasm::codecs::FsstCodec;
+
+    let strings = ["alpha", "beta gamma", "alpha", "the quick brown fox"];
+    let lengths: Vec<u32> = strings
+        .iter()
+        .map(|s| u32::try_from(s.len()).expect("fixture string length fits u32"))
+        .collect();
+    let mut flat: Vec<u8> = Vec::new();
+    for s in &strings {
+        flat.extend_from_slice(s.as_bytes());
+    }
+
+    let blob = FsstCodec::encode(&flat, &lengths).expect("encode");
+    assert_eq!(&blob[0..4], b"GFST");
+
+    let codec = FsstCodec::open(&blob).expect("open");
+    assert_eq!(codec.len() as usize, strings.len());
+    for (i, expected) in strings.iter().enumerate() {
+        let decoded_bytes = codec.get(u32::try_from(i).expect("fixture index fits u32"));
+        let decoded_str = std::str::from_utf8(&decoded_bytes).expect("utf-8");
+        assert_eq!(decoded_str, *expected, "string {i} mismatched");
+    }
+}
+
+#[cfg(feature = "webgraph-codec")]
+#[wasm_bindgen_test]
+fn webgraph_codec_encode_open_successors_round_trip() {
+    use grafeo_wasm::codecs::WebGraphCodec;
+
+    // Star graph: node 0 connects to 1, 2, 3; node 5 has a self-loop.
+    let srcs: Vec<u32> = vec![0, 0, 0, 5];
+    let dsts: Vec<u32> = vec![1, 2, 3, 5];
+    let blob = WebGraphCodec::encode(6, &srcs, &dsts).expect("encode");
+    assert_eq!(&blob[0..4], b"GWBG");
+
+    let codec = WebGraphCodec::open(&blob).expect("open");
+    // Ids/counts cross to JS as f64 (exact below 2^53).
+    assert_eq!(codec.num_nodes(), 6.0);
+    assert_eq!(codec.num_edges().expect("num edges"), 4.0);
+    assert_eq!(codec.out_degree(0.0).expect("node 0 out degree"), 3.0);
+    assert_eq!(
+        codec.successors(0.0).expect("node 0 successors"),
+        vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        codec.successors(1.0).expect("node 1 successors"),
+        Vec::<f64>::new()
+    );
+    assert_eq!(codec.successors(5.0).expect("node 5 successors"), vec![5.0]);
 }
