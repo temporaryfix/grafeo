@@ -11,7 +11,7 @@ use std::fmt;
 /// Machine-readable error code for programmatic error handling.
 ///
 /// Error codes follow the pattern `GRAFEO-{category}{number}`:
-/// - **Q**: Query errors (parse, semantic, timeout)
+/// - **Q**: Query errors (parse, semantic, timeout, cancellation)
 /// - **T**: Transaction errors (conflict, timeout, state)
 /// - **S**: Storage errors (full, corruption)
 /// - **V**: Validation errors (not found, type mismatch, invalid input)
@@ -44,6 +44,8 @@ pub enum ErrorCode {
     QueryOptimization,
     /// Query execution failed.
     QueryExecution,
+    /// Query execution was explicitly cancelled by its caller.
+    QueryCancelled,
 
     // Transaction errors (T)
     /// Write-write conflict (retry possible).
@@ -66,6 +68,12 @@ pub enum ErrorCode {
     StorageCorrupted,
     /// Recovery from WAL failed.
     StorageRecoveryFailed,
+    /// Resume cursor is malformed or inconsistent with the retained feed.
+    CursorInvalid,
+    /// Resume cursor belongs to a different store or native feed.
+    CursorForeign,
+    /// Resume cursor precedes the retained window.
+    CursorEvicted,
 
     // Validation errors (V)
     /// Request validation failed.
@@ -101,6 +109,7 @@ impl ErrorCode {
             Self::QueryUnsupported => "GRAFEO-Q004",
             Self::QueryOptimization => "GRAFEO-Q005",
             Self::QueryExecution => "GRAFEO-Q006",
+            Self::QueryCancelled => "GRAFEO-Q007",
 
             Self::TransactionConflict => "GRAFEO-T001",
             Self::TransactionTimeout => "GRAFEO-T002",
@@ -112,6 +121,9 @@ impl ErrorCode {
             Self::StorageFull => "GRAFEO-S001",
             Self::StorageCorrupted => "GRAFEO-S002",
             Self::StorageRecoveryFailed => "GRAFEO-S003",
+            Self::CursorInvalid => "GRAFEO-S004",
+            Self::CursorForeign => "GRAFEO-S005",
+            Self::CursorEvicted => "GRAFEO-S006",
 
             Self::InvalidInput => "GRAFEO-V001",
             Self::NodeNotFound => "GRAFEO-V002",
@@ -181,6 +193,9 @@ pub enum Error {
     /// Storage error.
     Storage(StorageError),
 
+    /// Authenticated-encryption failure.
+    Crypto(CryptoError),
+
     /// Query error.
     Query(QueryError),
 
@@ -192,6 +207,22 @@ pub enum Error {
 
     /// Internal error (should not happen in normal operation).
     Internal(String),
+
+    /// An error augmented with operation context while retaining the exact
+    /// structured primary error as its source.
+    Context {
+        /// The structured primary error.
+        source: Box<Error>,
+        /// Additional operation context.
+        context: String,
+    },
+    /// Pre-admitted primary and secondary failures, accessible with typed inspection.
+    RetainedContext {
+        /// Original machine-readable primary classification.
+        code: ErrorCode,
+        /// Accounted owner of typed operation or [`RetainedErrorContext`] diagnostics.
+        source: RetainedErrorOwner,
+    },
 }
 
 impl Error {
@@ -207,10 +238,23 @@ impl Error {
             Error::InvalidValue(_) => ErrorCode::InvalidInput,
             Error::Transaction(e) => e.error_code(),
             Error::Storage(e) => e.error_code(),
+            Error::Crypto(e) => e.error_code(),
             Error::Query(e) => e.error_code(),
             Error::Serialization(_) => ErrorCode::SerializationError,
             Error::Io(_) => ErrorCode::IoError,
             Error::Internal(_) => ErrorCode::Internal,
+            Error::Context { source, .. } => source.error_code(),
+            Error::RetainedContext { code, .. } => *code,
+        }
+    }
+
+    /// Adds human-readable operation context without changing the primary
+    /// error code or discarding its structured payload.
+    #[must_use]
+    pub fn with_context(self, context: impl Into<String>) -> Self {
+        Self::Context {
+            source: Box::new(self),
+            context: context.into(),
         }
     }
 }
@@ -232,10 +276,13 @@ impl fmt::Display for Error {
             Error::InvalidValue(msg) => write!(f, "{code}: Invalid value: {msg}"),
             Error::Transaction(e) => write!(f, "{code}: {e}"),
             Error::Storage(e) => write!(f, "{code}: {e}"),
+            Error::Crypto(e) => write!(f, "{code}: {e}"),
             Error::Query(e) => write!(f, "{e}"),
             Error::Serialization(msg) => write!(f, "{code}: Serialization error: {msg}"),
             Error::Io(e) => write!(f, "{code}: I/O error: {e}"),
             Error::Internal(msg) => write!(f, "{code}: Internal error: {msg}"),
+            Error::Context { source, context } => write!(f, "{source}; {context}"),
+            Error::RetainedContext { source, .. } => fmt::Display::fmt(source, f),
         }
     }
 }
@@ -246,8 +293,179 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Transaction(e) => Some(e),
             Error::Storage(e) => Some(e),
+            Error::Crypto(e) => Some(e),
             Error::Query(e) => Some(e),
+            Error::Context { source, .. } => Some(source.as_ref()),
+            Error::RetainedContext { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+/// Accounted secondary-context ownership with a contained last-owner destructor.
+pub struct RetainedErrorOwner {
+    authority: Option<crate::memory::buffer::AccountedError>,
+    format_panicked: std::sync::atomic::AtomicBool,
+}
+impl RetainedErrorOwner {
+    /// Borrows an exact retained payload without detaching its accounting owner.
+    pub fn inspect<T, R>(&self, inspect: impl FnOnce(&T) -> R) -> Option<R>
+    where
+        T: std::error::Error + Send + 'static,
+    {
+        self.authority.as_ref()?.inspect(inspect)
+    }
+}
+impl From<crate::memory::buffer::AccountedError> for RetainedErrorOwner {
+    fn from(error: crate::memory::buffer::AccountedError) -> Self {
+        Self {
+            authority: Some(error),
+            format_panicked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+impl fmt::Display for RetainedErrorOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &self.authority {
+                Some(error) => fmt::Display::fmt(error, formatter),
+                None => Ok(()),
+            }));
+        match result {
+            Ok(result) => result,
+            Err(payload) => {
+                self.format_panicked
+                    .store(true, std::sync::atomic::Ordering::Release);
+                std::mem::forget(payload);
+                formatter.write_str("opaque diagnostic formatting failed")
+            }
+        }
+    }
+}
+impl fmt::Debug for RetainedErrorOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+impl std::error::Error for RetainedErrorOwner {}
+impl Drop for RetainedErrorOwner {
+    fn drop(&mut self) {
+        if *self.format_panicked.get_mut() {
+            // The escaped panic payload remains covered by its original owner.
+            std::mem::forget(self.authority.take());
+        } else if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.authority.take())))
+        {
+            // AccountedError has quarantined the failed payload and its grant.
+            std::mem::forget(payload);
+        }
+    }
+}
+
+/// Typed payload published into a pre-admitted error slot by owned execution.
+/// Each opaque diagnostic is formatted and destroyed in its own unwind boundary.
+/// The accounted publisher retains its block/grant if payload destruction panics.
+pub struct RetainedErrorContext {
+    primary: Option<Error>,
+    secondary: Option<Error>,
+    phase: &'static str,
+    format_panicked: std::sync::atomic::AtomicBool,
+}
+
+impl RetainedErrorContext {
+    /// Retains both errors without formatting or allocating.
+    pub fn new(primary: Error, secondary: Error, phase: &'static str) -> Self {
+        Self {
+            primary: Some(primary),
+            secondary: Some(secondary),
+            phase,
+            format_panicked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Retains a sole opaque failure before any secondary exists.
+    pub fn from_primary(primary: Error) -> Self {
+        Self {
+            primary: Some(primary),
+            secondary: None,
+            phase: "",
+            format_panicked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Borrows the original failure during accounted typed inspection.
+    #[must_use]
+    pub fn primary(&self) -> Option<&Error> {
+        self.primary.as_ref()
+    }
+
+    /// Borrows the secondary failure during accounted typed inspection.
+    #[must_use]
+    pub fn secondary(&self) -> Option<&Error> {
+        self.secondary.as_ref()
+    }
+}
+
+impl fmt::Display for RetainedErrorContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn format_one(
+            error: &Option<Error>,
+            formatter: &mut fmt::Formatter<'_>,
+            poisoned: &std::sync::atomic::AtomicBool,
+        ) -> fmt::Result {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(error) = error {
+                    fmt::Display::fmt(error, formatter)
+                } else {
+                    Ok(())
+                }
+            }));
+            match outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    poisoned.store(true, std::sync::atomic::Ordering::Release);
+                    std::mem::forget(payload);
+                    formatter.write_str("opaque diagnostic formatting failed")
+                }
+            }
+        }
+        format_one(&self.primary, formatter, &self.format_panicked)?;
+        if self.secondary.is_none() {
+            return Ok(());
+        }
+        write!(formatter, "; {} also failed: ", self.phase)?;
+        format_one(&self.secondary, formatter, &self.format_panicked)
+    }
+}
+impl fmt::Debug for RetainedErrorContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+impl std::error::Error for RetainedErrorContext {}
+impl Drop for RetainedErrorContext {
+    fn drop(&mut self) {
+        let mut first_panic = None;
+        for error in [self.primary.take(), self.secondary.take()] {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(error)))
+            {
+                if first_panic.is_none() {
+                    first_panic = Some(payload);
+                } else {
+                    std::mem::forget(payload);
+                }
+            }
+        }
+        if let Some(payload) = first_panic {
+            // The publisher contains this unwind and keeps its grant attached
+            // to the partially destroyed block; never drop opaque panic payloads.
+            std::panic::resume_unwind(payload);
+        }
+        if *self.format_panicked.get_mut() {
+            // A forgotten formatting payload still requires this block's
+            // authority. A zero-sized sentinel quarantines its publisher grant.
+            std::panic::resume_unwind(Box::new(()));
         }
     }
 }
@@ -288,6 +506,9 @@ pub enum TransactionError {
 
     /// Invalid transaction state.
     InvalidState(String),
+
+    /// WAL abort/log/fsync failed; the session and database are poisoned.
+    DurabilityFailure(String),
 }
 
 impl TransactionError {
@@ -302,7 +523,9 @@ impl TransactionError {
             Self::Deadlock => ErrorCode::TransactionDeadlock,
             Self::Timeout => ErrorCode::TransactionTimeout,
             Self::ReadOnly => ErrorCode::TransactionReadOnly,
-            Self::InvalidState(_) => ErrorCode::TransactionInvalidState,
+            Self::InvalidState(_) | Self::DurabilityFailure(_) => {
+                ErrorCode::TransactionInvalidState
+            }
         }
     }
 }
@@ -320,6 +543,9 @@ impl fmt::Display for TransactionError {
             TransactionError::Timeout => write!(f, "Transaction timeout"),
             TransactionError::ReadOnly => write!(f, "Cannot write in read-only transaction"),
             TransactionError::InvalidState(msg) => write!(f, "Invalid transaction state: {msg}"),
+            TransactionError::DurabilityFailure(msg) => {
+                write!(f, "Durability failure (session poisoned): {msg}")
+            }
         }
     }
 }
@@ -350,6 +576,13 @@ pub enum StorageError {
 
     /// Checkpoint failed.
     CheckpointFailed(String),
+
+    /// Resume cursor is malformed, future, or inconsistent with this feed.
+    CursorInvalid,
+    /// Resume cursor belongs to a different store or native feed.
+    CursorForeign,
+    /// Resume cursor precedes the retained feed window.
+    CursorEvicted,
 }
 
 impl StorageError {
@@ -361,6 +594,9 @@ impl StorageError {
             Self::Full => ErrorCode::StorageFull,
             Self::InvalidWalEntry(_) | Self::CheckpointFailed(_) => ErrorCode::StorageCorrupted,
             Self::RecoveryFailed(_) => ErrorCode::StorageRecoveryFailed,
+            Self::CursorInvalid => ErrorCode::CursorInvalid,
+            Self::CursorForeign => ErrorCode::CursorForeign,
+            Self::CursorEvicted => ErrorCode::CursorEvicted,
         }
     }
 }
@@ -373,6 +609,13 @@ impl fmt::Display for StorageError {
             StorageError::InvalidWalEntry(msg) => write!(f, "Invalid WAL entry: {msg}"),
             StorageError::RecoveryFailed(msg) => write!(f, "Recovery failed: {msg}"),
             StorageError::CheckpointFailed(msg) => write!(f, "Checkpoint failed: {msg}"),
+            StorageError::CursorInvalid => write!(f, "Invalid or future change-feed cursor"),
+            StorageError::CursorForeign => {
+                write!(f, "Change-feed cursor belongs to another store or feed")
+            }
+            StorageError::CursorEvicted => {
+                write!(f, "Change-feed cursor precedes retained history")
+            }
         }
     }
 }
@@ -382,6 +625,57 @@ impl std::error::Error for StorageError {}
 impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         Error::Storage(e)
+    }
+}
+
+/// Allocation-free authenticated-encryption failures.
+///
+/// These variants deliberately carry no heap-backed message so bounded
+/// storage paths can report corrupt or unauthentic input without allocating
+/// while already handling a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CryptoError {
+    /// The input cannot contain a nonce, ciphertext, and authentication tag.
+    CiphertextTooShort,
+    /// The caller-owned plaintext destination has the wrong exact length.
+    PlaintextLengthMismatch,
+    /// The encryption primitive rejected an otherwise prepared operation.
+    EncryptionFailed,
+    /// Authentication failed because the key, nonce, AAD, or ciphertext differs.
+    AuthenticationFailed,
+}
+
+impl CryptoError {
+    /// Returns the machine-readable error code for this crypto failure.
+    #[must_use]
+    pub const fn error_code(self) -> ErrorCode {
+        match self {
+            Self::EncryptionFailed => ErrorCode::Internal,
+            Self::PlaintextLengthMismatch => ErrorCode::InvalidInput,
+            Self::CiphertextTooShort | Self::AuthenticationFailed => ErrorCode::StorageCorrupted,
+        }
+    }
+}
+
+impl fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CiphertextTooShort => f.write_str("Encrypted data is too short"),
+            Self::PlaintextLengthMismatch => {
+                f.write_str("Plaintext destination has the wrong length")
+            }
+            Self::EncryptionFailed => f.write_str("Authenticated encryption failed"),
+            Self::AuthenticationFailed => f.write_str("Authentication tag mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for CryptoError {}
+
+impl From<CryptoError> for Error {
+    fn from(error: CryptoError) -> Self {
+        Self::Crypto(error)
     }
 }
 
@@ -441,6 +735,12 @@ impl QueryError {
         )
     }
 
+    /// Creates an explicit query cancellation error.
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self::new(QueryErrorKind::Cancelled, "Query was cancelled")
+    }
+
     /// Returns the machine-readable error code for this query error.
     #[must_use]
     pub const fn error_code(&self) -> ErrorCode {
@@ -450,6 +750,8 @@ impl QueryError {
             QueryErrorKind::Optimization => ErrorCode::QueryOptimization,
             QueryErrorKind::Execution => ErrorCode::QueryExecution,
             QueryErrorKind::Timeout => ErrorCode::QueryTimeout,
+            QueryErrorKind::Cancelled => ErrorCode::QueryCancelled,
+            QueryErrorKind::Unsupported => ErrorCode::QueryUnsupported,
         }
     }
 
@@ -530,6 +832,10 @@ pub enum QueryErrorKind {
     Execution,
     /// Timeout error (query exceeded configured time limit).
     Timeout,
+    /// Query execution was explicitly cancelled by its caller.
+    Cancelled,
+    /// The query requests a feature that is deliberately unsupported.
+    Unsupported,
 }
 
 impl fmt::Display for QueryErrorKind {
@@ -541,6 +847,8 @@ impl fmt::Display for QueryErrorKind {
             QueryErrorKind::Optimization => write!(f, "optimization error"),
             QueryErrorKind::Execution => write!(f, "execution error"),
             QueryErrorKind::Timeout => write!(f, "timeout error"),
+            QueryErrorKind::Cancelled => write!(f, "cancelled query"),
+            QueryErrorKind::Unsupported => write!(f, "unsupported query"),
         }
     }
 }
@@ -611,12 +919,39 @@ mod tests {
     }
 
     #[test]
+    fn crypto_errors_have_structured_stable_codes() {
+        let authentication = Error::Crypto(CryptoError::AuthenticationFailed);
+        assert_eq!(authentication.error_code(), ErrorCode::StorageCorrupted);
+        assert_eq!(
+            authentication.to_string(),
+            "GRAFEO-S002: Authentication tag mismatch"
+        );
+
+        let encryption = Error::Crypto(CryptoError::EncryptionFailed);
+        assert_eq!(encryption.error_code(), ErrorCode::Internal);
+
+        let destination = Error::Crypto(CryptoError::PlaintextLengthMismatch);
+        assert_eq!(destination.error_code(), ErrorCode::InvalidInput);
+    }
+
+    #[test]
     fn test_query_timeout() {
         let err = QueryError::timeout();
         assert_eq!(err.kind, QueryErrorKind::Timeout);
         assert_eq!(err.error_code(), ErrorCode::QueryTimeout);
+        assert_eq!(err.error_code().as_str(), "GRAFEO-Q003");
         assert!(err.error_code().is_retryable());
         assert!(err.message.contains("timeout"));
+    }
+
+    #[test]
+    fn test_query_cancelled_has_distinct_stable_code() {
+        let err = QueryError::cancelled();
+        assert_eq!(err.kind, QueryErrorKind::Cancelled);
+        assert_eq!(err.error_code(), ErrorCode::QueryCancelled);
+        assert_eq!(err.error_code().as_str(), "GRAFEO-Q007");
+        assert!(!err.error_code().is_retryable());
+        assert_ne!(err.error_code(), QueryError::timeout().error_code());
     }
 
     #[test]
@@ -647,5 +982,127 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: Error = io_err.into();
         assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn contextual_error_preserves_primary_code_source_and_payload() {
+        let err = Error::NodeNotFound(crate::types::NodeId::new(42))
+            .with_context("spill query cleanup also failed: permission denied");
+
+        assert_eq!(err.error_code(), ErrorCode::NodeNotFound);
+        assert!(err.to_string().contains("Node not found: 42"));
+        assert!(err.to_string().contains("cleanup also failed"));
+        let source = std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<Error>())
+            .expect("context retains the structured primary error as its source");
+        assert!(matches!(
+            source,
+            Error::NodeNotFound(id) if *id == crate::types::NodeId::new(42)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod retained_context_tests {
+    use super::*;
+    use crate::memory::buffer::{
+        AccountedErrorPublisher, BufferManager, BufferManagerConfig, MemoryRegion,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct HostileDiagnostic {
+        displays: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        panic_display: bool,
+        panic_drop: bool,
+    }
+    impl fmt::Display for HostileDiagnostic {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.displays.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_display, "injected diagnostic formatting");
+            formatter.write_str("opaque diagnostic")
+        }
+    }
+    impl std::error::Error for HostileDiagnostic {}
+    impl Drop for HostileDiagnostic {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_drop, "injected diagnostic destruction");
+        }
+    }
+
+    #[test]
+    fn retained_context_contains_each_opaque_drop_and_quarantines_its_grant() {
+        let manager = BufferManager::new(BufferManagerConfig::default());
+        let displays = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let publisher = AccountedErrorPublisher::try_new(
+            manager
+                .try_allocate(0, MemoryRegion::ExecutionBuffers)
+                .unwrap(),
+        )
+        .unwrap();
+        let opaque = || {
+            Error::Io(std::io::Error::other(HostileDiagnostic {
+                displays: Arc::clone(&displays),
+                drops: Arc::clone(&drops),
+                panic_display: false,
+                panic_drop: true,
+            }))
+        };
+        let error = Error::RetainedContext {
+            code: ErrorCode::IoError,
+            source: publisher
+                .publish(RetainedErrorContext::new(opaque(), opaque(), "cleanup"))
+                .into(),
+        };
+        let charged = manager.allocated();
+        assert!(charged > 0);
+        assert!(error.to_string().contains("cleanup also failed"));
+        assert_eq!(displays.load(Ordering::SeqCst), 2);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(error))).is_ok());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(manager.allocated(), charged);
+    }
+
+    #[test]
+    fn retained_format_panic_keeps_primary_code_and_accounting_authority() {
+        let manager = BufferManager::new(BufferManagerConfig::default());
+        let publisher = AccountedErrorPublisher::try_new(
+            manager
+                .try_allocate(0, MemoryRegion::ExecutionBuffers)
+                .unwrap(),
+        )
+        .unwrap();
+        let secondary = Error::Io(std::io::Error::other(HostileDiagnostic {
+            displays: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::new(AtomicUsize::new(0)),
+            panic_display: true,
+            panic_drop: false,
+        }));
+        let error = Error::RetainedContext {
+            code: ErrorCode::QueryCancelled,
+            source: publisher
+                .publish(RetainedErrorContext::new(
+                    Error::Query(QueryError::cancelled()),
+                    secondary,
+                    "cleanup",
+                ))
+                .into(),
+        };
+        let charged = manager.allocated();
+        assert!(
+            error
+                .to_string()
+                .contains("opaque diagnostic formatting failed")
+        );
+        assert_eq!(error.error_code(), ErrorCode::QueryCancelled);
+        assert!(std::error::Error::source(&error).is_some());
+        drop(error);
+        assert_eq!(manager.allocated(), charged);
     }
 }

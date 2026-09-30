@@ -7,8 +7,9 @@
 //!
 //! Unlike [`crash`](super::crash) (which panics), injection returns an error
 //! so the session's normal error path runs. This matches how real runtime
-//! errors (constraint violations, parse errors) behave: the transaction stays
-//! active and the caller is expected to issue `ROLLBACK` explicitly.
+//! errors behave: the statement is rejected or its staged effects are rewound,
+//! while a caller-owned transaction remains active when cleanup succeeds. The
+//! caller may then continue, commit retained work, or roll back explicitly.
 //!
 //! Thread-local storage ensures concurrent tests never interfere with each
 //! other; only the thread that calls [`enable_statement_failure_after`] /
@@ -55,8 +56,9 @@ mod inner {
     }
 
     /// Conditionally return [`InjectedFailure`] when the statement counter
-    /// reaches zero. Insert this at the entry of each statement-execution
-    /// boundary. Zero-overhead when injection is disabled.
+    /// reaches zero. Insert this at a statement-execution boundary, either
+    /// before execution or after staged effects but before publication.
+    /// Zero-overhead when injection is disabled.
     ///
     /// Uses thread-local state so concurrent tests don't interfere.
     ///
@@ -164,29 +166,35 @@ mod inner {
 
 pub use inner::*;
 
+struct InjectionReset;
+
+impl Drop for InjectionReset {
+    fn drop(&mut self) {
+        disable_injection();
+    }
+}
+
 /// Run `f` with statement injection armed to fire on the `fail_after`-th call
-/// to [`maybe_fail_statement`]. Injection is automatically disabled after the
-/// closure returns.
+/// to [`maybe_fail_statement`]. Injection is automatically disabled when the
+/// closure returns or unwinds.
 pub fn with_statement_failure_after<F, T>(fail_after: u64, f: F) -> T
 where
     F: FnOnce() -> T,
 {
     enable_statement_failure_after(fail_after);
-    let result = f();
-    disable_injection();
-    result
+    let _reset = InjectionReset;
+    f()
 }
 
 /// Run `f` with a one-shot commit failure armed. Injection is automatically
-/// disabled after the closure returns.
+/// disabled when the closure returns or unwinds.
 pub fn with_commit_failure<F, T>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
     enable_commit_failure_once();
-    let result = f();
-    disable_injection();
-    result
+    let _reset = InjectionReset;
+    f()
 }
 
 #[cfg(test)]
@@ -217,6 +225,22 @@ mod tests {
         });
         assert_eq!(result.0, Err(InjectedFailure));
         assert_eq!(result.1, Ok(()), "commit trigger is one-shot");
+    }
+
+    #[test]
+    #[cfg(feature = "testing-statement-injection")]
+    fn scoped_injection_is_cleared_during_unwind() {
+        let statement_panic = std::panic::catch_unwind(|| {
+            with_statement_failure_after(1, || panic!("statement scope panic"));
+        });
+        assert!(statement_panic.is_err());
+        assert_eq!(maybe_fail_statement(), Ok(()));
+
+        let commit_panic = std::panic::catch_unwind(|| {
+            with_commit_failure(|| panic!("commit scope panic"));
+        });
+        assert!(commit_panic.is_err());
+        assert_eq!(maybe_fail_commit(), Ok(()));
     }
 
     #[test]

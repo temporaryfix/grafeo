@@ -16,11 +16,70 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_arch = "wasm32")]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 const LOGICAL_BITS: u32 = 16;
 const LOGICAL_MASK: u64 = (1 << LOGICAL_BITS) - 1; // 0xFFFF
-const MAX_LOGICAL: u64 = LOGICAL_MASK;
+const MAX_PHYSICAL_MS: u64 = u64::MAX >> LOGICAL_BITS;
+fn checked_strictly_after(timestamp: HlcTimestamp) -> Option<HlcTimestamp> {
+    timestamp
+        .as_u64()
+        .checked_add(1)
+        .map(HlcTimestamp::from_u64)
+}
+
+fn checked_next_for_now(last: HlcTimestamp, physical_ms: u64) -> Option<HlcTimestamp> {
+    if physical_ms > MAX_PHYSICAL_MS {
+        return None;
+    }
+    if physical_ms > last.physical_ms() {
+        Some(HlcTimestamp::new(physical_ms, 0))
+    } else {
+        // Incrementing the complete packed representation carries a full
+        // logical counter into the next physical millisecond.
+        checked_strictly_after(last)
+    }
+}
+
+fn checked_next_for_update(
+    last: HlcTimestamp,
+    received: HlcTimestamp,
+    physical_ms: u64,
+) -> Option<HlcTimestamp> {
+    if physical_ms > MAX_PHYSICAL_MS {
+        return None;
+    }
+    let last_physical = last.physical_ms();
+    let received_physical = received.physical_ms();
+    let max_physical = physical_ms.max(last_physical).max(received_physical);
+
+    if max_physical == physical_ms && physical_ms > last_physical && physical_ms > received_physical
+    {
+        Some(HlcTimestamp::new(physical_ms, 0))
+    } else if max_physical == last_physical && last_physical == received_physical {
+        checked_strictly_after(HlcTimestamp::new(
+            max_physical,
+            last.logical().max(received.logical()),
+        ))
+    } else if max_physical == last_physical {
+        checked_strictly_after(last)
+    } else {
+        checked_strictly_after(received)
+    }
+}
+
+/// There is no recoverable timestamp after the greatest packed `u64` value.
+/// Continuing would let a caller catch an ordinary panic after mutating state
+/// but before staging its ordered event, so mathematical exhaustion is a
+/// deliberate fail-stop boundary.
+#[cold]
+#[inline(never)]
+fn abort_terminal_exhaustion() -> ! {
+    std::process::abort()
+}
 
 /// A Hybrid Logical Clock timestamp.
 ///
@@ -42,9 +101,19 @@ impl HlcTimestamp {
     }
 
     /// Creates an HLC timestamp from the current wall clock (logical = 0).
+    ///
+    /// # Process termination
+    ///
+    /// Aborts if wall-clock milliseconds no longer fit the timestamp's 48-bit
+    /// physical component. [`HlcTimestamp::new`] remains a compatibility
+    /// constructor and deliberately retains its historical truncating shape.
     #[must_use]
     pub fn now() -> Self {
-        Self::new(wall_clock_ms(), 0)
+        let physical_ms = wall_clock_ms();
+        if physical_ms > MAX_PHYSICAL_MS {
+            abort_terminal_exhaustion();
+        }
+        Self::new(physical_ms, 0)
     }
 
     /// Returns the physical time component in milliseconds since Unix epoch.
@@ -131,10 +200,19 @@ pub struct HlcClock {
 
 impl HlcClock {
     /// Creates a new HLC clock initialized to the current wall-clock time.
+    ///
+    /// # Process termination
+    ///
+    /// Aborts if wall-clock milliseconds no longer fit the clock's 48-bit
+    /// physical component.
     #[must_use]
     pub fn new() -> Self {
+        let physical_ms = wall_clock_ms();
+        if physical_ms > MAX_PHYSICAL_MS {
+            abort_terminal_exhaustion();
+        }
         Self {
-            last: AtomicU64::new(HlcTimestamp::now().as_u64()),
+            last: AtomicU64::new(HlcTimestamp::new(physical_ms, 0).as_u64()),
         }
     }
 
@@ -148,29 +226,22 @@ impl HlcClock {
     ///   and increments the logical counter.
     ///
     /// Uses a CAS loop for lock-free thread safety.
+    ///
+    /// # Process termination
+    ///
+    /// Aborts the process if the complete packed timestamp space is exhausted
+    /// at `u64::MAX`, where no strictly greater timestamp exists. This
+    /// mathematical terminal state is not a recoverable clock outcome.
     pub fn now(&self) -> HlcTimestamp {
-        let pt = wall_clock_ms();
+        self.now_at(wall_clock_ms())
+    }
+
+    fn now_at(&self, pt: u64) -> HlcTimestamp {
         loop {
             let last_raw = self.last.load(Ordering::Acquire);
             let last = HlcTimestamp::from_u64(last_raw);
-            let last_pt = last.physical_ms();
-            let last_lc = last.logical() as u64;
-
-            let next = match pt.cmp(&last_pt) {
-                std::cmp::Ordering::Greater => {
-                    // Wall clock advanced: reset logical counter
-                    HlcTimestamp::new(pt, 0)
-                }
-                std::cmp::Ordering::Equal => {
-                    // Same millisecond: increment logical
-                    let lc = last_lc.saturating_add(1).min(MAX_LOGICAL);
-                    HlcTimestamp::new(pt, lc as u16)
-                }
-                std::cmp::Ordering::Less => {
-                    // Clock went backward: keep last physical, increment logical
-                    let lc = last_lc.saturating_add(1).min(MAX_LOGICAL);
-                    HlcTimestamp::new(last_pt, lc as u16)
-                }
+            let Some(next) = checked_next_for_now(last, pt) else {
+                abort_terminal_exhaustion()
             };
 
             if self
@@ -190,34 +261,22 @@ impl HlcClock {
     /// current local time and the received remote timestamp. This
     /// preserves the causality guarantee: if event A happened-before
     /// event B, then `ts(A) < ts(B)`.
+    ///
+    /// # Process termination
+    ///
+    /// Aborts the process if advancing beyond the local or received timestamp
+    /// would exceed the complete packed timestamp space at `u64::MAX`. This
+    /// mathematical terminal state is not a recoverable clock outcome.
     pub fn update(&self, received: HlcTimestamp) -> HlcTimestamp {
-        let pt = wall_clock_ms();
+        self.update_at(received, wall_clock_ms())
+    }
+
+    fn update_at(&self, received: HlcTimestamp, pt: u64) -> HlcTimestamp {
         loop {
             let last_raw = self.last.load(Ordering::Acquire);
             let last = HlcTimestamp::from_u64(last_raw);
-            let last_pt = last.physical_ms();
-            let recv_pt = received.physical_ms();
-
-            let max_pt = pt.max(last_pt).max(recv_pt);
-
-            let next = if max_pt == pt && pt > last_pt && pt > recv_pt {
-                // Local wall clock is the newest: reset counter
-                HlcTimestamp::new(pt, 0)
-            } else if max_pt == last_pt && last_pt == recv_pt {
-                // All three equal: take max of both logical counters + 1
-                let lc = last.logical().max(received.logical()) as u64;
-                let lc = lc.saturating_add(1).min(MAX_LOGICAL);
-                HlcTimestamp::new(max_pt, lc as u16)
-            } else if max_pt == last_pt {
-                // Local HLC is ahead of remote and wall clock
-                let lc = (last.logical() as u64).saturating_add(1).min(MAX_LOGICAL);
-                HlcTimestamp::new(max_pt, lc as u16)
-            } else {
-                // Remote is ahead
-                let lc = (received.logical() as u64)
-                    .saturating_add(1)
-                    .min(MAX_LOGICAL);
-                HlcTimestamp::new(max_pt, lc as u16)
+            let Some(next) = checked_next_for_update(last, received, pt) else {
+                abort_terminal_exhaustion()
             };
 
             if self
@@ -263,6 +322,64 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn now_carries_logical_overflow_into_the_physical_component() {
+        let clock = HlcClock {
+            last: AtomicU64::new(HlcTimestamp::new(41, u16::MAX).as_u64()),
+        };
+
+        let next = clock.now_at(0);
+
+        assert_eq!(next, HlcTimestamp::new(42, 0));
+    }
+
+    #[test]
+    fn update_carries_logical_overflow_into_the_physical_component() {
+        let clock = HlcClock {
+            last: AtomicU64::new(HlcTimestamp::new(41, u16::MAX).as_u64()),
+        };
+
+        let next = clock.update_at(HlcTimestamp::new(41, u16::MAX), 0);
+
+        assert_eq!(next, HlcTimestamp::new(42, 0));
+    }
+
+    #[test]
+    fn now_checked_recurrence_reports_terminal_exhaustion() {
+        assert_eq!(
+            checked_next_for_now(HlcTimestamp::from_u64(u64::MAX), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn now_checked_recurrence_rejects_unencodable_physical_time() {
+        assert_eq!(
+            checked_next_for_now(HlcTimestamp::new(1, 0), MAX_PHYSICAL_MS + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn update_checked_recurrence_reports_terminal_exhaustion() {
+        assert_eq!(
+            checked_next_for_update(HlcTimestamp::new(1, 0), HlcTimestamp::from_u64(u64::MAX), 0,),
+            None
+        );
+    }
+
+    #[test]
+    fn update_checked_recurrence_rejects_unencodable_physical_time() {
+        assert_eq!(
+            checked_next_for_update(
+                HlcTimestamp::new(1, 0),
+                HlcTimestamp::new(2, 0),
+                MAX_PHYSICAL_MS + 1,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn encoding_roundtrip() {

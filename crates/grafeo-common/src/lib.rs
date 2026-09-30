@@ -38,10 +38,8 @@ pub use utils::error::{Error, Result};
 #[cfg(feature = "tiered-storage")]
 pub use mvcc::{ColdVersionRef, HotVersionRef, OptionalEpochId, VersionIndex, VersionRef};
 
-// Temporal property versioning (feature-gated)
-#[cfg(feature = "temporal")]
+// Temporal property versioning
 pub mod temporal;
-#[cfg(feature = "temporal")]
 pub use temporal::VersionLog;
 
 // Encryption at rest (feature-gated)

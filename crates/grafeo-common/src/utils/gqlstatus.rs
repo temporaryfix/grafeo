@@ -209,6 +209,8 @@ impl From<&super::error::Error> for GqlStatus {
                 QueryErrorKind::Optimization => GqlStatus::SYNTAX_ERROR,
                 QueryErrorKind::Execution => GqlStatus::DATA_EXCEPTION,
                 QueryErrorKind::Timeout => GqlStatus::DATA_EXCEPTION,
+                QueryErrorKind::Cancelled => GqlStatus::DATA_EXCEPTION,
+                QueryErrorKind::Unsupported => GqlStatus::DATA_EXCEPTION,
             },
             Error::Transaction(t) => match t {
                 TransactionError::ReadOnly => GqlStatus::INVALID_TX_READ_ONLY,
@@ -218,7 +220,9 @@ impl From<&super::error::Error> for GqlStatus {
                 | TransactionError::WriteConflict(_) => GqlStatus::TX_ROLLBACK,
                 TransactionError::SerializationFailure(_) => GqlStatus::TX_ROLLBACK,
                 TransactionError::Deadlock => GqlStatus::TX_ROLLBACK,
-                TransactionError::Timeout => GqlStatus::INVALID_TX_STATE,
+                TransactionError::Timeout | TransactionError::DurabilityFailure(_) => {
+                    GqlStatus::INVALID_TX_STATE
+                }
             },
             Error::TypeMismatch { .. } => GqlStatus::DATA_INVALID_VALUE_TYPE,
             Error::InvalidValue(_) => GqlStatus::DATA_EXCEPTION,
@@ -227,9 +231,21 @@ impl From<&super::error::Error> for GqlStatus {
                 GqlStatus::SYNTAX_INVALID_REFERENCE
             }
             Error::Storage(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Crypto(_) => GqlStatus::DATA_EXCEPTION,
             Error::Serialization(_) => GqlStatus::DATA_EXCEPTION,
             Error::Io(_) => GqlStatus::DATA_EXCEPTION,
             Error::Internal(_) => GqlStatus::DATA_EXCEPTION,
+            Error::Context { source, .. } => GqlStatus::from(source.as_ref()),
+            Error::RetainedContext { source, code } => source
+                .inspect::<super::error::RetainedErrorContext, _>(|context| {
+                    context.primary().map(GqlStatus::from)
+                })
+                .flatten()
+                .unwrap_or(match code {
+                    super::error::ErrorCode::TransactionConflict => GqlStatus::TX_ROLLBACK,
+                    super::error::ErrorCode::TypeMismatch => GqlStatus::DATA_INVALID_VALUE_TYPE,
+                    _ => GqlStatus::DATA_EXCEPTION,
+                }),
         }
     }
 }
@@ -387,6 +403,16 @@ mod tests {
         assert_eq!(
             GqlStatus::from(&semantic_err),
             GqlStatus::SYNTAX_INVALID_REFERENCE
+        );
+
+        let timeout = Error::Query(QueryError::timeout());
+        assert_eq!(GqlStatus::from(&timeout), GqlStatus::DATA_EXCEPTION);
+
+        let cancelled = Error::Query(QueryError::cancelled());
+        assert_eq!(GqlStatus::from(&cancelled), GqlStatus::DATA_EXCEPTION);
+        assert_eq!(
+            GqlStatus::from(&cancelled.with_context("cleanup also failed")),
+            GqlStatus::DATA_EXCEPTION
         );
 
         let tx_err = Error::Transaction(TransactionError::ReadOnly);

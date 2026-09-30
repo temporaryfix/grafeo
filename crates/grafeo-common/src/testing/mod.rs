@@ -4,3 +4,4 @@
 
 pub mod crash;
 pub mod statement_failure;
+pub mod wal_failure;

@@ -34,6 +34,7 @@ mod inner {
     thread_local! {
         static CRASH_COUNTER: Cell<u64> = const { Cell::new(u64::MAX) };
         static CRASH_ENABLED: Cell<bool> = const { Cell::new(false) };
+        static CRASH_NAMED: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 
     /// Conditionally panic when the crash counter reaches zero.
@@ -44,13 +45,25 @@ mod inner {
     ///
     /// Uses thread-local state so concurrent tests don't interfere.
     ///
+    /// A child process can also arm a named site with `GRAFEO_CRASH_NAMED=<label>`
+    /// (subprocess failpoint). That env is read once per process.
+    ///
     /// # Panics
     ///
     /// Panics (intentionally) when crash injection is enabled and the counter reaches zero.
     #[inline]
     pub fn maybe_crash(point: &'static str) {
+        assert!(
+            env_named_crash() != Some(point),
+            "crash injection at: {point}"
+        );
         CRASH_ENABLED.with(|enabled| {
             if !enabled.get() {
+                return;
+            }
+            let named = CRASH_NAMED.with(|n| n.get());
+            assert!(named != Some(point), "crash injection at: {point}");
+            if named.is_some() {
                 return;
             }
             CRASH_COUNTER.with(|counter| {
@@ -61,11 +74,29 @@ mod inner {
         });
     }
 
+    fn env_named_crash() -> Option<&'static str> {
+        static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if let Some(s) = NAME.get() {
+            return Some(s.as_str());
+        }
+        match std::env::var("GRAFEO_CRASH_NAMED") {
+            Ok(s) if !s.is_empty() => Some(NAME.get_or_init(|| s).as_str()),
+            _ => None,
+        }
+    }
+
     /// Enable crash injection to fire after `count` calls to [`maybe_crash`].
     ///
     /// Only affects the calling thread.
     pub fn enable_crash_at(count: u64) {
         CRASH_COUNTER.with(|c| c.set(count));
+        CRASH_NAMED.with(|n| n.set(None));
+        CRASH_ENABLED.with(|e| e.set(true));
+    }
+
+    /// Panic at the next [`maybe_crash`] call whose label equals `point`.
+    pub fn enable_crash_named(point: &'static str) {
+        CRASH_NAMED.with(|n| n.set(Some(point)));
         CRASH_ENABLED.with(|e| e.set(true));
     }
 
@@ -75,6 +106,7 @@ mod inner {
     pub fn disable_crash() {
         CRASH_ENABLED.with(|e| e.set(false));
         CRASH_COUNTER.with(|c| c.set(u64::MAX));
+        CRASH_NAMED.with(|n| n.set(None));
     }
 }
 
@@ -86,6 +118,9 @@ mod inner {
 
     /// No-op when crash injection is disabled.
     pub fn enable_crash_at(_count: u64) {}
+
+    /// No-op when crash injection is disabled.
+    pub fn enable_crash_named(_point: &'static str) {}
 
     /// No-op when crash injection is disabled.
     pub fn disable_crash() {}
@@ -116,6 +151,20 @@ where
     let result = std::panic::catch_unwind(f);
     disable_crash();
 
+    match result {
+        Ok(value) => CrashResult::Completed(value),
+        Err(_) => CrashResult::Crashed,
+    }
+}
+
+/// Run `f` and panic at the named [`maybe_crash`] site.
+pub fn with_crash_named<F, T>(point: &'static str, f: F) -> CrashResult<T>
+where
+    F: FnOnce() -> T,
+{
+    enable_crash_named(point);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    disable_crash();
     match result {
         Ok(value) => CrashResult::Completed(value),
         Err(_) => CrashResult::Crashed,

@@ -22,6 +22,7 @@ arcstr.workspace = true
 
 # Hashing
 foldhash.workspace = true
+blake3.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -43,10 +44,16 @@ zeroize = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+web-time = "1.1"
+
 [features]
 default = []
 tiered-storage = []
-temporal = []
 tracing = ["dep:tracing"]
 testing-crash-injection = []
 testing-statement-injection = []

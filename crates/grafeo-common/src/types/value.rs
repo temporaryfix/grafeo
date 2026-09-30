@@ -13,6 +13,13 @@ use std::sync::Arc;
 
 use super::{Date, Duration, Time, Timestamp, ZonedDatetime};
 
+/// Parser-inexpressible marker carried by Grafeo's internal RDF term pairs.
+///
+/// The marker lets execution operators distinguish sealed `[visible, exact, marker]`
+/// values from ordinary user lists without changing public list comparison semantics.
+#[doc(hidden)]
+pub const INTERNAL_RDF_TAGGED_TERM_MARKER: &str = "\0grafeo:rdf-tagged-term-pair";
+
 /// An interned property name - cheap to clone and compare.
 ///
 /// Property names like "name", "age", "created_at" get used repeatedly, so
@@ -171,6 +178,19 @@ pub enum Value {
         /// Per-replica negative contributions (decrements, stored as positive
         /// magnitudes).
         neg: Arc<std::collections::HashMap<String, u64>>,
+    },
+
+    /// RDF literal: lexical form plus optional language tag and/or datatype IRI.
+    ///
+    /// Simple `xsd:string` values without a language tag stay [`Value::String`].
+    /// `"Alix"` and `"Alix"@en` must not compare equal.
+    RdfLiteral {
+        /// Lexical form.
+        lexical: ArcStr,
+        /// Language tag (`@en`). Mutually exclusive with a non-langString datatype.
+        language: Option<ArcStr>,
+        /// Datatype IRI (`xsd:date`, …). None for language-tagged literals.
+        datatype: Option<ArcStr>,
     },
 }
 
@@ -360,6 +380,7 @@ impl Value {
             Value::Path { .. } => "PATH",
             Value::GCounter(_) => "GCOUNTER",
             Value::OnCounter { .. } => "PNCOUNTER",
+            Value::RdfLiteral { .. } => "RDF_LITERAL",
         }
     }
 
@@ -380,6 +401,103 @@ impl Value {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, bincode::error::DecodeError> {
         let (value, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
         Ok(value)
+    }
+
+    /// Returns a checked upper bound for this value's retained resident storage.
+    ///
+    /// Includes the Value slot, shared allocation headers, nested storage and
+    /// container capacity. Shared backings are conservatively charged for each
+    /// ownership edge; this is not a claim of uniquely allocated bytes.
+    /// The B-tree and hash-table bounds cover the pinned Rust 1.97 allocation
+    /// layouts, including spare nodes/buckets; ArcStr covers its 1.2 layout.
+    /// Returns `None` on arithmetic overflow or nesting beyond the bounded
+    /// measurement stack (256 levels), so callers can deny before cloning.
+    #[must_use]
+    pub fn retained_size_bytes(&self) -> Option<usize> {
+        self.retained_size_at_depth(0)
+    }
+
+    fn retained_size_at_depth(&self, depth: usize) -> Option<usize> {
+        if depth > 256 {
+            return None;
+        }
+        let word = size_of::<usize>();
+        let arc_header = word.checked_mul(2)?;
+        let arc_string = |value: &ArcStr| value.len().checked_add(arc_header)?.checked_add(7);
+        let array = |values: &[Value]| -> Option<usize> {
+            values.iter().try_fold(
+                arc_header.checked_add(std::mem::align_of::<Value>() - 1)?,
+                |total, value| total.checked_add(value.retained_size_at_depth(depth + 1)?),
+            )
+        };
+        let counter = |values: &std::collections::HashMap<String, u64>| -> Option<usize> {
+            // HashMap::capacity is the usable bucket count, not its allocation.
+            // Twice (capacity+1) bounds the bucket count; include control bytes
+            // and the largest supported trailing SIMD control group.
+            let mut total =
+                arc_header.checked_add(size_of::<std::collections::HashMap<String, u64>>())?;
+            if values.capacity() != 0 {
+                let buckets = values.capacity().checked_add(1)?.checked_mul(2)?;
+                total = total
+                    .checked_add(buckets.checked_mul(size_of::<(String, u64)>().checked_add(1)?)?)?
+                    .checked_add(128)?;
+            }
+            values
+                .keys()
+                .try_fold(total, |total, key| total.checked_add(key.capacity()))
+        };
+        let heap = match self {
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int64(_)
+            | Self::Float64(_)
+            | Self::Timestamp(_)
+            | Self::Date(_)
+            | Self::Time(_)
+            | Self::Duration(_)
+            | Self::ZonedDatetime(_) => 0,
+            Self::String(value) => arc_string(value)?,
+            Self::Bytes(value) => arc_header.checked_add(value.len())?,
+            Self::Vector(value) => {
+                arc_header.checked_add(value.len().checked_mul(size_of::<f32>())?)?
+            }
+            Self::List(values) => array(values)?,
+            Self::Map(values) => {
+                // Rust's B=6 B-tree stores eleven key/value slots and at most
+                // twelve child pointers per node. Every nonroot node retains
+                // at least five keys, and an empty map may retain one root.
+                let nodes = values.len().checked_div(5)?.checked_add(1)?;
+                let node = size_of::<PropertyKey>()
+                    .checked_add(size_of::<Value>())?
+                    .checked_mul(11)?
+                    .checked_add(word.checked_mul(16)?)?;
+                let initial = arc_header
+                    .checked_add(size_of::<std::collections::BTreeMap<PropertyKey, Value>>())?
+                    .checked_add(nodes.checked_mul(node)?)?;
+                values.iter().try_fold(initial, |total, (key, value)| {
+                    total.checked_add(arc_string(&key.0)?)?.checked_add(
+                        value
+                            .retained_size_at_depth(depth + 1)?
+                            .checked_sub(size_of::<Value>())?,
+                    )
+                })?
+            }
+            Self::Path { nodes, edges } => array(nodes)?.checked_add(array(edges)?)?,
+            Self::GCounter(values) => counter(values)?,
+            Self::OnCounter { pos, neg } => counter(pos)?.checked_add(counter(neg)?)?,
+            Self::RdfLiteral {
+                lexical,
+                language,
+                datatype,
+            } => {
+                let mut total = arc_string(lexical)?;
+                for value in [language, datatype].into_iter().flatten() {
+                    total = total.checked_add(arc_string(value)?)?;
+                }
+                total
+            }
+        };
+        size_of::<Value>().checked_add(heap)
     }
 
     /// Returns an estimate of the heap memory used by this value in bytes.
@@ -423,6 +541,15 @@ impl Value {
                 let n: usize = neg.keys().map(|k| k.len() + size_of::<u64>()).sum();
                 p + n
             }
+            Value::RdfLiteral {
+                lexical,
+                language,
+                datatype,
+            } => {
+                lexical.len()
+                    + language.as_ref().map_or(0, |s| s.len())
+                    + datatype.as_ref().map_or(0, |s| s.len())
+            }
         }
     }
 }
@@ -453,7 +580,7 @@ impl fmt::Debug for Value {
                 write!(f, "Path({} nodes, {} edges)", nodes.len(), edges.len())
             }
             Value::GCounter(counts) => {
-                let total: u64 = counts.values().sum();
+                let total: u128 = counts.values().copied().map(u128::from).sum();
                 write!(f, "GCounter(total={total}, replicas={})", counts.len())
             }
             Value::OnCounter { pos, neg } => {
@@ -465,6 +592,15 @@ impl fmt::Debug for Value {
                     write!(f, "OnCounter(net=-{})", neg_sum - pos_sum)
                 }
             }
+            Value::RdfLiteral {
+                lexical,
+                language,
+                datatype,
+            } => match (language, datatype) {
+                (Some(lang), _) => write!(f, "RdfLiteral(\"{lexical}\"@{lang})"),
+                (None, Some(dt)) => write!(f, "RdfLiteral(\"{lexical}\"^^{dt})"),
+                (None, None) => write!(f, "RdfLiteral(\"{lexical}\")"),
+            },
         }
     }
 }
@@ -531,7 +667,7 @@ impl fmt::Display for Value {
                 write!(f, ">")
             }
             Value::GCounter(counts) => {
-                let total: u64 = counts.values().sum();
+                let total: u128 = counts.values().copied().map(u128::from).sum();
                 write!(f, "GCounter({total})")
             }
             Value::OnCounter { pos, neg } => {
@@ -541,6 +677,20 @@ impl fmt::Display for Value {
                     write!(f, "OnCounter({})", pos_sum - neg_sum)
                 } else {
                     write!(f, "OnCounter(-{})", neg_sum - pos_sum)
+                }
+            }
+            Value::RdfLiteral {
+                lexical,
+                language,
+                datatype,
+            } => {
+                write!(f, "\"{lexical}\"")?;
+                if let Some(lang) = language {
+                    write!(f, "@{lang}")
+                } else if let Some(dt) = datatype {
+                    write!(f, "^^<{dt}>")
+                } else {
+                    Ok(())
                 }
             }
         }
@@ -674,8 +824,10 @@ impl<T: Into<Value>> From<Option<T>> for Value {
 /// # Note on Float Equality
 ///
 /// Two `HashableValue`s containing `f64` are considered equal if they have
-/// identical bit representations. This means `NaN == NaN` (same bits) and
-/// positive/negative zero are considered different.
+/// identical bit representations after canonicalizing signed zero. Identical
+/// NaN payloads compare equal, as do positive and negative zero. This rule also
+/// applies recursively inside lists, maps and paths; vector elements retain
+/// their exact `f32` bit identity.
 #[derive(Clone, Debug)]
 pub struct HashableValue(pub Value);
 
@@ -790,7 +942,9 @@ impl Ord for OrderedFloat64 {
 
 impl Hash for OrderedFloat64 {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
+        // Canonicalize -0.0 to +0.0 so hashing agrees with `eq` (which treats
+        // -0.0 == 0.0); otherwise the Hash/Eq contract is violated.
+        canonical_f64_bits(self.0).hash(state);
     }
 }
 
@@ -825,7 +979,8 @@ impl TryFrom<&Value> for OrderableValue {
             | Value::Vector(_)
             | Value::Path { .. }
             | Value::GCounter(_)
-            | Value::OnCounter { .. } => Err(()),
+            | Value::OnCounter { .. }
+            | Value::RdfLiteral { .. } => Err(()),
         }
     }
 }
@@ -974,6 +1129,15 @@ impl HashableValue {
     }
 }
 
+/// Canonical bit pattern of an `f64` for hashing/equality keys: maps `-0.0` to
+/// `+0.0` so the two signed zeros key as equal (IEEE-754 `-0.0 == 0.0`, which
+/// every query language honors in DISTINCT / GROUP BY / equality). NaN payloads
+/// are left untouched. Use this everywhere floats are turned into hash/eq keys
+/// so `Hash` and `Eq` stay consistent.
+pub fn canonical_f64_bits(f: f64) -> u64 {
+    (if f == 0.0 { 0.0 } else { f }).to_bits()
+}
+
 /// Hashes a `Value` by reference without cloning nested values.
 fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
     std::mem::discriminant(value).hash(state);
@@ -982,7 +1146,7 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
         Value::Null => {}
         Value::Bool(b) => b.hash(state),
         Value::Int64(i) => i.hash(state),
-        Value::Float64(f) => f.to_bits().hash(state),
+        Value::Float64(f) => canonical_f64_bits(*f).hash(state),
         Value::String(s) => s.hash(state),
         Value::Bytes(b) => b.hash(state),
         Value::Timestamp(t) => t.hash(state),
@@ -1045,6 +1209,15 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
                 v.hash(state);
             }
         }
+        Value::RdfLiteral {
+            lexical,
+            language,
+            datatype,
+        } => {
+            lexical.hash(state);
+            language.hash(state);
+            datatype.hash(state);
+        }
     }
 }
 
@@ -1057,7 +1230,7 @@ impl Hash for HashableValue {
 /// Compares two `Value`s for hashable equality by reference (bit-equal floats).
 fn values_hash_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
+        (Value::Float64(a), Value::Float64(b)) => canonical_f64_bits(*a) == canonical_f64_bits(*b),
         (Value::List(a), Value::List(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_hash_eq(x, y))
         }
@@ -1114,6 +1287,51 @@ impl From<HashableValue> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_bound_covers_nested_and_reserved_values() {
+        let mut counts = std::collections::HashMap::with_capacity(64);
+        let mut key = String::with_capacity(4096);
+        key.push_str("replica");
+        counts.insert(key, 7);
+        let minimum = counts.capacity() * std::mem::size_of::<(String, u64)>() + 4096;
+        let counter = Value::GCounter(Arc::new(counts));
+        assert!(counter.retained_size_bytes().unwrap() >= minimum);
+        let nested = Value::List(
+            vec![
+                Value::Map(Arc::new(
+                    [(PropertyKey::from("k"), Value::String("v".into()))]
+                        .into_iter()
+                        .collect(),
+                )),
+                counter.clone(),
+                Value::RdfLiteral {
+                    lexical: "lexical".into(),
+                    language: Some("en".into()),
+                    datatype: Some("urn:type".into()),
+                },
+                Value::Path {
+                    nodes: vec![Value::Int64(1)].into(),
+                    edges: vec![Value::String("edge".into())].into(),
+                },
+            ]
+            .into(),
+        );
+        let bound = nested.retained_size_bytes().expect("bounded nested value");
+        assert!(bound >= counter.retained_size_bytes().unwrap() + 4 * std::mem::size_of::<Value>());
+        let counter_bound = counter.retained_size_bytes().unwrap();
+        let repeated = Value::List(vec![counter.clone(), counter].into());
+        assert!(repeated.retained_size_bytes().unwrap() >= 2 * counter_bound);
+    }
+
+    #[test]
+    fn retained_bound_rejects_excessive_nesting() {
+        let mut value = Value::Null;
+        for _ in 0..258 {
+            value = Value::List(vec![value].into());
+        }
+        assert_eq!(value.retained_size_bytes(), None);
+    }
 
     #[test]
     fn test_value_type_checks() {
@@ -1295,19 +1513,22 @@ mod tests {
         map.insert(HashableValue::new(Value::Float64(nan)), 1);
         assert_eq!(map.get(&HashableValue::new(Value::Float64(nan))), Some(&1));
 
-        // Positive and negative zero have different bits
+        // Query equality treats signed zeroes as equal. Their hash-key
+        // representation is canonical too, so the second insert replaces the
+        // first instead of violating the Hash/Eq contract.
         let pos_zero = 0.0f64;
         let neg_zero = -0.0f64;
         map.insert(HashableValue::new(Value::Float64(pos_zero)), 2);
         map.insert(HashableValue::new(Value::Float64(neg_zero)), 3);
         assert_eq!(
             map.get(&HashableValue::new(Value::Float64(pos_zero))),
-            Some(&2)
+            Some(&3)
         );
         assert_eq!(
             map.get(&HashableValue::new(Value::Float64(neg_zero))),
             Some(&3)
         );
+        assert_eq!(map.len(), 2, "NaN plus one canonical signed-zero key");
     }
 
     #[test]
@@ -1384,7 +1605,7 @@ mod tests {
         assert!(v1 < v2);
         assert!(v2 < v_inf);
         assert!(v_inf < v_nan); // NaN is greater than everything
-        assert!(v_nan == v_nan); // NaN equals itself for total ordering
+        assert_eq!(v_nan, v_nan); // NaN equals itself for total ordering
     }
 
     #[test]
@@ -1714,6 +1935,20 @@ mod tests {
         counts.insert("node-b".to_string(), 5u64);
         let v = Value::GCounter(Arc::new(counts));
         assert_eq!(format!("{v}"), "GCounter(15)");
+    }
+
+    #[test]
+    fn test_gcounter_formatting_exceeds_u64_without_overflow() {
+        let counts = std::collections::HashMap::from([
+            ("a".to_owned(), u64::MAX),
+            ("b".to_owned(), u64::MAX),
+        ]);
+        let value = Value::GCounter(Arc::new(counts));
+        assert_eq!(format!("{value}"), "GCounter(36893488147419103230)");
+        assert_eq!(
+            format!("{value:?}"),
+            "GCounter(total=36893488147419103230, replicas=2)"
+        );
     }
 
     #[test]

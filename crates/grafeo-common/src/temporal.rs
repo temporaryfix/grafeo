@@ -113,6 +113,17 @@ impl<T> VersionLog<T> {
         self.entries.push((epoch, value));
     }
 
+    /// Reserves capacity for at least `additional` appended versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an allocation error if the requested capacity cannot be reserved.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), crate::memory::AllocError> {
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| crate::memory::AllocError::OutOfMemory)
+    }
+
     /// Removes all entries with `EpochId::PENDING` from the back of the log.
     ///
     /// PENDING entries are always at the tail (appended during an uncommitted
@@ -190,6 +201,34 @@ impl<T> VersionLog<T> {
         if baseline > 0 {
             self.entries.drain(..baseline);
         }
+    }
+
+    /// Garbage-collects old versions while preserving selected older epochs.
+    ///
+    /// Retains the same baseline and recent entries as [`Self::gc`], plus
+    /// every older entry whose epoch satisfies `preserve`. This includes all
+    /// entries at a selected epoch, preserving their original order. The
+    /// predicate is called only for entries that ordinary GC would discard.
+    /// No values are cloned and no additional storage is allocated.
+    pub fn gc_preserving(&mut self, min_epoch: EpochId, mut preserve: impl FnMut(EpochId) -> bool) {
+        if self.entries.len() <= 1 {
+            return;
+        }
+        let first_recent = self
+            .entries
+            .partition_point(|(epoch, _)| *epoch < min_epoch);
+        let Some(baseline) = first_recent.checked_sub(1) else {
+            return;
+        };
+        if baseline == 0 {
+            return;
+        }
+        let mut index = 0;
+        self.entries.retain(|(epoch, _)| {
+            let keep = index >= baseline || preserve(*epoch);
+            index += 1;
+            keep
+        });
     }
 
     /// Returns the number of versions in the log.
@@ -462,6 +501,89 @@ mod tests {
 
         // Single entry: never GC'd
         assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn test_gc_preserving_birth_epochs_and_same_epoch_order() {
+        let mut log = VersionLog::new();
+        for (created, value) in [
+            (1, "birth"),
+            (1, "amended"),
+            (2, "old"),
+            (4, "baseline"),
+            (6, "recent"),
+        ] {
+            log.append(epoch(created), value);
+        }
+        let mut visited = Vec::new();
+        log.gc_preserving(epoch(5), |created| {
+            visited.push(created);
+            created == epoch(1)
+        });
+        assert_eq!(visited, vec![epoch(1), epoch(1), epoch(2)]);
+        assert_eq!(
+            log.history(),
+            &[
+                (epoch(1), "birth"),
+                (epoch(1), "amended"),
+                (epoch(4), "baseline"),
+                (epoch(6), "recent")
+            ]
+        );
+        assert_eq!(log.at(epoch(1)), Some(&"amended"));
+        assert_eq!(log.at(epoch(5)), Some(&"baseline"));
+
+        // Once the owner no longer needs its birth, ordinary retention wins.
+        log.gc_preserving(epoch(7), |_| false);
+        assert_eq!(log.history(), &[(epoch(6), "recent")]);
+    }
+
+    #[test]
+    fn test_gc_preserving_without_anchors_matches_ordinary_gc() {
+        for count in 0..=6 {
+            let mut original = VersionLog::new();
+            for value in 0..count {
+                original.append(epoch(value / 2), value);
+            }
+            original.append(EpochId::PENDING, 99);
+            for cutoff in [
+                epoch(0),
+                epoch(1),
+                epoch(2),
+                epoch(3),
+                epoch(100),
+                EpochId::PENDING,
+            ] {
+                let mut ordinary = original.clone();
+                let mut preserving = original.clone();
+                ordinary.gc(cutoff);
+                preserving.gc_preserving(cutoff, |_| false);
+                assert_eq!(preserving.history(), ordinary.history());
+            }
+        }
+    }
+
+    #[test]
+    fn test_gc_preserving_fast_paths_do_not_call_predicate() {
+        for mut log in [VersionLog::new(), VersionLog::with_value(epoch(5), 10)] {
+            let mut visited = false;
+            log.gc_preserving(epoch(10), |_| {
+                visited = true;
+                true
+            });
+            assert!(!visited);
+        }
+        let mut log = VersionLog::with_value(epoch(5), 10);
+        log.append(epoch(7), 20);
+        for cutoff in [epoch(1), epoch(6)] {
+            let mut visited = false;
+            log.gc_preserving(cutoff, |_| {
+                visited = true;
+                true
+            });
+            assert!(!visited);
+            assert_eq!(log.history(), &[(epoch(5), 10), (epoch(7), 20)]);
+        }
     }
 
     #[test]

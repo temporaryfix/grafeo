@@ -20,9 +20,10 @@ use crate::utils::error::Result;
 
 /// Identifies a section type in the container directory.
 ///
-/// Types 1-9 are **data sections** (authoritative, cannot be rebuilt).
-/// Types 10-19 are **index sections** (derived, can be rebuilt from data).
-/// Types 20+ are reserved for future acceleration structures.
+/// Types 1-9 are model/metadata sections. Types 10-19 are index acceleration
+/// sections; whether a particular wire generation is rebuildable or must be
+/// installed exactly is part of that generation's recovery contract. Types
+/// 20+ are reserved for future acceleration structures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u32)]
 #[non_exhaustive]
@@ -40,8 +41,16 @@ pub enum SectionType {
     /// previously-deleted base node does not reappear after reload
     /// when the next compact has not yet run.
     OverlayDeletions = 5,
+    /// Store identity, logical world cut, and container recovery-image seal.
+    ///
+    /// This section is required so a reader that does not understand logical
+    /// store identity cannot silently rewrite a container under a new handle
+    /// namespace.
+    WorldMetadata = 6,
+    /// Retained native change feed and durable sequence/floor authority.
+    Cdc = 7,
 
-    /// Vector embeddings, HNSW topology, quantization data.
+    /// Vector embeddings, HNSW topology, and quantization data.
     VectorStore = 10,
     /// BM25 inverted index: term dictionary, postings lists.
     TextIndex = 11,
@@ -52,13 +61,13 @@ pub enum SectionType {
 }
 
 impl SectionType {
-    /// Whether this section type holds authoritative data (not rebuildable).
+    /// Whether this section type is in the model/metadata range.
     #[must_use]
     pub const fn is_data_section(self) -> bool {
         (self as u32) < 10
     }
 
-    /// Whether this section type holds a derived index (rebuildable from data).
+    /// Whether this section type is in the index/acceleration range.
     #[must_use]
     pub const fn is_index_section(self) -> bool {
         (self as u32) >= 10
@@ -70,8 +79,10 @@ impl SectionType {
 /// Flags for a section entry in the container directory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionFlags {
-    /// Bit 0: section is required (older binaries must refuse to open if unknown).
-    /// When false, unknown section types can be safely skipped.
+    /// Bit 0: historical required-section directory hint. The current reader
+    /// fails closed on every unknown type and validates generation-specific
+    /// recovery contracts independently of this bit. A future directory
+    /// format may define a forward-compatible skip contract.
     pub required: bool,
     /// Bit 1: section data can be mmap'd for zero-copy access.
     pub mmap_able: bool,
@@ -129,6 +140,10 @@ impl SectionType {
                 // reader that ignores it fails open (deleted base nodes
                 // reappear) rather than failing closed (refuse to open).
                 required: false,
+                mmap_able: false,
+            },
+            Self::WorldMetadata | Self::Cdc => SectionFlags {
+                required: true,
                 mmap_able: false,
             },
             Self::VectorStore | Self::TextIndex | Self::RdfRing | Self::PropertyIndex => {
@@ -325,6 +340,17 @@ mod tests {
         assert!(SectionType::TextIndex.is_index_section());
         assert!(SectionType::RdfRing.is_index_section());
         assert!(SectionType::PropertyIndex.is_index_section());
+    }
+
+    #[test]
+    fn world_metadata_is_required_authoritative_data() {
+        assert_eq!(SectionType::WorldMetadata as u32, 6);
+        assert!(SectionType::WorldMetadata.is_data_section());
+        assert!(!SectionType::WorldMetadata.is_index_section());
+
+        let flags = SectionType::WorldMetadata.default_flags();
+        assert!(flags.required);
+        assert!(!flags.mmap_able);
     }
 
     #[test]
