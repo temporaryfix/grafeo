@@ -1,0 +1,343 @@
+{
+  "purpose": "Index for one bounded source review; not a runtime qualification or merge plan.",
+  "default_case": "D1",
+  "review_code_commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+  "upstream_main_commit": "22d39f24be01ecfed1d30093bc395e3f363df7ea",
+  "upstream_release_commit": "e7c48583f39306e862414ecfb721ca0adf5b2a97",
+  "upstream_release_branch": "release/0.5.44",
+  "upstream_refs_rechecked_at": "2026-09-29T23:53:49.232852+00:00",
+  "reading_guide": "REVIEW.md",
+  "llm_prompt": "review/LLM.md",
+  "optional_inventory": "review/INVENTORY.md",
+  "execution_default": "read_only_no_build",
+  "runtime_evidence": "The cases below have not been rerun on this public export. Expected values describe source assertions.",
+  "cases": [
+    {
+      "id": "D1",
+      "brief": "review/DURABILITY.md",
+      "upstream_issues": [
+        498,
+        448
+      ],
+      "decision": "Adapt the two LPG failure cases to the upstream WAL group; agree failed-handle and retry behavior.",
+      "initial_reading": [
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/c1_durability.rs",
+          "start_line": 162,
+          "end_line": 186,
+          "symbol_or_purpose": "lpg_commit_append_failure_is_unpublished_and_recovery_aborts_it"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/c1_durability.rs",
+          "start_line": 220,
+          "end_line": 251,
+          "symbol_or_purpose": "lpg_lost_commit_ack_is_resolved_as_committed_by_recovery"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/src/session/mod.rs",
+          "start_line": 11430,
+          "end_line": 11493,
+          "symbol_or_purpose": "WAL marker acknowledgment before prepared state installation"
+        },
+        {
+          "repository": "GrafeoDB/grafeo",
+          "commit": "22d39f24be01ecfed1d30093bc395e3f363df7ea",
+          "path": "crates/grafeo-engine/src/session/mod.rs",
+          "start_line": 4173,
+          "end_line": 4243,
+          "symbol_or_purpose": "Upstream commit publication and warning-only WAL flush"
+        }
+      ],
+      "optional_reading": [
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/src/transaction/manager.rs",
+          "start_line": 1452,
+          "end_line": 1482,
+          "symbol_or_purpose": "prepare_durable_commit"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/c1_durability.rs",
+          "start_line": 8,
+          "end_line": 43,
+          "symbol_or_purpose": "Feature gates and Sync-mode LPG fixture"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-storage/src/wal/log.rs",
+          "start_line": 1351,
+          "end_line": 1394,
+          "symbol_or_purpose": "Pre-write commit failure injection"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-storage/src/wal/log.rs",
+          "start_line": 1632,
+          "end_line": 1642,
+          "symbol_or_purpose": "Post-write acknowledgment failure injection"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-storage/src/wal/log.rs",
+          "start_line": 283,
+          "end_line": 323,
+          "symbol_or_purpose": "Sync-mode flush and sync before acknowledgment"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-storage/src/wal/record.rs",
+          "start_line": 1037,
+          "end_line": 1059,
+          "symbol_or_purpose": "Commit record requires sync"
+        }
+      ],
+      "expected_assertions": [
+        "Pre-append failure: commit returns error, node_count is 0 in process and after reopen.",
+        "Lost acknowledgment after a synced marker: commit returns unknown-outcome error, original handle is poisoned, in-process node_count is 0, recovered node_count is 1."
+      ],
+      "commands": [
+        {
+          "argv": [
+            "cargo",
+            "+1.97.1",
+            "test",
+            "--locked",
+            "-p",
+            "grafeo-engine",
+            "--no-default-features",
+            "--features",
+            "lpg,gql,triple-store,sparql,wal,grafeo-file,testing-crash-injection",
+            "--test",
+            "c1_durability",
+            "lpg_commit_append_failure_is_unpublished_and_recovery_aborts_it",
+            "--",
+            "--exact",
+            "--test-threads=1"
+          ],
+          "expected_selected_tests": 1,
+          "execution_status": "not_run_on_review_export"
+        },
+        {
+          "argv": [
+            "cargo",
+            "+1.97.1",
+            "test",
+            "--locked",
+            "-p",
+            "grafeo-engine",
+            "--no-default-features",
+            "--features",
+            "lpg,gql,triple-store,sparql,wal,grafeo-file,testing-crash-injection",
+            "--test",
+            "c1_durability",
+            "lpg_lost_commit_ack_is_resolved_as_committed_by_recovery",
+            "--",
+            "--exact",
+            "--test-threads=1"
+          ],
+          "expected_selected_tests": 1,
+          "execution_status": "not_run_on_review_export"
+        }
+      ],
+      "preserve": [
+        "Upstream grouped WAL and savepoint order",
+        "Graph-qualified writes and direct-write performance path",
+        "Existing recovery/checkpoint controls"
+      ],
+      "adoption_boundary": "Tests and commit ordering first; do not transplant the complete catalog/RDF/CDC preparation method or change the WAL format for this case."
+    },
+    {
+      "id": "P1",
+      "brief": "review/PATHS.md",
+      "upstream_issues": [
+        318,
+        463
+      ],
+      "decision": "Adapt the witnesses and path reconstruction to the current upstream shortest-path operator; agree public path value shape.",
+      "initial_reading": [
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/support/mod.rs",
+          "start_line": 31,
+          "end_line": 159,
+          "symbol_or_purpose": "Shared adversarial fixture and independent traversal"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/path_semantics.rs",
+          "start_line": 731,
+          "end_line": 820,
+          "symbol_or_purpose": "cypher_shortest_paths_cover_free_targets_and_parallel_edges"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/path_semantics.rs",
+          "start_line": 824,
+          "end_line": 901,
+          "symbol_or_purpose": "cypher_shortest_path_exposes_raw_edge_values"
+        }
+      ],
+      "optional_reading": [
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/src/query/planner/lpg/expand.rs",
+          "start_line": 206,
+          "end_line": 263,
+          "symbol_or_purpose": "Length, nodes, edges and path output columns"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-core/src/execution/operators/variable_length_expand.rs",
+          "start_line": 646,
+          "end_line": 704,
+          "symbol_or_purpose": "materialize_path and append_output_suffix"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/path_semantics.rs",
+          "start_line": 306,
+          "end_line": 323,
+          "symbol_or_purpose": "correlated_shortest_predicate_matches_separate_match_binding"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-core/src/execution/operators/variable_length_expand.rs",
+          "start_line": 2978,
+          "end_line": 3050,
+          "symbol_or_purpose": "unified_shortest_snapshot_traversal_and_ssi_read_recording"
+        }
+      ],
+      "expected_assertions": [
+        "Before the additional parallel REL edge: five free targets a,b,d,g,h.",
+        "After it: nine shortest paths, a*2,b*1,d*3,g*1,h*2, with distinct real edge-ID sequences.",
+        "Pinned path control uses actual edge IDs even when a property is named _id with value 999."
+      ],
+      "commands": [
+        {
+          "argv": [
+            "cargo",
+            "+1.97.1",
+            "test",
+            "--locked",
+            "-p",
+            "grafeo-engine",
+            "--no-default-features",
+            "--features",
+            "lpg,cypher",
+            "--test",
+            "path_semantics",
+            "cypher_shortest_"
+          ],
+          "expected_selected_tests": 2,
+          "execution_status": "not_run_on_review_export"
+        }
+      ],
+      "preserve": [
+        "Upstream #516 unreachable, hop-bound, OPTIONAL and later-row fixes",
+        "Correlation and snapshot/read-tracking behavior",
+        "Multiplicity when paths are observed"
+      ],
+      "adoption_boundary": "Partial #318 witness, not full graph-element API completion; shared traversal and #463 speed work need separate assessment."
+    },
+    {
+      "id": "H1",
+      "brief": "review/HISTORY.md",
+      "upstream_issues": [
+        389,
+        449,
+        450
+      ],
+      "decision": "Adopt a retained-history persistence witness independently of the physical compact-store design.",
+      "initial_reading": [
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/temporal_host.rs",
+          "start_line": 180,
+          "end_line": 271,
+          "symbol_or_purpose": "persist_as_of_after_compact_save_open_without_recompact"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/src/database/crud.rs",
+          "start_line": 312,
+          "end_line": 332,
+          "symbol_or_purpose": "get_node_property_at_epoch"
+        },
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-core/src/graph/compact/layered.rs",
+          "start_line": 3699,
+          "end_line": 3733,
+          "symbol_or_purpose": "Historical overlay/base property lookup"
+        }
+      ],
+      "optional_reading": [
+        {
+          "repository": "temporaryfix/grafeo",
+          "commit": "dc6b43b10adc758c16ab9bc01f3cde7283f83df6",
+          "path": "crates/grafeo-engine/tests/temporal_persistence_fidelity.rs",
+          "start_line": 1223,
+          "end_line": 1246,
+          "symbol_or_purpose": "exact_save_after_recompact_preserves_the_complete_timeline"
+        }
+      ],
+      "expected_assertions": [
+        "After compact/close/reopen: current property 51.6; at retained epoch e1, property 51.5.",
+        "Earlier edge epoch has both neighbors; deletion epoch has only the surviving neighbor."
+      ],
+      "commands": [
+        {
+          "argv": [
+            "cargo",
+            "+1.97.1",
+            "test",
+            "--locked",
+            "-p",
+            "grafeo-engine",
+            "--no-default-features",
+            "--features",
+            "temporal-host",
+            "--test",
+            "temporal_host",
+            "persist_as_of_after_compact_save_open_without_recompact",
+            "--",
+            "--exact",
+            "--test-threads=1"
+          ],
+          "expected_selected_tests": 1,
+          "execution_status": "not_run_on_review_export"
+        }
+      ],
+      "preserve": [
+        "Agreed bounded-retention and collection semantics",
+        "Upstream compact-core direction",
+        "Compatibility and migration obligations"
+      ],
+      "adoption_boundary": "A persistence witness, not proof of snapshot isolation/serializability or a proposal for unbounded history."
+    }
+  ],
+  "review_series_sections": 47
+}
