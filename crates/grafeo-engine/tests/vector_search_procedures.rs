@@ -5,7 +5,7 @@
 //! rows as the direct `db.vector_search` / `db.mmr_search` / `db.text_search`
 //! APIs.
 
-#![cfg(all(feature = "algos", feature = "vector-index", feature = "lpg"))]
+#![cfg(all(feature = "gql", feature = "vector-index", feature = "lpg"))]
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
@@ -17,18 +17,129 @@ fn vec3(x: f32, y: f32, z: f32) -> Value {
 fn setup_vector_graph() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let n1 = db.create_node(&["Doc"]);
-    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
-    db.set_node_property(n1, "title", Value::from("A"));
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .expect("set node property");
+    db.set_node_property(n1, "title", Value::from("A"))
+        .expect("set node property");
     let n2 = db.create_node(&["Doc"]);
-    db.set_node_property(n2, "emb", vec3(0.9, 0.1, 0.0));
-    db.set_node_property(n2, "title", Value::from("B"));
+    db.set_node_property(n2, "emb", vec3(0.9, 0.1, 0.0))
+        .expect("set node property");
+    db.set_node_property(n2, "title", Value::from("B"))
+        .expect("set node property");
     let n3 = db.create_node(&["Doc"]);
-    db.set_node_property(n3, "emb", vec3(0.0, 1.0, 0.0));
-    db.set_node_property(n3, "title", Value::from("C"));
+    db.set_node_property(n3, "emb", vec3(0.0, 1.0, 0.0))
+        .expect("set node property");
+    db.set_node_property(n3, "title", Value::from("C"))
+        .expect("set node property");
 
-    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-        .expect("create vector index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("create vector index");
     db
+}
+
+#[test]
+#[cfg(feature = "compact-store")]
+fn compact_vector_call_keeps_snapshot_and_reads_own_vector_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_engine::transaction::IsolationLevel;
+
+    fn distances(
+        session: &grafeo_engine::Session,
+    ) -> Result<Vec<(i64, f64)>, Box<dyn std::error::Error>> {
+        let result =
+            session.execute("CALL grafeo.search.vector('Doc', 'emb', [1.0, 0.0, 0.0], 3)")?;
+        assert_eq!(result.columns, ["node_id", "distance"]);
+        let mut rows = Vec::new();
+        for row in result.rows() {
+            let [Value::Int64(node), Value::Float64(distance)] = row.as_slice() else {
+                return Err("invalid vector CALL row".into());
+            };
+            rows.push((*node, *distance));
+        }
+        rows.sort_by_key(|(node, _)| *node);
+        Ok(rows)
+    }
+
+    fn assert_distances(actual: &[(i64, f64)], expected: &[(i64, f64)], stage: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{stage}: exact row multiplicity"
+        );
+        for ((node, distance), (expected_node, expected_distance)) in actual.iter().zip(expected) {
+            assert_eq!(node, expected_node, "{stage}: exact node identity");
+            assert!(
+                distance.is_finite() && (distance - expected_distance).abs() <= 1e-6,
+                "{stage}: node {node}, distance {distance}, expected {expected_distance} within 1e-6"
+            );
+        }
+    }
+
+    let mut db = setup_vector_graph();
+    let nodes = grafeo_engine::database::testing::root_lpg_store(&db).node_ids();
+    let [a, b, c] = nodes.as_slice() else {
+        return Err("expected three fixture nodes".into());
+    };
+    let (a, b, c) = (*a, *b, *c);
+    // Unit axes have theoretical distances zero or one; f32 SIMD cosine
+    // normalization can introduce small roundoff even for identical vectors.
+    db.set_node_property(b, "emb", vec3(0.0, 1.0, 0.0))?;
+    db.set_node_property(c, "emb", vec3(0.0, 0.0, 1.0))?;
+    // No Session exists while compact retires the native source.
+    db.compact()?;
+    let (a_id, b_id, c_id) = (
+        i64::try_from(a.0)?,
+        i64::try_from(b.0)?,
+        i64::try_from(c.0)?,
+    );
+    let initial = vec![(a_id, 0.0), (b_id, 1.0), (c_id, 1.0)];
+    let mut snapshot = db.session();
+    snapshot.begin_transaction_with_isolation(IsolationLevel::Serializable)?;
+    assert_distances(&distances(&snapshot)?, &initial, "initial compact snapshot");
+
+    let mut writer = db.session();
+    writer.begin_transaction()?;
+    writer.set_node_property(a, "emb", vec3(0.0, 1.0, 0.0))?;
+    writer.commit()?;
+    drop(writer);
+    assert_distances(
+        &distances(&snapshot)?,
+        &initial,
+        "committed vector SET must not change the older CALL snapshot",
+    );
+    let current = vec![(a_id, 1.0), (b_id, 1.0), (c_id, 1.0)];
+    assert_distances(
+        &distances(&db.session())?,
+        &current,
+        "current after concurrent SET",
+    );
+
+    snapshot.set_node_property(c, "emb", vec3(1.0, 0.0, 0.0))?;
+    assert_distances(
+        &distances(&snapshot)?,
+        &[(a_id, 0.0), (b_id, 1.0), (c_id, 0.0)],
+        "CALL must merge its own vector SET with historical compact vectors",
+    );
+    snapshot.rollback()?;
+    assert_distances(
+        &distances(&db.session())?,
+        &current,
+        "rollback must discard the private vector without losing the concurrent committed SET",
+    );
+    Ok(())
 }
 
 #[test]
@@ -172,14 +283,25 @@ mod text {
     fn setup_text_graph() -> GrafeoDB {
         let db = GrafeoDB::new_in_memory();
         let n1 = db.create_node(&["Doc"]);
-        db.set_node_property(n1, "body", Value::from("graph databases are great"));
+        db.set_node_property(n1, "body", Value::from("graph databases are great"))
+            .expect("set node property");
         let n2 = db.create_node(&["Doc"]);
-        db.set_node_property(n2, "body", Value::from("vector search for retrieval"));
+        db.set_node_property(n2, "body", Value::from("vector search for retrieval"))
+            .expect("set node property");
         let n3 = db.create_node(&["Doc"]);
-        db.set_node_property(n3, "body", Value::from("graph neural networks for nlp"));
+        db.set_node_property(n3, "body", Value::from("graph neural networks for nlp"))
+            .expect("set node property");
 
-        db.create_text_index("Doc", "body")
-            .expect("create text index");
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "body".into(),
+            kind: grafeo_engine::IndexCreateKind::Text {
+                min_token_length: None,
+            },
+        })
+        .expect("create text index");
         db
     }
 

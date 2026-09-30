@@ -35,13 +35,25 @@
 //! ```
 
 use super::VectorAccessor;
-use super::quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
+use super::hnsw::HnswMutationGuard;
+#[cfg(feature = "lpg")]
+use super::hnsw::HnswScopeTransition;
+use super::hnsw::{HnswExactState, PreparedHnswExactState};
+use super::quantization::{
+    BinaryQuantizer, ProductQuantizer, ProductQuantizerExactState, QuantizationType,
+    ScalarQuantizer, ScalarQuantizerExactState,
+};
 use super::{HnswConfig, HnswIndex, compute_distance};
 use grafeo_common::types::NodeId;
 use ordered_float::OrderedFloat;
+#[cfg(all(feature = "lpg", feature = "compact-store"))]
+use parking_lot::ReentrantMutex;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+#[cfg(feature = "lpg")]
+pub(crate) mod maintenance;
 
 /// HNSW index with quantization support for memory-efficient search.
 ///
@@ -70,20 +82,315 @@ pub struct QuantizedHnswIndex {
     binary_vectors: RwLock<HashMap<NodeId, Vec<u64>>>,
     /// Product quantization codes: NodeId -> M u8 codes.
     product_codes: RwLock<HashMap<NodeId, Vec<u8>>>,
-    /// Whether to rescore with full precision vectors.
-    rescore: bool,
-    /// Rescore factor: search for this many candidates before rescoring.
-    /// Final results = top k from rescore_factor * k candidates.
-    rescore_factor: usize,
-    /// Number of training samples before quantizer is trained.
-    training_threshold: usize,
+    /// Runtime options are interior-mutable so a v3 recovery can install the
+    /// exact persisted values into an already-registered index handle.
+    options: RwLock<QuantizedOptions>,
     /// Training samples collected before training the quantizer.
     training_samples: RwLock<Vec<Arc<[f32]>>>,
     /// Whether the quantizer has been trained.
     quantizer_trained: RwLock<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuantizedOptions {
+    rescore: bool,
+    rescore_factor: usize,
+    training_threshold: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QuantizedExactState {
+    pub(super) hnsw: HnswExactState,
+    pub(super) quantization_type: QuantizationType,
+    pub(super) scalar_quantizer: Option<ScalarQuantizerExactState>,
+    pub(super) product_quantizer: Option<ProductQuantizerExactState>,
+    pub(super) vectors: Vec<(NodeId, Vec<f32>)>,
+    pub(super) scalar_vectors: Vec<(NodeId, Vec<u8>)>,
+    pub(super) binary_vectors: Vec<(NodeId, Vec<u64>)>,
+    pub(super) product_codes: Vec<(NodeId, Vec<u8>)>,
+    pub(super) rescore: bool,
+    pub(super) rescore_factor: usize,
+    pub(super) training_threshold: usize,
+    pub(super) training_samples: Vec<Vec<f32>>,
+    pub(super) quantizer_trained: bool,
+}
+
+pub(super) struct PreparedQuantizedExactState {
+    hnsw: PreparedHnswExactState,
+    scalar_quantizer: Option<ScalarQuantizer>,
+    product_quantizer: Option<ProductQuantizer>,
+    vectors: HashMap<NodeId, Arc<[f32]>>,
+    scalar_vectors: HashMap<NodeId, Vec<u8>>,
+    binary_vectors: HashMap<NodeId, Vec<u64>>,
+    product_codes: HashMap<NodeId, Vec<u8>>,
+    options: QuantizedOptions,
+    training_samples: Vec<Arc<[f32]>>,
+    quantizer_trained: bool,
+}
+
+fn ordered_entry_ids<T>(
+    entries: &[(NodeId, T)],
+    description: &str,
+) -> std::result::Result<HashSet<NodeId>, String> {
+    let mut ids = HashSet::with_capacity(entries.len());
+    let mut previous = None;
+    for (id, _) in entries {
+        if !id.is_valid() || previous.is_some_and(|prior| prior >= *id) {
+            return Err(format!(
+                "{description} contains an invalid, duplicate, or non-canonical node ID"
+            ));
+        }
+        previous = Some(*id);
+        ids.insert(*id);
+    }
+    Ok(ids)
+}
+
+fn validate_quantized_exact_state(
+    state: &QuantizedExactState,
+    target: &QuantizedHnswIndex,
+) -> std::result::Result<(), String> {
+    target.hnsw.validate_exact_state(&state.hnsw)?;
+    if state.quantization_type != target.quantization_type {
+        return Err("quantized snapshot kind does not match target index".to_string());
+    }
+    if state.rescore_factor == 0 || state.training_threshold < 10 {
+        return Err("quantized snapshot contains invalid runtime options".to_string());
+    }
+
+    let dimensions = state.hnsw.config.dimensions;
+    let topology_ids: HashSet<NodeId> = state.hnsw.nodes.iter().map(|(id, _)| *id).collect();
+    let vector_ids = ordered_entry_ids(&state.vectors, "full-precision vector map")?;
+    if vector_ids != topology_ids {
+        return Err("quantized snapshot vector IDs do not match HNSW topology".to_string());
+    }
+    if state
+        .vectors
+        .iter()
+        .any(|(_, vector)| vector.len() != dimensions)
+        || state
+            .training_samples
+            .iter()
+            .any(|vector| vector.len() != dimensions)
+    {
+        return Err("quantized snapshot contains a vector with wrong dimensions".to_string());
+    }
+
+    let scalar_ids = ordered_entry_ids(&state.scalar_vectors, "scalar code map")?;
+    let binary_ids = ordered_entry_ids(&state.binary_vectors, "binary code map")?;
+    let product_ids = ordered_entry_ids(&state.product_codes, "product code map")?;
+
+    match state.quantization_type {
+        QuantizationType::None => {
+            if state.quantizer_trained
+                || state.scalar_quantizer.is_some()
+                || state.product_quantizer.is_some()
+                || !scalar_ids.is_empty()
+                || !binary_ids.is_empty()
+                || !product_ids.is_empty()
+                || !state.training_samples.is_empty()
+            {
+                return Err("unquantized snapshot contains quantizer state".to_string());
+            }
+        }
+        QuantizationType::Binary => {
+            if state.quantizer_trained
+                || state.scalar_quantizer.is_some()
+                || state.product_quantizer.is_some()
+                || !scalar_ids.is_empty()
+                || !product_ids.is_empty()
+                || !state.training_samples.is_empty()
+                || binary_ids != topology_ids
+            {
+                return Err("binary snapshot contains inconsistent quantizer state".to_string());
+            }
+            let words = dimensions.div_ceil(64);
+            if state
+                .binary_vectors
+                .iter()
+                .any(|(_, codes)| codes.len() != words)
+            {
+                return Err("binary snapshot contains a code with wrong dimensions".to_string());
+            }
+            let padding_bits = dimensions % 64;
+            if padding_bits != 0 {
+                let padding_mask = !((1_u64 << padding_bits) - 1);
+                if state
+                    .binary_vectors
+                    .iter()
+                    .any(|(_, codes)| codes.last().is_some_and(|last| last & padding_mask != 0))
+                {
+                    return Err("binary snapshot contains non-canonical padding bits".to_string());
+                }
+            }
+            for ((vector_id, vector), (code_id, codes)) in
+                state.vectors.iter().zip(&state.binary_vectors)
+            {
+                if vector_id != code_id || BinaryQuantizer::quantize(vector) != *codes {
+                    return Err(
+                        "binary snapshot code does not match its full-precision vector".to_string(),
+                    );
+                }
+            }
+        }
+        QuantizationType::Scalar => {
+            if state.product_quantizer.is_some()
+                || !binary_ids.is_empty()
+                || !product_ids.is_empty()
+            {
+                return Err("scalar snapshot contains foreign quantizer state".to_string());
+            }
+            if state.quantizer_trained {
+                let Some(quantizer) = state.scalar_quantizer.clone() else {
+                    return Err("trained scalar snapshot has no quantizer".to_string());
+                };
+                let quantizer = ScalarQuantizer::from_exact_state(quantizer)?;
+                if quantizer.dimensions() != dimensions
+                    || scalar_ids != topology_ids
+                    || !state.training_samples.is_empty()
+                {
+                    return Err("trained scalar snapshot is incomplete".to_string());
+                }
+                if state
+                    .scalar_vectors
+                    .iter()
+                    .any(|(_, codes)| codes.len() != dimensions)
+                {
+                    return Err("scalar snapshot contains a code with wrong dimensions".to_string());
+                }
+                for ((vector_id, vector), (code_id, codes)) in
+                    state.vectors.iter().zip(&state.scalar_vectors)
+                {
+                    if vector_id != code_id || quantizer.quantize(vector) != *codes {
+                        return Err(
+                            "scalar snapshot code does not match its full-precision vector"
+                                .to_string(),
+                        );
+                    }
+                }
+            } else if state.scalar_quantizer.is_some()
+                || !scalar_ids.is_empty()
+                || state.training_samples.len() >= state.training_threshold
+            {
+                return Err("untrained scalar snapshot is inconsistent".to_string());
+            }
+        }
+        QuantizationType::Product { num_subvectors } => {
+            if state.scalar_quantizer.is_some() || !scalar_ids.is_empty() || !binary_ids.is_empty()
+            {
+                return Err("product snapshot contains inconsistent quantizer state".to_string());
+            }
+            if state.quantizer_trained {
+                let Some(quantizer) = state.product_quantizer.clone() else {
+                    return Err("trained product snapshot has no quantizer".to_string());
+                };
+                let quantizer = ProductQuantizer::from_exact_state(quantizer)?;
+                if quantizer.dimensions() != dimensions
+                    || quantizer.num_subvectors() != num_subvectors
+                    || product_ids != topology_ids
+                    || !state.training_samples.is_empty()
+                {
+                    return Err("trained product snapshot is incomplete".to_string());
+                }
+                if state
+                    .product_codes
+                    .iter()
+                    .any(|(_, codes)| codes.len() != num_subvectors)
+                {
+                    return Err(
+                        "product snapshot contains a code with wrong dimensions".to_string()
+                    );
+                }
+                if state.product_codes.iter().any(|(_, codes)| {
+                    codes
+                        .iter()
+                        .any(|code| usize::from(*code) >= quantizer.num_centroids())
+                }) {
+                    return Err(
+                        "product snapshot contains a code outside its centroid table".to_string(),
+                    );
+                }
+                for ((vector_id, vector), (code_id, codes)) in
+                    state.vectors.iter().zip(&state.product_codes)
+                {
+                    if vector_id != code_id || quantizer.quantize(vector) != *codes {
+                        return Err(
+                            "product snapshot code does not match its full-precision vector"
+                                .to_string(),
+                        );
+                    }
+                }
+            } else if state.product_quantizer.is_some()
+                || !product_ids.is_empty()
+                || state.training_samples.len() >= state.training_threshold
+            {
+                return Err("untrained product snapshot is inconsistent".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl QuantizedHnswIndex {
+    #[cfg(feature = "lpg")]
+    pub(crate) fn binding_is_compatible(
+        &self,
+        owner: u64,
+        slot: u64,
+        transition: &HnswScopeTransition,
+    ) -> bool {
+        self.hnsw.binding_is_compatible(owner, slot, transition)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn is_bound_to(
+        &self,
+        owner: u64,
+        slot: u64,
+        transition: &HnswScopeTransition,
+    ) -> bool {
+        self.hnsw.is_bound_to(owner, slot, transition)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn bind_under_transition(
+        &self,
+        owner: u64,
+        slot: u64,
+        transition: &HnswScopeTransition,
+    ) -> bool {
+        self.hnsw.bind_under_transition(owner, slot, transition)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn scope_is_unsealed(&self, transition: &HnswScopeTransition) -> bool {
+        self.hnsw.scope_is_unsealed(transition)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn scope_is_compatible(&self, scope: u64, transition: &HnswScopeTransition) -> bool {
+        self.hnsw.scope_is_compatible(scope, transition)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn seal_with_scope_under_transition(
+        &self,
+        scope: u64,
+        transition: &HnswScopeTransition,
+    ) -> bool {
+        self.hnsw
+            .seal_with_scope_under_transition(scope, transition)
+    }
+
+    pub(super) fn pin_mutation(&self) -> Option<HnswMutationGuard<'_>> {
+        self.hnsw.pin_mutation()
+    }
+
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(super) fn publication_gate(&self) -> Arc<ReentrantMutex<()>> {
+        self.hnsw.publication_gate()
+    }
+
     /// Creates a new quantized HNSW index.
     ///
     /// # Arguments
@@ -101,9 +408,11 @@ impl QuantizedHnswIndex {
             scalar_vectors: RwLock::new(HashMap::new()),
             binary_vectors: RwLock::new(HashMap::new()),
             product_codes: RwLock::new(HashMap::new()),
-            rescore: true,
-            rescore_factor: 2,
-            training_threshold: 1000,
+            options: RwLock::new(QuantizedOptions {
+                rescore: true,
+                rescore_factor: 2,
+                training_threshold: 1000,
+            }),
             training_samples: RwLock::new(Vec::new()),
             quantizer_trained: RwLock::new(false),
         }
@@ -121,9 +430,11 @@ impl QuantizedHnswIndex {
             scalar_vectors: RwLock::new(HashMap::new()),
             binary_vectors: RwLock::new(HashMap::new()),
             product_codes: RwLock::new(HashMap::new()),
-            rescore: true,
-            rescore_factor: 2,
-            training_threshold: 1000,
+            options: RwLock::new(QuantizedOptions {
+                rescore: true,
+                rescore_factor: 2,
+                training_threshold: 1000,
+            }),
             training_samples: RwLock::new(Vec::new()),
             quantizer_trained: RwLock::new(false),
         }
@@ -134,7 +445,7 @@ impl QuantizedHnswIndex {
     /// Faster but less accurate. Useful when you need maximum speed.
     #[must_use]
     pub fn without_rescore(mut self) -> Self {
-        self.rescore = false;
+        self.options.get_mut().rescore = false;
         self
     }
 
@@ -147,7 +458,7 @@ impl QuantizedHnswIndex {
     /// Higher values improve recall at the cost of latency.
     #[must_use]
     pub fn with_rescore_factor(mut self, factor: usize) -> Self {
-        self.rescore_factor = factor.max(1);
+        self.options.get_mut().rescore_factor = factor.max(1);
         self
     }
 
@@ -159,7 +470,7 @@ impl QuantizedHnswIndex {
     /// Default: 1000
     #[must_use]
     pub fn with_training_threshold(mut self, threshold: usize) -> Self {
-        self.training_threshold = threshold.max(10);
+        self.options.get_mut().training_threshold = threshold.max(10);
         self
     }
 
@@ -173,6 +484,39 @@ impl QuantizedHnswIndex {
     #[must_use]
     pub fn config(&self) -> &HnswConfig {
         self.hnsw.config()
+    }
+
+    /// Whether rescoring with the original full-precision vectors is enabled.
+    #[must_use]
+    pub fn rescoring_enabled(&self) -> bool {
+        self.options.read().rescore
+    }
+
+    /// Candidate multiplier used before full-precision rescoring.
+    #[must_use]
+    pub fn rescore_factor(&self) -> usize {
+        self.options.read().rescore_factor
+    }
+
+    /// Number of samples collected before a trainable quantizer is fitted.
+    #[must_use]
+    pub fn training_threshold(&self) -> usize {
+        self.options.read().training_threshold
+    }
+
+    /// Returns `true` when the quantized-specific settings can be recreated by
+    /// persistence descriptors that carry only the quantization kind.
+    ///
+    /// `QuantizationType::None` is intentionally excluded: restoring that tag
+    /// currently constructs a plain HNSW index, which changes the concrete
+    /// index kind even though both use full-precision vectors.
+    #[must_use]
+    pub fn has_persistence_defaults(&self) -> bool {
+        let options = self.options.read();
+        self.quantization_type != QuantizationType::None
+            && options.rescore
+            && options.rescore_factor == 2
+            && options.training_threshold == 1000
     }
 
     /// Returns the number of vectors in the index.
@@ -252,6 +596,9 @@ impl QuantizedHnswIndex {
     ///
     /// Panics if vector dimensions don't match configuration.
     pub fn insert(&self, id: NodeId, vector: &[f32]) {
+        let Some(_mutation) = self.pin_mutation() else {
+            return;
+        };
         // Store full-precision vector
         let arc: Arc<[f32]> = vector.into();
         self.vectors.write().insert(id, arc);
@@ -274,6 +621,7 @@ impl QuantizedHnswIndex {
     /// Inserts with scalar quantization.
     fn insert_scalar_quantized(&self, id: NodeId, vector: &[f32]) {
         let trained = *self.quantizer_trained.read();
+        let training_threshold = self.options.read().training_threshold;
 
         if trained {
             // Quantizer is ready, quantize and store
@@ -287,7 +635,7 @@ impl QuantizedHnswIndex {
             let mut samples = self.training_samples.write();
             samples.push(vector_arc);
 
-            if samples.len() >= self.training_threshold {
+            if samples.len() >= training_threshold {
                 // Time to train the quantizer
                 let refs: Vec<&[f32]> = samples.iter().map(|v| v.as_ref()).collect();
                 let quantizer = ScalarQuantizer::train(&refs);
@@ -316,6 +664,7 @@ impl QuantizedHnswIndex {
     /// Inserts with product quantization.
     fn insert_product_quantized(&self, id: NodeId, vector: &[f32], num_subvectors: usize) {
         let trained = *self.quantizer_trained.read();
+        let training_threshold = self.options.read().training_threshold;
 
         if trained {
             // Quantizer is ready, quantize and store
@@ -329,7 +678,7 @@ impl QuantizedHnswIndex {
             let mut samples = self.training_samples.write();
             samples.push(vector_arc);
 
-            if samples.len() >= self.training_threshold {
+            if samples.len() >= training_threshold {
                 // Time to train the product quantizer
                 let refs: Vec<&[f32]> = samples.iter().map(|v| v.as_ref()).collect();
                 let quantizer = ProductQuantizer::train(&refs, num_subvectors, 256, 10);
@@ -367,6 +716,7 @@ impl QuantizedHnswIndex {
     /// Searches with a custom ef (beam width) parameter.
     #[must_use]
     pub fn search_with_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)> {
+        let _reader = self.hnsw.admit_reader();
         let accessor = self.accessor();
         match self.quantization_type {
             QuantizationType::None => {
@@ -390,6 +740,7 @@ impl QuantizedHnswIndex {
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
         let trained = *self.quantizer_trained.read();
+        let options = *self.options.read();
 
         if !trained {
             // Quantizer not ready, fall back to exact search
@@ -398,8 +749,8 @@ impl QuantizedHnswIndex {
 
         // Get candidates using HNSW (with full precision distances for now)
         // In a production system, you'd modify HNSW to use quantized distances
-        let num_candidates = if self.rescore {
-            k.saturating_mul(self.rescore_factor)
+        let num_candidates = if options.rescore {
+            k.saturating_mul(options.rescore_factor)
         } else {
             k
         };
@@ -408,7 +759,7 @@ impl QuantizedHnswIndex {
             .hnsw
             .search_with_ef(query, num_candidates, ef, accessor);
 
-        if !self.rescore {
+        if !options.rescore {
             return candidates.into_iter().take(k).collect();
         }
 
@@ -424,6 +775,9 @@ impl QuantizedHnswIndex {
         ef: usize,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
+        #[cfg(all(test, feature = "lpg"))]
+        maintenance::binary_read_seam();
+        let options = *self.options.read();
         let binary_vecs = self.binary_vectors.read();
 
         if binary_vecs.is_empty() {
@@ -435,8 +789,8 @@ impl QuantizedHnswIndex {
         let dims = self.config().dimensions;
 
         // Get candidates - use more candidates for binary (less accurate)
-        let num_candidates = if self.rescore {
-            k.saturating_mul(self.rescore_factor).saturating_mul(2) // Binary needs more candidates
+        let num_candidates = if options.rescore {
+            k.saturating_mul(options.rescore_factor).saturating_mul(2) // Binary needs more candidates
         } else {
             k
         };
@@ -461,7 +815,7 @@ impl QuantizedHnswIndex {
         scored.sort_by_key(|(_, d)| OrderedFloat(*d));
         scored.truncate(num_candidates);
 
-        if !self.rescore {
+        if !options.rescore {
             return scored.into_iter().take(k).collect();
         }
 
@@ -478,6 +832,7 @@ impl QuantizedHnswIndex {
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
         let trained = *self.quantizer_trained.read();
+        let options = *self.options.read();
 
         if !trained {
             // Quantizer not ready, fall back to exact search
@@ -485,8 +840,8 @@ impl QuantizedHnswIndex {
         }
 
         // Get candidates using HNSW
-        let num_candidates = if self.rescore {
-            k.saturating_mul(self.rescore_factor)
+        let num_candidates = if options.rescore {
+            k.saturating_mul(options.rescore_factor)
         } else {
             k
         };
@@ -495,7 +850,7 @@ impl QuantizedHnswIndex {
             .hnsw
             .search_with_ef(query, num_candidates, ef, accessor);
 
-        if !self.rescore {
+        if !options.rescore {
             return candidates.into_iter().take(k).collect();
         }
 
@@ -522,7 +877,7 @@ impl QuantizedHnswIndex {
             scored.truncate(k);
 
             // Optionally rescore top results with full precision
-            if self.rescore {
+            if options.rescore {
                 return self.rescore_candidates(query, scored, k);
             }
 
@@ -564,28 +919,99 @@ impl QuantizedHnswIndex {
         self.vectors.read().get(&id).cloned()
     }
 
-    /// Returns true if the index contains the given ID.
+    /// Returns true if the index contains a **live** (non-deleted) vector
+    /// with the given ID.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
         self.hnsw.contains(id)
     }
 
-    /// Removes a vector from the index.
+    /// Returns `true` if the topology contains `id`, regardless of whether
+    /// it has been soft-deleted.
+    ///
+    /// Used by GC passes and tests to verify the node was retained as a
+    /// routing hop after soft-deletion.
+    #[must_use]
+    pub fn contains_including_deleted(&self, id: NodeId) -> bool {
+        self.hnsw.contains_including_deleted(id)
+    }
+
+    #[cfg(all(test, feature = "lpg"))]
+    pub(crate) fn state_fingerprint(
+        &self,
+    ) -> (usize, usize, usize, usize, usize, usize, usize, bool) {
+        let (topology, deleted) = self.hnsw.state_counts();
+        (
+            self.vectors.read().len(),
+            self.scalar_vectors.read().len(),
+            self.binary_vectors.read().len(),
+            self.product_codes.read().len(),
+            self.training_samples.read().len(),
+            topology,
+            deleted,
+            *self.quantizer_trained.read(),
+        )
+    }
+
+    /// Soft-deletes a vector from the index.
+    ///
+    /// The node is **retained** in the HNSW topology as a routing hop and
+    /// its vectors/codes are kept for potential future rescore or GC.
+    /// It is excluded from search results and from [`Self::len`] /
+    /// [`Self::contains`].
+    ///
+    /// Returns `true` if the ID was present (and is now marked deleted).
+    /// Returns `false` if the ID was not in the topology at all.
+    ///
+    /// Re-inserting a deleted ID via [`Self::insert`] un-deletes it.
     pub fn remove(&self, id: NodeId) -> bool {
-        self.vectors.write().remove(&id);
-        match self.quantization_type {
-            QuantizationType::None => {}
-            QuantizationType::Scalar => {
-                self.scalar_vectors.write().remove(&id);
-            }
-            QuantizationType::Binary => {
-                self.binary_vectors.write().remove(&id);
-            }
-            QuantizationType::Product { .. } => {
-                self.product_codes.write().remove(&id);
-            }
-        }
+        // Do NOT remove from vectors/codes maps — keep them for routing-hop
+        // rescore and GC. Only soft-delete in the underlying topology.
         self.hnsw.remove(id)
+    }
+
+    /// Garbage collects soft-deleted nodes that are no longer needed.
+    ///
+    /// Delegates to the inner `HnswIndex::gc` using an accessor backed by
+    /// this index's internal `vectors` map, then drops non-live nodes from
+    /// all internal quantized-code maps (`scalar_vectors`, `binary_vectors`,
+    /// `product_codes`) and from `vectors`.
+    ///
+    /// After GC, only nodes where `is_live(id)` returns `true` remain in
+    /// every internal map.
+    ///
+    /// # Errors
+    /// Rejects denied authority or invalid retained vectors before topology or
+    /// code maps change. The retention predicate is evaluated once per node.
+    pub fn gc(&self, is_live: &dyn Fn(NodeId) -> bool) -> std::result::Result<(), String> {
+        let _mutation = self
+            .pin_mutation()
+            .ok_or_else(|| "quantized HNSW GC requires mutation authority".to_string())?;
+        let retained = std::cell::RefCell::new(std::collections::HashSet::new());
+        let keep = |id| {
+            let keep = is_live(id);
+            if keep {
+                retained.borrow_mut().insert(id);
+            }
+            keep
+        };
+        let accessor = |id| self.vectors.read().get(&id).cloned();
+        // Inner GC captures required payloads before publishing and preserves
+        // retained tombstones. Its failure leaves every auxiliary map untouched.
+        self.hnsw.gc(&keep, &accessor)?;
+        let retained = retained.into_inner();
+        self.vectors.write().retain(|id, _| retained.contains(id));
+        self.scalar_vectors
+            .write()
+            .retain(|id, _| retained.contains(id));
+        self.binary_vectors
+            .write()
+            .retain(|id, _| retained.contains(id));
+        self.product_codes
+            .write()
+            .retain(|id, _| retained.contains(id));
+        // training_samples only holds pre-training data; no per-node retention needed.
+        Ok(())
     }
 
     /// Batch insert multiple vectors.
@@ -593,6 +1019,9 @@ impl QuantizedHnswIndex {
     where
         I: IntoIterator<Item = (NodeId, &'a [f32])>,
     {
+        let Some(_mutation) = self.pin_mutation() else {
+            return;
+        };
         for (id, vec) in vectors {
             self.insert(id, vec);
         }
@@ -728,6 +1157,131 @@ impl QuantizedHnswIndex {
         }
     }
 
+    /// Captures the full quantized index post-image, including routing vectors,
+    /// trained quantizers/codes, pre-training samples, and HNSW continuation.
+    pub(super) fn snapshot_exact(&self) -> std::result::Result<QuantizedExactState, String> {
+        let publication_gate = self.hnsw.publication_gate();
+        let _publication = publication_gate.lock();
+
+        let hnsw = self.hnsw.snapshot_exact()?;
+        let options = *self.options.read();
+        let scalar_quantizer = self
+            .scalar_quantizer
+            .read()
+            .as_ref()
+            .map(ScalarQuantizer::snapshot_exact);
+        let product_quantizer = self
+            .product_quantizer
+            .read()
+            .as_ref()
+            .map(ProductQuantizer::snapshot_exact);
+        let mut vectors: Vec<_> = self
+            .vectors
+            .read()
+            .iter()
+            .map(|(id, vector)| (*id, vector.to_vec()))
+            .collect();
+        let mut scalar_vectors: Vec<_> = self
+            .scalar_vectors
+            .read()
+            .iter()
+            .map(|(id, codes)| (*id, codes.clone()))
+            .collect();
+        let mut binary_vectors: Vec<_> = self
+            .binary_vectors
+            .read()
+            .iter()
+            .map(|(id, codes)| (*id, codes.clone()))
+            .collect();
+        let mut product_codes: Vec<_> = self
+            .product_codes
+            .read()
+            .iter()
+            .map(|(id, codes)| (*id, codes.clone()))
+            .collect();
+        vectors.sort_by_key(|(id, _)| *id);
+        scalar_vectors.sort_by_key(|(id, _)| *id);
+        binary_vectors.sort_by_key(|(id, _)| *id);
+        product_codes.sort_by_key(|(id, _)| *id);
+
+        let state = QuantizedExactState {
+            hnsw,
+            quantization_type: self.quantization_type,
+            scalar_quantizer,
+            product_quantizer,
+            vectors,
+            scalar_vectors,
+            binary_vectors,
+            product_codes,
+            rescore: options.rescore,
+            rescore_factor: options.rescore_factor,
+            training_threshold: options.training_threshold,
+            training_samples: self
+                .training_samples
+                .read()
+                .iter()
+                .map(|sample| sample.to_vec())
+                .collect(),
+            quantizer_trained: *self.quantizer_trained.read(),
+        };
+        validate_quantized_exact_state(&state, self)?;
+        Ok(state)
+    }
+
+    pub(super) fn prepare_exact_restore(
+        &self,
+        state: QuantizedExactState,
+    ) -> std::result::Result<PreparedQuantizedExactState, String> {
+        validate_quantized_exact_state(&state, self)?;
+        let hnsw = self.hnsw.prepare_exact_restore(state.hnsw)?;
+        let scalar_quantizer = state
+            .scalar_quantizer
+            .map(ScalarQuantizer::from_exact_state)
+            .transpose()?;
+        let product_quantizer = state
+            .product_quantizer
+            .map(ProductQuantizer::from_exact_state)
+            .transpose()?;
+        Ok(PreparedQuantizedExactState {
+            hnsw,
+            scalar_quantizer,
+            product_quantizer,
+            vectors: state
+                .vectors
+                .into_iter()
+                .map(|(id, vector)| (id, Arc::from(vector)))
+                .collect(),
+            scalar_vectors: state.scalar_vectors.into_iter().collect(),
+            binary_vectors: state.binary_vectors.into_iter().collect(),
+            product_codes: state.product_codes.into_iter().collect(),
+            options: QuantizedOptions {
+                rescore: state.rescore,
+                rescore_factor: state.rescore_factor,
+                training_threshold: state.training_threshold,
+            },
+            training_samples: state.training_samples.into_iter().map(Arc::from).collect(),
+            quantizer_trained: state.quantizer_trained,
+        })
+    }
+
+    #[cfg(feature = "compact-store")]
+    pub(super) fn freeze_exact_read_snapshot(&self) {
+        self.hnsw.freeze_exact_read_snapshot();
+    }
+
+    pub(super) fn apply_prepared_exact_restore(&self, state: PreparedQuantizedExactState) {
+        self.hnsw.apply_prepared_exact_restore(state.hnsw);
+        *self.vectors.write() = state.vectors;
+        *self.scalar_quantizer.write() = state.scalar_quantizer;
+        *self.product_quantizer.write() = state.product_quantizer;
+        *self.scalar_vectors.write() = state.scalar_vectors;
+        *self.binary_vectors.write() = state.binary_vectors;
+        *self.product_codes.write() = state.product_codes;
+        *self.options.write() = state.options;
+        *self.training_samples.write() = state.training_samples;
+        *self.quantizer_trained.write() = state.quantizer_trained;
+    }
+
     /// Snapshot the underlying HNSW topology for serialization.
     #[must_use]
     pub fn snapshot_topology(&self) -> (Option<NodeId>, usize, Vec<(NodeId, Vec<Vec<NodeId>>)>) {
@@ -750,15 +1304,89 @@ impl QuantizedHnswIndex {
     pub fn heap_memory_bytes(&self) -> usize {
         self.hnsw.heap_memory_bytes() + self.memory_usage()
     }
+
+    /// Snapshot-aware predicate-filtered search with external accessor rescoring.
+    ///
+    /// Coarse-search the quantized graph over a widened pool (`ef` is widened
+    /// by `VISIBLE_EF_FACTOR` from the HNSW layer), then **rescore every
+    /// candidate using the supplied `accessor`** (the snapshot-aware
+    /// as-of-E accessor, NOT the internal `vectors` map). Filter by
+    /// `is_visible` and return the top-k.
+    ///
+    /// If `accessor.get_vector(id)` returns `None` for a candidate the
+    /// candidate is silently dropped (no vector at that snapshot).
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        // Inner HNSW admission alone ends before external snapshot callbacks.
+        // Enter before any auxiliary read and retain through final rescoring.
+        let _reader = self.hnsw.admit_reader();
+        // Widen the candidate pool at the HNSW level so that filtering
+        // invisible nodes still leaves ≥ k candidates for rescoring.
+        // We reuse the VISIBLE_EF_FACTOR from the plain HNSW layer.
+        use super::hnsw::VISIBLE_EF_FACTOR;
+        let ef_wide = ef.max(k.saturating_mul(VISIBLE_EF_FACTOR));
+
+        // Coarse-search: use the internal full-precision accessor for graph
+        // traversal (same accessor the existing search methods use).
+        let internal_accessor = self.accessor();
+        let options = *self.options.read();
+        let num_candidates = if options.rescore {
+            k.saturating_mul(options.rescore_factor)
+                .saturating_mul(VISIBLE_EF_FACTOR)
+                .max(ef_wide)
+        } else {
+            ef_wide
+        };
+
+        // Current-latest search filters physical tombstones too early: a
+        // snapshot can still see those nodes. Traverse retained routing state
+        // with the native visibility-aware path, then apply the caller's exact
+        // snapshot predicate and payload during rescoring below.
+        let candidates = self.hnsw.search_visible_candidates(
+            query,
+            num_candidates,
+            ef_wide,
+            &|_| true,
+            &internal_accessor,
+            false,
+        );
+
+        // Rescore with the supplied snapshot accessor and apply the visibility
+        // predicate.  This is the key difference from the plain search path:
+        // distances come from `accessor`, not from `self.vectors`.
+        let metric = self.config().metric;
+        let mut results: Vec<(NodeId, f32)> = candidates
+            .into_iter()
+            .filter(|(id, _)| is_visible(*id))
+            .filter_map(|(id, _)| {
+                accessor.get_vector(id).map(|v| {
+                    let exact_dist = compute_distance(query, &v, metric);
+                    (id, exact_dist)
+                })
+            })
+            .collect();
+
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        results
+    }
 }
 
 impl std::fmt::Debug for QuantizedHnswIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let options = self.options.read();
         f.debug_struct("QuantizedHnswIndex")
             .field("len", &self.len())
             .field("quantization", &self.quantization_type)
-            .field("rescore", &self.rescore)
-            .field("rescore_factor", &self.rescore_factor)
+            .field("rescore", &options.rescore)
+            .field("rescore_factor", &options.rescore_factor)
             .field(
                 "theoretical_compression",
                 &self.theoretical_compression_ratio(),
@@ -780,6 +1408,65 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn assert_hnsw_exact_eq(actual: &HnswExactState, expected: &HnswExactState) {
+        assert_eq!(actual.config.dimensions, expected.config.dimensions);
+        assert_eq!(actual.config.metric, expected.config.metric);
+        assert_eq!(actual.config.m, expected.config.m);
+        assert_eq!(actual.config.m_max, expected.config.m_max);
+        assert_eq!(
+            actual.config.ef_construction,
+            expected.config.ef_construction
+        );
+        assert_eq!(actual.config.ef, expected.config.ef);
+        assert_eq!(actual.config.ml.to_bits(), expected.config.ml.to_bits());
+        assert_eq!(
+            actual.config.alpha.to_bits(),
+            expected.config.alpha.to_bits()
+        );
+        assert_eq!(actual.config.max_elements, expected.config.max_elements);
+        assert_eq!(actual.entry_point, expected.entry_point);
+        assert_eq!(actual.max_level, expected.max_level);
+        assert_eq!(actual.nodes, expected.nodes);
+        assert_eq!(actual.deleted, expected.deleted);
+        assert_eq!(actual.rng_state, expected.rng_state);
+    }
+
+    fn assert_quantized_exact_eq(actual: &QuantizedExactState, expected: &QuantizedExactState) {
+        assert_hnsw_exact_eq(&actual.hnsw, &expected.hnsw);
+        assert_eq!(actual.quantization_type, expected.quantization_type);
+        assert_eq!(actual.vectors, expected.vectors);
+        assert_eq!(actual.scalar_vectors, expected.scalar_vectors);
+        assert_eq!(actual.binary_vectors, expected.binary_vectors);
+        assert_eq!(actual.product_codes, expected.product_codes);
+        assert_eq!(actual.rescore, expected.rescore);
+        assert_eq!(actual.rescore_factor, expected.rescore_factor);
+        assert_eq!(actual.training_threshold, expected.training_threshold);
+        assert_eq!(actual.training_samples, expected.training_samples);
+        assert_eq!(actual.quantizer_trained, expected.quantizer_trained);
+
+        match (&actual.scalar_quantizer, &expected.scalar_quantizer) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.min, expected.min);
+                assert_eq!(actual.scale, expected.scale);
+                assert_eq!(actual.inv_scale, expected.inv_scale);
+                assert_eq!(actual.dimensions, expected.dimensions);
+            }
+            _ => panic!("scalar quantizer presence changed across rollback"),
+        }
+        match (&actual.product_quantizer, &expected.product_quantizer) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.num_subvectors, expected.num_subvectors);
+                assert_eq!(actual.num_centroids, expected.num_centroids);
+                assert_eq!(actual.subvector_dim, expected.subvector_dim);
+                assert_eq!(actual.dimensions, expected.dimensions);
+                assert_eq!(actual.centroids, expected.centroids);
+            }
+            _ => panic!("product quantizer presence changed across rollback"),
+        }
     }
 
     #[test]
@@ -855,6 +1542,34 @@ mod tests {
         let results = index.search(&vectors[25], 5);
         assert_eq!(results.len(), 5);
         // Without rescoring, might not be exact but should be close
+    }
+
+    #[test]
+    fn persistence_defaults_reject_unencoded_quantized_options() {
+        let config = HnswConfig::new(8, DistanceMetric::Cosine);
+        assert!(
+            QuantizedHnswIndex::new(config.clone(), QuantizationType::Scalar)
+                .has_persistence_defaults()
+        );
+        assert!(
+            !QuantizedHnswIndex::new(config.clone(), QuantizationType::None)
+                .has_persistence_defaults()
+        );
+        assert!(
+            !QuantizedHnswIndex::new(config.clone(), QuantizationType::Binary)
+                .without_rescore()
+                .has_persistence_defaults()
+        );
+        assert!(
+            !QuantizedHnswIndex::new(config.clone(), QuantizationType::Binary)
+                .with_rescore_factor(7)
+                .has_persistence_defaults()
+        );
+        assert!(
+            !QuantizedHnswIndex::new(config, QuantizationType::Binary)
+                .with_training_threshold(10)
+                .has_persistence_defaults()
+        );
     }
 
     #[test]
@@ -1093,6 +1808,69 @@ mod tests {
         assert_eq!(before.len(), after.len());
     }
 
+    // ── search_visible tests (quantized) ───────────────────────────────────
+
+    /// search_visible on a QuantizedHnswIndex excludes invisible nodes, and
+    /// ranking follows the **passed accessor** (not the internally-stored
+    /// vectors). We insert one set of vectors, pass a different accessor, and
+    /// assert the results follow the accessor's geometry.
+    #[test]
+    fn search_visible_quantized() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        // Insert ids 1..=10 with "build" vectors spread across [0,1]^4.
+        for i in 1u64..=10 {
+            let v: Vec<f32> = (0..4).map(|j| ((i - 1) * 4 + j) as f32 / 40.0).collect();
+            index.insert(NodeId::new(i), &v);
+        }
+        assert_eq!(index.len(), 10);
+
+        // Override accessor: map every node to a single known vector so we
+        // control ranking independently of the inserted vectors.
+        // Node 1 maps to [0.0; 4], node 2 to [0.1, 0,0,0], ..., node 10 to
+        // [0.9, 0,0,0]. The query [0.95,0,0,0] is closest to node 10 then 9…
+        let mut override_map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=10 {
+            let v: Arc<[f32]> = Arc::from(vec![(i as f32 - 1.0) / 10.0, 0.0, 0.0, 0.0]);
+            override_map.insert(NodeId::new(i), v);
+        }
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { override_map.get(&id).cloned() };
+
+        // Invisible nodes: 5 and 7.
+        let is_visible = |id: NodeId| id != NodeId::new(5) && id != NodeId::new(7);
+
+        let query = [0.95f32, 0.0, 0.0, 0.0];
+        let results = index.search_visible(&query, 5, 20, &is_visible, &accessor);
+
+        // No invisible nodes.
+        for (id, _) in &results {
+            assert!(
+                *id != NodeId::new(5) && *id != NodeId::new(7),
+                "invisible node {id:?} in quantized search_visible results"
+            );
+        }
+        // Must return exactly 5 (8 visible, k=5).
+        assert_eq!(results.len(), 5, "expected 5 results; got {results:?}");
+
+        // Closest to [0.95,0,0,0] in override_map is node 10 ([0.9,0,0,0], dist=0.05),
+        // then node 9 ([0.8,0,0,0], dist=0.15), etc. The override accessor must
+        // dictate the ranking: node 10 must be first.
+        assert_eq!(
+            results[0].0,
+            NodeId::new(10),
+            "node 10 should be closest in override accessor; got {results:?}"
+        );
+
+        // Distances computed by override accessor must be ascending.
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].1 <= results[i].1,
+                "results not sorted at index {i}: {results:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_heap_memory_bytes() {
         let config = HnswConfig::new(4, DistanceMetric::Euclidean);
@@ -1104,5 +1882,216 @@ mod tests {
             index.heap_memory_bytes() > empty_mem,
             "memory should grow after insert"
         );
+    }
+
+    // ── GC tests (quantized) ──────────────────────────────────────────
+
+    #[test]
+    fn gc_quantized_retained_tombstone_exact_restore_and_noop() -> Result<(), String> {
+        for kind in [
+            QuantizationType::None,
+            QuantizationType::Scalar,
+            QuantizationType::Binary,
+            QuantizationType::Product { num_subvectors: 2 },
+        ] {
+            let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+            let index = QuantizedHnswIndex::with_seed(config.clone(), kind, 42);
+            for id in 1..=8 {
+                index.insert(NodeId::new(id), &[id as f32; 4]);
+            }
+            index.remove(NodeId::new(2));
+            index.remove(NodeId::new(3));
+            let historical_accessor =
+                |id: NodeId| -> Option<Arc<[f32]>> { Some(vec![id.as_u64() as f32; 4].into()) };
+            let visible = |id| id != NodeId::new(2);
+            assert!(
+                index
+                    .search_visible(&[3.0; 4], 8, 32, &visible, &historical_accessor)
+                    .iter()
+                    .any(|(id, _)| *id == NodeId::new(3))
+            );
+            let before = index.snapshot_exact()?;
+            index.gc(&|_| true)?;
+            assert_quantized_exact_eq(&index.snapshot_exact()?, &before);
+            let restored = QuantizedHnswIndex::with_seed(config, kind, 99);
+            restored.apply_prepared_exact_restore(restored.prepare_exact_restore(before)?);
+            let calls = std::cell::RefCell::new(HashMap::new());
+            index.gc(&|id| {
+                *calls.borrow_mut().entry(id).or_insert(0) += 1;
+                id != NodeId::new(2)
+            })?;
+            assert_eq!(calls.borrow().len(), 8);
+            assert!(calls.borrow().values().all(|count| *count == 1));
+            restored.gc(&|id| id != NodeId::new(2))?;
+            assert_quantized_exact_eq(&index.snapshot_exact()?, &restored.snapshot_exact()?);
+            assert!(!index.contains_including_deleted(NodeId::new(2)));
+            assert!(index.contains_including_deleted(NodeId::new(3)));
+            assert!(!index.contains(NodeId::new(3)));
+            assert!(
+                index
+                    .search_visible(&[3.0; 4], 8, 32, &visible, &historical_accessor)
+                    .iter()
+                    .any(|(id, _)| *id == NodeId::new(3))
+            );
+            assert!(
+                !index
+                    .search(&[3.0; 4], 8)
+                    .iter()
+                    .any(|(id, _)| *id == NodeId::new(3))
+            );
+            let retained = index.snapshot_exact()?;
+            index.gc(&|_| true)?;
+            assert_quantized_exact_eq(&index.snapshot_exact()?, &retained);
+            index.insert(NodeId::new(9), &[9.0; 4]);
+            restored.insert(NodeId::new(9), &[9.0; 4]);
+            assert_quantized_exact_eq(&index.snapshot_exact()?, &restored.snapshot_exact()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gc_quantized_missing_retained_payload_rejects_before_publication() -> Result<(), String> {
+        let index = QuantizedHnswIndex::with_seed(
+            HnswConfig::new(4, DistanceMetric::Euclidean),
+            QuantizationType::Scalar,
+            42,
+        );
+        for id in 1..=4 {
+            index.insert(NodeId::new(id), &[id as f32; 4]);
+        }
+        index.remove(NodeId::new(2));
+        let before = index.snapshot_exact()?;
+        let missing = index
+            .vectors
+            .write()
+            .remove(&NodeId::new(3))
+            .ok_or("missing fixture vector")?;
+        assert!(index.gc(&|id| id != NodeId::new(2)).is_err());
+        assert!(index.contains_including_deleted(NodeId::new(2)));
+        index.vectors.write().insert(NodeId::new(3), missing);
+        assert_quantized_exact_eq(&index.snapshot_exact()?, &before);
+        Ok(())
+    }
+
+    /// GC on QuantizedHnswIndex drops the below-horizon node from the
+    /// topology and all internal maps; retains live nodes.
+    #[test]
+    fn gc_quantized_drops_deleted_below_horizon() -> Result<(), String> {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        for i in 1u64..=5 {
+            let v: f32 = i as f32 / 6.0;
+            index.insert(NodeId::new(i), &[v, v, v, v]);
+        }
+        assert_eq!(index.len(), 5);
+
+        // Soft-delete node 3.
+        assert!(index.remove(NodeId::new(3)));
+        assert_eq!(index.len(), 4);
+        assert!(index.contains_including_deleted(NodeId::new(3)));
+
+        // GC: node 3 is not live (deleted below horizon).
+        index.gc(&|id| id != NodeId::new(3))?;
+
+        // Node 3 gone from topology and internal maps.
+        assert!(
+            !index.contains_including_deleted(NodeId::new(3)),
+            "GC must remove node 3 from topology"
+        );
+        assert_eq!(index.len(), 4);
+
+        // Remaining nodes present and searchable.
+        for i in [1u64, 2, 4, 5] {
+            assert!(
+                index.contains(NodeId::new(i)),
+                "live node {i} must survive GC"
+            );
+        }
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 4);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            !ids.contains(&3),
+            "node 3 must not appear in search: {ids:?}"
+        );
+
+        // All-live GC retains everything.
+        index.gc(&|_id| true)?;
+        assert_eq!(index.len(), 4);
+        for i in [1u64, 2, 4, 5] {
+            assert!(index.contains(NodeId::new(i)));
+        }
+        Ok(())
+    }
+
+    // ── Soft-delete (MVCC) tests ──────────────────────────────────────
+
+    /// Soft-delete on QuantizedHnswIndex: deleted node absent from
+    /// results but topology preserved for routing.
+    #[test]
+    fn soft_delete_retains_topology_quantized() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        index.insert(NodeId::new(1), &[0.1, 0.1, 0.1, 0.1]);
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5]);
+        index.insert(NodeId::new(3), &[0.9, 0.9, 0.9, 0.9]);
+        assert_eq!(index.len(), 3);
+
+        // Soft-delete node 2
+        assert!(index.remove(NodeId::new(2)));
+
+        // Search must not return node 2
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 3);
+        assert!(
+            results.iter().all(|(id, _)| *id != NodeId::new(2)),
+            "soft-deleted node 2 must not appear in results: {results:?}"
+        );
+
+        // Public API
+        assert!(!index.contains(NodeId::new(2)));
+        assert!(index.contains_including_deleted(NodeId::new(2)));
+        assert_eq!(index.len(), 2);
+
+        // Re-insert un-deletes
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5]);
+        assert!(index.contains(NodeId::new(2)));
+        assert_eq!(index.len(), 3);
+
+        // Remove of non-existent returns false
+        assert!(!index.remove(NodeId::new(99)));
+    }
+
+    /// Connectivity: after soft-deleting middle nodes, far-end live
+    /// nodes remain findable through the deleted routing hops.
+    #[test]
+    fn soft_delete_routes_through_deleted_quantized() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean).with_m(4);
+        let index = QuantizedHnswIndex::with_seed(config, QuantizationType::None, 42);
+
+        for i in 1u64..=7 {
+            let v = (i as f32) / 8.0;
+            index.insert(NodeId::new(i), &[v, v, v, v]);
+        }
+        assert_eq!(index.len(), 7);
+
+        // Delete middle
+        index.remove(NodeId::new(3));
+        index.remove(NodeId::new(4));
+        index.remove(NodeId::new(5));
+        assert_eq!(index.len(), 4);
+
+        let results = index.search(&[0.85, 0.85, 0.85, 0.85], 4);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            ids.contains(&6) || ids.contains(&7),
+            "live nodes 6 or 7 must be reachable after deleting middle nodes; got {ids:?}"
+        );
+        for (id, _) in &results {
+            assert!(
+                !matches!(id.as_u64(), 3..=5),
+                "deleted node {id:?} must not appear in results"
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Tests the `mmr_search()` database method with various parameters.
 
-#![cfg(feature = "vector-index")]
+#![cfg(all(feature = "lpg", feature = "vector-index"))]
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
@@ -16,22 +16,40 @@ fn setup_db() -> GrafeoDB {
 
     // Create 5 nodes with varied vectors
     let n1 = db.create_node(&["Doc"]);
-    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .expect("set node property");
 
     let n2 = db.create_node(&["Doc"]);
-    db.set_node_property(n2, "emb", vec3(0.95, 0.05, 0.0)); // very similar to n1
+    db.set_node_property(n2, "emb", vec3(0.95, 0.05, 0.0))
+        .expect("set node property"); // very similar to n1
 
     let n3 = db.create_node(&["Doc"]);
-    db.set_node_property(n3, "emb", vec3(0.0, 1.0, 0.0)); // orthogonal
+    db.set_node_property(n3, "emb", vec3(0.0, 1.0, 0.0))
+        .expect("set node property"); // orthogonal
 
     let n4 = db.create_node(&["Doc"]);
-    db.set_node_property(n4, "emb", vec3(0.0, 0.0, 1.0)); // orthogonal
+    db.set_node_property(n4, "emb", vec3(0.0, 0.0, 1.0))
+        .expect("set node property"); // orthogonal
 
     let n5 = db.create_node(&["Doc"]);
-    db.set_node_property(n5, "emb", vec3(0.9, 0.1, 0.0)); // similar to n1
+    db.set_node_property(n5, "emb", vec3(0.9, 0.1, 0.0))
+        .expect("set node property"); // similar to n1
 
-    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-        .expect("create index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("create index");
 
     db
 }

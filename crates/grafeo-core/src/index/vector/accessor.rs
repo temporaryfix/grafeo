@@ -26,6 +26,31 @@ use grafeo_common::types::{NodeId, PropertyKey, Value};
 
 use crate::graph::GraphStore;
 
+/// Converts a stored value into the `f32` representation used by vector
+/// indexes.
+///
+/// Native embeddings are stored as [`Value::Vector`]. GQL inline literals are
+/// represented as numeric [`Value::List`] values, so accepting both forms keeps
+/// index construction, incremental maintenance, and search accessors
+/// consistent. Mixed or non-numeric lists are not vectors.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn value_to_vector(value: &Value) -> Option<Arc<[f32]>> {
+    match value {
+        Value::Vector(vector) => Some(Arc::clone(vector)),
+        Value::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Float64(value) => Some(*value as f32),
+                Value::Int64(value) => Some(*value as f32),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Arc::from),
+        _ => None,
+    }
+}
+
 /// Trait for reading vectors by node ID.
 ///
 /// HNSW is topology-only: vectors live in property storage, not in
@@ -58,10 +83,10 @@ impl<'a> PropertyVectorAccessor<'a> {
 
 impl VectorAccessor for PropertyVectorAccessor<'_> {
     fn get_vector(&self, id: NodeId) -> Option<Arc<[f32]>> {
-        match self.store.get_node_property(id, &self.property) {
-            Some(Value::Vector(v)) => Some(v),
-            _ => None,
-        }
+        self.store
+            .get_node_property(id, &self.property)
+            .as_ref()
+            .and_then(value_to_vector)
     }
 }
 
@@ -101,10 +126,10 @@ impl VectorAccessor for SpillableVectorAccessor<'_> {
             return Some(v);
         }
         // Fall back to property store (new inserts after spill)
-        match self.store.get_node_property(id, &self.property) {
-            Some(Value::Vector(v)) => Some(v),
-            _ => None,
-        }
+        self.store
+            .get_node_property(id, &self.property)
+            .as_ref()
+            .and_then(value_to_vector)
     }
 }
 
@@ -180,6 +205,26 @@ mod tests {
         store.set_node_property(id, "name", Value::from("hello"));
         let name_accessor = PropertyVectorAccessor::new(&store, "name");
         assert!(name_accessor.get_vector(id).is_none());
+    }
+
+    #[test]
+    fn property_vector_accessor_accepts_gql_numeric_list() {
+        let store = LpgStore::new().unwrap();
+        let id = store.create_node(&["Test"]);
+        store.set_node_property(
+            id,
+            "embedding",
+            Value::List(vec![Value::Float64(1.0), Value::Int64(2), Value::Float64(3.0)].into()),
+        );
+
+        let accessor = PropertyVectorAccessor::new(&store, "embedding");
+        assert_eq!(accessor.get_vector(id).unwrap().as_ref(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn value_to_vector_rejects_non_numeric_list() {
+        let value = Value::List(vec![Value::Float64(1.0), Value::from("two")].into());
+        assert!(value_to_vector(&value).is_none());
     }
 }
 

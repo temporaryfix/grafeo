@@ -41,11 +41,26 @@ fn setup_euclidean_fixture() -> GrafeoDB {
         ("d09", 0.9),
     ] {
         let n = db.create_node(&["Item"]);
-        db.set_node_property(n, "label", Value::String(label.into()));
-        db.set_node_property(n, "vec", Value::Vector(vec![d, 0.0, 0.0].into()));
+        db.set_node_property(n, "label", Value::String(label.into()))
+            .expect("set node property");
+        db.set_node_property(n, "vec", Value::Vector(vec![d, 0.0, 0.0].into()))
+            .expect("set node property");
     }
-    db.create_vector_index("Item", "vec", Some(3), Some("euclidean"), None, None, None)
-        .expect("create vector index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Item".into()),
+        property: "vec".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("euclidean".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("create vector index");
     db
 }
 
@@ -96,11 +111,26 @@ fn setup_manhattan_fixture() -> GrafeoDB {
         ("d09", 0.9),
     ] {
         let n = db.create_node(&["Item"]);
-        db.set_node_property(n, "label", Value::String(label.into()));
-        db.set_node_property(n, "vec", Value::Vector(vec![d, 0.0, 0.0].into()));
+        db.set_node_property(n, "label", Value::String(label.into()))
+            .expect("set node property");
+        db.set_node_property(n, "vec", Value::Vector(vec![d, 0.0, 0.0].into()))
+            .expect("set node property");
     }
-    db.create_vector_index("Item", "vec", Some(3), Some("manhattan"), None, None, None)
-        .expect("create vector index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Item".into()),
+        property: "vec".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("manhattan".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("create vector index");
     db
 }
 

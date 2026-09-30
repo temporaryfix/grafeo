@@ -104,6 +104,18 @@ impl QuantizationType {
         }
     }
 
+    /// Returns a configuration string that preserves all strategy parameters.
+    ///
+    /// Unlike [`Self::name`], product quantization includes its subvector count
+    /// (for example, `"pq16"`) so persistence and index rebuilds are lossless.
+    #[must_use]
+    pub fn persistence_name(&self) -> String {
+        match self {
+            Self::Product { num_subvectors } => format!("pq{num_subvectors}"),
+            _ => self.name().to_string(),
+        }
+    }
+
     /// Parses from string (case-insensitive).
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
@@ -177,7 +189,86 @@ pub struct ScalarQuantizer {
     dimensions: usize,
 }
 
+#[cfg(feature = "vector-index")]
+#[derive(Debug, Clone)]
+pub(super) struct ScalarQuantizerExactState {
+    pub(super) min: Vec<f32>,
+    pub(super) scale: Vec<f32>,
+    pub(super) inv_scale: Vec<f32>,
+    pub(super) dimensions: usize,
+}
+
 impl ScalarQuantizer {
+    /// Checks that decoded storage matches the declared dimension before a
+    /// caller uses indexing-based hot paths.
+    #[must_use]
+    pub(super) fn has_valid_storage(&self) -> bool {
+        self.dimensions > 0
+            && self.min.len() == self.dimensions
+            && self.scale.len() == self.dimensions
+            && self.inv_scale.len() == self.dimensions
+            && self.min.iter().all(|value| value.is_finite())
+            && self
+                .scale
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+            && self
+                .inv_scale
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+    }
+
+    pub(super) fn storage_parts(&self) -> (&[f32], &[f32], &[f32]) {
+        (&self.min, &self.scale, &self.inv_scale)
+    }
+
+    pub(super) fn from_storage_parts(
+        dimensions: usize,
+        min: Vec<f32>,
+        scale: Vec<f32>,
+        inv_scale: Vec<f32>,
+    ) -> std::result::Result<Self, &'static str> {
+        let quantizer = Self {
+            min,
+            scale,
+            inv_scale,
+            dimensions,
+        };
+        if !quantizer.has_valid_storage() {
+            return Err("scalar quantizer storage is structurally or numerically invalid");
+        }
+        Ok(quantizer)
+    }
+
+    #[cfg(feature = "vector-index")]
+    pub(super) fn snapshot_exact(&self) -> ScalarQuantizerExactState {
+        ScalarQuantizerExactState {
+            min: self.min.clone(),
+            scale: self.scale.clone(),
+            inv_scale: self.inv_scale.clone(),
+            dimensions: self.dimensions,
+        }
+    }
+
+    #[cfg(feature = "vector-index")]
+    pub(super) fn from_exact_state(
+        state: ScalarQuantizerExactState,
+    ) -> std::result::Result<Self, String> {
+        if state.dimensions == 0
+            || state.min.len() != state.dimensions
+            || state.scale.len() != state.dimensions
+            || state.inv_scale.len() != state.dimensions
+        {
+            return Err("scalar quantizer snapshot has inconsistent dimensions".to_string());
+        }
+        Ok(Self {
+            min: state.min,
+            scale: state.scale,
+            inv_scale: state.inv_scale,
+            dimensions: state.dimensions,
+        })
+    }
+
     /// Trains a scalar quantizer from sample vectors.
     ///
     /// Learns the min/max value per dimension from the training data.
@@ -551,7 +642,58 @@ pub struct ProductQuantizer {
     centroids: Vec<f32>,
 }
 
+#[cfg(feature = "vector-index")]
+#[derive(Debug, Clone)]
+pub(super) struct ProductQuantizerExactState {
+    pub(super) num_subvectors: usize,
+    pub(super) num_centroids: usize,
+    pub(super) subvector_dim: usize,
+    pub(super) dimensions: usize,
+    pub(super) centroids: Vec<f32>,
+}
+
 impl ProductQuantizer {
+    #[cfg(feature = "vector-index")]
+    pub(super) fn snapshot_exact(&self) -> ProductQuantizerExactState {
+        ProductQuantizerExactState {
+            num_subvectors: self.num_subvectors,
+            num_centroids: self.num_centroids,
+            subvector_dim: self.subvector_dim,
+            dimensions: self.dimensions,
+            centroids: self.centroids.clone(),
+        }
+    }
+
+    #[cfg(feature = "vector-index")]
+    pub(super) fn from_exact_state(
+        state: ProductQuantizerExactState,
+    ) -> std::result::Result<Self, String> {
+        if state.num_subvectors == 0
+            || state.num_centroids == 0
+            || state.num_centroids > 256
+            || state.dimensions == 0
+            || !state.dimensions.is_multiple_of(state.num_subvectors)
+            || state.subvector_dim != state.dimensions / state.num_subvectors
+        {
+            return Err("product quantizer snapshot has inconsistent parameters".to_string());
+        }
+        let expected_centroids = state
+            .num_subvectors
+            .checked_mul(state.num_centroids)
+            .and_then(|count| count.checked_mul(state.subvector_dim))
+            .ok_or_else(|| "product quantizer centroid count overflows".to_string())?;
+        if state.centroids.len() != expected_centroids {
+            return Err("product quantizer snapshot has inconsistent centroid count".to_string());
+        }
+        Ok(Self {
+            num_subvectors: state.num_subvectors,
+            num_centroids: state.num_centroids,
+            subvector_dim: state.subvector_dim,
+            dimensions: state.dimensions,
+            centroids: state.centroids,
+        })
+    }
+
     /// Trains a product quantizer from sample vectors using k-means clustering.
     ///
     /// # Arguments
@@ -757,6 +899,12 @@ impl ProductQuantizer {
     #[must_use]
     pub fn code_size(&self) -> usize {
         self.num_subvectors // M u8 codes
+    }
+
+    /// Borrow the stored codebook for checked internal publication preparation.
+    #[cfg(all(feature = "vector-index", feature = "lpg"))]
+    pub(super) fn centroid_values(&self) -> &[f32] {
+        &self.centroids
     }
 
     /// Returns the compression ratio compared to f32 storage.
@@ -1234,6 +1382,15 @@ mod tests {
         assert_eq!(
             QuantizationType::from_str("pq32"),
             Some(QuantizationType::Product { num_subvectors: 32 })
+        );
+    }
+
+    #[test]
+    fn test_quantization_persistence_name_preserves_product_subvectors() {
+        assert_eq!(QuantizationType::Scalar.persistence_name(), "scalar");
+        assert_eq!(
+            QuantizationType::Product { num_subvectors: 16 }.persistence_name(),
+            "pq16"
         );
     }
 

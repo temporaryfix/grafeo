@@ -772,11 +772,24 @@ unsafe fn horizontal_sum_wasm(v: std::arch::wasm32::v128) -> f32 {
         + f32x4_extract_lane::<3>(v)
 }
 
+/// Loads four valid floats without requiring 16-byte alignment.
+///
+/// # Safety
+/// `pointer` must be valid and aligned for reading four initialized `f32`s.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+unsafe fn load_f32x4_wasm(pointer: *const f32) -> std::arch::wasm32::v128 {
+    // SAFETY: [f32; 4] has f32 alignment and the caller provides all four values.
+    let values = unsafe { pointer.cast::<[f32; 4]>().read() };
+    // SAFETY: both types are 128 bits and every bit pattern is valid for v128.
+    unsafe { std::mem::transmute::<[f32; 4], std::arch::wasm32::v128>(values) }
+}
+
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 unsafe fn dot_product_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::wasm32::*;
 
-    // SAFETY precondition: the raw `v128_load` on `b` below is bounded by
+    // SAFETY precondition: the four-float load on `b` below is bounded by
     // `a.len()`, so mismatched lengths would read out of `b`. The public
     // `dot_product_simd` dispatcher asserts length equality in all builds
     // before dispatching here (see #311).
@@ -785,9 +798,10 @@ unsafe fn dot_product_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0;
     let mut sum = f32x4_splat(0.0);
 
+    // The load needs only f32 alignment; this bound provides four valid floats.
     while i + 4 <= n {
-        let va = v128_load(a.as_ptr().add(i) as *const v128);
-        let vb = v128_load(b.as_ptr().add(i) as *const v128);
+        let va = load_f32x4_wasm(a.as_ptr().add(i));
+        let vb = load_f32x4_wasm(b.as_ptr().add(i));
         sum = f32x4_add(sum, f32x4_mul(va, vb));
         i += 4;
     }
@@ -809,9 +823,10 @@ unsafe fn euclidean_squared_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0;
     let mut sum = f32x4_splat(0.0);
 
+    // The load needs only f32 alignment; this bound provides four valid floats.
     while i + 4 <= n {
-        let va = v128_load(a.as_ptr().add(i) as *const v128);
-        let vb = v128_load(b.as_ptr().add(i) as *const v128);
+        let va = load_f32x4_wasm(a.as_ptr().add(i));
+        let vb = load_f32x4_wasm(b.as_ptr().add(i));
         let diff = f32x4_sub(va, vb);
         sum = f32x4_add(sum, f32x4_mul(diff, diff));
         i += 4;
@@ -819,8 +834,8 @@ unsafe fn euclidean_squared_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
 
     let mut result = horizontal_sum_wasm(sum);
     while i < n {
-        let d = a[i] - b[i];
-        result += d * d;
+        let difference = a[i] - b[i];
+        result += difference * difference;
         i += 1;
     }
     result
@@ -837,9 +852,10 @@ unsafe fn cosine_distance_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     let mut na = f32x4_splat(0.0);
     let mut nb = f32x4_splat(0.0);
 
+    // The load needs only f32 alignment; this bound provides four valid floats.
     while i + 4 <= n {
-        let va = v128_load(a.as_ptr().add(i) as *const v128);
-        let vb = v128_load(b.as_ptr().add(i) as *const v128);
+        let va = load_f32x4_wasm(a.as_ptr().add(i));
+        let vb = load_f32x4_wasm(b.as_ptr().add(i));
         dot = f32x4_add(dot, f32x4_mul(va, vb));
         na = f32x4_add(na, f32x4_mul(va, va));
         nb = f32x4_add(nb, f32x4_mul(vb, vb));
@@ -870,9 +886,10 @@ unsafe fn manhattan_distance_wasm_simd(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0;
     let mut sum = f32x4_splat(0.0);
 
+    // The load needs only f32 alignment; this bound provides four valid floats.
     while i + 4 <= n {
-        let va = v128_load(a.as_ptr().add(i) as *const v128);
-        let vb = v128_load(b.as_ptr().add(i) as *const v128);
+        let va = load_f32x4_wasm(a.as_ptr().add(i));
+        let vb = load_f32x4_wasm(b.as_ptr().add(i));
         let diff = f32x4_sub(va, vb);
         sum = f32x4_add(sum, f32x4_abs(diff));
         i += 4;

@@ -82,6 +82,7 @@ mod accessor;
 mod distance;
 mod mmr;
 pub mod quantization;
+pub mod rabitq;
 mod simd;
 pub mod storage;
 pub mod zone_map;
@@ -99,6 +100,7 @@ pub mod section;
 
 pub use accessor::{
     PropertyVectorAccessor, SpillableVectorAccessor, VectorAccessor, VectorAccessorKind,
+    value_to_vector,
 };
 pub use distance::{
     DistanceMetric, compute_distance, cosine_distance, cosine_similarity, dot_product,
@@ -107,6 +109,10 @@ pub use distance::{
 };
 pub use mmr::mmr_select;
 pub use quantization::{BinaryQuantizer, ProductQuantizer, QuantizationType, ScalarQuantizer};
+pub use rabitq::{
+    RabitqCode, RabitqError, RabitqIndex, RabitqQuantizer, RabitqQuery, RabitqView,
+    TwoStageVectorIndex,
+};
 #[cfg(feature = "mmap")]
 pub use storage::MmapStorage;
 pub use storage::{RamStorage, StorageBackend, VectorStorage};
@@ -114,8 +120,12 @@ pub use zone_map::VectorZoneMap;
 
 #[cfg(feature = "vector-index")]
 pub use config::HnswConfig;
+#[cfg(all(feature = "vector-index", feature = "lpg"))]
+pub(crate) mod maintenance;
 #[cfg(feature = "vector-index")]
 pub use hnsw::HnswIndex;
+#[cfg(all(feature = "vector-index", feature = "lpg"))]
+pub(crate) use hnsw::HnswScopeTransition;
 #[cfg(feature = "vector-index")]
 pub use quantized_hnsw::QuantizedHnswIndex;
 #[cfg(feature = "vector-index")]
@@ -124,7 +134,13 @@ pub use section::VectorStoreSection;
 
 use grafeo_common::types::NodeId;
 #[cfg(feature = "vector-index")]
+use hnsw::{HnswExactState, PreparedHnswExactState};
+#[cfg(feature = "vector-index")]
+use quantized_hnsw::{PreparedQuantizedExactState, QuantizedExactState};
+#[cfg(feature = "vector-index")]
 use std::collections::HashSet;
+#[cfg(feature = "vector-index")]
+use std::sync::Arc;
 
 // ── VectorIndexKind ────────────────────────────────────────────────
 
@@ -140,8 +156,485 @@ pub enum VectorIndexKind {
     Quantized(QuantizedHnswIndex),
 }
 
+/// Owned mutation exclusion retained across an exact runtime index handoff.
+///
+/// Every vector mutator enters the same reentrant publication gate. Holding
+/// this fence after creating a frozen fork therefore keeps the fork equal to
+/// the source until the caller publishes the registry move or abandons it.
+#[cfg(all(feature = "vector-index", feature = "lpg", feature = "compact-store"))]
+pub(crate) struct VectorIndexReadFence {
+    _guard:
+        parking_lot::ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
+}
+
+#[cfg(feature = "vector-index")]
+#[derive(Debug, Clone)]
+enum VectorExactState {
+    Hnsw(HnswExactState),
+    Quantized(QuantizedExactState),
+}
+
+#[cfg(feature = "vector-index")]
+enum PreparedVectorExactState {
+    Hnsw(PreparedHnswExactState),
+    Quantized(PreparedQuantizedExactState),
+}
+
+#[cfg(feature = "vector-index")]
+struct VectorExactRestoreGuard<'index> {
+    index: &'index VectorIndexKind,
+    _mutation: hnsw::HnswMutationGuard<'index>,
+}
+
+/// A concrete replacement bound to its exact target and a retained mutation
+/// guard. Binding checks every rejection condition before any state is moved;
+/// applying the resulting capability cannot encounter a target/kind mismatch.
+#[cfg(feature = "vector-index")]
+#[must_use = "a ready exact replacement must be applied or explicitly abandoned"]
+enum ReadyVectorExactRestore<'index, 'guard> {
+    Hnsw {
+        target: &'index HnswIndex,
+        state: PreparedHnswExactState,
+        _guard: &'guard VectorExactRestoreGuard<'index>,
+    },
+    Quantized {
+        target: &'index QuantizedHnswIndex,
+        state: PreparedQuantizedExactState,
+        _guard: &'guard VectorExactRestoreGuard<'index>,
+    },
+}
+
+#[cfg(feature = "vector-index")]
+impl<'index, 'guard> ReadyVectorExactRestore<'index, 'guard> {
+    fn bind(
+        target: &'index VectorIndexKind,
+        state: PreparedVectorExactState,
+        guard: &'guard VectorExactRestoreGuard<'index>,
+    ) -> std::result::Result<Self, String> {
+        if !std::ptr::eq(target, guard.index) {
+            return Err("vector restore guard belongs to a different target".to_string());
+        }
+        match (target, state) {
+            (VectorIndexKind::Hnsw(target), PreparedVectorExactState::Hnsw(state)) => {
+                Ok(Self::Hnsw {
+                    target,
+                    state,
+                    _guard: guard,
+                })
+            }
+            (VectorIndexKind::Quantized(target), PreparedVectorExactState::Quantized(state)) => {
+                Ok(Self::Quantized {
+                    target,
+                    state,
+                    _guard: guard,
+                })
+            }
+            _ => Err("prepared vector state concrete kind does not match target index".to_string()),
+        }
+    }
+
+    fn apply(self) {
+        match self {
+            Self::Hnsw { target, state, .. } => target.apply_prepared_exact_restore(state),
+            Self::Quantized { target, state, .. } => target.apply_prepared_exact_restore(state),
+        }
+    }
+}
+
+/// Read-only capability for an LPG-owned vector index.
+///
+/// Cloning this value clones only the handle. Topology mutation remains owned
+/// by the graph store and its transaction/publication protocol.
+#[cfg(feature = "vector-index")]
+#[derive(Clone)]
+pub struct VectorIndexView {
+    inner: Arc<VectorIndexKind>,
+}
+
+#[cfg(feature = "vector-index")]
+impl VectorIndexView {
+    pub(crate) fn new(inner: Arc<VectorIndexKind>) -> Self {
+        Self { inner }
+    }
+
+    /// Internal borrowed target. Public maintenance additionally requires the
+    /// concrete owning store and its continuously held write authority.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn commit_target(&self) -> &VectorIndexKind {
+        &self.inner
+    }
+
+    fn snapshot_exact(&self) -> std::result::Result<VectorExactState, String> {
+        self.inner.snapshot_exact_state()
+    }
+
+    fn prepare_exact_restore(
+        &self,
+        state: VectorExactState,
+    ) -> std::result::Result<PreparedVectorExactState, String> {
+        self.inner.prepare_exact_state(state)
+    }
+
+    fn pin_exact_restore(&self) -> Option<VectorExactRestoreGuard<'_>> {
+        let index = self.inner.as_ref();
+        let mutation = index.pin_mutation()?;
+        Some(VectorExactRestoreGuard {
+            index,
+            _mutation: mutation,
+        })
+    }
+
+    fn exact_restore_identity(&self) -> *const VectorIndexKind {
+        Arc::as_ptr(&self.inner)
+    }
+
+    fn bind_exact_restore<'index, 'guard>(
+        &'index self,
+        state: PreparedVectorExactState,
+        guard: &'guard VectorExactRestoreGuard<'index>,
+    ) -> std::result::Result<ReadyVectorExactRestore<'index, 'guard>, String> {
+        ReadyVectorExactRestore::bind(self.inner.as_ref(), state, guard)
+    }
+
+    /// Returns the HNSW configuration.
+    #[must_use]
+    pub fn config(&self) -> &HnswConfig {
+        self.inner.config()
+    }
+
+    /// Returns the number of live vectors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns whether the index has no live vectors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns whether the index contains `id`.
+    #[must_use]
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.inner.contains(id)
+    }
+
+    /// Searches for the nearest neighbors.
+    #[must_use]
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        self.inner.search(query, k, accessor)
+    }
+
+    /// Searches with a custom beam width.
+    #[must_use]
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        self.inner.search_with_ef(query, k, ef, accessor)
+    }
+
+    /// Searches within an allowlist.
+    #[must_use]
+    pub fn search_with_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowlist: &HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        self.inner.search_with_filter(query, k, allowlist, accessor)
+    }
+
+    /// Searches with a custom beam width within an allowlist.
+    #[must_use]
+    pub fn search_with_ef_and_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        allowlist: &HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        self.inner
+            .search_with_ef_and_filter(query, k, ef, allowlist, accessor)
+    }
+
+    /// Batch-searches query vectors.
+    #[must_use]
+    pub fn batch_search(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<Vec<(NodeId, f32)>> {
+        self.inner.batch_search(queries, k, accessor)
+    }
+
+    /// Batch-searches with a custom beam width.
+    #[must_use]
+    pub fn batch_search_with_ef(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<Vec<(NodeId, f32)>> {
+        self.inner.batch_search_with_ef(queries, k, ef, accessor)
+    }
+
+    /// Batch-searches within an allowlist.
+    #[must_use]
+    pub fn batch_search_with_filter(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        allowlist: &HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<Vec<(NodeId, f32)>> {
+        self.inner
+            .batch_search_with_filter(queries, k, allowlist, accessor)
+    }
+
+    /// Batch-searches with a custom beam width within an allowlist.
+    #[must_use]
+    pub fn batch_search_with_ef_and_filter(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        allowlist: &HashSet<NodeId>,
+        accessor: &impl VectorAccessor,
+    ) -> Vec<Vec<(NodeId, f32)>> {
+        self.inner
+            .batch_search_with_ef_and_filter(queries, k, ef, allowlist, accessor)
+    }
+
+    /// Searches with snapshot visibility supplied by the caller.
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        self.inner
+            .search_visible(query, k, ef, is_visible, accessor)
+    }
+
+    /// Snapshots topology for read-only persistence/export.
+    #[must_use]
+    pub fn snapshot_topology(&self) -> (Option<NodeId>, usize, Vec<(NodeId, Vec<Vec<NodeId>>)>) {
+        self.inner.snapshot_topology()
+    }
+
+    /// Returns estimated heap usage.
+    #[must_use]
+    pub fn heap_memory_bytes(&self) -> usize {
+        self.inner.heap_memory_bytes()
+    }
+
+    /// Returns the quantization type, if any.
+    #[must_use]
+    pub fn quantization_type(&self) -> Option<QuantizationType> {
+        self.inner.quantization_type()
+    }
+
+    /// Returns whether the current persistence descriptors can reconstruct
+    /// this index exactly.
+    #[must_use]
+    pub fn has_persistence_representable_kind(&self) -> bool {
+        self.inner.has_persistence_representable_kind()
+    }
+}
+
+#[cfg(feature = "vector-index")]
+impl std::fmt::Debug for VectorIndexView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndexView")
+            .field("config", self.config())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(feature = "vector-index")]
 impl VectorIndexKind {
+    fn snapshot_exact_state(&self) -> std::result::Result<VectorExactState, String> {
+        match self {
+            Self::Hnsw(index) => index.snapshot_exact().map(VectorExactState::Hnsw),
+            Self::Quantized(index) => index.snapshot_exact().map(VectorExactState::Quantized),
+        }
+    }
+
+    fn prepare_exact_state(
+        &self,
+        state: VectorExactState,
+    ) -> std::result::Result<PreparedVectorExactState, String> {
+        match (self, state) {
+            (Self::Hnsw(index), VectorExactState::Hnsw(state)) => index
+                .prepare_exact_restore(state)
+                .map(PreparedVectorExactState::Hnsw),
+            (Self::Quantized(index), VectorExactState::Quantized(state)) => index
+                .prepare_exact_restore(state)
+                .map(PreparedVectorExactState::Quantized),
+            _ => Err("vector snapshot concrete kind does not match target index".to_string()),
+        }
+    }
+
+    /// Creates a detached, permanently read-only clone of this index's exact
+    /// logical state for a retained compact generation.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(crate) fn fork_exact_read_snapshot(
+        &self,
+    ) -> std::result::Result<Arc<VectorIndexKind>, String> {
+        let state = self.snapshot_exact_state()?;
+        let fork = match &state {
+            VectorExactState::Hnsw(state) => {
+                Self::Hnsw(HnswIndex::with_seed(state.config.clone(), 0))
+            }
+            VectorExactState::Quantized(state) => Self::Quantized(QuantizedHnswIndex::with_seed(
+                state.hnsw.config.clone(),
+                state.quantization_type,
+                0,
+            )),
+        };
+        let prepared = fork.prepare_exact_state(state)?;
+        let mutation = fork
+            .pin_mutation()
+            .ok_or_else(|| "fresh vector snapshot clone rejected exact restore".to_string())?;
+        let guard = VectorExactRestoreGuard {
+            index: &fork,
+            _mutation: mutation,
+        };
+        ReadyVectorExactRestore::bind(&fork, prepared, &guard)?.apply();
+        drop(guard);
+        match &fork {
+            Self::Hnsw(index) => index.freeze_exact_read_snapshot(),
+            Self::Quantized(index) => index.freeze_exact_read_snapshot(),
+        }
+        Ok(Arc::new(fork))
+    }
+
+    /// Forks an exact frozen image while retaining exclusion against all
+    /// subsequent source mutations.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(crate) fn fork_exact_read_snapshot_with_fence(
+        &self,
+    ) -> std::result::Result<(Arc<VectorIndexKind>, VectorIndexReadFence), String> {
+        let gate = match self {
+            Self::Hnsw(index) => index.publication_gate(),
+            Self::Quantized(index) => index.publication_gate(),
+        };
+        let guard = gate.lock_arc();
+        let fork = self.fork_exact_read_snapshot()?;
+        Ok((fork, VectorIndexReadFence { _guard: guard }))
+    }
+
+    /// Retains the global, rare index-ownership transition gate.
+    ///
+    /// LPG uses one proof across the preflight and apply phases for every
+    /// index in a named-graph tree, preventing retained aliases from changing
+    /// an index scope between those phases.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn pin_scope_transition() -> hnsw::HnswScopeTransition {
+        hnsw::HnswScopeTransition::acquire()
+    }
+
+    /// Compatibility entry point for the currently committed LPG installer.
+    /// The staged store-authority follow-up retains one transition across its
+    /// complete multi-index preflight and calls the `_under_transition` form
+    /// directly; keeping this narrow wrapper lets the vector hardening commit
+    /// remain independently buildable until that follow-up lands.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn binding_is_compatible(
+        &self,
+        owner: u64,
+        slot: u64,
+        transition: &hnsw::HnswScopeTransition,
+    ) -> bool {
+        match self {
+            Self::Hnsw(index) => index.binding_is_compatible(owner, slot, transition),
+            Self::Quantized(index) => index.binding_is_compatible(owner, slot, transition),
+        }
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn is_bound_to(
+        &self,
+        owner: u64,
+        slot: u64,
+        transition: &hnsw::HnswScopeTransition,
+    ) -> bool {
+        match self {
+            Self::Hnsw(index) => index.is_bound_to(owner, slot, transition),
+            Self::Quantized(index) => index.is_bound_to(owner, slot, transition),
+        }
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn bind_under_transition(
+        &self,
+        owner: u64,
+        slot: u64,
+        transition: &hnsw::HnswScopeTransition,
+    ) -> bool {
+        match self {
+            Self::Hnsw(index) => index.bind_under_transition(owner, slot, transition),
+            Self::Quantized(index) => index.bind_under_transition(owner, slot, transition),
+        }
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn scope_is_unsealed(&self, transition: &hnsw::HnswScopeTransition) -> bool {
+        match self {
+            Self::Hnsw(index) => index.scope_is_unsealed(transition),
+            Self::Quantized(index) => index.scope_is_unsealed(transition),
+        }
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn scope_is_compatible(
+        &self,
+        scope: u64,
+        transition: &hnsw::HnswScopeTransition,
+    ) -> bool {
+        match self {
+            Self::Hnsw(index) => index.scope_is_compatible(scope, transition),
+            Self::Quantized(index) => index.scope_is_compatible(scope, transition),
+        }
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(crate) fn seal_with_scope_under_transition(
+        &self,
+        scope: u64,
+        transition: &hnsw::HnswScopeTransition,
+    ) -> bool {
+        match self {
+            Self::Hnsw(index) => index.seal_with_scope_under_transition(scope, transition),
+            Self::Quantized(index) => index.seal_with_scope_under_transition(scope, transition),
+        }
+    }
+
+    fn pin_mutation(&self) -> Option<hnsw::HnswMutationGuard<'_>> {
+        match self {
+            Self::Hnsw(index) => index.pin_mutation(),
+            Self::Quantized(index) => index.pin_mutation(),
+        }
+    }
+
     /// Returns the HNSW configuration.
     #[must_use]
     pub fn config(&self) -> &HnswConfig {
@@ -319,6 +812,27 @@ impl VectorIndexKind {
         }
     }
 
+    /// Snapshot-aware predicate-filtered search.
+    ///
+    /// Traverses the full graph for connectivity, returns only nodes that
+    /// satisfy `is_visible`, and scores via the supplied `accessor`.
+    /// The beam is widened by `VISIBLE_EF_FACTOR` (4×) so filtering still
+    /// yields `k` results. Uses `&dyn` so the caller can pass trait objects.
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        match self {
+            Self::Hnsw(idx) => idx.search_visible(query, k, ef, is_visible, accessor),
+            Self::Quantized(idx) => idx.search_visible(query, k, ef, is_visible, accessor),
+        }
+    }
+
     /// Snapshot the HNSW topology for serialization.
     #[must_use]
     pub fn snapshot_topology(&self) -> (Option<NodeId>, usize, Vec<(NodeId, Vec<Vec<NodeId>>)>) {
@@ -350,12 +864,43 @@ impl VectorIndexKind {
         }
     }
 
+    /// Garbage collects soft-deleted nodes below the GC horizon.
+    ///
+    /// Rebuilds the HNSW topology retaining only nodes where `is_live(id)`
+    /// is `true`. For the plain HNSW variant, `accessor` is used to supply
+    /// each live node's vector during the rebuild; for the quantized variant,
+    /// vectors are read from the internal store and `accessor` is unused
+    /// (callers may pass a no-op).
+    ///
+    /// # Errors
+    /// Rejects denied authority or invalid retained vectors without replacing state.
+    pub fn gc(
+        &self,
+        is_live: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> std::result::Result<(), String> {
+        match self {
+            Self::Hnsw(idx) => idx.gc(is_live, accessor),
+            Self::Quantized(idx) => idx.gc(is_live),
+        }
+    }
+
     /// Returns the quantization type, if this is a quantized index.
     #[must_use]
     pub fn quantization_type(&self) -> Option<QuantizationType> {
         match self {
             Self::Hnsw(_) => None,
             Self::Quantized(idx) => Some(idx.quantization_type()),
+        }
+    }
+
+    /// Whether current persistence descriptors can reconstruct the index kind
+    /// and every quantized-specific option exactly.
+    #[must_use]
+    pub fn has_persistence_representable_kind(&self) -> bool {
+        match self {
+            Self::Hnsw(_) => true,
+            Self::Quantized(index) => index.has_persistence_defaults(),
         }
     }
 

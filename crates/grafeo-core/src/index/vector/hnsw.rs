@@ -57,10 +57,92 @@ use super::paged_topology::{MmapTopology, NeighborsIter as MmapNeighborsIter};
 use crate::index::vector::HnswConfig;
 use grafeo_common::types::NodeId;
 use ordered_float::OrderedFloat;
-use parking_lot::RwLock;
-use rand::{RngExt, SeedableRng};
+#[cfg(feature = "lpg")]
+use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{ReentrantMutex, ReentrantMutexGuard, RwLock, RwLockReadGuard};
+use rand::RngExt;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "lpg")]
+pub(crate) mod maintenance;
+
+/// Serializes the rare transition from standalone to store-owned indexes.
+///
+/// A graph can own several indexes and must be able to validate every scope
+/// before publishing any of them. Keeping this gate process-wide lets that
+/// preflight and publication share one stable transition proof even when a
+/// caller retained an alias to one of the indexes.
+#[cfg(feature = "lpg")]
+static HNSW_SCOPE_TRANSITION_GATE: Mutex<()> = Mutex::new(());
+
+/// Stable PRNG algorithm identifier carried by Vector Store v3 snapshots.
+///
+/// The algorithm is deliberately owned here rather than delegated to `rand`:
+/// `SmallRng` is allowed to change implementation between dependency releases
+/// and does not expose a portable serialized continuation. SplitMix64 has a
+/// single `u64` state and a fixed transition, so a restored index makes
+/// exactly the same future level choices as the source index.
+pub(super) const HNSW_RNG_SPLITMIX64: u8 = 1;
+
+/// Hard safety ceiling for a sampled HNSW level.
+///
+/// Sixty-four layers are already far beyond the useful hierarchy depth for
+/// any addressable graph, while keeping malformed/extreme public
+/// configurations from turning one insertion into an unbounded allocation.
+const HNSW_MAX_SAMPLED_LEVEL: usize = 63;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HnswRng {
+    state: u64,
+}
+
+impl HnswRng {
+    const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    const fn from_state(state: u64) -> Self {
+        Self { state }
+    }
+
+    fn from_entropy() -> Self {
+        Self::from_state(rand::rng().random())
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(Self::GAMMA);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        // Every output is in (0, 1] and is exactly representable,
+        // independent of host architecture. Excluding zero is essential:
+        // `-ln(0)` would otherwise make level selection unbounded.
+        const SCALE: f64 = 1.0 / ((1_u64 << 53) as f64);
+        (((self.next_u64() >> 11) + 1) as f64) * SCALE
+    }
+}
+
+/// Proof that no HNSW index can change ownership scope until this value drops.
+///
+/// The constructor is deliberately private to the vector module. LPG sealing
+/// uses the proof to make a multi-index preflight and apply failure-atomic.
+#[cfg(feature = "lpg")]
+pub(crate) struct HnswScopeTransition {
+    _guard: MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "lpg")]
+impl HnswScopeTransition {
+    pub(super) fn acquire() -> Self {
+        Self {
+            _guard: HNSW_SCOPE_TRANSITION_GATE.lock(),
+        }
+    }
+}
 
 /// A neighbor entry in the HNSW graph.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,19 +214,221 @@ struct HnswNode {
     neighbors: Vec<Vec<NodeId>>,
 }
 
+/// Complete, portable HNSW state used by Vector Store v3.
+///
+/// The topology-only v1/v2 representation omitted soft deletes and the PRNG
+/// continuation. Restoring it could therefore resurrect deleted results and
+/// make the next insertion choose a different layer. This state is the exact
+/// logical post-image needed to continue construction deterministically.
+#[derive(Debug, Clone)]
+pub(super) struct HnswExactState {
+    pub(super) config: HnswConfig,
+    pub(super) entry_point: Option<NodeId>,
+    pub(super) max_level: usize,
+    pub(super) nodes: Vec<(NodeId, Vec<Vec<NodeId>>)>,
+    pub(super) deleted: Vec<NodeId>,
+    pub(super) rng_state: u64,
+}
+
+/// Fully validated and allocated replacement state.
+///
+/// Construction may fail, but publication is only a sequence of lock-guarded
+/// moves. This is what gives a v3 restore its failure-before-mutation boundary.
+pub(super) struct PreparedHnswExactState {
+    entry_point: Option<NodeId>,
+    max_level: usize,
+    nodes: HashMap<NodeId, HnswNode>,
+    deleted: HashSet<NodeId>,
+    rng: HnswRng,
+}
+
+fn hnsw_configs_match(left: &HnswConfig, right: &HnswConfig) -> bool {
+    left.dimensions == right.dimensions
+        && left.metric == right.metric
+        && left.m == right.m
+        && left.m_max == right.m_max
+        && left.ef_construction == right.ef_construction
+        && left.ef == right.ef
+        && left.ml.to_bits() == right.ml.to_bits()
+        && left.alpha.to_bits() == right.alpha.to_bits()
+        && left.max_elements == right.max_elements
+}
+
+fn validate_hnsw_exact_state(
+    state: &HnswExactState,
+    target_config: &HnswConfig,
+) -> std::result::Result<(), String> {
+    if !hnsw_configs_match(&state.config, target_config) {
+        return Err("HNSW snapshot configuration does not match target index".to_string());
+    }
+    let mut node_ids = HashSet::with_capacity(state.nodes.len());
+    let mut previous = None;
+    let mut observed_max_level = 0;
+    for (id, layers) in &state.nodes {
+        if !id.is_valid() {
+            return Err("HNSW snapshot contains an invalid node ID".to_string());
+        }
+        if previous.is_some_and(|prior| prior >= *id) {
+            return Err("HNSW snapshot node IDs are duplicate or non-canonical".to_string());
+        }
+        previous = Some(*id);
+        if layers.is_empty() {
+            return Err(format!("HNSW node {id} has no topology layer"));
+        }
+        observed_max_level = observed_max_level.max(layers.len() - 1);
+        node_ids.insert(*id);
+    }
+
+    match (state.nodes.is_empty(), state.entry_point) {
+        (true, None) if state.max_level == 0 && state.deleted.is_empty() => return Ok(()),
+        (true, _) => {
+            return Err("empty HNSW snapshot has an entry point, level, or delete set".to_string());
+        }
+        (false, None) => return Err("non-empty HNSW snapshot has no entry point".to_string()),
+        (false, Some(_)) => {}
+    }
+
+    if observed_max_level != state.max_level {
+        return Err(format!(
+            "HNSW max level mismatch: header {}, topology {observed_max_level}",
+            state.max_level
+        ));
+    }
+    let entry_point = state
+        .entry_point
+        .expect("non-empty snapshot entry point checked above");
+    let Some((_, entry_layers)) = state.nodes.iter().find(|(id, _)| *id == entry_point) else {
+        return Err("HNSW entry point is absent from topology".to_string());
+    };
+    if entry_layers.len() != state.max_level + 1 {
+        return Err("HNSW entry point does not occupy the maximum layer".to_string());
+    }
+
+    let layer_counts: HashMap<NodeId, usize> = state
+        .nodes
+        .iter()
+        .map(|(id, layers)| (*id, layers.len()))
+        .collect();
+    for (id, layers) in &state.nodes {
+        for (layer, neighbors) in layers.iter().enumerate() {
+            let mut unique = HashSet::with_capacity(neighbors.len());
+            for neighbor in neighbors {
+                if !neighbor.is_valid() {
+                    return Err(format!("HNSW node {id} has an invalid neighbor"));
+                }
+                if *neighbor == *id {
+                    return Err(format!("HNSW node {id} contains a self-neighbor"));
+                }
+                let Some(neighbor_layers) = layer_counts.get(neighbor) else {
+                    return Err(format!(
+                        "HNSW node {id} references missing neighbor {neighbor}"
+                    ));
+                };
+                if *neighbor_layers <= layer {
+                    return Err(format!(
+                        "HNSW node {id} references neighbor {neighbor} above its maximum layer"
+                    ));
+                }
+                if !unique.insert(*neighbor) {
+                    return Err(format!(
+                        "HNSW node {id} has duplicate neighbor {neighbor} at layer {layer}"
+                    ));
+                }
+            }
+        }
+    }
+
+    previous = None;
+    for id in &state.deleted {
+        if !id.is_valid() || !node_ids.contains(id) {
+            return Err("HNSW delete set contains an invalid or absent node".to_string());
+        }
+        if previous.is_some_and(|prior| prior >= *id) {
+            return Err("HNSW delete set is duplicate or non-canonical".to_string());
+        }
+        previous = Some(*id);
+    }
+    Ok(())
+}
+
+/// Exact inverse of one HNSW insertion.
+///
+/// Existing neighbor lists are moved back into place during rollback, so the
+/// rollback path performs no allocation and does not need a vector accessor.
+/// This matters for an unwind guard: allocating or rebuilding from `Drop`
+/// could turn one caught panic into a process-aborting double panic.
+struct HnswInsertionUndo {
+    entry_point: Option<NodeId>,
+    max_level: usize,
+    rng: HnswRng,
+    was_deleted: bool,
+    old_node: Option<HnswNode>,
+    neighbor_layers: Vec<(NodeId, usize, Vec<NodeId>)>,
+}
+
+/// Restores an insertion if any user-supplied vector accessor panics midway
+/// through HNSW construction. Successful inserts discard the undo payload.
+struct HnswInsertRollback<'index> {
+    index: &'index HnswIndex,
+    id: NodeId,
+    undo: Option<HnswInsertionUndo>,
+}
+
+impl HnswInsertRollback<'_> {
+    fn disarm(mut self) {
+        self.undo = None;
+    }
+}
+
+impl Drop for HnswInsertRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            self.index.rollback_insertion(self.id, undo);
+        }
+    }
+}
+
+/// Holds the retained-alias serialization gate and the store write-scope pin
+/// for one complete public topology mutation.
+pub(super) struct HnswMutationGuard<'index> {
+    _publication: ReentrantMutexGuard<'index, ()>,
+    _scope: RwLockReadGuard<'index, ()>,
+}
+
 /// Topology storage backend for [`HnswIndex`].
 ///
 /// Two variants: [`Heap`](Self::Heap) is the build/mutation-friendly
 /// representation (HashMap of node neighbor lists); [`Mmap`](Self::Mmap)
-/// is a zero-copy view into a [`MmapTopology`] buffer, used when the
-/// section was loaded from a `.grafeo` mmap. Reads are unified through
-/// [`Self::neighbors_at`]; mutations require [`Self::Heap`].
+/// keeps a zero-copy [`MmapTopology`] base plus sparse aggregate-maintenance
+/// overrides. Reads are unified through [`Self::neighbors_at`]; ordinary
+/// insertion still requires [`Self::Heap`].
 enum TopologyBackend {
     /// Heap-resident, build-and-mutation friendly.
     Heap(HashMap<NodeId, HnswNode>),
-    /// Zero-copy `Bytes`-backed view (Phase 7c). Read-only — mutations
-    /// will panic.
-    Mmap(MmapTopology),
+    /// Immutable `Bytes`-backed base plus private prepared-write overrides.
+    /// Ordinary insertion rejects this backend; aggregate maintenance can
+    /// install a sparse override without materializing the complete base.
+    Mmap {
+        base: MmapTopology,
+        overrides: HashMap<NodeId, HnswNode>,
+        additional_nodes: usize,
+    },
+}
+
+/// Borrowed topology reads shared by live search and private sparse staging.
+trait TopologyRead {
+    fn len(&self) -> usize;
+    fn neighbors_at(&self, id: NodeId, layer: usize) -> Option<HnswNeighborsIter<'_>>;
+}
+
+impl TopologyRead for TopologyBackend {
+    fn len(&self) -> usize {
+        Self::len(self)
+    }
+
+    fn neighbors_at(&self, id: NodeId, layer: usize) -> Option<HnswNeighborsIter<'_>> {
+        Self::neighbors_at(self, id, layer)
+    }
 }
 
 impl TopologyBackend {
@@ -159,21 +443,29 @@ impl TopologyBackend {
     fn len(&self) -> usize {
         match self {
             Self::Heap(map) => map.len(),
-            Self::Mmap(topo) => topo.len(),
+            Self::Mmap {
+                base,
+                additional_nodes,
+                ..
+            } => base.len() + additional_nodes,
         }
     }
 
     fn is_empty(&self) -> bool {
         match self {
             Self::Heap(map) => map.is_empty(),
-            Self::Mmap(topo) => topo.is_empty(),
+            Self::Mmap {
+                base, overrides, ..
+            } => base.is_empty() && overrides.is_empty(),
         }
     }
 
     fn contains(&self, id: NodeId) -> bool {
         match self {
             Self::Heap(map) => map.contains_key(&id),
-            Self::Mmap(topo) => topo.contains(id),
+            Self::Mmap {
+                base, overrides, ..
+            } => overrides.contains_key(&id) || base.contains(id),
         }
     }
 
@@ -188,7 +480,17 @@ impl TopologyBackend {
                     None
                 }
             }),
-            Self::Mmap(topo) => topo.neighbors_at(id, layer).map(HnswNeighborsIter::Mmap),
+            Self::Mmap {
+                base, overrides, ..
+            } => {
+                if let Some(node) = overrides.get(&id) {
+                    node.neighbors
+                        .get(layer)
+                        .map(|neighbors| HnswNeighborsIter::Heap(neighbors.iter()))
+                } else {
+                    base.neighbors_at(id, layer).map(HnswNeighborsIter::Mmap)
+                }
+            }
         }
     }
 
@@ -197,8 +499,29 @@ impl TopologyBackend {
     fn as_heap_mut(&mut self) -> &mut HashMap<NodeId, HnswNode> {
         match self {
             Self::Heap(map) => map,
-            Self::Mmap(_) => {
+            Self::Mmap { .. } => {
                 panic!("HNSW topology is in mmap mode; cannot mutate. Reload to RAM first.")
+            }
+        }
+    }
+
+    fn snapshot_nodes(&self) -> Vec<(NodeId, Vec<Vec<NodeId>>)> {
+        match self {
+            Self::Heap(map) => map
+                .iter()
+                .map(|(id, node)| (*id, node.neighbors.clone()))
+                .collect(),
+            Self::Mmap {
+                base, overrides, ..
+            } => {
+                let mut rows = snapshot_mmap_topology(base);
+                rows.retain(|(id, _)| !overrides.contains_key(id));
+                rows.extend(
+                    overrides
+                        .iter()
+                        .map(|(id, node)| (*id, node.neighbors.clone())),
+                );
+                rows
             }
         }
     }
@@ -237,6 +560,15 @@ impl Iterator for HnswNeighborsIter<'_> {
 /// Thread-safe approximate nearest neighbor index supporting concurrent
 /// reads and exclusive writes. This index is topology-only: vectors are
 /// read through a [`VectorAccessor`] rather than stored internally.
+///
+/// # Soft-delete (MVCC)
+///
+/// Deleted nodes are retained in the graph topology as routing hops for
+/// snapshot isolation. `remove(id)` marks `id` in `deleted` rather than
+/// erasing it. Search excludes deleted nodes from *results* but still
+/// traverses them during beam/greedy search, so live nodes reachable only
+/// through a deleted hop remain findable. A separate GC pass (not in this
+/// struct) compacts the graph by rebuilding without dead nodes.
 pub struct HnswIndex {
     /// Index configuration.
     config: HnswConfig,
@@ -248,7 +580,33 @@ pub struct HnswIndex {
     /// Current maximum layer in the index.
     max_level: RwLock<usize>,
     /// Random number generator for level selection.
-    rng: RwLock<rand::rngs::StdRng>,
+    rng: RwLock<HnswRng>,
+    /// Soft-deleted node IDs. These nodes remain in `nodes` as routing
+    /// hops but are excluded from search results and from `len`/`contains`.
+    deleted: RwLock<HashSet<NodeId>>,
+    /// Store-scoped authority required once this index belongs to a sealed
+    /// WAL-backed graph (`0` means the standalone index remains mutable).
+    mutation_scope: AtomicU64,
+    /// Stable logical-store and label/property-slot binding, distinct from the
+    /// database write scope. Binding occurs at index installation so one
+    /// retained index cannot back two stores or two derived-index meanings.
+    #[cfg(feature = "lpg")]
+    owner_store: AtomicU64,
+    #[cfg(feature = "lpg")]
+    owner_slot: AtomicU64,
+    /// Serializes complete topology mutations, including prepared commits and
+    /// insertion rollback, against mutations through retained aliases.
+    publication_gate: Arc<ReentrantMutex<()>>,
+    /// Parallel public search admission. Aggregate maintenance excludes these
+    /// readers before acquiring graph entity/property writers, since searches
+    /// may call graph-backed accessors while holding topology readers.
+    reader_admission: RwLock<()>,
+    /// The alias mutex is reentrant. Reject same-thread ordinary mutations
+    /// while a private aggregate postimage depends on unchanged live state.
+    maintenance_active: std::sync::atomic::AtomicBool,
+    /// Shared for complete logical mutations, exclusive while ownership scope
+    /// is published. This closes the check-then-mutate race for retained aliases.
+    mutation_scope_gate: RwLock<()>,
 }
 
 impl HnswIndex {
@@ -260,7 +618,17 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
-            rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
+            rng: RwLock::new(HnswRng::from_entropy()),
+            deleted: RwLock::new(HashSet::new()),
+            mutation_scope: AtomicU64::new(0),
+            #[cfg(feature = "lpg")]
+            owner_store: AtomicU64::new(0),
+            #[cfg(feature = "lpg")]
+            owner_slot: AtomicU64::new(0),
+            publication_gate: Arc::new(ReentrantMutex::new(())),
+            reader_admission: RwLock::new(()),
+            maintenance_active: std::sync::atomic::AtomicBool::new(false),
+            mutation_scope_gate: RwLock::new(()),
         }
     }
 
@@ -275,7 +643,17 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::with_capacity(capacity)),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
-            rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
+            rng: RwLock::new(HnswRng::from_entropy()),
+            deleted: RwLock::new(HashSet::new()),
+            mutation_scope: AtomicU64::new(0),
+            #[cfg(feature = "lpg")]
+            owner_store: AtomicU64::new(0),
+            #[cfg(feature = "lpg")]
+            owner_slot: AtomicU64::new(0),
+            publication_gate: Arc::new(ReentrantMutex::new(())),
+            reader_admission: RwLock::new(()),
+            maintenance_active: std::sync::atomic::AtomicBool::new(false),
+            mutation_scope_gate: RwLock::new(()),
         }
     }
 
@@ -287,7 +665,169 @@ impl HnswIndex {
             nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
-            rng: RwLock::new(rand::rngs::StdRng::seed_from_u64(seed)),
+            rng: RwLock::new(HnswRng::from_state(seed)),
+            deleted: RwLock::new(HashSet::new()),
+            mutation_scope: AtomicU64::new(0),
+            #[cfg(feature = "lpg")]
+            owner_store: AtomicU64::new(0),
+            #[cfg(feature = "lpg")]
+            owner_slot: AtomicU64::new(0),
+            publication_gate: Arc::new(ReentrantMutex::new(())),
+            reader_admission: RwLock::new(()),
+            maintenance_active: std::sync::atomic::AtomicBool::new(false),
+            mutation_scope_gate: RwLock::new(()),
+        }
+    }
+
+    #[cfg(all(test, feature = "lpg"))]
+    fn seal_with_scope(&self, scope: u64) -> bool {
+        let transition = HnswScopeTransition::acquire();
+        self.seal_with_scope_under_transition(scope, &transition)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(super) fn binding_is_compatible(
+        &self,
+        owner: u64,
+        slot: u64,
+        _transition: &HnswScopeTransition,
+    ) -> bool {
+        if owner == 0 || slot == 0 {
+            return false;
+        }
+        let current_owner = self.owner_store.load(Ordering::Acquire);
+        let current_slot = self.owner_slot.load(Ordering::Acquire);
+        (current_owner == 0 && current_slot == 0)
+            || (current_owner == owner && current_slot == slot)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(super) fn is_bound_to(
+        &self,
+        owner: u64,
+        slot: u64,
+        _transition: &HnswScopeTransition,
+    ) -> bool {
+        owner != 0
+            && slot != 0
+            && self.owner_store.load(Ordering::Acquire) == owner
+            && self.owner_slot.load(Ordering::Acquire) == slot
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(super) fn bind_under_transition(
+        &self,
+        owner: u64,
+        slot: u64,
+        _transition: &HnswScopeTransition,
+    ) -> bool {
+        if owner == 0 || slot == 0 {
+            return false;
+        }
+        let current_owner = self.owner_store.load(Ordering::Acquire);
+        let current_slot = self.owner_slot.load(Ordering::Acquire);
+        match (current_owner, current_slot) {
+            (0, 0) => {
+                // Every binding transition retains the process-wide token, so
+                // legitimate readers observe only stable pairs. Publish owner
+                // last with Release so it also publishes the slot.
+                self.owner_slot.store(slot, Ordering::Relaxed);
+                self.owner_store.store(owner, Ordering::Release);
+                true
+            }
+            (existing_owner, existing_slot) => existing_owner == owner && existing_slot == slot,
+        }
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(super) fn scope_is_unsealed(&self, _transition: &HnswScopeTransition) -> bool {
+        self.mutation_scope.load(Ordering::Acquire) == 0
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(super) fn scope_is_compatible(
+        &self,
+        scope: u64,
+        _transition: &HnswScopeTransition,
+    ) -> bool {
+        let current = self.mutation_scope.load(Ordering::Acquire);
+        scope != 0 && (current == 0 || current == scope)
+    }
+
+    #[cfg(feature = "lpg")]
+    pub(super) fn seal_with_scope_under_transition(
+        &self,
+        scope: u64,
+        _transition: &HnswScopeTransition,
+    ) -> bool {
+        if scope == 0 {
+            return false;
+        }
+        let _active_mutations = self.mutation_scope_gate.write();
+        match self
+            .mutation_scope
+            .compare_exchange(0, scope, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(existing) => existing == scope,
+        }
+    }
+
+    pub(super) fn publication_gate(&self) -> Arc<ReentrantMutex<()>> {
+        Arc::clone(&self.publication_gate)
+    }
+
+    fn rollback_insertion(&self, id: NodeId, undo: HnswInsertionUndo) {
+        let mut nodes = self.nodes.write();
+        let TopologyBackend::Heap(nodes) = &mut *nodes else {
+            // A retained publication guard excludes topology replacement while
+            // an undo is live, so this branch is unreachable without internal
+            // corruption. Never allocate or panic from an unwind path.
+            return;
+        };
+
+        if let Some(old_node) = undo.old_node {
+            nodes.insert(id, old_node);
+        } else {
+            nodes.remove(&id);
+        }
+        for (neighbor, layer, old_neighbors) in undo.neighbor_layers.into_iter().rev() {
+            if let Some(node) = nodes.get_mut(&neighbor)
+                && let Some(neighbors) = node.neighbors.get_mut(layer)
+            {
+                *neighbors = old_neighbors;
+            }
+        }
+        *self.entry_point.write() = undo.entry_point;
+        *self.max_level.write() = undo.max_level;
+        *self.rng.write() = undo.rng;
+        let mut deleted = self.deleted.write();
+        if undo.was_deleted {
+            deleted.insert(id);
+        } else {
+            deleted.remove(&id);
+        }
+    }
+
+    pub(super) fn pin_mutation(&self) -> Option<HnswMutationGuard<'_>> {
+        let publication = self.publication_gate.lock();
+        if self.maintenance_active.load(Ordering::Acquire) {
+            return None;
+        }
+        // Mutators such as `gc` and `batch_insert` call other mutators. A
+        // recursive shared acquisition keeps their entire public operation
+        // linearized even when a scope transition is already waiting.
+        let scope_guard = self.mutation_scope_gate.read_recursive();
+        let scope = self.mutation_scope.load(Ordering::Acquire);
+        if scope == 0
+            || std::num::NonZeroU64::new(scope).is_some_and(crate::graph::write_permit::is_held)
+        {
+            Some(HnswMutationGuard {
+                _publication: publication,
+                _scope: scope_guard,
+            })
+        } else {
+            None
         }
     }
 
@@ -297,16 +837,25 @@ impl HnswIndex {
         &self.config
     }
 
-    /// Returns the number of vectors in the index.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.nodes.read().len()
+    /// Quantized wrappers retain this same admission through auxiliary reads
+    /// and graph callbacks, outside the recursive admission of inner searches.
+    pub(super) fn admit_reader(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.reader_admission.read_recursive()
     }
 
-    /// Returns true if the index is empty.
+    /// Returns the number of **live** (non-deleted) vectors in the index.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes
+            .read()
+            .len()
+            .saturating_sub(self.deleted.read().len())
+    }
+
+    /// Returns true if there are no live (non-deleted) vectors in the index.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
+        self.len() == 0
     }
 
     /// Snapshot the topology for serialization.
@@ -323,21 +872,103 @@ impl HnswIndex {
         let entry_point = *self.entry_point.read();
         let max_level = *self.max_level.read();
 
-        let mut node_data: Vec<(NodeId, Vec<Vec<NodeId>>)> = match &*nodes {
-            TopologyBackend::Heap(map) => map
-                .iter()
-                .map(|(id, node)| (*id, node.neighbors.clone()))
-                .collect(),
-            TopologyBackend::Mmap(topo) => {
-                // Read-out path used during checkpoint of an mmap-backed
-                // index. Iterate every node by binary-searching the
-                // page index. Materializes neighbor Vecs.
-                snapshot_mmap_topology(topo)
-            }
-        };
+        let mut node_data = nodes.snapshot_nodes();
         node_data.sort_by_key(|(id, _)| *id);
 
         (entry_point, max_level, node_data)
+    }
+
+    /// Captures every state component that affects present or future HNSW
+    /// behaviour.
+    ///
+    /// The publication gate makes the multi-lock read coherent.
+    pub(super) fn snapshot_exact(&self) -> std::result::Result<HnswExactState, String> {
+        let _publication = self.publication_gate.lock();
+        let _scope = self.mutation_scope_gate.read_recursive();
+        let nodes = self.nodes.read();
+        let entry_point = *self.entry_point.read();
+        let max_level = *self.max_level.read();
+        let rng_state = self.rng.read().state;
+        let mut deleted: Vec<NodeId> = self.deleted.read().iter().copied().collect();
+
+        let mut node_data = nodes.snapshot_nodes();
+        node_data.sort_by_key(|(id, _)| *id);
+        deleted.sort_unstable();
+
+        let state = HnswExactState {
+            config: self.config.clone(),
+            entry_point,
+            max_level,
+            nodes: node_data,
+            deleted,
+            rng_state,
+        };
+        validate_hnsw_exact_state(&state, &self.config)?;
+        Ok(state)
+    }
+
+    /// Validates and allocates an exact replacement without changing this
+    /// index. The target configuration is immutable, so it must match every
+    /// persisted field bit-for-bit rather than being partially reconstructed.
+    pub(super) fn prepare_exact_restore(
+        &self,
+        state: HnswExactState,
+    ) -> std::result::Result<PreparedHnswExactState, String> {
+        self.validate_exact_state(&state)?;
+
+        let nodes = state
+            .nodes
+            .into_iter()
+            .map(|(id, neighbors)| (id, HnswNode { neighbors }))
+            .collect();
+        let deleted = state.deleted.into_iter().collect();
+        Ok(PreparedHnswExactState {
+            entry_point: state.entry_point,
+            max_level: state.max_level,
+            nodes,
+            deleted,
+            rng: HnswRng::from_state(state.rng_state),
+        })
+    }
+
+    pub(super) fn validate_exact_state(
+        &self,
+        state: &HnswExactState,
+    ) -> std::result::Result<(), String> {
+        validate_hnsw_exact_state(state, &self.config)
+    }
+
+    /// Permanently seals a detached historical clone against mutation.
+    ///
+    /// The fresh scope is intentionally discarded, making the clone a read
+    /// capability only. This is used when a retained compact generation needs
+    /// the exact pre-handoff index image for old readers.
+    #[cfg(feature = "compact-store")]
+    pub(super) fn freeze_exact_read_snapshot(&self) {
+        let frozen_scope = crate::graph::write_permit::WriteAuthority::new()
+            .scope()
+            .get();
+        let _active_mutations = self.mutation_scope_gate.write();
+        let previous = self.mutation_scope.swap(frozen_scope, Ordering::AcqRel);
+        debug_assert_eq!(previous, 0, "only a fresh exact clone may be frozen");
+    }
+
+    /// Publishes a prevalidated replacement while the caller retains this
+    /// index's mutation guard.
+    pub(super) fn apply_prepared_exact_restore(&self, state: PreparedHnswExactState) {
+        // Readers acquire `nodes` first, so retaining all state write locks and
+        // publishing the node map last on unlock prevents a mixed old/new read.
+        let mut nodes = self.nodes.write();
+        let mut entry_point = self.entry_point.write();
+        let mut max_level = self.max_level.write();
+        let mut rng = self.rng.write();
+        let mut deleted = self.deleted.write();
+
+        *nodes = TopologyBackend::Heap(state.nodes);
+        *entry_point = state.entry_point;
+        *max_level = state.max_level;
+        *rng = state.rng;
+        *deleted = state.deleted;
     }
 
     /// Restore topology from a snapshot. Replaces all current data.
@@ -346,12 +977,18 @@ impl HnswIndex {
     /// mutations work without needing a reload. Equivalent to constructing
     /// a fresh index and calling `insert` for each node, but skips the
     /// graph-build cost.
+    ///
+    /// Also clears the soft-deleted set, since the snapshot is a clean
+    /// point-in-time image with no pending deletes.
     pub fn restore_topology(
         &self,
         entry_point: Option<NodeId>,
         max_level: usize,
         node_data: Vec<(NodeId, Vec<Vec<NodeId>>)>,
     ) {
+        let Some(_mutation) = self.pin_mutation() else {
+            return;
+        };
         let mut backend = self.nodes.write();
         let mut fresh: HashMap<NodeId, HnswNode> = HashMap::with_capacity(node_data.len());
         for (id, neighbors) in node_data {
@@ -360,6 +997,7 @@ impl HnswIndex {
         *backend = TopologyBackend::Heap(fresh);
         *self.entry_point.write() = entry_point;
         *self.max_level.write() = max_level;
+        self.deleted.write().clear();
     }
 
     /// Adopt a [`MmapTopology`] as the topology backend (Phase 7c).
@@ -367,16 +1005,23 @@ impl HnswIndex {
     /// Replaces any existing topology with a zero-copy view of the
     /// given mmap-backed buffer. Reads through the backend will serve
     /// from the [`bytes::Bytes`] without rebuilding a `HashMap`.
-    /// Mutating operations ([`Self::insert`], [`Self::remove`]) will
-    /// panic until the backend is reloaded into RAM via
-    /// [`Self::restore_topology`].
+    /// Ordinary [`Self::insert`] rejects this backend until it is reloaded
+    /// into RAM via [`Self::restore_topology`]. Soft deletion and internal
+    /// prepared aggregate maintenance do not require a full RAM copy.
     ///
     /// `entry_point` and `max_level` are taken from the topology header.
     pub fn adopt_mmap_topology(&self, topo: MmapTopology) {
+        let Some(_mutation) = self.pin_mutation() else {
+            return;
+        };
         let entry_point = topo.entry_point();
         let max_level = topo.max_level();
         let mut backend = self.nodes.write();
-        *backend = TopologyBackend::Mmap(topo);
+        *backend = TopologyBackend::Mmap {
+            base: topo,
+            overrides: HashMap::new(),
+            additional_nodes: 0,
+        };
         *self.entry_point.write() = entry_point;
         *self.max_level.write() = max_level;
     }
@@ -384,18 +1029,18 @@ impl HnswIndex {
     /// Returns true if the backend is currently mmap-backed.
     #[must_use]
     pub fn is_mmap_backed(&self) -> bool {
-        matches!(*self.nodes.read(), TopologyBackend::Mmap(_))
+        matches!(*self.nodes.read(), TopologyBackend::Mmap { .. })
     }
 
     /// Returns estimated heap memory in bytes for the HNSW topology.
     ///
-    /// In mmap mode, returns only the small struct overhead — the
-    /// neighbor data lives in the mmap.
+    /// In mmap mode, counts mutable override allocations only; the immutable
+    /// base neighbor data remains in the mmap.
     #[must_use]
     pub fn heap_memory_bytes(&self) -> usize {
         let nodes = self.nodes.read();
         match &*nodes {
-            TopologyBackend::Heap(map) => {
+            TopologyBackend::Heap(map) | TopologyBackend::Mmap { overrides: map, .. } => {
                 let map_overhead = map.capacity()
                     * (std::mem::size_of::<NodeId>() + std::mem::size_of::<HnswNode>() + 1);
                 let mut node_bytes = 0usize;
@@ -407,7 +1052,6 @@ impl HnswIndex {
                 }
                 map_overhead + node_bytes
             }
-            TopologyBackend::Mmap(_) => std::mem::size_of::<TopologyBackend>(),
         }
     }
 
@@ -420,6 +1064,9 @@ impl HnswIndex {
     ///
     /// Panics if the vector dimensions don't match the configuration.
     pub fn insert(&self, id: NodeId, vector: &[f32], accessor: &impl VectorAccessor) {
+        let Some(_mutation) = self.pin_mutation() else {
+            return;
+        };
         assert_eq!(
             vector.len(),
             self.config.dimensions,
@@ -427,12 +1074,22 @@ impl HnswIndex {
             self.config.dimensions,
             vector.len()
         );
+        // Reject the immutable backend before advancing the insertion RNG.
+        // The retained publication guard prevents a concurrent topology swap,
+        // so a caught unsupported-mutation panic leaves retry state exact.
+        assert!(
+            !self.is_mmap_backed(),
+            "HNSW topology is in mmap mode; cannot mutate. Reload to RAM first."
+        );
 
-        let level = self.random_level();
-
-        // Create the new node (topology only)
-        let node = HnswNode {
-            neighbors: vec![Vec::new(); level + 1],
+        // Advancing the RNG is part of the insertion state: if a hostile
+        // accessor unwinds later, retry must see the same topology decision.
+        let rng_before = *self.rng.read();
+        let sampled_level = self.random_level();
+        let mut rollback = HnswInsertRollback {
+            index: self,
+            id,
+            undo: None,
         };
 
         let mut nodes = self.nodes.write();
@@ -445,8 +1102,27 @@ impl HnswIndex {
 
         // Capacity check + first-insertion path. Scoped so the mutable
         // borrow ends before the per-layer search loop reborrows `&nodes`.
+        let level;
         {
             let nodes_map = nodes.as_heap_mut();
+            let old_node = nodes_map.get(&id).cloned();
+            // Re-embedding an existing identity keeps its established layer
+            // height. In particular, replacing the entry point with a shorter
+            // node would leave `max_level` naming a layer the entry point no
+            // longer occupies. A genuinely new identity uses the next sampled
+            // level as before.
+            level = old_node
+                .as_ref()
+                .map_or(sampled_level, |node| node.neighbors.len().saturating_sub(1));
+
+            rollback.undo = Some(HnswInsertionUndo {
+                entry_point: *entry_point,
+                max_level: *max_level,
+                rng: rng_before,
+                was_deleted: self.deleted.read().contains(&id),
+                old_node: old_node.clone(),
+                neighbor_layers: Vec::new(),
+            });
 
             if let Some(max) = self.config.max_elements
                 && !nodes_map.contains_key(&id)
@@ -458,25 +1134,38 @@ impl HnswIndex {
                 );
             }
 
+            // Retain an existing identity's outgoing links long enough to seed
+            // its reconnection search, including when it is the entry point.
+            // Each rebuilt layer is replaced below. A new identity starts with
+            // the usual empty topology.
+            let node = old_node.unwrap_or_else(|| HnswNode {
+                neighbors: vec![Vec::new(); level + 1],
+            });
+
             // First insertion
             if entry_point.is_none() {
+                self.deleted.write().remove(&id);
                 nodes_map.insert(id, node);
                 *entry_point = Some(id);
                 *max_level = level;
+                rollback.disarm();
                 return;
             }
+
+            nodes_map.insert(id, node);
         }
 
         let ep = entry_point.expect("entry_point confirmed Some above");
         let current_max_level = *max_level;
 
-        // Insert the new node so subsequent searches can find it.
-        nodes.as_heap_mut().insert(id, node);
+        // The exact prior node (normally absent) is already owned by
+        // `rollback`; clear any prior soft delete before reconnecting it.
+        self.deleted.write().remove(&id);
 
         // Search from top to the level above the new node's max layer.
         let mut current_ep = ep;
         for lc in (level + 1..=current_max_level).rev() {
-            current_ep = self.search_layer_single(&nodes, accessor, vector, current_ep, lc);
+            current_ep = self.search_layer_single(&*nodes, accessor, vector, current_ep, lc);
         }
 
         // For each layer from the new node's max layer down to 0
@@ -488,14 +1177,18 @@ impl HnswIndex {
             };
 
             // Find ef_construction nearest neighbors at this layer
-            let neighbors = self.search_layer(
-                &nodes,
-                accessor,
-                vector,
-                current_ep,
-                self.config.ef_construction,
-                lc,
-            );
+            let neighbors: Vec<_> = self
+                .search_layer(
+                    &*nodes,
+                    accessor,
+                    vector,
+                    current_ep,
+                    self.config.ef_construction,
+                    lc,
+                )
+                .into_iter()
+                .filter(|neighbor| neighbor.id != id)
+                .collect();
 
             // Select neighbors using diversity-aware heuristic
             let selected = self.select_neighbors_heuristic(accessor, &neighbors, m_max);
@@ -512,7 +1205,15 @@ impl HnswIndex {
                 for &neighbor_id in &selected {
                     if let Some(neighbor) = nodes_map.get_mut(&neighbor_id)
                         && neighbor.neighbors.len() > lc
+                        && !neighbor.neighbors[lc].contains(&id)
                     {
+                        if let Some(undo) = rollback.undo.as_mut() {
+                            // Clone and record before mutating. If allocation
+                            // unwinds, the rollback guard still owns every
+                            // earlier inverse and the current list is intact.
+                            let old_neighbors = neighbor.neighbors[lc].clone();
+                            undo.neighbor_layers.push((neighbor_id, lc, old_neighbors));
+                        }
                         neighbor.neighbors[lc].push(id);
 
                         if neighbor.neighbors[lc].len() > m_max {
@@ -574,6 +1275,106 @@ impl HnswIndex {
             *entry_point = Some(id);
             *max_level = level;
         }
+        rollback.disarm();
+    }
+
+    /// Garbage collects soft-deleted nodes that are no longer needed.
+    ///
+    /// Rebuilds the HNSW topology from its existing RNG continuation, retaining
+    /// exactly nodes where `is_live(id)` returns `true`. Nodes that are
+    /// soft-deleted and no longer retained (i.e., their
+    /// delete epoch is at or below the GC horizon) are permanently removed
+    /// from the topology; live soft-deleted nodes (above horizon) are
+    /// retained as deleted routing nodes, not resurrected results.
+    ///
+    /// A full rebuild is used (HNSW has no cheap in-place hard-delete).
+    /// GC is amortized and runs infrequently relative to inserts/deletes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects denied mutation authority or an unavailable/invalid retained
+    /// vector before publishing any replacement. Retained tombstones remain
+    /// routing nodes, never live results. A no-removal collection is exact no-op.
+    pub fn gc(
+        &self,
+        is_live: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> std::result::Result<(), String> {
+        let _mutation = self
+            .pin_mutation()
+            .ok_or_else(|| "HNSW GC requires mutation authority".to_string())?;
+        // Publication admission is reentrant: a caller's predicate/accessor
+        // must not change the source while its private successor is prepared.
+        // Reset before releasing the publication pin, including on unwind.
+        struct Preparation<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Preparation<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.maintenance_active.store(true, Ordering::Release);
+        let _preparation = Preparation(&self.maintenance_active);
+        let mut retained_ids: Vec<NodeId> = {
+            let nodes = self.nodes.read();
+            match &*nodes {
+                TopologyBackend::Heap(map) => map.keys().copied().collect(),
+                TopologyBackend::Mmap {
+                    base, overrides, ..
+                } => base
+                    .iter_node_ids()
+                    .chain(overrides.keys().copied().filter(|id| !base.contains(*id)))
+                    .collect(),
+            }
+        };
+        // Record the caller's decision once, in canonical order. Rebuilding
+        // from a hash-map iteration order or fresh entropy cannot be replayed
+        // from an exact preimage and the same GC horizon.
+        retained_ids.sort_unstable();
+        let previous_count = retained_ids.len();
+        retained_ids.retain(|id| is_live(*id));
+        if retained_ids.len() == previous_count {
+            return Ok(());
+        }
+
+        let mut vectors = HashMap::new();
+        vectors
+            .try_reserve(retained_ids.len())
+            .map_err(|_| "cannot allocate HNSW GC vectors".to_string())?;
+        for &id in &retained_ids {
+            let vector = accessor
+                .get_vector(id)
+                .ok_or_else(|| format!("HNSW GC lacks retained vector for {id:?}"))?;
+            if vector.len() != self.config.dimensions
+                || vector.iter().any(|value| !value.is_finite())
+            {
+                return Err(format!("HNSW GC has invalid retained vector for {id:?}"));
+            }
+            vectors.insert(id, vector);
+        }
+        let retained_accessor = |id| vectors.get(&id).cloned();
+        let fresh = HnswIndex::with_seed(self.config.clone(), 0);
+        *fresh.rng.write() = *self.rng.read();
+        for id in retained_ids {
+            let vector = vectors
+                .get(&id)
+                .ok_or_else(|| "HNSW GC lost a prepared vector".to_string())?;
+            fresh.insert(id, vector, &retained_accessor);
+        }
+        let mut deleted = self.deleted.read().clone();
+        deleted.retain(|id| vectors.contains_key(id));
+        let TopologyBackend::Heap(nodes) = fresh.nodes.into_inner() else {
+            return Err("HNSW GC candidate is not writable topology".to_string());
+        };
+        // Reuse the exact installer's coherent multi-lock publication, including
+        // the RNG continuation and surviving deletion set.
+        self.apply_prepared_exact_restore(PreparedHnswExactState {
+            nodes,
+            entry_point: fresh.entry_point.into_inner(),
+            max_level: fresh.max_level.into_inner(),
+            rng: fresh.rng.into_inner(),
+            deleted,
+        });
+        Ok(())
     }
 
     /// Searches for the k nearest neighbors to the query vector.
@@ -609,6 +1410,7 @@ impl HnswIndex {
         ef: usize,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
+        let _reader = self.reader_admission.read_recursive();
         assert_eq!(
             query.len(),
             self.config.dimensions,
@@ -630,16 +1432,20 @@ impl HnswIndex {
         // Greedy search from top layer to layer 1
         let mut current_ep = ep;
         for lc in (1..=max_level).rev() {
-            current_ep = self.search_layer_single(&nodes, accessor, query, current_ep, lc);
+            current_ep = self.search_layer_single(&*nodes, accessor, query, current_ep, lc);
         }
 
         // Beam search at layer 0
         let ef_search = ef.max(k);
-        let candidates = self.search_layer(&nodes, accessor, query, current_ep, ef_search, 0);
+        let candidates = self.search_layer(&*nodes, accessor, query, current_ep, ef_search, 0);
 
-        // Return top k
+        // Collect top-k, filtering soft-deleted nodes from results.
+        // The beam still routed through deleted nodes above (connectivity),
+        // but they must not appear in what is returned to the caller.
+        let deleted = self.deleted.read();
         candidates
             .into_iter()
+            .filter(|n| !deleted.contains(&n.id))
             .take(k)
             .map(|n| (n.id, n.distance))
             .collect()
@@ -664,8 +1470,9 @@ impl HnswIndex {
         if allowlist.is_empty() {
             return Vec::new();
         }
-        // Auto-scale ef based on selectivity ratio
-        let total = self.nodes.read().len();
+        // Auto-scale ef based on selectivity ratio.
+        // Use live count (excludes soft-deleted) so selectivity is accurate.
+        let total = self.len();
         let selectivity = if total == 0 {
             1.0
         } else {
@@ -698,6 +1505,7 @@ impl HnswIndex {
         allowlist: &HashSet<NodeId>,
         accessor: &impl VectorAccessor,
     ) -> Vec<(NodeId, f32)> {
+        let _reader = self.reader_admission.read_recursive();
         if allowlist.is_empty() {
             return Vec::new();
         }
@@ -723,70 +1531,111 @@ impl HnswIndex {
         // Greedy search from top layer to layer 1
         let mut current_ep = ep;
         for lc in (1..=max_level).rev() {
-            current_ep = self.search_layer_single(&nodes, accessor, query, current_ep, lc);
+            current_ep = self.search_layer_single(&*nodes, accessor, query, current_ep, lc);
         }
 
         // Filtered beam search at layer 0
         let ef_search = ef.max(k);
-        let candidates = self
-            .search_layer_filtered(&nodes, accessor, query, current_ep, ef_search, 0, allowlist);
+        let candidates = self.search_layer_filtered(
+            &*nodes, accessor, query, current_ep, ef_search, 0, allowlist,
+        );
 
-        // Return top k
+        // Collect top-k; also exclude soft-deleted nodes (beam traversed them,
+        // but they must not appear in results).
+        let deleted = self.deleted.read();
         candidates
             .into_iter()
+            .filter(|n| !deleted.contains(&n.id))
             .take(k)
             .map(|n| (n.id, n.distance))
             .collect()
     }
 
-    /// Removes a vector from the index.
+    /// Soft-deletes a vector from the index.
     ///
-    /// Returns true if the vector was found and removed.
+    /// The node is **retained** in the topology as a routing hop for
+    /// snapshot isolation and graph connectivity. It is excluded from
+    /// search results and from [`Self::len`] / [`Self::contains`].
+    ///
+    /// Returns `true` if the ID was present (and is now marked deleted).
+    /// Returns `false` if the ID was not in the topology at all.
+    ///
+    /// Re-inserting a deleted ID via [`Self::insert`] un-deletes it.
+    ///
+    /// Works on both heap-backed and mmap-backed topologies (the topology
+    /// is never mutated; only the in-memory `deleted` set is updated).
     pub fn remove(&self, id: NodeId) -> bool {
-        let mut nodes = self.nodes.write();
-        let mut entry_point = self.entry_point.write();
-
-        let nodes_map = nodes.as_heap_mut();
-
-        if nodes_map.remove(&id).is_none() {
+        let Some(_mutation) = self.pin_mutation() else {
+            return false;
+        };
+        // A node that is already soft-deleted is not "present" from the
+        // caller's perspective — removing it again returns false.
+        if self.deleted.read().contains(&id) {
             return false;
         }
-
-        // Remove bidirectional links
-        for (_, node) in nodes_map.iter_mut() {
-            for neighbors in &mut node.neighbors {
-                neighbors.retain(|&n| n != id);
-            }
+        // Verify the node exists in the topology (works on both backends).
+        if !self.nodes.read().contains(id) {
+            return false;
         }
-
-        // Update entry point if needed
-        if *entry_point == Some(id) {
-            *entry_point = nodes_map.keys().next().copied();
-        }
-
+        // Mark as soft-deleted; topology and links are untouched.
+        self.deleted.write().insert(id);
         true
     }
 
-    /// Returns true if the index contains a vector with the given ID.
+    /// Returns `true` if the index contains a **live** (non-deleted) vector
+    /// with the given ID.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
+        self.nodes.read().contains(id) && !self.deleted.read().contains(&id)
+    }
+
+    /// Returns `true` if the topology contains `id`, regardless of whether
+    /// it has been soft-deleted.
+    ///
+    /// Used by GC passes and tests to verify the node was retained as a
+    /// routing hop after soft-deletion.
+    #[must_use]
+    pub fn contains_including_deleted(&self, id: NodeId) -> bool {
         self.nodes.read().contains(id)
     }
 
+    #[cfg(all(test, feature = "lpg"))]
+    pub(super) fn state_counts(&self) -> (usize, usize) {
+        (self.nodes.read().len(), self.deleted.read().len())
+    }
+
     /// Generates a random level for a new node.
+    ///
+    /// `libm` is pinned because the standard library does not promise that
+    /// transcendental functions produce identical results on every target.
+    /// Combined with the serialized SplitMix64 continuation, this makes the
+    /// level stream portable rather than merely repeatable on one machine.
     fn random_level(&self) -> usize {
         let mut rng = self.rng.write();
-        let r: f64 = rng.random();
-        // reason: HNSW level is non-negative (r in [0,1), -ln(r) >= 0), fits usize
+        Self::sample_level(&mut rng, self.config.ml)
+    }
+
+    fn sample_level(rng: &mut HnswRng, ml: f64) -> usize {
+        let r = rng.next_f64();
+        let sampled = -libm::log(r) * ml;
+        if sampled.is_nan() || sampled <= 0.0 {
+            return 0;
+        }
+        if sampled >= HNSW_MAX_SAMPLED_LEVEL as f64 {
+            return HNSW_MAX_SAMPLED_LEVEL;
+        }
+        // Even a publicly constructed extreme configuration cannot request an
+        // allocation beyond the useful HNSW hierarchy depth.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let level = (-r.ln() * self.config.ml).floor() as usize;
-        level
+        {
+            libm::floor(sampled) as usize
+        }
     }
 
     /// Single-element greedy search at a layer.
     fn search_layer_single(
         &self,
-        nodes: &TopologyBackend,
+        nodes: &impl TopologyRead,
         accessor: &impl VectorAccessor,
         query: &[f32],
         ep: NodeId,
@@ -820,7 +1669,7 @@ impl HnswIndex {
     /// Beam search at a layer, returning ef nearest neighbors.
     fn search_layer(
         &self,
-        nodes: &TopologyBackend,
+        nodes: &impl TopologyRead,
         accessor: &impl VectorAccessor,
         query: &[f32],
         ep: NodeId,
@@ -909,7 +1758,7 @@ impl HnswIndex {
     #[allow(clippy::too_many_arguments)]
     fn search_layer_filtered(
         &self,
-        nodes: &TopologyBackend,
+        nodes: &impl TopologyRead,
         accessor: &impl VectorAccessor,
         query: &[f32],
         ep: NodeId,
@@ -1061,11 +1910,15 @@ impl HnswIndex {
             return;
         }
 
+        *neighbors = Self::pruned_neighbors_with_distances(distances, m);
+    }
+
+    fn pruned_neighbors_with_distances(distances: &[(NodeId, f32)], m: usize) -> Vec<NodeId> {
         // Sort by distance
         let mut sorted: Vec<_> = distances.to_vec();
         sorted.sort_by_key(|a| OrderedFloat(a.1));
 
-        *neighbors = sorted.into_iter().take(m).map(|(id, _)| id).collect();
+        sorted.into_iter().take(m).map(|(id, _)| id).collect()
     }
 
     /// Computes distance between two raw vectors using the configured metric.
@@ -1078,6 +1931,9 @@ impl HnswIndex {
     fn node_distance(&self, accessor: &impl VectorAccessor, query: &[f32], id: NodeId) -> f32 {
         accessor
             .get_vector(id)
+            // Soft-deleted routing hops can outlive their indexed property.
+            // An incompatible replacement is unavailable routing payload.
+            .filter(|vector| vector.len() == query.len())
             .map_or(f32::MAX, |v| self.vector_distance(query, &v))
     }
 
@@ -1128,6 +1984,9 @@ impl HnswIndex {
     where
         I: IntoIterator<Item = (NodeId, &'a [f32])>,
     {
+        let Some(_mutation) = self.pin_mutation() else {
+            return;
+        };
         for (id, vector) in vectors {
             self.insert(id, vector, accessor);
         }
@@ -1312,6 +2171,136 @@ impl HnswIndex {
     }
 }
 
+// ── Visible-predicate search (snapshot-aware) ──────────────────────────────
+//
+// EF widening factor: the beam is run with ef * VISIBLE_EF_FACTOR so that
+// filtering invisible nodes still leaves ≥ k visible candidates.
+pub(super) const VISIBLE_EF_FACTOR: usize = 4;
+
+impl HnswIndex {
+    /// Snapshot-aware predicate-filtered search.
+    ///
+    /// Traverses **all** graph neighbors (deleted + invisible nodes remain
+    /// routing hops and are never skipped during traversal), but only
+    /// returns candidates that satisfy `is_visible(id)`.
+    ///
+    /// Distances are computed via the supplied `accessor`, not from any
+    /// internal storage. This lets the caller wire in a snapshot-aware
+    /// accessor (returning as-of-snapshot vectors) at a later stage.
+    ///
+    /// If `accessor.get_vector(id)` returns `None` or an incompatible dimension
+    /// for a candidate, it is skipped (no usable vector at that snapshot).
+    ///
+    /// The beam width is widened to `ef.max(k * VISIBLE_EF_FACTOR)` so
+    /// that filtering invisible nodes still leaves ≥ k results.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len()` does not match the configured `dimensions`.
+    ///
+    /// # Returns
+    ///
+    /// Up to `k` (id, distance) pairs sorted by distance (ascending).
+    #[must_use]
+    pub fn search_visible(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+    ) -> Vec<(NodeId, f32)> {
+        self.search_visible_candidates(
+            query,
+            k,
+            ef.max(k.saturating_mul(VISIBLE_EF_FACTOR)),
+            is_visible,
+            accessor,
+            true,
+        )
+    }
+
+    /// Visibility-aware candidates with an already calibrated beam budget.
+    /// Quantized search has widened its coarse candidate count itself; widening
+    /// again here would multiply its traversal cost without changing its limit.
+    /// Its stable internal accessor also needs no duplicate distance pass;
+    /// public snapshot search retains its original final accessor evaluation.
+    pub(super) fn search_visible_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        is_visible: &dyn Fn(NodeId) -> bool,
+        accessor: &dyn VectorAccessor,
+        rescore_candidates: bool,
+    ) -> Vec<(NodeId, f32)> {
+        let _reader = self.reader_admission.read_recursive();
+        assert_eq!(
+            query.len(),
+            self.config.dimensions,
+            "Query dimensions mismatch: expected {}, got {}",
+            self.config.dimensions,
+            query.len()
+        );
+
+        let nodes = self.nodes.read();
+        let entry_point = self.entry_point.read();
+        let max_level = *self.max_level.read();
+
+        if entry_point.is_none() || nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let ep = entry_point.expect("entry_point confirmed Some above");
+
+        // The private beam helpers are generic over `impl VectorAccessor`
+        // (monomorphised, require `Sized`). To accept a `&dyn VectorAccessor`
+        // we wrap it in a thin newtype that *is* `Sized`.
+        struct DynAccessorRef<'a>(&'a dyn VectorAccessor);
+        impl VectorAccessor for DynAccessorRef<'_> {
+            fn get_vector(&self, id: NodeId) -> Option<Arc<[f32]>> {
+                self.0.get_vector(id)
+            }
+        }
+        let wrapped = DynAccessorRef(accessor);
+
+        // Greedy descent from top layer to layer 1 — traverse through all nodes.
+        let mut current_ep = ep;
+        for lc in (1..=max_level).rev() {
+            current_ep = self.search_layer_single(&*nodes, &wrapped, query, current_ep, lc);
+        }
+
+        let ef_search = ef.max(k);
+
+        // Full beam at layer 0 — all neighbors traversed, no pruning.
+        let candidates = self.search_layer(&*nodes, &wrapped, query, current_ep, ef_search, 0);
+
+        // Collect visible candidates, scored by the supplied accessor.
+        // If the accessor returns None for a node (no vector at this snapshot),
+        // skip it.
+        let mut results: Vec<(NodeId, f32)> = candidates
+            .into_iter()
+            .filter(|n| is_visible(n.id))
+            .filter_map(|n| {
+                if !rescore_candidates {
+                    return Some((n.id, n.distance));
+                }
+                // Re-score with the passed accessor in case it differs from the
+                // one used during graph traversal (the beam already used it, so
+                // this is just a consistency pass — same cost, always correct).
+                accessor
+                    .get_vector(n.id)
+                    .filter(|vector| vector.len() == query.len())
+                    .map(|v| (n.id, self.vector_distance(query, &v)))
+            })
+            .collect();
+
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        results
+    }
+}
+
 impl std::fmt::Debug for HnswIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HnswIndex")
@@ -1325,7 +2314,14 @@ impl std::fmt::Debug for HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lpg")]
+    use crate::graph::write_permit::{WriteAuthority, with_authority};
     use crate::index::vector::DistanceMetric;
+    use crate::index::vector::VectorIndexKind;
+    #[cfg(feature = "lpg")]
+    use std::sync::mpsc;
+    #[cfg(feature = "lpg")]
+    use std::time::Duration;
 
     fn create_test_vectors(n: usize, dim: usize) -> Vec<Vec<f32>> {
         (0..n)
@@ -1340,6 +2336,281 @@ mod tests {
     /// Builds an accessor backed by a HashMap.
     fn make_accessor(map: &HashMap<NodeId, Arc<[f32]>>) -> impl VectorAccessor + '_ {
         move |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() }
+    }
+
+    #[test]
+    fn level_sampling_excludes_zero_and_bounds_extreme_public_configurations() {
+        // SplitMix64's mix of zero is zero. Advancing this predecessor state
+        // therefore exercised ln(0) before the open-closed conversion.
+        let zero_output_seed = 0_u64.wrapping_sub(HnswRng::GAMMA);
+        let mut rng = HnswRng::from_state(zero_output_seed);
+        let sample = rng.next_f64();
+        assert!(sample > 0.0 && sample <= 1.0);
+
+        // `with_m(1)` is publicly constructible and produces an infinite ml.
+        // Persistence must preserve it, while insertion remains bounded and
+        // cannot turn that configuration into an unbounded allocation.
+        let index = HnswIndex::with_seed(
+            HnswConfig::new(1, DistanceMetric::Euclidean).with_m(1),
+            zero_output_seed,
+        );
+        let vector = Arc::<[f32]>::from([1.0]);
+        let accessor = |_id: NodeId| Some(Arc::clone(&vector));
+        index.insert(NodeId::new(1), &vector, &accessor);
+        let (_, level, nodes) = index.snapshot_topology();
+        assert!(level <= HNSW_MAX_SAMPLED_LEVEL);
+        assert!(nodes[0].1.len() <= HNSW_MAX_SAMPLED_LEVEL + 1);
+        let state = index
+            .snapshot_exact()
+            .expect("public m=1 configuration remains checkpointable");
+        let target = HnswIndex::with_seed(index.config().clone(), 9);
+        target
+            .prepare_exact_restore(state)
+            .expect("public m=1 configuration remains restorable");
+    }
+
+    #[test]
+    fn level_sampling_has_a_portable_pinned_sequence() {
+        let mut config = HnswConfig::new(1, DistanceMetric::Euclidean);
+        config.ml = 1.0;
+        let index = HnswIndex::with_seed(config, 0x0123_4567_89ab_cdef);
+        let levels: Vec<_> = (0..24).map(|_| index.random_level()).collect();
+        assert_eq!(
+            levels,
+            [
+                2, 0, 1, 0, 5, 2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 7, 0, 0, 1, 0, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn accessor_unwind_restores_exact_topology_and_rng_for_retry() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean)
+            .with_m(2)
+            .with_m_max(1);
+        let actual = HnswIndex::with_seed(config.clone(), 73);
+        let expected = HnswIndex::with_seed(config, 73);
+        let mut vectors = HashMap::new();
+        for raw in 1_u64..=33 {
+            let value = raw as f32 / 34.0;
+            vectors.insert(
+                NodeId::new(raw),
+                Arc::<[f32]>::from([value, value, value, value]),
+            );
+        }
+        let accessor = make_accessor(&vectors);
+        for raw in 1_u64..=32 {
+            let id = NodeId::new(raw);
+            let vector = vectors.get(&id).expect("fixture vector");
+            actual.insert(id, vector, &accessor);
+            expected.insert(id, vector, &accessor);
+        }
+        let before = actual.snapshot_topology();
+        let new_id = NodeId::new(33);
+        let new_vector = vectors.get(&new_id).expect("new vector");
+        let hostile_accessor = |id: NodeId| -> Option<Arc<[f32]>> {
+            assert_ne!(
+                id, new_id,
+                "hostile accessor unwind after an existing neighbor was linked"
+            );
+            vectors.get(&id).cloned()
+        };
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            actual.insert(new_id, new_vector, &hostile_accessor);
+        }));
+        assert!(unwind.is_err(), "fixture must reach the hostile accessor");
+        assert_eq!(actual.snapshot_topology(), before);
+
+        actual.insert(new_id, new_vector, &accessor);
+        expected.insert(new_id, new_vector, &accessor);
+        assert_eq!(
+            actual.snapshot_topology(),
+            expected.snapshot_topology(),
+            "caught unwind must restore RNG state as well as visible topology"
+        );
+    }
+
+    #[test]
+    fn existing_identity_insertion_unwind_restores_topology_and_rng() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean)
+            .with_m(4)
+            .with_ef_construction(32);
+        let index = Arc::new(VectorIndexKind::Hnsw(HnswIndex::with_seed(
+            config,
+            0x005a_6e1d,
+        )));
+        let hnsw = index.as_hnsw().expect("plain HNSW fixture");
+        let vectors = RwLock::new(HashMap::<NodeId, Arc<[f32]>>::new());
+        for raw in 1_u64..=24 {
+            let value = raw as f32 / 24.0;
+            let id = NodeId::new(raw);
+            vectors
+                .write()
+                .insert(id, Arc::from([value, value, value, value]));
+            let vector = vectors.read().get(&id).cloned().expect("fixture vector");
+            let accessor = |candidate| vectors.read().get(&candidate).cloned();
+            index.insert(id, &vector, &accessor);
+        }
+
+        let entry_point = hnsw.snapshot_topology().0;
+        let id = (1_u64..=24)
+            .map(NodeId::new)
+            .find(|candidate| Some(*candidate) != entry_point)
+            .expect("fixture has a non-entry-point identity");
+        let before = hnsw.snapshot_exact().expect("exact recovered state");
+        let assert_exact = |actual: &HnswExactState, expected: &HnswExactState| {
+            assert!(hnsw_configs_match(&actual.config, &expected.config));
+            assert_eq!(actual.entry_point, expected.entry_point);
+            assert_eq!(actual.max_level, expected.max_level);
+            assert_eq!(actual.nodes, expected.nodes);
+            assert_eq!(actual.deleted, expected.deleted);
+            assert_eq!(actual.rng_state, expected.rng_state);
+        };
+        vectors
+            .write()
+            .insert(id, Arc::from([-100.0, -100.0, -100.0, -100.0]));
+        assert!(index.remove(id));
+        let before_hostile_insert = hnsw
+            .snapshot_exact()
+            .expect("ordinary re-embedding pre-insert state");
+        let accessor_calls = std::sync::atomic::AtomicUsize::new(0);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let vector = vectors
+                .read()
+                .get(&id)
+                .cloned()
+                .expect("replacement vector");
+            let hostile_accessor = |candidate| {
+                assert_ne!(
+                    accessor_calls.fetch_add(1, Ordering::SeqCst),
+                    1,
+                    "hostile accessor panic after insertion work began"
+                );
+                vectors.read().get(&candidate).cloned()
+            };
+            index.insert(id, &vector, &hostile_accessor);
+        }));
+        assert!(
+            unwind.is_err(),
+            "hostile accessor must unwind existing-ID insertion"
+        );
+        assert_exact(
+            &hnsw.snapshot_exact().expect("post-hostile exact state"),
+            &before_hostile_insert,
+        );
+
+        // A normal retry after the caught unwind must execute the logical update.
+        let vector = vectors
+            .read()
+            .get(&id)
+            .cloned()
+            .expect("replacement vector");
+        let accessor = |candidate| vectors.read().get(&candidate).cloned();
+        index.insert(id, &vector, &accessor);
+
+        assert!(index.contains(id));
+        let logically_updated = hnsw
+            .snapshot_exact()
+            .expect("logical same-identity update remains canonical");
+        assert_ne!(
+            logically_updated.rng_state, before.rng_state,
+            "the logical update must execute a real rebuild"
+        );
+    }
+
+    #[cfg(feature = "lpg")]
+    #[test]
+    fn derived_index_binding_is_exact_and_zero_fails_closed() {
+        let index = HnswIndex::new(HnswConfig::new(2, DistanceMetric::Euclidean));
+        let transition = HnswScopeTransition::acquire();
+
+        assert!(!index.binding_is_compatible(0, 1, &transition));
+        assert!(!index.binding_is_compatible(1, 0, &transition));
+        assert!(index.binding_is_compatible(11, 17, &transition));
+        assert!(index.bind_under_transition(11, 17, &transition));
+        assert!(index.is_bound_to(11, 17, &transition));
+        assert!(index.bind_under_transition(11, 17, &transition));
+        assert!(!index.binding_is_compatible(12, 17, &transition));
+        assert!(!index.binding_is_compatible(11, 18, &transition));
+        assert!(!index.bind_under_transition(12, 17, &transition));
+        assert!(!index.bind_under_transition(11, 18, &transition));
+
+        assert!(index.scope_is_unsealed(&transition));
+        assert!(!index.scope_is_compatible(0, &transition));
+        assert!(!index.seal_with_scope_under_transition(0, &transition));
+    }
+
+    #[cfg(feature = "lpg")]
+    #[test]
+    fn scope_seal_waits_for_inflight_mutation_and_retained_alias_fails_closed() {
+        let owner = WriteAuthority::new();
+        let foreign = WriteAuthority::new();
+        let index = Arc::new(HnswIndex::with_seed(
+            HnswConfig::new(2, DistanceMetric::Euclidean),
+            7,
+        ));
+
+        // Model a public mutation that has passed its authority check but has
+        // not completed. Scope publication must wait for the retained proof,
+        // rather than changing authorization underneath the operation.
+        let in_flight = index
+            .pin_mutation()
+            .expect("a standalone index accepts a mutation");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (sealed_tx, sealed_rx) = mpsc::channel();
+        let sealing_index = Arc::clone(&index);
+        let owner_scope = owner.scope().get();
+        let sealing_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let sealed = sealing_index.seal_with_scope(owner_scope);
+            sealed_tx.send(sealed).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            sealed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "scope publication must block behind an in-flight mutation"
+        );
+        assert_eq!(index.mutation_scope.load(Ordering::Acquire), 0);
+        drop(in_flight);
+        assert!(
+            sealed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("scope publication completes once the mutation retires")
+        );
+        sealing_thread.join().unwrap();
+
+        let no_vectors = |_id: NodeId| -> Option<Arc<[f32]>> { None };
+        index.insert(NodeId::new(1), &[1.0, 0.0], &no_vectors);
+        assert!(
+            !index.contains(NodeId::new(1)),
+            "a raw retained alias must fail closed after sealing"
+        );
+        with_authority(&foreign, || {
+            index.insert(NodeId::new(1), &[1.0, 0.0], &no_vectors);
+        });
+        assert!(
+            !index.contains(NodeId::new(1)),
+            "foreign authority must not authorize the retained alias"
+        );
+        with_authority(&owner, || {
+            index.insert(NodeId::new(1), &[1.0, 0.0], &no_vectors);
+        });
+        assert!(index.contains(NodeId::new(1)));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_authority(&owner, || {
+                let panicking_accessor =
+                    |_id: NodeId| -> Option<Arc<[f32]>> { panic!("injected accessor panic") };
+                index.insert(NodeId::new(2), &[0.0, 1.0], &panicking_accessor);
+            });
+        }));
+        assert!(panic.is_err());
+        index.insert(NodeId::new(3), &[0.5, 0.5], &no_vectors);
+        assert!(
+            !index.contains(NodeId::new(3)),
+            "caught panic must release both the mutation proof and owner authority"
+        );
     }
 
     #[test]
@@ -2376,10 +3647,9 @@ mod tests {
     }
 
     /// Mutating an mmap-backed index must panic with a clear message,
-    /// not silently no-op or corrupt state.
+    /// not silently no-op, corrupt state, or consume retry RNG state.
     #[test]
-    #[should_panic(expected = "mmap mode")]
-    fn gus_mmap_backed_insert_panics() {
+    fn gus_mmap_backed_insert_panics_without_advancing_rng() {
         let config = HnswConfig::new(4, DistanceMetric::Cosine);
         let nodes = vec![(NodeId::new(1), vec![vec![]])];
         let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes);
@@ -2390,21 +3660,36 @@ mod tests {
 
         let map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
         let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
-        index.insert(NodeId::new(2), &[0.0, 0.0, 0.0, 0.0], &accessor);
+        let mut expected_rng = *index.rng.read();
+        let expected_next = expected_rng.next_f64();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index.insert(NodeId::new(2), &[0.0, 0.0, 0.0, 0.0], &accessor);
+        }));
+        assert!(caught.is_err(), "mmap insertion must fail closed");
+        let mut actual_rng = *index.rng.read();
+        let actual_next = actual_rng.next_f64();
+        assert_eq!(actual_next.to_bits(), expected_next.to_bits());
     }
 
-    /// Removing on an mmap-backed index must panic.
+    /// Soft-delete on an mmap-backed index must work without panic:
+    /// the node is marked deleted in the in-memory `deleted` set and
+    /// excluded from search results, but the topology is untouched.
     #[test]
-    #[should_panic(expected = "mmap mode")]
-    fn vincent_mmap_backed_remove_panics() {
+    fn vincent_mmap_backed_remove_soft_deletes() {
         let config = HnswConfig::new(4, DistanceMetric::Cosine);
-        let nodes = vec![(NodeId::new(1), vec![vec![]])];
-        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes);
+        let nodes_data = vec![(NodeId::new(1), vec![vec![]])];
+        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes_data);
         let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
 
         let index = HnswIndex::new(config);
         index.adopt_mmap_topology(topo);
-        index.remove(NodeId::new(1));
+
+        // Soft-delete must succeed on mmap-backed index
+        assert!(index.remove(NodeId::new(1)));
+        // Node is still in topology but excluded from public API
+        assert!(!index.contains(NodeId::new(1)));
+        assert!(index.contains_including_deleted(NodeId::new(1)));
+        assert_eq!(index.len(), 0);
     }
 
     /// `restore_topology` after `adopt_mmap_topology` must put the
@@ -2609,6 +3894,336 @@ mod tests {
         }
     }
 
+    // ── Soft-delete (MVCC) tests ──────────────────────────────────────
+
+    /// Soft-delete: node is removed from search results but the topology
+    /// is preserved so other live nodes remain reachable.
+    #[test]
+    fn soft_delete_retains_topology() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        map.insert(NodeId::new(1), vec![0.1, 0.1, 0.1, 0.1].into());
+        map.insert(NodeId::new(2), vec![0.5, 0.5, 0.5, 0.5].into());
+        map.insert(NodeId::new(3), vec![0.9, 0.9, 0.9, 0.9].into());
+        let accessor = make_accessor(&map);
+
+        index.insert(NodeId::new(1), &[0.1, 0.1, 0.1, 0.1], &accessor);
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5], &accessor);
+        index.insert(NodeId::new(3), &[0.9, 0.9, 0.9, 0.9], &accessor);
+        assert_eq!(index.len(), 3);
+
+        // Soft-delete node 2
+        assert!(index.remove(NodeId::new(2)));
+
+        // Search must not return node 2
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 3, &accessor);
+        assert!(
+            results.iter().all(|(id, _)| *id != NodeId::new(2)),
+            "soft-deleted node 2 must not appear in results: {results:?}"
+        );
+
+        // Public API: deleted node is not "live"
+        assert!(!index.contains(NodeId::new(2)));
+        // Topology still holds it (routing hop)
+        assert!(index.contains_including_deleted(NodeId::new(2)));
+        // len counts live nodes only
+        assert_eq!(index.len(), 2);
+
+        // Re-insert (un-delete): node 2 is live again
+        index.insert(NodeId::new(2), &[0.5, 0.5, 0.5, 0.5], &accessor);
+        assert!(index.contains(NodeId::new(2)));
+        assert_eq!(index.len(), 3);
+
+        // Removing non-existent node returns false
+        assert!(!index.remove(NodeId::new(99)));
+    }
+
+    #[test]
+    fn soft_deleted_routing_hop_with_changed_dimensions_is_unavailable() {
+        let index = HnswIndex::with_seed(HnswConfig::new(2, DistanceMetric::Euclidean), 42);
+        let removed = NodeId::new(1);
+        let live = NodeId::new(2);
+        let mut vectors: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        vectors.insert(removed, Arc::from([1.0, 0.0]));
+        vectors.insert(live, Arc::from([0.0, 1.0]));
+        index.insert(removed, &[1.0, 0.0], &make_accessor(&vectors));
+        index.insert(live, &[0.0, 1.0], &make_accessor(&vectors));
+        assert!(index.remove(removed));
+        vectors.insert(removed, Arc::from([1.0, 0.0, 0.0]));
+        let accessor = make_accessor(&vectors);
+        assert_eq!(index.search(&[0.0, 1.0], 10, &accessor), vec![(live, 0.0)]);
+        // A caller's visibility predicate must not re-admit an incompatible
+        // routing payload during the separate candidate re-score.
+        assert_eq!(
+            index.search_visible(&[0.0, 1.0], 10, 40, &|_| true, &accessor),
+            vec![(live, 0.0)]
+        );
+        assert!(index.contains_including_deleted(removed));
+    }
+
+    // ── GC tests ──────────────────────────────────────────────────────
+
+    fn gc_fixture() -> (HnswIndex, HashMap<NodeId, Arc<[f32]>>) {
+        let index = HnswIndex::with_seed(HnswConfig::new(4, DistanceMetric::Euclidean), 42);
+        let vectors: HashMap<_, Arc<[f32]>> = (1..=8)
+            .map(|id| (NodeId::new(id), vec![id as f32; 4].into()))
+            .collect();
+        let accessor = make_accessor(&vectors);
+        for id in 1..=8 {
+            index.insert(NodeId::new(id), &vectors[&NodeId::new(id)], &accessor);
+        }
+        drop(accessor);
+        (index, vectors)
+    }
+
+    fn assert_gc_state_same(left: &HnswExactState, right: &HnswExactState) {
+        assert_eq!(left.entry_point, right.entry_point);
+        assert_eq!(left.max_level, right.max_level);
+        assert_eq!(left.nodes, right.nodes);
+        assert_eq!(left.deleted, right.deleted);
+        assert_eq!(left.rng_state, right.rng_state);
+    }
+
+    #[test]
+    fn gc_no_removal_preserves_exact_state_without_reading_vectors() -> Result<(), String> {
+        let (index, _) = gc_fixture();
+        index.remove(NodeId::new(3));
+        let before = index.snapshot_exact()?;
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        index.gc(&|_| true, &|_| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            None
+        })?;
+        assert_gc_state_same(&index.snapshot_exact()?, &before);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_rebuild_preserves_above_horizon_tombstones() -> Result<(), String> {
+        let (index, vectors) = gc_fixture();
+        index.remove(NodeId::new(2));
+        index.remove(NodeId::new(3));
+        let accessor = make_accessor(&vectors);
+        index.gc(&|id| id != NodeId::new(2), &accessor)?;
+        assert!(!index.contains_including_deleted(NodeId::new(2)));
+        assert!(index.contains_including_deleted(NodeId::new(3)));
+        assert!(!index.contains(NodeId::new(3)));
+        assert_eq!(index.snapshot_exact()?.deleted, vec![NodeId::new(3)]);
+        assert!(
+            index
+                .search(&[3.0; 4], 8, &accessor)
+                .iter()
+                .all(|(id, _)| *id != NodeId::new(3))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gc_exact_restore_rebuild_and_next_insert_are_deterministic() -> Result<(), String> {
+        let (index, mut vectors) = gc_fixture();
+        index.remove(NodeId::new(2));
+        let restored = HnswIndex::with_seed(index.config.clone(), 99);
+        restored
+            .apply_prepared_exact_restore(restored.prepare_exact_restore(index.snapshot_exact()?)?);
+        let accessor = make_accessor(&vectors);
+        index.gc(&|id| id != NodeId::new(2), &accessor)?;
+        restored.gc(&|id| id != NodeId::new(2), &accessor)?;
+        assert_gc_state_same(&index.snapshot_exact()?, &restored.snapshot_exact()?);
+        drop(accessor);
+        vectors.insert(NodeId::new(9), vec![9.0; 4].into());
+        let accessor = make_accessor(&vectors);
+        index.insert(NodeId::new(9), &[9.0; 4], &accessor);
+        restored.insert(NodeId::new(9), &[9.0; 4], &accessor);
+        assert_gc_state_same(&index.snapshot_exact()?, &restored.snapshot_exact()?);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_unavailable_retained_vector_leaves_exact_state_unchanged() -> Result<(), String> {
+        let (index, mut vectors) = gc_fixture();
+        index.remove(NodeId::new(2));
+        let before = index.snapshot_exact()?;
+        vectors.remove(&NodeId::new(3));
+        assert!(
+            index
+                .gc(&|id| id != NodeId::new(2), &make_accessor(&vectors))
+                .is_err()
+        );
+        assert_gc_state_same(&index.snapshot_exact()?, &before);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_invalid_retained_vector_and_denied_authority_preserve_state() -> Result<(), String> {
+        let (index, mut vectors) = gc_fixture();
+        index.remove(NodeId::new(2));
+        let before = index.snapshot_exact()?;
+        for invalid in [vec![1.0; 3], vec![f32::NAN; 4]] {
+            vectors.insert(NodeId::new(3), invalid.into());
+            assert!(
+                index
+                    .gc(&|id| id != NodeId::new(2), &make_accessor(&vectors))
+                    .is_err()
+            );
+            assert_gc_state_same(&index.snapshot_exact()?, &before);
+        }
+        #[cfg(feature = "compact-store")]
+        {
+            index.freeze_exact_read_snapshot();
+            assert!(index.gc(&|_| true, &make_accessor(&vectors)).is_err());
+            assert_gc_state_same(&index.snapshot_exact()?, &before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gc_callbacks_cannot_mutate_source_and_unwind_releases_admission() -> Result<(), String> {
+        let (index, vectors) = gc_fixture();
+        index.remove(NodeId::new(2));
+        let accessor = make_accessor(&vectors);
+        index.gc(
+            &|id| {
+                assert!(!index.remove(NodeId::new(4)));
+                assert!(index.gc(&|_| true, &accessor).is_err());
+                id != NodeId::new(2)
+            },
+            &|id| {
+                assert!(!index.remove(NodeId::new(4)));
+                index.insert(NodeId::new(90), &[90.0; 4], &accessor);
+                vectors.get(&id).cloned()
+            },
+        )?;
+        assert!(index.contains(NodeId::new(4)));
+        assert!(!index.contains_including_deleted(NodeId::new(90)));
+        let before = index.snapshot_exact()?;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = index.gc(&|_| panic!("GC predicate unwind"), &accessor);
+        }));
+        assert!(unwind.is_err());
+        assert_gc_state_same(&index.snapshot_exact()?, &before);
+        assert!(index.remove(NodeId::new(4)));
+        Ok(())
+    }
+
+    /// GC drops nodes below the horizon and keeps nodes above it.
+    /// A live-but-soft-deleted node (is_live=true despite being in the
+    /// deleted set) is retained by the GC rebuild.
+    #[test]
+    fn gc_drops_deleted_below_horizon() -> Result<(), String> {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=5 {
+            let v: f32 = i as f32 / 6.0;
+            map.insert(NodeId::new(i), vec![v, v, v, v].into());
+        }
+        let accessor = make_accessor(&map);
+
+        for i in 1u64..=5 {
+            let v = map[&NodeId::new(i)].clone();
+            index.insert(NodeId::new(i), &v, &accessor);
+        }
+        assert_eq!(index.len(), 5);
+
+        // Soft-delete node 3.
+        assert!(index.remove(NodeId::new(3)));
+        assert_eq!(index.len(), 4);
+        // Still in topology as a routing hop.
+        assert!(index.contains_including_deleted(NodeId::new(3)));
+
+        // GC with is_live = "not node 3" (simulates delete committed below horizon).
+        index.gc(&|id| id != NodeId::new(3), &accessor)?;
+
+        // Node 3 must be gone from the topology entirely.
+        assert!(
+            !index.contains_including_deleted(NodeId::new(3)),
+            "GC must remove node 3 from topology"
+        );
+        // Remaining live nodes are all present and searchable.
+        for i in [1u64, 2, 4, 5] {
+            assert!(
+                index.contains(NodeId::new(i)),
+                "live node {i} must still be present after GC"
+            );
+        }
+        let results = index.search(&[0.5, 0.5, 0.5, 0.5], 4, &accessor);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            !ids.contains(&3),
+            "node 3 must not appear in search after GC: {ids:?}"
+        );
+        assert_eq!(
+            index.len(),
+            4,
+            "index must report 4 live nodes after GC; got {}",
+            index.len()
+        );
+
+        // GC with is_live = all nodes — every node in the topology is kept.
+        // (Node 3 is already gone from a previous GC; the others are kept.)
+        index.gc(&|_id| true, &accessor)?;
+        assert_eq!(
+            index.len(),
+            4,
+            "all-live GC must retain the 4 remaining nodes"
+        );
+        for i in [1u64, 2, 4, 5] {
+            assert!(
+                index.contains(NodeId::new(i)),
+                "node {i} must be retained by all-live GC"
+            );
+        }
+        Ok(())
+    }
+
+    /// Connectivity preservation: after soft-deleting a "bridge" node,
+    /// remaining live nodes are still findable via search.
+    #[test]
+    fn soft_delete_routes_through_deleted() {
+        // Build a 7-node index; after deleting several middle nodes,
+        // the cluster at the far end must still be reachable.
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean).with_m(4);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        // Linear chain: 1 → 2 → 3 → 4 → 5 → 6 → 7
+        for i in 1u64..=7 {
+            let v = (i as f32) / 8.0;
+            map.insert(NodeId::new(i), vec![v, v, v, v].into());
+        }
+        let accessor = make_accessor(&map);
+        for i in 1u64..=7 {
+            let v = (i as f32) / 8.0;
+            index.insert(NodeId::new(i), &[v, v, v, v], &accessor);
+        }
+        assert_eq!(index.len(), 7);
+
+        // Delete nodes 3, 4, 5 (middle of the chain)
+        index.remove(NodeId::new(3));
+        index.remove(NodeId::new(4));
+        index.remove(NodeId::new(5));
+        assert_eq!(index.len(), 4);
+
+        // Node 6 and 7 must still be findable
+        let results = index.search(&[0.85, 0.85, 0.85, 0.85], 4, &accessor);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| id.as_u64()).collect();
+        assert!(
+            ids.contains(&6) || ids.contains(&7),
+            "live nodes 6 or 7 must be reachable after deleting middle nodes; got {ids:?}"
+        );
+        // No deleted nodes in results
+        for (id, _) in &results {
+            assert!(
+                !matches!(id.as_u64(), 3..=5),
+                "deleted node {id:?} must not appear in results"
+            );
+        }
+    }
+
     /// Empty-allowlist filter must short-circuit cleanly in mmap mode.
     #[test]
     fn django_mmap_empty_allowlist_returns_empty() {
@@ -2650,5 +4265,97 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(mmap_index.len(), 0);
         assert!(mmap_index.is_empty());
+    }
+
+    // ── search_visible (snapshot-aware predicate filter) tests ──────────────
+
+    /// search_visible returns only IDs that pass is_visible; invisible IDs
+    /// (5, 7) must be absent from results. With 10 nodes and 2 invisible,
+    /// k≤8 should return min(k, 8) results.
+    #[test]
+    fn search_visible_excludes_invisible() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        // Insert ids 1..=10 with distinct vectors.
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=10 {
+            let v: Vec<f32> = (0..4).map(|j| ((i - 1) * 4 + j) as f32 / 40.0).collect();
+            map.insert(NodeId::new(i), Arc::from(v.as_slice()));
+        }
+        let accessor = make_accessor(&map);
+
+        for i in 1u64..=10 {
+            let v = map[&NodeId::new(i)].clone();
+            index.insert(NodeId::new(i), &v, &accessor);
+        }
+        assert_eq!(index.len(), 10);
+
+        let is_visible = |id: NodeId| id != NodeId::new(5) && id != NodeId::new(7);
+
+        // Query near the centre; ask for up to 8 results.
+        let query = [0.25f32, 0.25, 0.25, 0.25];
+        let results = index.search_visible(&query, 8, 20, &is_visible, &accessor);
+
+        // Must not contain 5 or 7.
+        for (id, _) in &results {
+            assert!(
+                *id != NodeId::new(5) && *id != NodeId::new(7),
+                "invisible node {id:?} appeared in search_visible results"
+            );
+        }
+        // 10 total − 2 invisible = 8 visible; asking for k=8 → must return 8.
+        assert_eq!(
+            results.len(),
+            8,
+            "expected 8 visible results, got {}: {results:?}",
+            results.len()
+        );
+        // Results must be sorted by distance (ascending).
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].1 <= results[i].1,
+                "results not sorted at index {i}: {:?}",
+                results
+            );
+        }
+    }
+
+    /// With half the nodes invisible, search_visible(k=3) must still return 3
+    /// visible results (the widened ef compensates for filtering losses).
+    #[test]
+    fn search_visible_widens_for_recall() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let index = HnswIndex::with_seed(config, 42);
+
+        let mut map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        for i in 1u64..=20 {
+            let v: Vec<f32> = (0..4).map(|j| ((i - 1) * 4 + j) as f32 / 80.0).collect();
+            map.insert(NodeId::new(i), Arc::from(v.as_slice()));
+        }
+        let accessor = make_accessor(&map);
+        for i in 1u64..=20 {
+            let v = map[&NodeId::new(i)].clone();
+            index.insert(NodeId::new(i), &v, &accessor);
+        }
+
+        // Odd IDs are invisible (10 invisible, 10 visible).
+        let is_visible = |id: NodeId| id.as_u64().is_multiple_of(2);
+
+        let query = [0.25f32, 0.25, 0.25, 0.25];
+        let results = index.search_visible(&query, 3, 10, &is_visible, &accessor);
+
+        // Must return exactly 3 (10 visible nodes exist, k=3).
+        assert_eq!(
+            results.len(),
+            3,
+            "expected 3 visible results from widened ef; got {results:?}"
+        );
+        for (id, _) in &results {
+            assert!(
+                id.as_u64() % 2 == 0,
+                "odd (invisible) node {id:?} appeared in results"
+            );
+        }
     }
 }

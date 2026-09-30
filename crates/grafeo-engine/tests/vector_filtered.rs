@@ -3,7 +3,7 @@
 //! Tests that `vector_search`, `batch_vector_search`, and `mmr_search`
 //! correctly restrict results when property equality filters are provided.
 
-#![cfg(feature = "vector-index")]
+#![cfg(all(feature = "lpg", feature = "vector-index"))]
 
 use std::collections::HashMap;
 
@@ -21,36 +21,67 @@ fn setup_db() -> GrafeoDB {
 
     // user_id=1: nodes near [1, 0, 0]
     let n1 = db.create_node(&["Doc"]);
-    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
-    db.set_node_property(n1, "user_id", Value::Int64(1));
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .expect("set node property");
+    db.set_node_property(n1, "user_id", Value::Int64(1))
+        .expect("set node property");
 
     let n2 = db.create_node(&["Doc"]);
-    db.set_node_property(n2, "emb", vec3(0.95, 0.05, 0.0));
-    db.set_node_property(n2, "user_id", Value::Int64(1));
+    db.set_node_property(n2, "emb", vec3(0.95, 0.05, 0.0))
+        .expect("set node property");
+    db.set_node_property(n2, "user_id", Value::Int64(1))
+        .expect("set node property");
 
     // user_id=2: nodes near [0, 1, 0]
     let n3 = db.create_node(&["Doc"]);
-    db.set_node_property(n3, "emb", vec3(0.0, 1.0, 0.0));
-    db.set_node_property(n3, "user_id", Value::Int64(2));
+    db.set_node_property(n3, "emb", vec3(0.0, 1.0, 0.0))
+        .expect("set node property");
+    db.set_node_property(n3, "user_id", Value::Int64(2))
+        .expect("set node property");
 
     let n4 = db.create_node(&["Doc"]);
-    db.set_node_property(n4, "emb", vec3(0.05, 0.95, 0.0));
-    db.set_node_property(n4, "user_id", Value::Int64(2));
+    db.set_node_property(n4, "emb", vec3(0.05, 0.95, 0.0))
+        .expect("set node property");
+    db.set_node_property(n4, "user_id", Value::Int64(2))
+        .expect("set node property");
 
     // user_id=3: node near [0, 0, 1]
     let n5 = db.create_node(&["Doc"]);
-    db.set_node_property(n5, "emb", vec3(0.0, 0.0, 1.0));
-    db.set_node_property(n5, "user_id", Value::Int64(3));
+    db.set_node_property(n5, "emb", vec3(0.0, 0.0, 1.0))
+        .expect("set node property");
+    db.set_node_property(n5, "user_id", Value::Int64(3))
+        .expect("set node property");
 
     // No user_id property
     let n6 = db.create_node(&["Doc"]);
-    db.set_node_property(n6, "emb", vec3(0.5, 0.5, 0.0));
+    db.set_node_property(n6, "emb", vec3(0.5, 0.5, 0.0))
+        .expect("set node property");
 
     // Create property index for fast lookups
-    db.create_property_index("user_id");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "user_id".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
 
-    db.create_vector_index("Doc", "emb", Some(3), Some("cosine"), None, None, None)
-        .expect("create index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("create index");
 
     let _ = (n1, n2, n3, n4, n5, n6);
     db
@@ -202,7 +233,8 @@ fn test_filtered_search_non_indexed_property() {
 
     // Set "category" on first 2 nodes only
     for (id, _) in results_all.iter().take(2) {
-        db.set_node_property(*id, "category", Value::String("science".into()));
+        db.set_node_property(*id, "category", Value::String("science".into()))
+            .expect("set node property");
     }
 
     // No property index for "category": should still work (scan fallback)
@@ -222,7 +254,20 @@ fn test_filtered_search_non_indexed_property() {
 #[test]
 fn test_create_vector_index_no_dims_no_data_errors() {
     let db = GrafeoDB::new_in_memory();
-    let result = db.create_vector_index("Doc", "emb", None, None, None, None, None);
+    let result = db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: None,
+            metric: None,
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    });
     assert!(result.is_err(), "should error without dimensions or data");
 }
 
@@ -230,12 +275,26 @@ fn test_create_vector_index_no_dims_no_data_errors() {
 #[test]
 fn test_create_vector_index_with_dims_no_data_succeeds() {
     let db = GrafeoDB::new_in_memory();
-    db.create_vector_index("Doc", "emb", Some(4), Some("cosine"), None, None, None)
-        .expect("should create empty index with explicit dimensions");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(4),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("should create empty index with explicit dimensions");
 
     // Insert a node with vector after index creation, auto-insert should work
     let id = db.create_node(&["Doc"]);
-    db.set_node_property(id, "emb", Value::Vector(vec![1.0, 0.0, 0.0, 0.0].into()));
+    db.set_node_property(id, "emb", Value::Vector(vec![1.0, 0.0, 0.0, 0.0].into()))
+        .expect("set node property");
 
     let results = db
         .vector_search("Doc", "emb", &[1.0, 0.0, 0.0, 0.0], 5, None, None)
@@ -250,15 +309,20 @@ fn test_grafeo_memory_pattern() {
     let db = GrafeoDB::new_in_memory();
 
     // Create vector index first (grafeo-memory calls _ensure_indexes early)
-    db.create_vector_index(
-        "Memory",
-        "embedding",
-        Some(4),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Memory".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(4),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .expect("create index");
 
     // Create nodes with properties at creation time (grafeo-memory pattern)
@@ -280,7 +344,8 @@ fn test_grafeo_memory_pattern() {
 
         // Set embedding separately (grafeo-memory calls set_node_property for vectors)
         let emb = vec![(i as f32) / 10.0, 1.0 - (i as f32) / 10.0, 0.1, 0.1];
-        db.set_node_property(id, "embedding", Value::Vector(emb.into()));
+        db.set_node_property(id, "embedding", Value::Vector(emb.into()))
+            .expect("set node property");
     }
 
     // Search WITHOUT filters first: should work
@@ -324,8 +389,21 @@ fn test_grafeo_memory_pattern() {
 fn setup_operator_db() -> GrafeoDB {
     use grafeo_common::types::PropertyKey;
     let db = GrafeoDB::new_in_memory();
-    db.create_vector_index("Item", "emb", Some(3), Some("cosine"), None, None, None)
-        .expect("create index");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Item".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .expect("create index");
 
     for i in 0..10 {
         let category = match i % 3 {
@@ -346,7 +424,8 @@ fn setup_operator_db() -> GrafeoDB {
             ],
         );
         let emb = vec![(i as f32) / 10.0, 1.0 - (i as f32) / 10.0, 0.5];
-        db.set_node_property(id, "emb", Value::Vector(emb.into()));
+        db.set_node_property(id, "emb", Value::Vector(emb.into()))
+            .expect("set node property");
     }
     db
 }
@@ -604,17 +683,35 @@ fn test_filter_ne_excludes_nodes_missing_property() {
 
     // 3 nodes: two with color, one without
     let n1 = db.create_node(&["Item"]);
-    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0));
-    db.set_node_property(n1, "color", Value::String("red".into()));
-    db.create_vector_index("Item", "emb", Some(3), None, None, None, None)
-        .unwrap();
+    db.set_node_property(n1, "emb", vec3(1.0, 0.0, 0.0))
+        .expect("set node property");
+    db.set_node_property(n1, "color", Value::String("red".into()))
+        .expect("set node property");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Item".into()),
+        property: "emb".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: None,
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
+    .unwrap();
 
     let n2 = db.create_node(&["Item"]);
-    db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0));
-    db.set_node_property(n2, "color", Value::String("blue".into()));
+    db.set_node_property(n2, "emb", vec3(0.0, 1.0, 0.0))
+        .expect("set node property");
+    db.set_node_property(n2, "color", Value::String("blue".into()))
+        .expect("set node property");
 
     let n3 = db.create_node(&["Item"]);
-    db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0));
+    db.set_node_property(n3, "emb", vec3(0.0, 0.0, 1.0))
+        .expect("set node property");
     // n3 has no "color" property
 
     // $ne: "red" should match n2 (blue) but NOT n3 (no color)

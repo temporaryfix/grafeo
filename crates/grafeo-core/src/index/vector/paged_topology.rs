@@ -63,6 +63,8 @@ pub enum PagedTopologyError {
     UnsupportedVersion(u8),
     /// `has_entry_point` byte is neither 0 nor 1.
     InvalidEntryPointFlag(u8),
+    /// Reserved/header fields are not in their canonical zero form.
+    NonCanonicalHeader,
     /// `n_nodes` field overflows the platform-native usize.
     SizeOverflow,
     /// Index region is shorter than `n_nodes` declares.
@@ -107,6 +109,13 @@ pub enum PagedTopologyError {
         /// Bytes available in the input.
         actual: usize,
     },
+    /// A node image contains bytes not accounted for by its declared levels.
+    TrailingNodePayload {
+        /// NodeId whose image was non-canonical.
+        node: u64,
+        /// Number of unconsumed bytes.
+        trailing: usize,
+    },
 }
 
 impl std::fmt::Display for PagedTopologyError {
@@ -119,6 +128,9 @@ impl std::fmt::Display for PagedTopologyError {
             }
             Self::InvalidEntryPointFlag(b) => {
                 write!(f, "paged topology invalid has_entry_point flag {b}")
+            }
+            Self::NonCanonicalHeader => {
+                write!(f, "paged topology header is not canonical")
             }
             Self::SizeOverflow => write!(f, "paged topology size field overflows usize"),
             Self::TruncatedIndex { expected, actual } => write!(
@@ -150,6 +162,10 @@ impl std::fmt::Display for PagedTopologyError {
             } => write!(
                 f,
                 "paged topology node {node} level {level} neighbors truncated: expected {expected} bytes, got {actual}"
+            ),
+            Self::TrailingNodePayload { node, trailing } => write!(
+                f,
+                "paged topology node {node} contains {trailing} trailing payload bytes"
             ),
         }
     }
@@ -257,6 +273,9 @@ pub fn deserialize_topology(
     if has_entry_point > 1 {
         return Err(PagedTopologyError::InvalidEntryPointFlag(has_entry_point));
     }
+    if data[6..8] != [0; 2] || data[20..24] != [0; 4] {
+        return Err(PagedTopologyError::NonCanonicalHeader);
+    }
 
     let n_nodes_u64 = u64::from_le_bytes(
         data[8..16]
@@ -280,6 +299,9 @@ pub fn deserialize_topology(
     let entry_point = if has_entry_point == 1 {
         Some(NodeId::new(entry_raw))
     } else {
+        if entry_raw != 0 {
+            return Err(PagedTopologyError::NonCanonicalHeader);
+        }
         None
     };
 
@@ -326,6 +348,9 @@ pub fn deserialize_topology(
         if usize::try_from(offset).map_err(|_| PagedTopologyError::SizeOverflow)? > payload_len {
             return Err(PagedTopologyError::PayloadOffsetOutOfRange { index: i, offset });
         }
+        if i == 0 && offset != 0 {
+            return Err(PagedTopologyError::PayloadOffsetOutOfRange { index: i, offset });
+        }
         if let Some(prev) = prev_offset
             && offset <= prev
             && i > 0
@@ -355,9 +380,27 @@ pub fn deserialize_topology(
         );
         let offset_usize = usize::try_from(offset).map_err(|_| PagedTopologyError::SizeOverflow)?;
 
-        let payload = &data[payload_start..];
-        let layers = decode_node_payload(payload, offset_usize, id)?;
+        let end_offset = if i + 1 == n_nodes {
+            payload_len
+        } else {
+            let next_entry = HEADER_SIZE + (i + 1) * INDEX_ENTRY_SIZE;
+            usize::try_from(u64::from_le_bytes(
+                data[next_entry + 8..next_entry + 16]
+                    .try_into()
+                    .expect("slice length 8 fits u64 array"),
+            ))
+            .map_err(|_| PagedTopologyError::SizeOverflow)?
+        };
+        let payload = &data[payload_start + offset_usize..payload_start + end_offset];
+        let layers = decode_node_payload(payload, id)?;
         node_data.push((NodeId::new(id), layers));
+    }
+
+    if n_nodes == 0 && payload_len != 0 {
+        return Err(PagedTopologyError::TrailingNodePayload {
+            node: 0,
+            trailing: payload_len,
+        });
     }
 
     Ok((entry_point, max_level, node_data))
@@ -365,22 +408,32 @@ pub fn deserialize_topology(
 
 fn decode_node_payload(
     payload: &[u8],
-    offset: usize,
     node_id: u64,
 ) -> Result<Vec<Vec<NodeId>>, PagedTopologyError> {
-    if payload.len() < offset + 4 {
+    if payload.len() < 4 {
         return Err(PagedTopologyError::TruncatedNodeHeader { node: node_id });
     }
     let n_levels = u32::from_le_bytes(
-        payload[offset..offset + 4]
+        payload[..4]
             .try_into()
             .expect("slice length 4 fits u32 array"),
     );
-    let mut cursor = offset + 4;
-    let mut layers: Vec<Vec<NodeId>> = Vec::with_capacity(n_levels as usize);
+    let n_levels_usize = usize::try_from(n_levels).map_err(|_| PagedTopologyError::SizeOverflow)?;
+    let available_level_headers = (payload.len() - 4) / 4;
+    if n_levels_usize > available_level_headers {
+        return Err(PagedTopologyError::TruncatedLevelHeader {
+            node: node_id,
+            level: u32::try_from(available_level_headers).unwrap_or(u32::MAX),
+        });
+    }
+    let mut cursor = 4_usize;
+    let mut layers: Vec<Vec<NodeId>> = Vec::with_capacity(n_levels_usize);
 
     for level in 0..n_levels {
-        if payload.len() < cursor + 4 {
+        let level_header_end = cursor
+            .checked_add(4)
+            .ok_or(PagedTopologyError::SizeOverflow)?;
+        if payload.len() < level_header_end {
             return Err(PagedTopologyError::TruncatedLevelHeader {
                 node: node_id,
                 level,
@@ -398,7 +451,10 @@ fn decode_node_payload(
         let neighbors_bytes = n_neighbors_usize
             .checked_mul(8)
             .ok_or(PagedTopologyError::SizeOverflow)?;
-        if payload.len() < cursor + neighbors_bytes {
+        let neighbors_end = cursor
+            .checked_add(neighbors_bytes)
+            .ok_or(PagedTopologyError::SizeOverflow)?;
+        if payload.len() < neighbors_end {
             return Err(PagedTopologyError::TruncatedNeighbors {
                 node: node_id,
                 level,
@@ -417,8 +473,15 @@ fn decode_node_payload(
             );
             neighbors.push(NodeId::new(nb));
         }
-        cursor += neighbors_bytes;
+        cursor = neighbors_end;
         layers.push(neighbors);
+    }
+
+    if cursor != payload.len() {
+        return Err(PagedTopologyError::TrailingNodePayload {
+            node: node_id,
+            trailing: payload.len() - cursor,
+        });
     }
 
     Ok(layers)
