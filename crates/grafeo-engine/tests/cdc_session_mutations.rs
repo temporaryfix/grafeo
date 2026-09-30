@@ -46,7 +46,9 @@ fn insert_through_session_generates_create_event() {
     };
 
     // Check CDC recorded the creation
-    let history = db.history(node_id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+        .unwrap();
     assert!(
         !history.is_empty(),
         "CDC should record session INSERT, got 0 events"
@@ -76,7 +78,9 @@ fn set_through_session_generates_update_event() {
         .execute("MATCH (n:Person {name: 'Alix'}) SET n.city = 'Amsterdam'")
         .unwrap();
 
-    let history = db.history(node_id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+        .unwrap();
     let update_count = history
         .iter()
         .filter(|e| e.kind == ChangeKind::Update)
@@ -105,7 +109,9 @@ fn delete_through_session_generates_delete_event() {
         .execute("MATCH (n:Person {name: 'Alix'}) DELETE n")
         .unwrap();
 
-    let history = db.history(node_id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+        .unwrap();
     assert!(
         history.iter().any(|e| e.kind == ChangeKind::Delete),
         "Should contain a Delete event from session DELETE"
@@ -137,9 +143,8 @@ fn rollback_discards_cdc_events() {
 
     // Check that no CDC events leaked
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
     assert!(
@@ -160,9 +165,8 @@ fn multi_statement_transaction_flushes_on_commit() {
 
     // Before commit: check that CDC log has no events yet
     let pre_commit_changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
     assert!(
@@ -175,9 +179,8 @@ fn multi_statement_transaction_flushes_on_commit() {
 
     // After commit: CDC log should have events
     let post_commit_changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
     let create_count = post_commit_changes
@@ -218,9 +221,8 @@ fn savepoint_rollback_discards_post_savepoint_events() {
 
     // CDC should only have events for Alix, not Gus
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
     let create_count = changes
@@ -246,9 +248,8 @@ fn edge_creation_through_session_generates_cdc() {
         .unwrap();
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -286,9 +287,8 @@ fn auto_commit_insert_generates_cdc() {
         .unwrap();
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
     assert!(
@@ -319,9 +319,8 @@ fn edge_deletion_through_session_generates_cdc() {
         .unwrap();
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -360,7 +359,9 @@ fn remove_property_through_session_generates_cdc() {
         other => panic!("Expected Int64, got: {other:?}"),
     };
 
-    let history = db.history(node_id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+        .unwrap();
     let update_count = history
         .iter()
         .filter(|e| e.kind == ChangeKind::Update)
@@ -394,7 +395,9 @@ fn set_label_through_session_generates_cdc() {
         .execute("MATCH (n:Person {name: 'Alix'}) SET n:Employee")
         .unwrap();
 
-    let history = db.history(node_id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(node_id))
+        .unwrap();
     // Should have Create + at least one Update (for label and possibly SET)
     assert!(
         history.len() >= 2,
@@ -423,9 +426,8 @@ fn set_edge_property_through_session_generates_cdc() {
         .unwrap();
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -457,9 +459,8 @@ fn detach_delete_through_session_generates_cdc() {
         .unwrap();
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -500,9 +501,8 @@ fn multiple_property_updates_in_transaction_generate_cdc() {
     session.commit().unwrap();
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -515,3 +515,9 @@ fn multiple_property_updates_in_transaction_generate_cdc() {
         "Should have Update events for property changes, got {update_count}"
     );
 }
+
+#[cfg(feature = "cdc")]
+#[path = "support/cdc_pages.rs"]
+mod cdc_pages;
+#[cfg(feature = "cdc")]
+use cdc_pages::CdcFixtureChanges;

@@ -1,13 +1,14 @@
 //! Tests for CDC recording through the direct CRUD API (`db.create_node()` etc.).
 //!
-//! These exercise the CDC paths in `crud.rs` that record events directly to
-//! the `CdcLog` (as opposed to session-driven mutations via `CdcGraphStore`).
+//! Direct database CRUD delegates to Session framing and the same
+//! transaction-owned accumulator as query and batch mutations. These tests
+//! guard that canonical surface against missing or duplicate events.
 //!
 //! ```bash
 //! cargo test --features "cdc" -p grafeo-engine --test cdc_crud_api
 //! ```
 
-#![cfg(feature = "cdc")]
+#![cfg(all(feature = "cdc", feature = "lpg"))]
 
 use grafeo_common::types::Value;
 use grafeo_engine::cdc::{ChangeKind, EntityId};
@@ -29,7 +30,9 @@ fn create_node_with_props_generates_cdc() {
         vec![("name", Value::from("Alix")), ("age", Value::Int64(30))],
     );
 
-    let history = db.history(id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(id))
+        .unwrap();
     assert!(!history.is_empty(), "Should have CDC events");
     let create = history
         .iter()
@@ -49,13 +52,17 @@ fn create_node_with_props_generates_cdc() {
 fn delete_node_generates_cdc_with_before_snapshot() {
     let db = db();
     let id = db.create_node(&["Person"]);
-    db.set_node_property(id, "name", Value::from("Alix"));
-    db.set_node_property(id, "city", Value::from("Amsterdam"));
+    db.set_node_property(id, "name", Value::from("Alix"))
+        .expect("set node property");
+    db.set_node_property(id, "city", Value::from("Amsterdam"))
+        .expect("set node property");
 
     let deleted = db.delete_node(id);
     assert!(deleted);
 
-    let history = db.history(id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(id))
+        .unwrap();
     let del = history
         .iter()
         .find(|e| e.kind == ChangeKind::Delete)
@@ -73,10 +80,14 @@ fn delete_node_generates_cdc_with_before_snapshot() {
 fn set_node_property_records_old_and_new_values() {
     let db = db();
     let id = db.create_node(&["Person"]);
-    db.set_node_property(id, "name", Value::from("Alix"));
-    db.set_node_property(id, "name", Value::from("Gus"));
+    db.set_node_property(id, "name", Value::from("Alix"))
+        .expect("set node property");
+    db.set_node_property(id, "name", Value::from("Gus"))
+        .expect("set node property");
 
-    let history = db.history(id).unwrap();
+    let history = db
+        .fixture_changes(grafeo_engine::cdc::EntityHistoryQuery::new(id))
+        .unwrap();
     let updates: Vec<_> = history
         .iter()
         .filter(|e| e.kind == ChangeKind::Update)
@@ -107,9 +118,8 @@ fn create_edge_generates_cdc() {
     let eid = db.create_edge(a, b, "KNOWS");
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -141,9 +151,8 @@ fn create_edge_with_props_generates_cdc() {
     );
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -166,15 +175,15 @@ fn delete_edge_generates_cdc_with_before_snapshot() {
     let a = db.create_node(&["Person"]);
     let b = db.create_node(&["Person"]);
     let eid = db.create_edge(a, b, "KNOWS");
-    db.set_edge_property(eid, "since", Value::Int64(2020));
+    db.set_edge_property(eid, "since", Value::Int64(2020))
+        .expect("set edge property");
 
     let deleted = db.delete_edge(eid);
     assert!(deleted);
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -196,13 +205,14 @@ fn set_edge_property_records_old_and_new_values() {
     let a = db.create_node(&["Person"]);
     let b = db.create_node(&["Person"]);
     let eid = db.create_edge(a, b, "KNOWS");
-    db.set_edge_property(eid, "weight", Value::Float64(0.5));
-    db.set_edge_property(eid, "weight", Value::Float64(0.9));
+    db.set_edge_property(eid, "weight", Value::Float64(0.5))
+        .expect("set edge property");
+    db.set_edge_property(eid, "weight", Value::Float64(0.9))
+        .expect("set edge property");
 
     let changes = db
-        .changes_between(
-            grafeo_common::types::EpochId::new(0),
-            grafeo_common::types::EpochId::new(u64::MAX),
+        .fixture_changes(
+            grafeo_common::types::EpochId::new(0)..=grafeo_common::types::EpochId::new(u64::MAX),
         )
         .unwrap();
 
@@ -241,7 +251,7 @@ fn database_gc_prunes_cdc_events() {
     }
 
     let before_gc = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap()
         .len();
     assert!(
@@ -250,10 +260,10 @@ fn database_gc_prunes_cdc_events() {
     );
 
     // Trigger database GC, which calls cdc_log.apply_retention(current_epoch)
-    db.gc();
+    db.gc().expect("collect retained history");
 
     let after_gc = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap()
         .len();
 
@@ -267,6 +277,7 @@ fn database_gc_prunes_cdc_events() {
     );
 }
 
+#[cfg(feature = "gql")]
 #[test]
 fn database_gc_prunes_old_cdc_events_with_session_commits() {
     use grafeo_common::types::EpochId;
@@ -288,10 +299,16 @@ fn database_gc_prunes_old_cdc_events_with_session_commits() {
 
     // CDC should have events (auto-GC may have pruned some old ones)
     let events = db
-        .changes_between(EpochId::new(0), EpochId::new(u64::MAX))
+        .fixture_changes(EpochId::new(0)..=EpochId::new(u64::MAX))
         .unwrap();
     assert!(
         !events.is_empty(),
         "CDC should retain recent events after auto-GC"
     );
 }
+
+#[cfg(feature = "cdc")]
+#[path = "support/cdc_pages.rs"]
+mod cdc_pages;
+#[cfg(feature = "cdc")]
+use cdc_pages::CdcFixtureChanges;
