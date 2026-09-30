@@ -180,14 +180,18 @@ mod tests {
     #[test]
     fn extracts_nodes_and_edges() {
         let mut result = QueryResult::new(vec!["n".into(), "e".into()]);
-        result.push_row(vec![
-            node_map(1, &["Person"], &[("name", Value::String("Alix".into()))]),
-            edge_map(10, "KNOWS", 1, 2, &[("since", Value::Int64(2020))]),
-        ]);
-        result.push_row(vec![
-            node_map(2, &["Person"], &[("name", Value::String("Gus".into()))]),
-            Value::Null,
-        ]);
+        result
+            .push_row(vec![
+                node_map(1, &["Person"], &[("name", Value::String("Alix".into()))]),
+                edge_map(10, "KNOWS", 1, 2, &[("since", Value::Int64(2020))]),
+            ])
+            .expect("admit first entity fixture row");
+        result
+            .push_row(vec![
+                node_map(2, &["Person"], &[("name", Value::String("Gus".into()))]),
+                Value::Null,
+            ])
+            .expect("admit second entity fixture row");
 
         let (nodes, edges) = extract_entities(&result);
 
@@ -208,8 +212,12 @@ mod tests {
     #[test]
     fn deduplicates_by_id() {
         let mut result = QueryResult::new(vec!["n".into()]);
-        result.push_row(vec![node_map(1, &["Person"], &[])]);
-        result.push_row(vec![node_map(1, &["Person"], &[])]);
+        result
+            .push_row(vec![node_map(1, &["Person"], &[])])
+            .expect("admit duplicate entity fixture row");
+        result
+            .push_row(vec![node_map(1, &["Person"], &[])])
+            .expect("admit duplicate entity fixture row");
 
         let (nodes, _) = extract_entities(&result);
         assert_eq!(nodes.len(), 1);
