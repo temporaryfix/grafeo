@@ -37,7 +37,9 @@ By default, the `embedded` profile is enabled: GQL, AI features (vector/text/hyb
 
 ```bash
 cargo add grafeo                                             # Default (embedded profile)
-cargo add grafeo --no-default-features --features full       # All languages + AI + storage + RDF
+cargo add grafeo --features lpg,rdf                          # Dual model: LPG + SPARQL/triples
+cargo add grafeo --no-default-features --features temporal-host   # temporal host slice (same engine)
+cargo add grafeo --no-default-features --features native     # Parser-free LPG + RDF quads
 cargo add grafeo --no-default-features --features languages  # All languages, no AI
 cargo add grafeo --no-default-features --features gql,ai     # GQL + AI features
 cargo add grafeo --no-default-features --features gql        # Minimal: GQL only

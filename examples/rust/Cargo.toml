@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-grafeo = { path = "../../crates/grafeo", default-features = false, features = ["embedded"] }
+grafeo = { path = "../../crates/grafeo", default-features = false, features = ["lpg-model", "gql", "ai", "algos", "parallel", "regex", "jsonl-import", "grafeo-file", "arrow-export"] }
 
 [[bin]]
 name = "basic"
@@ -42,4 +42,4 @@ required-features = ["full"]
 [features]
 default = []
 storage = ["grafeo/storage"]
-full = ["grafeo/full"]
+full = ["grafeo/lpg", "grafeo/rdf", "grafeo/analytics", "grafeo/ai", "grafeo/languages", "grafeo/parallel", "grafeo/arrow-export", "grafeo/enterprise"]

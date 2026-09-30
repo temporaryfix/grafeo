@@ -22,7 +22,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 mimalloc = { workspace = true, optional = true }
 
 [features]
-default = ["embedded"]
+default = ["lpg-model", "gql", "ai", "algos", "parallel", "regex", "jsonl-import", "grafeo-file", "arrow-export"]
 
 # Atomic query language features
 gql = ["grafeo-engine/gql"]
@@ -55,26 +55,32 @@ jsonl-import = ["grafeo-engine/jsonl-import"]  # JSON Lines bulk import
 parquet-import = ["grafeo-engine/parquet-import"]  # Apache Parquet bulk import
 
 # Persona-based profiles
-lpg = ["grafeo-engine/lpg", "gql", "cypher", "gremlin", "sql-pgq", "storage", "regex"]  # Graph App Developer: LPG model + all LPG query languages
-rdf = ["triple-store", "gql", "sparql", "graphql", "storage", "regex", "shacl"]  # Knowledge Engineer: RDF model + SPARQL/GraphQL + SHACL validation
+lpg-model = ["grafeo-engine/lpg"]  # LPG model primitive without persona language/storage extras
+lpg = ["lpg-model", "gql", "cypher", "gremlin", "sql-pgq", "storage", "regex"]  # Graph App Developer: LPG model + all LPG query languages
+rdf = ["triple-store", "sparql", "graphql", "ring-index", "storage", "regex", "shacl"]  # Knowledge Engineer: complete RDF query, validation, indexing, and persistence profile
 analytics = ["algos", "vector-index", "text-index", "hybrid-search", "jsonl-import", "parquet-import"]  # Data Scientist: algorithms + search + bulk import
 ai = ["vector-index", "text-index", "hybrid-search", "cdc"]  # AI/Agent Developer: search + change tracking
-edge = ["grafeo-engine/lpg", "gql", "regex-lite"]  # Frontend/Edge: minimal WASM-friendly
+edge = ["lpg-model", "gql", "compact-store", "regex-lite"]  # Frontend/Edge: compact, WASM-friendly LPG profile
 enterprise = ["metrics", "tracing", "async-storage"]  # Platform Operator: observability + async I/O
-
-# Deployment-based profiles (deprecated, use persona profiles instead)
-embedded = ["grafeo-engine/lpg", "gql", "ai", "algos", "parallel", "regex", "grafeo-file", "arrow-export"]  # Deprecated: use lpg + ai + algos
-browser = ["edge"]  # Deprecated: use edge
-server = ["embedded", "languages", "storage", "triple-store", "cdc", "async-storage", "tracing", "shacl"]  # Deprecated: use lpg + rdf + ai + enterprise
-full = ["server"]  # Deprecated: use lpg + rdf + analytics + ai
 
 # Platform capabilities
 parallel = ["grafeo-engine/parallel"]
 wal = ["grafeo-engine/wal"]
 spill = ["grafeo-engine/spill"]
 mmap = ["grafeo-engine/mmap"]
-temporal = ["grafeo-engine/temporal"]  # Append-only versioned properties
 compact-store = ["grafeo-engine/compact-store"]  # CompactStore: columnar graph for read-only workloads
+statement-table = ["grafeo-engine/statement-table"]  # Claim/statement ingest (opaque ClaimRef layout)
+# Embedded temporal host slice. Enable facade cfgs so StatementIngest re-exports.
+# Do not enable persona `lpg` (that pulls GQL/Cypher/Gremlin).
+temporal-host = [
+    "grafeo-engine/temporal-host",
+    "compact-store",
+    "statement-table",
+    "wal",
+    "text-index",
+]
+# Parser-free LPG + RDF (no GQL/SPARQL/Cypher/Gremlin/GraphQL/SQL-PGQ).
+native = ["grafeo-engine/native", "triple-store"]
 grafeo-file = ["grafeo-engine/grafeo-file"]  # Single-file .grafeo database format
 async-storage = ["grafeo-engine/async-storage"]  # Async WAL and storage backend
 

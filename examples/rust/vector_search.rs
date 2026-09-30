@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (title, embedding) in documents {
         // Create a document node using the programmatic API
         let node_id = db.create_node(&["Document"]);
-        db.set_node_property(node_id, "title", Value::from(*title));
+        db.set_node_property(node_id, "title", Value::from(*title))?;
 
         // Store the embedding as a Vector property.
         // Value::Vector wraps an Arc<[f32]>, created from a Vec.
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_id,
             "embedding",
             Value::Vector(embedding.to_vec().into()),
-        );
+        )?;
     }
 
     println!("Created {} documents with embeddings\n", documents.len());
@@ -42,15 +42,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   - metric: "cosine", "euclidean", or "dot_product"
     //   - m: max connections per layer (None = default 16)
     //   - ef_construction: build-time search width (None = default 200)
-    db.create_vector_index(
-        "Document",
-        "embedding",
-        Some(4),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )?;
+    db.create_index(grafeo::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Document".into()),
+        property: "embedding".into(),
+        kind: grafeo::IndexCreateKind::Vector {
+            dimensions: Some(4),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })?;
     println!("Built HNSW index (cosine similarity, 4 dimensions)");
 
     // ── Search for similar documents ──────────────────────────────

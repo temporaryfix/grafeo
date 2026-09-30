@@ -19,7 +19,8 @@
 //! | `graphql` | GraphQL | Schema-based queries |
 //! | `sql-pgq` | SQL/PGQ | SQL:2023 GRAPH_TABLE |
 //!
-//! Use the `full` feature to enable everything.
+//! Compose the persona features (`lpg`, `rdf`, `analytics`, and `ai`) for the
+//! capabilities an application needs.
 //!
 //! ## Quick Start
 //!
@@ -38,14 +39,40 @@
 //! # Ok::<(), grafeo::Error>(())
 //! ```
 //!
-#![forbid(unsafe_code)]
-
 //! ## Performance Features
 //!
 //! Enable platform-optimized memory allocators for 10-20% faster allocations:
 //!
 //! - `jemalloc` - Linux/macOS (x86_64, aarch64)
 //! - `mimalloc-allocator` - Windows
+//!
+#![forbid(unsafe_code)]
+
+// Named profiles are public capability contracts. Keep these compile-time
+// guards beside the facade so a manifest-only edit cannot silently turn a
+// comprehensive profile into a smaller build. Users who need minimal binaries
+// can compose the atomic features directly.
+#[cfg(all(
+    feature = "rdf",
+    not(all(
+        feature = "triple-store",
+        feature = "sparql",
+        feature = "graphql",
+        feature = "ring-index",
+        feature = "storage",
+        feature = "regex",
+        feature = "shacl"
+    ))
+))]
+compile_error!(
+    "the `rdf` profile must retain its complete query/index/validation/storage contract"
+);
+
+#[cfg(all(
+    feature = "edge",
+    not(all(feature = "gql", feature = "compact-store", feature = "regex-lite"))
+))]
+compile_error!("the `edge` profile must retain LPG/GQL/compact-store/regex-lite");
 
 // Platform-optimized memory allocators (enabled via features)
 // jemalloc: Linux/macOS x86_64/aarch64 - better multi-threaded performance
@@ -66,10 +93,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Re-export the main database API
 pub use grafeo_engine::{
-    AccessMode, Catalog, CatalogError, Config, ConfigError, DurabilityMode, GrafeoDB, Grant,
-    GraphModel, GraphStore, GraphStoreMut, Identity, IndexDefinition, IndexType, Role, Session,
-    StatementKind, VERSION,
+    AccessMode, Catalog, CatalogError, Config, ConfigError, Direction, DurabilityMode, GrafeoDB,
+    Grant, GraphModel, GraphStore, GraphStoreMut, Identity, IndexDefinition, IndexType,
+    IsolationLevel, PhysicalIndexFamily, PhysicalIndexKey, Role, Session, StatementKind,
+    TransactionManagerView, VERSION,
 };
+#[cfg(feature = "statement-table")]
+pub use grafeo_engine::{StatementIngest, StatementRow};
 
 // Re-export submodules for qualified access (e.g. grafeo::auth::Identity)
 pub use grafeo_engine::admin;
@@ -88,7 +118,40 @@ pub use grafeo_engine::MemoryUsage;
 pub use grafeo_engine::ProjectionSpec;
 
 // Re-export core types - you'll need these for working with IDs and values
-pub use grafeo_common::types::{EdgeId, NodeId, Value};
+pub use grafeo_common::types::{
+    ContentId, EdgeId, EpochId, GraphPath, IndexId, NodeId, PropertyKey, Value,
+};
+#[cfg(all(feature = "compact-store", feature = "mmap", feature = "lpg"))]
+pub use grafeo_engine::CompactStoreTieredView;
+#[cfg(feature = "grafeo-file")]
+pub use grafeo_engine::DatabaseFileView;
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+pub use grafeo_engine::LayeredStoreView;
+pub use grafeo_engine::{
+    AuthoritativeFormat, Digest256, GraphIncarnationId, GraphModelTag, HistoryCompleteness,
+    InvalidValidTimeInterval, MAX_RECOVERY_IMAGE_COMPONENTS, ModelFormatVersion, ProjectionCut,
+    ProjectionReconciliationState, ProjectionSourceGraph, RecoveryImageComponent,
+    RecoveryImageCoordinatesV1, RecoveryImageDigest, SchemaCut, SnapshotArtifact, StateDigest,
+    StateDigestKind, StatementHandle, StoreId, TaiNanoseconds, ValidTimeInterval, WorldCut,
+    WorldCutDescriptor, WorldCutError, WorldIdentityMetadataV1, WorldMetadataSectionV1,
+    WorldMetadataSectionV2,
+};
+#[cfg(any(
+    feature = "lpg",
+    feature = "lpg-model",
+    feature = "edge",
+    feature = "temporal-host",
+    feature = "native"
+))]
+pub use grafeo_engine::{CreateIndexRequest, IndexCreateKind};
+#[cfg(feature = "compact-store")]
+pub use grafeo_engine::{GraphScrub, NodeTableScrub, RelTableScrub};
+#[cfg(feature = "triple-store")]
+pub use grafeo_engine::{
+    Quad, RdfCdcPage, RdfDatasetHistory, RdfGraphIdentity, RdfGraphLife, RdfHistoricalQuad,
+    RdfHistoryCursor, RdfHistoryCursorError, RdfHistoryCut, RdfHistoryDiff, RdfHistoryError,
+    RdfHistoryTransition, RdfHistoryTransitionKind, RdfQuadVersion, Term, Triple,
+};
 
 // Re-export error types so users don't need to depend on grafeo-common directly
 pub use grafeo_common::utils::error::{Error, Result};
