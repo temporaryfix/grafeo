@@ -19,16 +19,106 @@
 //!
 //! [`LpgStore`]: crate::graph::lpg::LpgStore
 
+use crate::execution::operators::{SharedReadTracker, SharedWriteTracker};
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
+#[cfg(feature = "lpg")]
+use crate::graph::lpg::TxDelta;
 use crate::graph::lpg::{Edge, Node};
 #[cfg(feature = "vector-index")]
 use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
-use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
-use grafeo_common::utils::hash::FxHashMap;
+use grafeo_common::types::{EdgeId, EpochId, LabelId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
+
+/// Transaction-local structural state captured by an engine savepoint.
+///
+/// The fields are intentionally crate-private: callers treat this as an
+/// opaque token and hand it back to [`GraphStoreMut::tx_structural_restore`].
+/// Concrete stores use it to retain pre-savepoint creates/deletes while
+/// removing the later tail, including tiered-store base tombstones.
+#[derive(Clone, Debug, Default)]
+pub struct TxStructuralSnapshot {
+    #[cfg_attr(not(feature = "lpg"), allow(dead_code))]
+    pub(crate) node_creates: Vec<NodeId>,
+    #[cfg_attr(not(feature = "lpg"), allow(dead_code))]
+    pub(crate) edge_creates: Vec<EdgeId>,
+    #[cfg_attr(not(feature = "lpg"), allow(dead_code))]
+    pub(crate) node_deletes: Vec<NodeId>,
+    #[cfg_attr(not(feature = "lpg"), allow(dead_code))]
+    pub(crate) edge_deletes: Vec<(NodeId, EdgeId, NodeId)>,
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(crate) base_node_deletes: Vec<NodeId>,
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(crate) base_edge_deletes: Vec<EdgeId>,
+}
+
+#[cfg(feature = "lpg")]
+pub(crate) fn validate_index_node_preparation(
+    publication_epoch: EpochId,
+    transaction_id: Option<TransactionId>,
+) -> grafeo_common::utils::error::Result<()> {
+    use grafeo_common::utils::error::{Error, TransactionError};
+
+    if publication_epoch == EpochId::PENDING
+        || transaction_id == Some(TransactionId::INVALID)
+        || transaction_id == Some(TransactionId::SYSTEM)
+    {
+        return Err(Error::Transaction(TransactionError::InvalidState(
+            "index-row preparation requires a committed epoch and an optional non-system transaction"
+                .into(),
+        )));
+    }
+    Ok(())
+}
+
+/// Opaque representation identity identified by a commit source, not a write
+/// permit or a promise that its registry overlay is still current.
+///
+/// Read-only graph handles may identify their representation without exposing
+/// concrete stores or their maintenance methods. Only the core commit driver
+/// can inspect the representation, and it still requires exact write authority.
+///
+/// ```compile_fail
+/// use grafeo_core::graph::traits::{GraphStore, LpgCommitTarget};
+/// fn recover_writable_store(read_only: &dyn GraphStore) {
+///     let target = read_only.lpg_commit_target().unwrap();
+///     let raw_store = target.representation; // private: not a downcast escape
+/// }
+/// ```
+#[cfg(feature = "lpg")]
+#[derive(Clone, Copy)]
+pub struct LpgCommitTarget<'store> {
+    pub(crate) representation: LpgCommitRepresentation<'store>,
+}
+
+#[cfg(feature = "lpg")]
+#[derive(Clone, Copy)]
+pub(crate) enum LpgCommitRepresentation<'store> {
+    /// Native LPG representation.
+    Native(&'store crate::graph::lpg::LpgStore),
+    /// A cold base and its current mutable LPG overlay.
+    #[cfg(feature = "compact-store")]
+    Layered(&'store crate::graph::compact::layered::LayeredStore),
+}
+
+#[cfg(feature = "lpg")]
+impl<'store> LpgCommitTarget<'store> {
+    pub(crate) fn native(store: &'store crate::graph::lpg::LpgStore) -> Self {
+        Self {
+            representation: LpgCommitRepresentation::Native(store),
+        }
+    }
+
+    #[cfg(feature = "compact-store")]
+    pub(crate) fn layered(store: &'store crate::graph::compact::layered::LayeredStore) -> Self {
+        Self {
+            representation: LpgCommitRepresentation::Layered(store),
+        }
+    }
+}
 
 /// Read-only graph operations used by the query engine.
 ///
@@ -42,6 +132,25 @@ use std::sync::Arc;
 /// dispatch. Traversal methods return `Vec` instead of `impl Iterator` to
 /// enable this.
 pub trait GraphStore: Send + Sync {
+    /// Identifies the exact mutable representation behind a commit source.
+    ///
+    /// This read-only capability grants no write authority. The commit driver
+    /// must still pin the representation and qualify its captured registry
+    /// store. The opaque result exposes no concrete store or mutation methods
+    /// to callers discovering a target through a read-only graph view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state error when this view does not expose a
+    /// supported LPG commit representation.
+    #[cfg(feature = "lpg")]
+    fn lpg_commit_target(&self) -> grafeo_common::utils::error::Result<LpgCommitTarget<'_>> {
+        Err(grafeo_common::utils::error::TransactionError::InvalidState(
+            "graph view does not expose an LPG commit target".into(),
+        )
+        .into())
+    }
+
     // --- Point lookups ---
 
     /// Returns a node by ID (latest visible version at current epoch).
@@ -84,6 +193,191 @@ pub trait GraphStore: Send + Sync {
     /// Gets a single property from an edge without loading all properties.
     fn get_edge_property(&self, id: EdgeId, key: &PropertyKey) -> Option<Value>;
 
+    /// Node ids created (PENDING) by `transaction_id` in this tx, for MERGE
+    /// read-your-writes candidate discovery. Default: none.
+    fn pending_node_creates(&self, _transaction_id: TransactionId) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    /// Edge ids created (PENDING) by `transaction_id` in this tx.
+    /// Mirrors [`pending_node_creates`](Self::pending_node_creates) for edges.
+    /// Default: none (stores without a PENDING edge create list return empty).
+    fn pending_edge_creates(&self, _transaction_id: TransactionId) -> Vec<EdgeId> {
+        Vec::new()
+    }
+
+    /// Attaches a read tracker for `tx`. Called by the engine at Serializable tx
+    /// begin. Default no-op — only `LpgStore` (and wrappers that delegate to it)
+    /// need an override.
+    fn register_read_tracker(&self, _tx: TransactionId, _tracker: SharedReadTracker) {}
+
+    /// Removes the read tracker for `tx`. Called at commit/rollback. Default no-op.
+    fn unregister_read_tracker(&self, _tx: TransactionId) {}
+
+    /// Records a complete label-predicate scan for Serializable anti-phantom
+    /// detection. Implementations must record the predicate before enumerating
+    /// rows so empty and small result sets are protected too. Qualified scans
+    /// must use the stable logical label name even before catalog interning;
+    /// the whole-dataset key is reserved for genuinely unqualified scans.
+    ///
+    /// The default is a no-op for stores without engine transaction tracking.
+    fn record_label_predicate_read(&self, _tx: TransactionId, _label: &str) {}
+
+    /// Records a complete relationship-type predicate scan for Serializable
+    /// anti-phantom detection. Qualified scans must use the stable logical type
+    /// name even before catalog interning; the whole-dataset key is reserved for
+    /// genuinely unqualified scans.
+    fn record_rel_type_predicate_read(&self, _tx: TransactionId, _rel_type: &str) {}
+
+    /// Records an unqualified structural scan of the native LPG dataset.
+    ///
+    /// Used for unlabeled node scans and untyped edge traversals, including
+    /// empty scans. Fine entity reads remain independently recorded.
+    fn record_lpg_dataset_read(&self, _tx: TransactionId) {}
+
+    /// Attaches a write tracker for `tx` (anti-phantom index-write recording).
+    ///
+    /// Called by the engine at Serializable tx begin alongside
+    /// [`register_read_tracker`](Self::register_read_tracker). Default no-op —
+    /// only `LpgStore` (and wrappers that delegate to it) need an override.
+    fn register_write_tracker(&self, _tx: TransactionId, _tracker: SharedWriteTracker) {}
+
+    /// Removes the write tracker for `tx`. Called at commit/rollback. Default no-op.
+    fn unregister_write_tracker(&self, _tx: TransactionId) {}
+
+    /// Non-draining snapshot of node ids this transaction has queued for deletion.
+    /// Default: none (stores without deferred node-delete tracking return empty).
+    fn pending_node_deletes_peek(&self, _transaction_id: TransactionId) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    /// Non-draining snapshot of edge ids this transaction has queued for deletion.
+    /// Default: none (stores without deferred edge-delete tracking return empty).
+    fn pending_edge_deletes_peek(&self, _transaction_id: TransactionId) -> Vec<EdgeId> {
+        Vec::new()
+    }
+
+    /// Non-draining snapshot of entities touched via the property/label overlay.
+    /// Returns `(node_ids, edge_ids)` of all entities in the transaction's delta.
+    /// Default: empty (stores without a per-transaction overlay return nothing).
+    fn overlay_touched_entities(
+        &self,
+        _transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        (Vec::new(), Vec::new())
+    }
+
+    /// Non-draining snapshot of property-level writes from the overlay, for use
+    /// under `ConflictGranularity::Property`.
+    ///
+    /// Returns:
+    /// - `Vec<(NodeId, Option<String>)>`: each node-property write as
+    ///   `(node, Some(key))`.  Label changes (structural) are returned as
+    ///   `(node, None)`.
+    /// - `Vec<(EdgeId, Option<String>)>`: edge-property writes as
+    ///   `(edge, Some(key))`.
+    ///
+    /// The `Option<String>` becomes `Option<u64>` (a `PropTag`) in the session
+    /// commit path after calling `prop_tag(key)`.
+    ///
+    /// Default: empty (stores without a per-transaction overlay return nothing).
+    fn overlay_touched_properties(
+        &self,
+        _transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        (Vec::new(), Vec::new())
+    }
+
+    /// Snapshot-consistent node property read (unified-MVCC accessor).
+    ///
+    /// Default: ignores isolation and returns the committed value — safe for
+    /// stores without a per-transaction delta. `LpgStore` overrides this to
+    /// merge its delta for the writing transaction.
+    fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        let _ = (epoch, transaction_id);
+        self.get_node_property(id, key)
+    }
+
+    /// Snapshot-consistent edge property read. See [`read_node_property_visible`](Self::read_node_property_visible).
+    fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        let _ = (epoch, transaction_id);
+        self.get_edge_property(id, key)
+    }
+
+    /// Snapshot-consistent whole-node property map (whole-entity MVCC accessor).
+    ///
+    /// Default: ignores isolation and returns the committed whole-property map —
+    /// safe for stores without a per-transaction delta. `LpgStore` overrides this
+    /// to merge its buffered delta for the writing transaction, so `RETURN n`
+    /// reflects buffered writes (read-your-writes for whole-entity projections).
+    fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        let _ = (epoch, transaction_id);
+        self.get_nodes_properties_batch(&[id])
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot-consistent whole-edge property map. See [`read_node_properties_visible`](Self::read_node_properties_visible).
+    fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashMap<PropertyKey, Value> {
+        let _ = (epoch, transaction_id);
+        self.get_edge(id)
+            .map(|e| {
+                e.properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Snapshot-consistent node label set (unified-MVCC label accessor).
+    ///
+    /// Returns the set of committed label **names** merged with the writing
+    /// transaction's buffered label ops. With `transaction_id = Some(tx)` the
+    /// writer's buffered `Add` ops are inserted and buffered `Remove` ops are
+    /// deleted before returning.  With `transaction_id = None` only the
+    /// committed set is returned.
+    ///
+    /// Default: returns the committed label names by loading the node via
+    /// [`get_node`](Self::get_node). This is correct-by-construction for stores
+    /// without a per-transaction label delta (WAL, CDC, Layered stores). The
+    /// `epoch` and `transaction_id` parameters are ignored in the default —
+    /// those stores have no uncommitted delta to merge. `LpgStore` overrides
+    /// this to merge its delta for the writing transaction.
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> FxHashSet<ArcStr> {
+        let _ = (epoch, transaction_id);
+        self.get_node(id)
+            .map(|n| n.labels.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Gets a property for multiple nodes in a single batch operation.
     fn get_node_property_batch(&self, ids: &[NodeId], key: &PropertyKey) -> Vec<Option<Value>>;
 
@@ -115,6 +409,208 @@ pub trait GraphStore: Send + Sync {
     /// Returns (target_node, edge_id) pairs for edges from a node.
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)>;
 
+    /// Returns whether traversal may contain a transport edge whose endpoint
+    /// has not arrived yet. The default keeps ordinary stores on the direct
+    /// adjacency path without per-edge endpoint checks.
+    #[doc(hidden)]
+    fn may_have_unresolved_transport_edges(&self) -> bool {
+        false
+    }
+
+    /// Returns snapshot-visible `(target_node, edge_id)` pairs for edges from
+    /// a node, and records each visible edge into the SSI read-set.
+    ///
+    /// The default delegates to `edges_from` (no MVCC visibility filter, no
+    /// recording).  `LpgStore` overrides with the raw-adjacency + version-chain
+    /// path described in `LpgStore::edges_from_versioned`.
+    fn edges_from_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        let _ = (epoch, transaction_id);
+        self.edges_from(node, direction)
+    }
+
+    /// Returns neighbor node IDs reachable via snapshot-visible edges.
+    ///
+    /// The default delegates to `neighbors` (no MVCC visibility filter, no
+    /// recording).  `LpgStore` overrides via `neighbors_versioned`.
+    fn neighbors_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        let _ = (epoch, transaction_id);
+        self.neighbors(node, direction)
+    }
+
+    /// Edges visible at `epoch` (as-of topology). Default filters
+    /// [`edges_from`](Self::edges_from) with epoch visibility.
+    ///
+    /// Compact/Layered stores override with packed as-of (no current-CSR
+    /// `filter(is_open)`).
+    fn edges_from_at_epoch(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        let mut out = Vec::new();
+        self.fill_edges_from_at_epoch(node, direction, epoch, &mut out);
+        out
+    }
+
+    /// Appends current `(neighbor, edge_id)` pairs into `out` (does not clear).
+    fn fill_edges_from(&self, node: NodeId, direction: Direction, out: &mut Vec<(NodeId, EdgeId)>) {
+        out.extend(self.edges_from(node, direction));
+    }
+
+    /// Appends current neighbor node IDs into `out` (does not clear).
+    ///
+    /// Dest-only hops use this so they never look up [`EdgeId`]s. Default
+    /// extends [`neighbors`](Self::neighbors); CompactStore walks CSR targets.
+    fn fill_neighbors(&self, node: NodeId, direction: Direction, out: &mut Vec<NodeId>) {
+        out.extend(self.neighbors(node, direction));
+    }
+
+    /// One-shot dest lists for every node that has neighbors in `direction`.
+    ///
+    /// Default fills per node. `LpgStore` dumps both adjacency maps under
+    /// one lock each so triangle COUNT is not 2N hash-map acquisitions.
+    fn snapshot_neighbors(&self, direction: Direction) -> Vec<(NodeId, Vec<NodeId>)> {
+        let ids = self.node_ids();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut dests = Vec::new();
+            self.fill_neighbors(id, direction, &mut dests);
+            if !dests.is_empty() {
+                out.push((id, dests));
+            }
+        }
+        out
+    }
+
+    /// Directed triangle COUNT on dest-sorted CSR slices, if this store has them.
+    ///
+    /// `None` means the caller should snapshot + HashMap. CompactStore
+    /// intersects `fwd.neighbors(b)` with `bwd.neighbors(a)` in offset space
+    /// (no `NodeId` vecs). `dest_label` is a mid-hop label, or `None`.
+    fn try_count_directed_triangles(
+        &self,
+        _starts: &[NodeId],
+        _dest_label: Option<&str>,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Same as [`Self::try_count_directed_triangles`] over every node (no start list).
+    fn try_count_all_directed_triangles(&self, _dest_label: Option<&str>) -> Option<u64> {
+        None
+    }
+
+    /// True when every stored edge matches at least one of `types`.
+    ///
+    /// Empty `types` means "all types" and always returns true. Default is
+    /// conservative (`types` empty only) so typed filters still walk.
+    fn all_edges_have_types(&self, types: &[String]) -> bool {
+        types.is_empty()
+    }
+
+    /// Number of current edges from `node` in `direction` matching `types`.
+    ///
+    /// Empty `types` matches every type. Default fills then filters; stores
+    /// with typed CSR / a single edge type override with a degree read.
+    fn count_edges_from(&self, node: NodeId, direction: Direction, types: &[String]) -> usize {
+        let mut out = Vec::new();
+        self.fill_edges_from(node, direction, &mut out);
+        if types.is_empty() || self.all_edges_have_types(types) {
+            return out.len();
+        }
+        out.iter()
+            .filter(|(_, eid)| {
+                self.edge_type(*eid).is_some_and(|actual| {
+                    types
+                        .iter()
+                        .any(|t| actual.as_str().eq_ignore_ascii_case(t.as_str()))
+                })
+            })
+            .count()
+    }
+
+    /// Appends as-of `(neighbor, edge_id)` pairs into `out` (does not clear).
+    ///
+    /// Default filters [`edges_from`](Self::edges_from). Compact/Layered
+    /// override with packed fill (no current-CSR `filter(is_open)`).
+    fn fill_edges_from_at_epoch(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        out: &mut Vec<(NodeId, EdgeId)>,
+    ) {
+        out.extend(
+            self.edges_from(node, direction)
+                .into_iter()
+                .filter(|(target, eid)| {
+                    self.is_edge_visible_at_epoch(*eid, epoch)
+                        && self.is_node_visible_at_epoch(*target, epoch)
+                }),
+        );
+    }
+
+    /// Fills `out` with dests visible at `epoch` (clears `out` first).
+    ///
+    /// Dest-only: no [`EdgeId`]s. Default maps [`Self::fill_edges_from_at_epoch`].
+    /// Compact/Layered override with packed / CSR fill. Whole-graph and seeded
+    /// as-of hops should call this, not `neighbors_at_epoch` → `Vec`.
+    fn fill_neighbors_at_epoch(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        out: &mut Vec<NodeId>,
+    ) {
+        out.clear();
+        let mut edges = Vec::new();
+        self.fill_edges_from_at_epoch(node, direction, epoch, &mut edges);
+        out.extend(edges.into_iter().map(|(nid, _)| nid));
+    }
+
+    /// Dest-only as-of fill restricted to `types` (empty = every edge type).
+    ///
+    /// Default fills all dests then drops those whose as-of edge type is
+    /// not in `types`. Compact/Layered walk only matching RelTables.
+    fn fill_neighbors_of_types_at_epoch(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        types: &[String],
+        out: &mut Vec<NodeId>,
+    ) {
+        if types.is_empty() || self.all_edges_have_types(types) {
+            self.fill_neighbors_at_epoch(node, direction, epoch, out);
+            return;
+        }
+        out.clear();
+        let mut edges = Vec::new();
+        self.fill_edges_from_at_epoch(node, direction, epoch, &mut edges);
+        out.extend(edges.into_iter().filter_map(|(nid, eid)| {
+            let ty = self.get_edge_at_epoch(eid, epoch).map(|e| e.edge_type);
+            ty.filter(|actual| {
+                types
+                    .iter()
+                    .any(|t| actual.as_str().eq_ignore_ascii_case(t.as_str()))
+            })
+            .map(|_| nid)
+        }));
+    }
+
     /// Returns the out-degree of a node (number of outgoing edges).
     fn out_degree(&self, node: NodeId) -> usize;
 
@@ -139,8 +635,151 @@ pub trait GraphStore: Send + Sync {
         self.node_ids()
     }
 
+    /// Materializes the final node rows used to prepare physical indexes.
+    ///
+    /// The caller must serialize database publication while this image is
+    /// collected. `publication_epoch` names the committed frontier, not the
+    /// transaction's start epoch. `Some(transaction_id)` overlays only that
+    /// transaction's final changes, including creates, deletes and labels;
+    /// `None` collects committed rows for replay or copy preparation.
+    ///
+    /// Implementations must include all storage tiers, exclude foreign pending
+    /// creates, preserve rows with foreign pending deletes, and leave overlays
+    /// and read/SSI trackers unchanged. Returned rows are ordered by node ID.
+    /// This is an owned preparation image, not an independently acquired
+    /// database publication barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the store cannot supply this contract,
+    /// the epoch is PENDING, or the supplied transaction ID is INVALID or
+    /// SYSTEM. System/replay preparation must use the committed-only `None`.
+    /// There is deliberately no fallback to ordinary query or raw-store reads.
+    #[doc(hidden)]
+    fn prepare_index_node_rows(
+        &self,
+        _publication_epoch: EpochId,
+        _transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::error::Result<Vec<Node>> {
+        use grafeo_common::utils::error::{Error, TransactionError};
+
+        Err(Error::Transaction(TransactionError::InvalidState(
+            "this graph store does not support final index-row preparation".into(),
+        )))
+    }
+
+    /// The same non-recording preparation view, restricted to supplied node
+    /// identities. Survivor maintenance uses this to avoid scanning unchanged
+    /// graph rows. Callers supply unique identities; missing/invisible rows
+    /// are omitted and results remain ordered by node ID.
+    ///
+    /// # Errors
+    /// Returns a structured error for unsupported sources or invalid context.
+    #[doc(hidden)]
+    fn prepare_index_node_rows_by_id(
+        &self,
+        _publication_epoch: EpochId,
+        _transaction_id: Option<TransactionId>,
+        _ids: &[NodeId],
+    ) -> grafeo_common::utils::error::Result<Vec<Node>> {
+        Err(grafeo_common::utils::error::TransactionError::InvalidState(
+            "this graph store does not support sparse index-row preparation".into(),
+        )
+        .into())
+    }
+
+    /// Nodes for which `transaction_id` has an uncommitted buffered write to
+    /// `key`, or `None` when this store cannot enumerate them.
+    ///
+    /// `None` is the safe answer and the default. A caller that cannot learn
+    /// which nodes a transaction has written must not serve that transaction from
+    /// the committed property index, because the index cannot see those writes —
+    /// it would miss the writer's own `SET`. Stores that keep a per-transaction
+    /// property delta override this; wrapping stores delegate.
+    fn nodes_with_buffered_property(
+        &self,
+        transaction_id: TransactionId,
+        key: &PropertyKey,
+    ) -> Option<Vec<NodeId>> {
+        let _ = (transaction_id, key);
+        None
+    }
+
     /// Returns node IDs with a specific label.
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId>;
+
+    /// Returns whether node `id` carries `label`.
+    ///
+    /// Point lookups ask this instead of scanning `nodes_by_label`: an indexed
+    /// lookup that intersected the label's whole id set cost the label's
+    /// cardinality per query — 30.6 ms at a million labelled nodes against
+    /// 12.8 µs for the same lookup unlabelled
+    /// The work counter records materialisation instead of elapsed time.
+    ///
+    /// The default answers from `nodes_by_label`, so every store agrees with the
+    /// set its own scans return. Stores that hold a label index should override
+    /// this with an O(1) membership test, and wrapping stores should delegate so
+    /// the override survives the wrapping.
+    fn node_has_label(&self, id: NodeId, label: &str) -> bool {
+        self.nodes_by_label(label).contains(&id)
+    }
+
+    /// Returns whether `id` carries `label` in a transaction-visible view.
+    ///
+    /// The default keeps committed point lookups O(1) where a store provides
+    /// `node_has_label`. Stores without a per-transaction label delta fall back
+    /// to their visible label scan when a transaction is supplied.
+    fn node_has_label_visible(
+        &self,
+        id: NodeId,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> bool {
+        match transaction_id {
+            None => self.node_has_label(id, label),
+            Some(tx) => self.nodes_by_label_visible(label, Some(tx)).contains(&id),
+        }
+    }
+
+    /// Returns whether `id` carries `label` in the requested historical view.
+    ///
+    /// The default resolves the versioned node and checks its materialized
+    /// labels. Stores with a native historical label index may override this
+    /// with a point lookup; wrappers must preserve the supplied epoch and
+    /// transaction context.
+    fn node_has_label_at_epoch(
+        &self,
+        id: NodeId,
+        label: &str,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> bool {
+        self.get_node_versioned(id, epoch, transaction_id)
+            .is_some_and(|node| node.has_label(label))
+    }
+
+    /// Returns node IDs with a specific label, merging the writing
+    /// transaction's buffered label delta.
+    ///
+    /// When `transaction_id` is `Some`, the result includes nodes that the tx
+    /// buffered `:label` onto (via `add_label_buffered`) and excludes nodes it
+    /// buffered `:label` off of (`remove_label_buffered`).  When
+    /// `transaction_id` is `None`, this is identical to `nodes_by_label`.
+    ///
+    /// The default (for stores without a per-tx label delta) ignores
+    /// `transaction_id` and delegates to `nodes_by_label`. `LpgStore`
+    /// overrides to perform the delta merge.
+    ///
+    /// **MVCC contract:** never inserts uncommitted labels into `label_index`
+    /// — the delta merge happens only in this read path.
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        let _ = transaction_id;
+        self.nodes_by_label(label)
+    }
 
     /// Returns the number of non-deleted nodes with a specific label.
     ///
@@ -177,9 +816,11 @@ pub trait GraphStore: Send + Sync {
 
     // --- Index introspection ---
 
-    /// Returns `true` if a property index exists for the given property.
+    /// Returns `true` if equality on `property` can be served by a seek
+    /// ([`Self::find_nodes_by_property`]) instead of a label scan.
     ///
-    /// The default returns `false`, which is correct for stores without indexes.
+    /// True for an LPG property index **or** a CompactStore column (the
+    /// column *is* the index). Default is `false`.
     fn has_property_index(&self, _property: &str) -> bool {
         false
     }
@@ -254,6 +895,15 @@ pub trait GraphStore: Send + Sync {
         Vec::new()
     }
 
+    /// Returns the numeric `LabelId` for a label name, or `None` if the label
+    /// has never been interned. Used by `ScanOperator` to obtain the label's
+    /// predicate key for GE3 read-set escalation.
+    ///
+    /// Default returns `None`; overridden by `LpgStore`.
+    fn label_id_for_scan(&self, _label: &str) -> Option<LabelId> {
+        None
+    }
+
     // --- Visibility checks (fast path, avoids building full entities) ---
 
     /// Checks if a node is visible at the given epoch without building the full Node.
@@ -320,6 +970,23 @@ pub trait GraphStore: Send + Sync {
             .collect()
     }
 
+    /// Label-scan variant of [`Self::filter_visible_node_ids_versioned`]: MVCC-filters
+    /// `ids` and records each visible node under the `label_id` predicate bucket
+    /// for GE3 read-set escalation (GE3 activation).
+    ///
+    /// Default implementation delegates to [`Self::filter_visible_node_ids_versioned`]
+    /// (fine recording, no escalation) — overridden by engine-attached implementations
+    /// such as `LpgStore` to use `record_read_node_in_label`.
+    fn filter_visible_node_ids_in_label_versioned(
+        &self,
+        ids: &[NodeId],
+        epoch: EpochId,
+        transaction_id: TransactionId,
+        _label_id: LabelId,
+    ) -> Vec<NodeId> {
+        self.filter_visible_node_ids_versioned(ids, epoch, transaction_id)
+    }
+
     // --- History ---
 
     /// Returns all versions of a node with their creation/deletion epochs, newest first.
@@ -343,6 +1010,39 @@ pub trait GraphStore: Send + Sync {
     }
 }
 
+/// A predicate that can be answered by a registered property index.
+#[derive(Debug, Clone, Copy)]
+pub enum PropertyIndexPredicate<'a> {
+    /// Match one exact value.
+    Equal(&'a Value),
+    /// Match any value in the supplied set.
+    In(&'a [Value]),
+    /// Match values within the supplied bounds.
+    Range {
+        /// Lower scalar bound, or unbounded.
+        min: Option<&'a Value>,
+        /// Upper scalar bound, or unbounded.
+        max: Option<&'a Value>,
+        /// Includes values equal to the lower bound.
+        min_inclusive: bool,
+        /// Includes values equal to the upper bound.
+        max_inclusive: bool,
+    },
+}
+
+/// A historical property-index lookup request.
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyIndexRequest<'a> {
+    /// Property whose index is queried.
+    pub property: &'a str,
+    /// Predicate to evaluate through the index.
+    pub predicate: PropertyIndexPredicate<'a>,
+    /// Snapshot epoch at which the result must be complete.
+    pub epoch: EpochId,
+    /// Optional writing transaction whose buffered values are visible.
+    pub transaction_id: Option<TransactionId>,
+}
+
 /// Index-backed search capabilities that an LPG store may optionally provide.
 ///
 /// Keeps the base [`GraphStore`] scoped to graph-structure operations. Stores
@@ -358,6 +1058,23 @@ pub trait GraphStore: Send + Sync {
 /// plan, falling back to brute-force internally when the request is valid
 /// but no matching index exists.
 pub trait GraphStoreSearch: GraphStore {
+    /// Looks up nodes through a registered property index.
+    ///
+    /// `Some` is a complete result for the requested historical view;
+    /// `None` means the store has no matching index or cannot provide this
+    /// contract. Implementations must not return a scan disguised as an
+    /// indexed lookup.
+    ///
+    /// # Errors
+    /// Returns a storage or allocation error, or an explicit unsupported-view
+    /// error when the requested historical coverage is no longer available.
+    fn lookup_nodes_indexed(
+        &self,
+        _request: PropertyIndexRequest<'_>,
+    ) -> grafeo_common::utils::error::Result<Option<Vec<NodeId>>> {
+        Ok(None)
+    }
+
     // --- Range scan (lazy) ---
 
     /// Returns a lazy iterator over node ids whose property value falls
@@ -392,6 +1109,26 @@ pub trait GraphStoreSearch: GraphStore {
         false
     }
 
+    /// Returns the labels of every text index registered for the given property.
+    ///
+    /// Iterates all `"label:property"` index keys, splits on the last `':'`,
+    /// and collects the label part for every entry whose property component
+    /// matches `property`.
+    ///
+    /// Used by the Serializable exec-time predicate recorder to record
+    /// `(label, property)` index reads for **every** label that indexes the
+    /// queried property — not just the scan label.  This closes the multi-label
+    /// phantom hole where the scan label (`Tagged`) has no text index on
+    /// `body` but a concurrent insert writes a node labelled `:Article:Tagged`
+    /// whose `Article:body` index write goes undetected.
+    ///
+    /// Default implementation returns `Vec::new()` (no text indexes).
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    fn text_index_labels_for_property(&self, _property: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Scores a single document against a text query for per-row filter evaluation.
     ///
     /// Returns `None` when no text index exists for the (label, property) pair.
@@ -406,6 +1143,40 @@ pub trait GraphStoreSearch: GraphStore {
         _query: &str,
     ) -> Option<f64> {
         None
+    }
+
+    /// Snapshot-aware per-row BM25 score for Serializable transactions.
+    ///
+    /// Records `record_read_index(tx, "label:property")` **before** scoring so
+    /// that even a zero-result per-row predicate evaluation closes the
+    /// rw-antidependency cycle against a concurrent phantom insert.  Scores the
+    /// node using postings visible at `(epoch, tx)` (committed + tx delta) rather
+    /// than committed-latest.
+    ///
+    /// # Default
+    ///
+    /// Returns a structured unsupported-query error. Implementations must
+    /// qualify retained history instead of falling back to committed-latest.
+    ///
+    /// # Errors
+    /// Returns an error when snapshot-aware Text reads are unsupported or the
+    /// requested epoch is outside the index's retained history.
+    #[cfg(feature = "text-index")]
+    fn score_text_visible(
+        &self,
+        _node_id: NodeId,
+        _label: &str,
+        _property: &str,
+        _query: &str,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> grafeo_common::utils::error::Result<Option<f64>> {
+        Err(grafeo_common::utils::error::Error::Query(
+            grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                "snapshot-aware Text scoring is unsupported by this store",
+            ),
+        ))
     }
 
     /// Returns the top-`k` documents by BM25 score for a text query.
@@ -433,6 +1204,71 @@ pub trait GraphStoreSearch: GraphStore {
         _threshold: f64,
     ) -> Vec<(NodeId, f64)> {
         Vec::new()
+    }
+
+    /// Snapshot-aware top-`k` BM25 search for Serializable transactions.
+    ///
+    /// Returns the top-`k` documents visible at `epoch` for `tx`, merging
+    /// the committed index with the per-transaction write delta and recording
+    /// the index read in the SSI read-set so that a concurrent indexed SET on
+    /// the same `(label, property)` can form an rw-antidependency edge.
+    ///
+    /// # Default
+    ///
+    /// Returns a structured unsupported-query error, never committed-latest.
+    ///
+    /// # Errors
+    /// Returns an error when snapshot-aware Text reads are unsupported or the
+    /// requested epoch is outside the index's retained history.
+    #[cfg(feature = "text-index")]
+    fn text_search_visible(
+        &self,
+        _label: &str,
+        _property: &str,
+        _query: &str,
+        _k: usize,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> grafeo_common::utils::error::Result<Vec<(NodeId, f64)>> {
+        Err(grafeo_common::utils::error::Error::Query(
+            grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                "snapshot-aware Text search is unsupported by this store",
+            ),
+        ))
+    }
+
+    /// Snapshot-aware threshold BM25 search for Serializable transactions.
+    ///
+    /// Returns every document visible at `epoch` for `tx` whose BM25 score
+    /// meets or exceeds `threshold`, merging the committed index with the
+    /// per-transaction write delta and recording the index read in the SSI
+    /// read-set so that a concurrent indexed SET on the same `(label, property)`
+    /// can form an rw-antidependency edge.
+    ///
+    /// # Default
+    ///
+    /// Returns a structured unsupported-query error, never committed-latest.
+    ///
+    /// # Errors
+    /// Returns an error when snapshot-aware Text reads are unsupported or the
+    /// requested epoch is outside the index's retained history.
+    #[cfg(feature = "text-index")]
+    fn text_search_with_threshold_visible(
+        &self,
+        _label: &str,
+        _property: &str,
+        _query: &str,
+        _threshold: f64,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> grafeo_common::utils::error::Result<Vec<(NodeId, f64)>> {
+        Err(grafeo_common::utils::error::Error::Query(
+            grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                "snapshot-aware Text threshold search is unsupported by this store",
+            ),
+        ))
     }
 
     // --- Vector search (HNSW or brute force) ---
@@ -487,6 +1323,41 @@ pub trait GraphStoreSearch: GraphStore {
     ) -> Vec<(NodeId, f64)> {
         Vec::new()
     }
+
+    /// Snapshot-aware top-`k` vector search for transactions.
+    ///
+    /// Returns the `k` nearest nodes visible at `epoch` for `tx`, using the
+    /// committed HNSW index for graph-traversal connectivity while scoring each
+    /// candidate with the snapshot-consistent vector (as-of `epoch`, with
+    /// read-your-writes for `tx`'s own uncommitted `SET`s).
+    ///
+    /// Uncommitted vector writes buffered by `tx` on nodes that carry `label`
+    /// are brute-force merged into the result so they appear even before the
+    /// HNSW graph has been updated.
+    ///
+    /// # Default
+    ///
+    /// Delegates to the committed-latest [`vector_search`](Self::vector_search)
+    /// so non-LPG stores (columnar bases, RDF adapters, `LayeredStore` over
+    /// non-LPG) compile and behave unchanged.  LPG stores override this to
+    /// call `LpgStore::vector_search_visible`.
+    ///
+    /// The `label` and `property` form `"label:property"` for the index key.
+    #[cfg(feature = "vector-index")]
+    fn vector_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        _epoch: EpochId,
+        _tx: TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        // Non-LPG fall-through: committed-latest, no snapshot isolation.
+        // An empty label means "any label" (label-less scan) -> search all.
+        let label = if label.is_empty() { None } else { Some(label) };
+        self.vector_search(label, property, query, k, DistanceMetric::Cosine)
+    }
 }
 
 /// Write operations for graph mutation.
@@ -495,6 +1366,23 @@ pub trait GraphStoreSearch: GraphStore {
 /// replicas) can implement only `GraphStore`. Any mutable store is also
 /// readable via the supertrait bound.
 pub trait GraphStoreMut: GraphStoreSearch {
+    /// Retains the exact native store used for LPG transaction publication.
+    ///
+    /// Mutable external backends may expose a stable native store to the
+    /// engine. The target must remain the same for this source's lifetime;
+    /// independently replaceable Layered overlays must return `None`.
+    /// Read-only views cannot call this hook.
+    /// The returned anchor grants no write authority: publication still
+    /// qualifies it against this source's opaque representation under the
+    /// exact held database authority. Managed Layered databases use their
+    /// separately coordinated source/overlay capture, not this external hook.
+    ///
+    /// `None` means this backend does not support native LPG transactions.
+    #[cfg(feature = "lpg")]
+    fn lpg_commit_store(self: Arc<Self>) -> Option<Arc<crate::graph::lpg::LpgStore>> {
+        None
+    }
+
     // --- Node creation ---
 
     /// Creates a new node with the given labels.
@@ -621,6 +1509,136 @@ pub trait GraphStoreMut: GraphStoreSearch {
         self.remove_edge_property(id, key)
     }
 
+    /// Buffers an uncommitted node property write into the transaction's delta.
+    /// Default: falls back to write-through (`set_node_property_versioned`).
+    fn set_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.set_node_property_versioned(id, key, value, transaction_id);
+    }
+    /// Buffers an uncommitted node property removal. Default: write-through.
+    fn remove_node_property_buffered(&self, id: NodeId, key: &str, transaction_id: TransactionId) {
+        self.remove_node_property_versioned(id, key, transaction_id);
+    }
+    /// Buffers an uncommitted edge property write. Default: write-through.
+    fn set_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.set_edge_property_versioned(id, key, value, transaction_id);
+    }
+    /// Buffers an uncommitted edge property removal. Default: write-through.
+    fn remove_edge_property_buffered(&self, id: EdgeId, key: &str, transaction_id: TransactionId) {
+        self.remove_edge_property_versioned(id, key, transaction_id);
+    }
+    /// Promotes a transaction's buffered property delta to the committed store
+    /// (commit). Default: no-op (write-through stores have nothing buffered).
+    fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        let _ = transaction_id;
+    }
+    /// Drops a transaction's buffered property delta (rollback). Default: no-op.
+    fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        let _ = transaction_id;
+    }
+
+    /// Clones a transaction's buffered property delta for savepoint capture.
+    ///
+    /// Default returns an empty (default) snapshot; write-through stores have
+    /// no overlay, so restoring the default is a no-op.
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_snapshot(&self, transaction_id: TransactionId) -> TxDelta {
+        let _ = transaction_id;
+        TxDelta::default()
+    }
+
+    /// Restores a transaction's buffered property delta from a savepoint snapshot.
+    ///
+    /// Default is a no-op; write-through stores have no overlay to restore.
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_restore(&self, transaction_id: TransactionId, snapshot: TxDelta) {
+        let _ = (transaction_id, snapshot);
+    }
+
+    /// Captures transaction-local structural queues for a savepoint.
+    ///
+    /// Write-through stores without deferred MVCC state return an empty token.
+    fn tx_structural_snapshot(&self, transaction_id: TransactionId) -> TxStructuralSnapshot {
+        let _ = transaction_id;
+        TxStructuralSnapshot::default()
+    }
+
+    /// Restores transaction-local structural queues to a savepoint token.
+    ///
+    /// Implementations must remove post-savepoint delete marks as well as
+    /// truncating their bookkeeping lists. A prefix mismatch indicates an
+    /// internal ordering violation and must fail closed. A sealed store must
+    /// also reject the restore unless its owning write authority is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the caller lacks a sealed store's write authority,
+    /// or if the snapshot is not a valid prefix of the current
+    /// transaction-local structural state.
+    fn tx_structural_restore(
+        &self,
+        transaction_id: TransactionId,
+        snapshot: TxStructuralSnapshot,
+    ) -> std::result::Result<(), String> {
+        let _ = (transaction_id, snapshot);
+        Ok(())
+    }
+
+    /// Finalizes PENDING node deletes for a committed transaction: stamps
+    /// `deleted_epoch` PENDING→`commit_epoch` and applies deferred label-index
+    /// and property removal. Default: no-op (non-LPG stores have no pending deletes).
+    fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        let _ = (transaction_id, commit_epoch, node_ids);
+    }
+
+    /// Takes (removes and returns) the pending delete list for a transaction.
+    /// Default: empty vec (non-LPG stores have no pending deletes).
+    fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        let _ = transaction_id;
+        Vec::new()
+    }
+
+    /// Finalizes PENDING edge deletes for a committed transaction: stamps
+    /// `deleted_epoch` PENDING→`commit_epoch` and applies the deferred adjacency
+    /// tombstone, edge-property removal, and live/edge-type count decrements.
+    /// Each tuple is `(src, edge, dst)`. Default: no-op (non-LPG stores have no
+    /// pending edge deletes).
+    fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        let _ = (transaction_id, commit_epoch, edges);
+    }
+
+    /// Takes (removes and returns) the pending edge-delete list for a transaction.
+    /// Each tuple is `(src, edge, dst)`. Default: empty vec (non-LPG stores have
+    /// no pending edge deletes).
+    fn take_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId, NodeId)> {
+        let _ = transaction_id;
+        Vec::new()
+    }
+
     // --- Label mutation ---
 
     /// Adds a label to a node. Returns `true` if the label was new.
@@ -651,6 +1669,24 @@ pub trait GraphStoreMut: GraphStoreSearch {
         _transaction_id: TransactionId,
     ) -> bool {
         self.remove_label(node_id, label)
+    }
+
+    /// Buffers an uncommitted label add into the transaction's delta.
+    ///
+    /// Default: falls back to write-through (`add_label_versioned`). `LpgStore`
+    /// overrides this to buffer the change so other sessions cannot see it until
+    /// the transaction commits.
+    fn add_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        self.add_label_versioned(node_id, label, transaction_id);
+    }
+
+    /// Buffers an uncommitted label remove into the transaction's delta.
+    ///
+    /// Default: falls back to write-through (`remove_label_versioned`). `LpgStore`
+    /// overrides this to buffer the change so other sessions still see the label
+    /// until the transaction commits.
+    fn remove_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        self.remove_label_versioned(node_id, label, transaction_id);
     }
 
     // --- Convenience (with default implementations) ---
@@ -817,6 +1853,66 @@ impl GraphStoreSearch for NullGraphStore {}
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn default_temporal_text_reads_are_structured_unsupported() {
+        use grafeo_common::utils::error::{Error, QueryErrorKind};
+
+        let errors = [
+            NullGraphStore
+                .text_search_visible(
+                    "Doc",
+                    "body",
+                    "",
+                    0,
+                    EpochId::INITIAL,
+                    TransactionId::INVALID,
+                )
+                .map(|_| ()),
+            NullGraphStore
+                .text_search_with_threshold_visible(
+                    "Doc",
+                    "body",
+                    "",
+                    0.0,
+                    EpochId::INITIAL,
+                    TransactionId::INVALID,
+                )
+                .map(|_| ()),
+            NullGraphStore
+                .score_text_visible(
+                    NodeId::INVALID,
+                    "Doc",
+                    "body",
+                    "",
+                    EpochId::INITIAL,
+                    TransactionId::INVALID,
+                )
+                .map(|_| ()),
+        ];
+        for result in errors {
+            assert!(
+                matches!(result, Err(Error::Query(error)) if error.kind == QueryErrorKind::Unsupported)
+            );
+        }
+        assert!(NullGraphStore.text_search("Doc", "body", "", 0).is_empty());
+        assert_eq!(
+            NullGraphStore.score_text(NodeId::INVALID, "Doc", "body", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn default_index_node_preparation_is_structured_unsupported() {
+        use grafeo_common::utils::error::{Error, TransactionError};
+
+        assert!(matches!(
+            NullGraphStore.prepare_index_node_rows(EpochId::INITIAL, None),
+            Err(Error::Transaction(TransactionError::InvalidState(message)))
+                if message == "this graph store does not support final index-row preparation"
+        ));
+    }
 
     #[test]
     fn null_graph_store_point_lookups() {
@@ -1254,6 +2350,13 @@ mod tests {
                 .find(|n| n.id == node_id)
                 .is_some_and(|n| n.remove_label(label))
         }
+    }
+
+    #[cfg(feature = "lpg")]
+    #[test]
+    fn external_mutable_store_has_no_native_commit_target_by_default() {
+        let store: Arc<dyn GraphStoreMut> = Arc::new(TestMutStore::new());
+        assert!(store.lpg_commit_store().is_none());
     }
 
     #[test]

@@ -21,23 +21,20 @@
 //! | Bool | BitVector | 8x |
 
 use crate::codec::CompressionCodec;
-#[cfg(not(feature = "temporal"))]
-use crate::codec::block::DEFAULT_BLOCK_ROWS;
-#[cfg(not(feature = "temporal"))]
-use crate::codec::{CompressedData, DictionaryBuilder, DictionaryEncoding, TypeSpecificCompressor};
 use crate::index::zone_map::ZoneMapEntry;
-#[cfg(not(feature = "temporal"))]
-use arcstr::ArcStr;
-#[cfg(feature = "temporal")]
 use grafeo_common::temporal::VersionLog;
-#[cfg(feature = "temporal")]
 use grafeo_common::types::EpochId;
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey, Value};
 use grafeo_common::utils::hash::FxHashMap;
 use parking_lot::RwLock;
+#[cfg(feature = "lpg")]
+use parking_lot::RwLockWriteGuard;
 use std::cmp::Ordering;
 use std::hash::Hash;
 use std::marker::PhantomData;
+
+#[cfg(feature = "lpg")]
+pub(crate) mod commit;
 
 /// Compression mode for property columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,17 +48,6 @@ pub enum CompressionMode {
     /// Eagerly compress on every flush.
     Eager,
 }
-
-/// Threshold for automatic compression (number of values).
-#[cfg(not(feature = "temporal"))]
-const COMPRESSION_THRESHOLD: usize = 1000;
-
-/// Size of the hot buffer for recent writes (before compression).
-/// Larger buffer (4096) keeps more recent data uncompressed for faster reads.
-/// This trades ~64KB of memory overhead per column for 1.5-2x faster point lookups
-/// on recently-written data.
-#[cfg(not(feature = "temporal"))]
-const HOT_BUFFER_SIZE: usize = 4096;
 
 /// Comparison operators used for zone map predicate checks.
 ///
@@ -127,21 +113,18 @@ impl EntityId for EdgeId {
 /// # Example
 ///
 /// ```
-/// # #[cfg(not(feature = "temporal"))]
-/// # {
 /// use grafeo_core::graph::lpg::PropertyStorage;
-/// use grafeo_common::types::{NodeId, PropertyKey};
+/// use grafeo_common::types::{EpochId, NodeId, PropertyKey};
 ///
 /// let storage = PropertyStorage::new();
 /// let alix = NodeId::new(1);
 ///
-/// storage.set(alix, PropertyKey::new("name"), "Alix".into());
-/// storage.set(alix, PropertyKey::new("age"), 30i64.into());
+/// storage.set(alix, PropertyKey::new("name"), "Alix".into(), EpochId::INITIAL);
+/// storage.set(alix, PropertyKey::new("age"), 30i64.into(), EpochId::INITIAL);
 ///
 /// // Fetch all properties at once
 /// let props = storage.get_all(alix);
 /// assert_eq!(props.len(), 2);
-/// # }
 /// ```
 pub struct PropertyStorage<Id: EntityId = NodeId> {
     /// Map from property key to column.
@@ -152,7 +135,82 @@ pub struct PropertyStorage<Id: EntityId = NodeId> {
     _marker: PhantomData<Id>,
 }
 
+/// Intrinsically paired column postimage; the source retains displaced buffers.
+#[cfg(feature = "lpg")]
+pub(crate) struct PreparedPropertyRestore<'target, 'source, Id: EntityId> {
+    columns: RwLockWriteGuard<'target, FxHashMap<PropertyKey, PropertyColumn<Id>>>,
+    source: &'source mut PropertyStorage<Id>,
+}
+
+#[cfg(feature = "lpg")]
+impl<Id: EntityId> PreparedPropertyRestore<'_, '_, Id> {
+    pub(crate) fn install(&mut self) {
+        std::mem::swap(&mut *self.columns, self.source.columns.get_mut());
+    }
+}
+
+/// Write-locked, allocation-complete physical history removal.
+/// Dropping aborts unchanged; commit only removes already-selected keys.
+#[cfg(feature = "lpg")]
+pub(crate) struct PreparedPropertyHistoryPurge<'a, Id: EntityId> {
+    columns: RwLockWriteGuard<'a, FxHashMap<PropertyKey, PropertyColumn<Id>>>,
+    ids: Vec<Id>,
+}
+
+#[cfg(feature = "lpg")]
+impl<Id: EntityId> PreparedPropertyHistoryPurge<'_, Id> {
+    pub(crate) fn commit(mut self) {
+        for column in self.columns.values_mut() {
+            let mut changed = false;
+            for id in &self.ids {
+                changed |= column.values.remove(id).is_some();
+            }
+            if changed {
+                column.zone_map_dirty = true;
+                column.block_zone_maps.clear();
+            }
+        }
+    }
+}
+
 impl<Id: EntityId> PropertyStorage<Id> {
+    #[cfg(feature = "lpg")]
+    pub(crate) fn is_committed_restore_image(&self, frontier: EpochId) -> bool {
+        self.columns.read().values().all(|column| {
+            column.values.values().all(|history| {
+                history
+                    .iter()
+                    .all(|(epoch, _)| *epoch != EpochId::PENDING && *epoch <= frontier)
+            })
+        })
+    }
+
+    /// Reserves the actual empty column directory, without copying its image.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn prepare_pristine_restore<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedPropertyRestore<'target, 'source, Id>> {
+        let prepared = self.prepare_replacement(source)?;
+        if !prepared.columns.is_empty() {
+            return None;
+        }
+        Some(prepared)
+    }
+
+    /// Retains the actual populated column writer through a complete image swap.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn prepare_replacement<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedPropertyRestore<'target, 'source, Id>> {
+        let columns = self.columns.try_write()?;
+        if self.default_compression != source.default_compression {
+            return None;
+        }
+        Some(PreparedPropertyRestore { columns, source })
+    }
+
     /// Creates a new property storage.
     #[must_use]
     pub fn new() -> Self {
@@ -178,22 +236,10 @@ impl<Id: EntityId> PropertyStorage<Id> {
         self.default_compression = mode;
     }
 
-    /// Sets a property value for an entity.
-    #[cfg(not(feature = "temporal"))]
-    pub fn set(&self, id: Id, key: PropertyKey, value: Value) {
-        let mut columns = self.columns.write();
-        let mode = self.default_compression;
-        columns
-            .entry(key)
-            .or_insert_with(|| PropertyColumn::with_compression(mode))
-            .set(id, value);
-    }
-
     /// Sets a property value for an entity at a specific epoch.
     ///
     /// For non-transactional writes, pass the current epoch.
     /// For transactional writes, pass `EpochId::PENDING`.
-    #[cfg(feature = "temporal")]
     pub fn set(&self, id: Id, key: PropertyKey, value: Value, epoch: EpochId) {
         let mut columns = self.columns.write();
         let mode = self.default_compression;
@@ -201,6 +247,35 @@ impl<Id: EntityId> PropertyStorage<Id> {
             .entry(key)
             .or_insert_with(|| PropertyColumn::with_compression(mode))
             .set(id, value, epoch);
+    }
+
+    /// Applies a batch of property ops under a SINGLE write lock, so a
+    /// concurrent reader (`get_all`/`get_all_at`) observes them atomically —
+    /// all-or-nothing — rather than a half-applied state.
+    ///
+    /// `Some(value)` sets, `None` removes (tombstone at `epoch`). Used by commit
+    /// (`apply_tx_overlay`) to make a transaction's property changes appear
+    /// atomically, which closes the commit torn-read window: a reader can no
+    /// longer slip in between two of a commit's per-property writes.
+    pub fn apply_ops<I>(&self, ops: I, epoch: EpochId)
+    where
+        I: IntoIterator<Item = (Id, PropertyKey, Option<Value>)>,
+    {
+        let mut columns = self.columns.write();
+        let mode = self.default_compression;
+        for (id, key, value) in ops {
+            match value {
+                Some(v) => columns
+                    .entry(key)
+                    .or_insert_with(|| PropertyColumn::with_compression(mode))
+                    .set(id, v, epoch),
+                None => {
+                    if let Some(col) = columns.get_mut(&key) {
+                        col.remove(id, epoch);
+                    }
+                }
+            }
+        }
     }
 
     /// Enables compression for a specific column.
@@ -268,36 +343,61 @@ impl<Id: EntityId> PropertyStorage<Id> {
         columns.get(key).and_then(|col| col.get(id))
     }
 
-    /// Removes a property value for an entity.
-    #[cfg(not(feature = "temporal"))]
-    pub fn remove(&self, id: Id, key: &PropertyKey) -> Option<Value> {
-        let mut columns = self.columns.write();
-        columns.get_mut(key).and_then(|col| col.remove(id))
-    }
-
     /// Removes a property value for an entity (temporal: appends tombstone at epoch).
-    #[cfg(feature = "temporal")]
     pub fn remove(&self, id: Id, key: &PropertyKey, epoch: EpochId) -> Option<Value> {
         let mut columns = self.columns.write();
         columns.get_mut(key).and_then(|col| col.remove(id, epoch))
     }
 
-    /// Removes all properties for an entity.
-    #[cfg(not(feature = "temporal"))]
-    pub fn remove_all(&self, id: Id) {
-        let mut columns = self.columns.write();
-        for col in columns.values_mut() {
-            col.remove(id);
-        }
-    }
-
     /// Removes all properties for an entity (temporal: tombstones at current epoch).
-    #[cfg(feature = "temporal")]
     pub fn remove_all(&self, id: Id, epoch: EpochId) {
         let mut columns = self.columns.write();
         for col in columns.values_mut() {
             col.remove(id, epoch);
         }
+    }
+
+    /// Validates that every selected history is committed at or before
+    /// `boundary`, then prepares an allocation-free physical purge and retains
+    /// the property write guard across representation publication.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn can_purge_all_history(&self, ids: &[Id], boundary: EpochId) -> bool {
+        let columns = self.columns.read();
+        !columns.values().any(|column| {
+            ids.iter().any(|id| {
+                column.values.get(id).is_some_and(|log| {
+                    log.history()
+                        .iter()
+                        .any(|(epoch, _)| *epoch == EpochId::PENDING || *epoch > boundary)
+                })
+            })
+        })
+    }
+
+    /// Revalidates [`Self::can_purge_all_history`] under the retained write
+    /// guard and prepares an allocation-free physical purge.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn prepare_purge_all_history(
+        &self,
+        ids: &[Id],
+        boundary: EpochId,
+    ) -> Option<PreparedPropertyHistoryPurge<'_, Id>> {
+        let columns = self.columns.write();
+        if columns.values().any(|column| {
+            ids.iter().any(|id| {
+                column.values.get(id).is_some_and(|log| {
+                    log.history()
+                        .iter()
+                        .any(|(epoch, _)| *epoch == EpochId::PENDING || *epoch > boundary)
+                })
+            })
+        }) {
+            return None;
+        }
+        Some(PreparedPropertyHistoryPurge {
+            columns,
+            ids: ids.to_vec(),
+        })
     }
 
     /// Gets all properties for an entity.
@@ -455,70 +555,6 @@ impl<Id: EntityId> PropertyStorage<Id> {
         self.columns.write().clear();
     }
 
-    // ── Column-level spill / reload ────────────────────────────────
-
-    /// Evicts all values from a specific property column, freeing heap memory.
-    ///
-    /// Returns `(count, estimated_freed_bytes)`. The column stays registered
-    /// (zone map preserved) but `get()` returns `None` until `restore_column()`.
-    #[cfg(not(feature = "temporal"))]
-    pub fn evict_column(&self, key: &PropertyKey) -> (usize, usize) {
-        let mut columns = self.columns.write();
-        if let Some(column) = columns.get_mut(key) {
-            column.evict_values()
-        } else {
-            (0, 0)
-        }
-    }
-
-    /// Restores values into a previously evicted column.
-    ///
-    /// Clears the `spilled` flag on the column. If the column doesn't exist,
-    /// it is created.
-    #[cfg(not(feature = "temporal"))]
-    pub fn restore_column(&self, key: &PropertyKey, values: impl Iterator<Item = (Id, Value)>) {
-        let mut columns = self.columns.write();
-        let column = columns
-            .entry(key.clone())
-            .or_insert_with(|| PropertyColumn::with_compression(self.default_compression));
-        column.restore_values(values);
-    }
-
-    /// Drains all values from a column, returning them for export to disk.
-    ///
-    /// After this call, `is_column_spilled(key)` returns `true`.
-    /// The column remains registered (zone map preserved).
-    #[cfg(not(feature = "temporal"))]
-    pub fn drain_column(&self, key: &PropertyKey) -> Vec<(Id, Value)> {
-        let mut columns = self.columns.write();
-        if let Some(column) = columns.get_mut(key) {
-            column.drain_values()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Whether a specific column has been spilled to disk.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn is_column_spilled(&self, key: &PropertyKey) -> bool {
-        self.columns
-            .read()
-            .get(key)
-            .is_some_and(|col| col.is_spilled())
-    }
-
-    /// Marks a column as spilled without draining its values.
-    ///
-    /// Used on startup when re-establishing spill state: the column may
-    /// already be empty (loaded from a checkpoint that serialized after spill).
-    #[cfg(not(feature = "temporal"))]
-    pub fn mark_column_spilled(&self, key: &PropertyKey) {
-        let mut columns = self.columns.write();
-        let column = columns.entry(key.clone()).or_default();
-        column.mark_spilled();
-    }
-
     /// Gets a column by key for bulk access.
     #[must_use]
     pub fn column(&self, key: &PropertyKey) -> Option<PropertyColumnRef<'_, Id>> {
@@ -572,52 +608,6 @@ impl<Id: EntityId> PropertyStorage<Id> {
         columns.get(key).map(|col| col.block_zone_maps().to_vec())
     }
 
-    /// Returns the number of compressed blocks for a property column.
-    ///
-    /// Returns `None` when the column doesn't exist; returns `Some(0)` for
-    /// an uncompressed column.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn block_count_for(&self, key: &PropertyKey) -> Option<usize> {
-        self.columns.read().get(key).map(|col| col.block_count())
-    }
-
-    /// Decodes a single compressed block of a property column.
-    ///
-    /// See [`PropertyColumn::decode_block`] for semantics. Returns `None`
-    /// when the column doesn't exist, the column is uncompressed, or
-    /// `block_idx` is out of range.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn decode_block_for(
-        &self,
-        key: &PropertyKey,
-        block_idx: usize,
-    ) -> Option<DecodedBlock<Id>> {
-        self.columns
-            .read()
-            .get(key)
-            .and_then(|col| col.decode_block(block_idx))
-    }
-
-    /// Decodes every compressed block of a property column under a single
-    /// read-lock acquisition, returning them as a `Vec`.
-    ///
-    /// Returns an empty `Vec` when the column doesn't exist or is
-    /// uncompressed. Phase 4's iterator-bounds operator prefers
-    /// [`Self::decode_block_for`] (after pruning by zone map) over
-    /// decoding all blocks up-front; this method exists for tests and
-    /// debug tools that want the whole picture.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn decoded_blocks_for(&self, key: &PropertyKey) -> Vec<DecodedBlock<Id>> {
-        let columns = self.columns.read();
-        match columns.get(key) {
-            Some(col) => col.iter_decoded_blocks().collect(),
-            None => Vec::new(),
-        }
-    }
-
     /// Checks if a range predicate might match any values (using zone maps).
     ///
     /// Returns `false` only when we're *certain* no values match the range.
@@ -633,8 +623,13 @@ impl<Id: EntityId> PropertyStorage<Id> {
     ) -> bool {
         let columns = self.columns.read();
         columns.get(key).map_or(true, |col| {
-            col.zone_map()
-                .might_contain_range(min, max, min_inclusive, max_inclusive)
+            // Prepared publication can move values outside the old bounds or
+            // add a column whose zone map is still empty. Dirty metadata is
+            // not evidence that a range has no matches.
+            col.zone_map_dirty
+                || col
+                    .zone_map()
+                    .might_contain_range(min, max, min_inclusive, max_inclusive)
         }) // No column = assume might match (conservative)
     }
 
@@ -654,13 +649,32 @@ impl<Id: EntityId> Default for PropertyStorage<Id> {
 }
 
 // === Temporal-only methods for PropertyStorage ===
-#[cfg(feature = "temporal")]
 impl<Id: EntityId> PropertyStorage<Id> {
     /// Returns a write guard to the columns map for targeted rollback.
+    #[cfg(feature = "lpg")]
     pub(crate) fn columns_write(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, FxHashMap<PropertyKey, PropertyColumn<Id>>> {
         self.columns.write()
+    }
+
+    /// Physically removes one unpublished identity from every property column.
+    ///
+    /// This rollback-only seam is deliberately single-identity and in-place:
+    /// it performs no receipt allocation and cannot fail, so an unwind guard
+    /// may safely call it while restoring a failed representation promotion.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(crate) fn purge_identity_in_place(&self, id: Id) -> bool {
+        let mut removed = false;
+        let mut columns = self.columns.write();
+        for column in columns.values_mut() {
+            if column.values.remove(&id).is_some() {
+                removed = true;
+                column.zone_map_dirty = true;
+                column.block_zone_maps.clear();
+            }
+        }
+        removed
     }
 
     /// Gets a property value at a specific epoch.
@@ -707,6 +721,28 @@ impl<Id: EntityId> PropertyStorage<Id> {
         }
     }
 
+    /// Drops histories whose committed tombstone is visible at the GC floor.
+    ///
+    /// The caller must have no underlying property layer: an absent history
+    /// must not expose an older base value that this tombstone was masking.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn gc_expired_tombstones(&self, min_epoch: EpochId) {
+        if min_epoch == EpochId::PENDING {
+            return;
+        }
+        let mut columns = self.columns.write();
+        for column in columns.values_mut() {
+            let before = column.values.len();
+            column.values.retain(|_, log| {
+                !matches!(log.latest_entry(), Some((epoch, Value::Null)) if *epoch <= min_epoch)
+            });
+            if column.values.len() != before {
+                column.zone_map_dirty = true;
+                column.block_zone_maps.clear();
+            }
+        }
+    }
+
     /// Returns the full version history for all properties of an entity.
     ///
     /// Each entry is `(key, Vec<(epoch, value)>)`. Useful for snapshot
@@ -742,96 +778,34 @@ impl<Id: EntityId> PropertyStorage<Id> {
             .map(|log| log.history().iter().map(|(e, v)| (*e, v.clone())).collect())
             .unwrap_or_default()
     }
-}
 
-/// Compressed storage for a property column.
-///
-/// Holds the compressed representation of values along with the index
-/// mapping entity IDs to positions in the compressed array.
-#[cfg(not(feature = "temporal"))]
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum CompressedColumnData {
-    /// Compressed integers (Int64 values).
-    Integers {
-        /// Compressed data.
-        data: CompressedData,
-        /// Index: entity ID position -> compressed array index.
-        id_to_index: Vec<u64>,
-        /// Reverse index: compressed array index -> entity ID position.
-        index_to_id: Vec<u64>,
-    },
-    /// Dictionary-encoded strings.
-    Strings {
-        /// Dictionary encoding.
-        encoding: DictionaryEncoding,
-        /// Index: entity ID position -> dictionary index.
-        id_to_index: Vec<u64>,
-        /// Reverse index: dictionary index -> entity ID position.
-        index_to_id: Vec<u64>,
-    },
-    /// Compressed booleans.
-    Booleans {
-        /// Compressed data.
-        data: CompressedData,
-        /// Index: entity ID position -> bit index.
-        id_to_index: Vec<u64>,
-        /// Reverse index: bit index -> entity ID position.
-        index_to_id: Vec<u64>,
-    },
-}
-
-#[cfg(not(feature = "temporal"))]
-impl CompressedColumnData {
-    /// Returns the memory usage of the compressed data in bytes.
-    #[must_use]
-    pub fn memory_usage(&self) -> usize {
-        match self {
-            CompressedColumnData::Integers {
-                data,
-                id_to_index,
-                index_to_id,
-            } => {
-                data.data.len()
-                    + id_to_index.len() * std::mem::size_of::<u64>()
-                    + index_to_id.len() * std::mem::size_of::<u64>()
-            }
-            CompressedColumnData::Strings {
-                encoding,
-                id_to_index,
-                index_to_id,
-            } => {
-                encoding.code_count() * 4
-                    + encoding.dictionary().iter().map(|s| s.len()).sum::<usize>()
-                    + id_to_index.len() * std::mem::size_of::<u64>()
-                    + index_to_id.len() * std::mem::size_of::<u64>()
-            }
-            CompressedColumnData::Booleans {
-                data,
-                id_to_index,
-                index_to_id,
-            } => {
-                data.data.len()
-                    + id_to_index.len() * std::mem::size_of::<u64>()
-                    + index_to_id.len() * std::mem::size_of::<u64>()
-            }
-        }
+    /// Returns the complete version history for every identity in one column.
+    ///
+    /// This is used by detached index rebuilds to enumerate identities whose
+    /// current value is a tombstone or whose node has since been deleted.  It
+    /// intentionally exposes no write guard and performs one column read.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn column_history(&self, key: &PropertyKey) -> Vec<(Id, Vec<(EpochId, Value)>)> {
+        let columns = self.columns.read();
+        columns
+            .get(key)
+            .map(|column| {
+                column
+                    .values
+                    .iter()
+                    .map(|(id, log)| {
+                        (
+                            *id,
+                            log.history()
+                                .iter()
+                                .map(|(epoch, value)| (*epoch, value.clone()))
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
-}
-
-/// A decoded compressed block of `(id, value)` pairs from a property column.
-///
-/// Phase 4's iterator-bounds operator consumes these after pruning via
-/// per-block zone maps. The `entries` are sorted by entity id (matching
-/// the underlying compressed layout).
-#[cfg(not(feature = "temporal"))]
-#[derive(Debug, Clone)]
-pub struct DecodedBlock<Id: EntityId> {
-    /// Per-block min/max/null/row counts populated when the block was
-    /// compressed.
-    pub zone_map: ZoneMapEntry,
-    /// `(id, value)` pairs, sorted by id.
-    pub entries: Vec<(Id, Value)>,
 }
 
 /// Statistics about column compression.
@@ -868,13 +842,8 @@ impl CompressionStats {
 /// is enabled, the column automatically selects the best codec based on the
 /// data type and characteristics.
 pub struct PropertyColumn<Id: EntityId = NodeId> {
-    /// Sparse storage: entity ID -> value (hot buffer + uncompressed).
-    /// Used for recent writes and when compression is disabled.
-    #[cfg(not(feature = "temporal"))]
-    values: FxHashMap<Id, Value>,
     /// Versioned storage: entity ID -> append-only version log.
     /// Each value is tagged with the epoch it was written in.
-    #[cfg(feature = "temporal")]
     values: FxHashMap<Id, VersionLog<Value>>,
     /// Zone map tracking min/max/null_count for predicate pushdown.
     zone_map: ZoneMapEntry,
@@ -882,18 +851,6 @@ pub struct PropertyColumn<Id: EntityId = NodeId> {
     zone_map_dirty: bool,
     /// Compression mode for this column.
     compression_mode: CompressionMode,
-    /// Compressed data (when compression is enabled and triggered).
-    #[cfg(not(feature = "temporal"))]
-    compressed: Option<CompressedColumnData>,
-    /// Number of values before last compression.
-    #[cfg(not(feature = "temporal"))]
-    compressed_count: usize,
-    /// Whether this column's values have been spilled to disk.
-    /// When true, `get()` returns `None` for all IDs. The column remains
-    /// registered so the schema knows the property exists, but values are
-    /// served from a mmap-backed store instead.
-    #[cfg(not(feature = "temporal"))]
-    spilled: bool,
     /// Per-block zone maps populated when the column is compressed.
     ///
     /// Each entry covers a contiguous slice of `DEFAULT_BLOCK_ROWS` rows of
@@ -902,680 +859,6 @@ pub struct PropertyColumn<Id: EntityId = NodeId> {
     /// pruning would be meaningless). Phase 4 consumes these for lazy
     /// `range_iter`-style scans.
     block_zone_maps: Vec<ZoneMapEntry>,
-}
-
-#[cfg(not(feature = "temporal"))]
-impl<Id: EntityId> PropertyColumn<Id> {
-    /// Creates a new empty column.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            values: FxHashMap::default(),
-            zone_map: ZoneMapEntry::new(),
-            zone_map_dirty: false,
-            compression_mode: CompressionMode::None,
-            compressed: None,
-            compressed_count: 0,
-            spilled: false,
-            block_zone_maps: Vec::new(),
-        }
-    }
-
-    /// Creates a new column with the specified compression mode.
-    #[must_use]
-    pub fn with_compression(mode: CompressionMode) -> Self {
-        Self {
-            values: FxHashMap::default(),
-            zone_map: ZoneMapEntry::new(),
-            zone_map_dirty: false,
-            compression_mode: mode,
-            compressed: None,
-            compressed_count: 0,
-            spilled: false,
-            block_zone_maps: Vec::new(),
-        }
-    }
-
-    /// Sets the compression mode for this column.
-    pub fn set_compression_mode(&mut self, mode: CompressionMode) {
-        self.compression_mode = mode;
-        if mode == CompressionMode::None {
-            // Decompress if switching to no compression
-            if self.compressed.is_some() {
-                self.decompress_all();
-            }
-        }
-    }
-
-    /// Returns the compression mode for this column.
-    #[must_use]
-    pub fn compression_mode(&self) -> CompressionMode {
-        self.compression_mode
-    }
-
-    /// Sets a value for an entity.
-    pub fn set(&mut self, id: Id, value: Value) {
-        // Update zone map incrementally
-        self.update_zone_map_on_insert(&value);
-        self.values.insert(id, value);
-
-        // Check if we should compress (in Auto mode)
-        if self.compression_mode == CompressionMode::Auto {
-            let total_count = self.values.len() + self.compressed_count;
-            let hot_buffer_count = self.values.len();
-
-            // Compress when hot buffer exceeds threshold and total is large enough
-            if hot_buffer_count >= HOT_BUFFER_SIZE && total_count >= COMPRESSION_THRESHOLD {
-                self.compress();
-            }
-        }
-    }
-
-    /// Updates zone map when inserting a value.
-    fn update_zone_map_on_insert(&mut self, value: &Value) {
-        self.zone_map.row_count += 1;
-
-        if matches!(value, Value::Null) {
-            self.zone_map.null_count += 1;
-            return;
-        }
-
-        // Update min
-        match &self.zone_map.min {
-            None => self.zone_map.min = Some(value.clone()),
-            Some(current) => {
-                if compare_values(value, current) == Some(Ordering::Less) {
-                    self.zone_map.min = Some(value.clone());
-                }
-            }
-        }
-
-        // Update max
-        match &self.zone_map.max {
-            None => self.zone_map.max = Some(value.clone()),
-            Some(current) => {
-                if compare_values(value, current) == Some(Ordering::Greater) {
-                    self.zone_map.max = Some(value.clone());
-                }
-            }
-        }
-    }
-
-    /// Gets a value for an entity.
-    ///
-    /// First checks the hot buffer (uncompressed values), then falls back
-    /// to the compressed data if present.
-    #[must_use]
-    pub fn get(&self, id: Id) -> Option<Value> {
-        // First check hot buffer
-        if let Some(value) = self.values.get(&id) {
-            return Some(value.clone());
-        }
-
-        // For now, compressed data lookup is not implemented for sparse access
-        // because the compressed format stores values by index, not by entity ID.
-        // This would require maintaining an ID -> index map in CompressedColumnData.
-        // The compressed data is primarily useful for bulk/scan operations.
-        None
-    }
-
-    /// Removes a value for an entity.
-    pub fn remove(&mut self, id: Id) -> Option<Value> {
-        let removed = self.values.remove(&id);
-        if removed.is_some() {
-            // Mark zone map as dirty - would need full rebuild for accurate min/max
-            self.zone_map_dirty = true;
-        }
-        removed
-    }
-
-    // ── Spill / Reload ─────────────────────────────────────────────
-
-    /// Marks the column as spilled without clearing values.
-    ///
-    /// Used on startup when re-establishing spill state from persisted files.
-    pub fn mark_spilled(&mut self) {
-        self.spilled = true;
-    }
-
-    /// Whether this column's values have been spilled to disk.
-    ///
-    /// When spilled, `get()` returns `None` and values are served from an
-    /// external mmap-backed store. New writes still go into this column
-    /// (the accessor checks both).
-    #[must_use]
-    pub fn is_spilled(&self) -> bool {
-        self.spilled
-    }
-
-    /// Evicts all values from this column, freeing their heap memory.
-    ///
-    /// Returns `(count, estimated_freed_bytes)`. After this call,
-    /// `is_spilled()` returns `true` and `get()` returns `None` for all IDs.
-    /// The column remains registered in the schema (zone map, compression
-    /// metadata are preserved).
-    pub fn evict_values(&mut self) -> (usize, usize) {
-        let count = self.values.len();
-        let freed_bytes = self.heap_memory_bytes();
-        self.values.clear();
-        self.values.shrink_to_fit();
-        self.compressed = None;
-        self.compressed_count = 0;
-        self.block_zone_maps.clear();
-        self.spilled = true;
-        (count, freed_bytes)
-    }
-
-    /// Drains all values from this column, returning them for export.
-    ///
-    /// After this call, `is_spilled()` returns `true`. This combines
-    /// export + evict in one step to avoid cloning all values.
-    pub fn drain_values(&mut self) -> Vec<(Id, Value)> {
-        let drained: Vec<(Id, Value)> = self.values.drain().collect();
-        self.values.shrink_to_fit();
-        self.compressed = None;
-        self.compressed_count = 0;
-        self.block_zone_maps.clear();
-        self.spilled = true;
-        drained
-    }
-
-    /// Restores values into this column after a reload from disk.
-    ///
-    /// Clears the `spilled` flag. Callers are responsible for providing
-    /// the correct values (from `MmapStorage::export_all()` or similar).
-    pub fn restore_values(&mut self, values: impl Iterator<Item = (Id, Value)>) {
-        self.spilled = false;
-        // Insert directly into the map without calling set(), which would
-        // re-increment zone map counters (row_count, null_count) on top of
-        // the already-preserved zone map from before eviction.
-        for (id, value) in values {
-            self.values.insert(id, value);
-        }
-    }
-
-    /// Returns the number of values in this column (hot + compressed).
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.values.len() + self.compressed_count
-    }
-
-    /// Returns true if this column is empty.
-    #[cfg(test)]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.compressed_count == 0
-    }
-
-    /// Returns compression statistics for this column.
-    #[must_use]
-    pub fn compression_stats(&self) -> CompressionStats {
-        let hot_size = self.values.len() * std::mem::size_of::<Value>();
-        let compressed_size = self.compressed.as_ref().map_or(0, |c| c.memory_usage());
-        let codec = match &self.compressed {
-            Some(CompressedColumnData::Integers { data, .. }) => Some(data.codec),
-            Some(CompressedColumnData::Strings { .. }) => Some(CompressionCodec::Dictionary),
-            Some(CompressedColumnData::Booleans { data, .. }) => Some(data.codec),
-            None => None,
-        };
-
-        CompressionStats {
-            uncompressed_size: hot_size + self.compressed_count * std::mem::size_of::<Value>(),
-            compressed_size: hot_size + compressed_size,
-            value_count: self.len(),
-            codec,
-        }
-    }
-
-    /// Returns estimated heap memory for this column.
-    ///
-    /// Includes the hot buffer hash map capacity, zone map, and any
-    /// compressed data.
-    #[must_use]
-    pub fn heap_memory_bytes(&self) -> usize {
-        // Hot buffer: FxHashMap<Id, Value> capacity
-        let hot_bytes =
-            self.values.capacity() * (std::mem::size_of::<Id>() + std::mem::size_of::<Value>() + 1);
-        // Compressed data
-        let compressed_bytes = self.compressed.as_ref().map_or(0, |c| c.memory_usage());
-        // ZoneMapEntry is inline (no heap), so just hot + compressed
-        hot_bytes + compressed_bytes
-    }
-
-    /// Returns whether the column has compressed data.
-    #[must_use]
-    #[cfg(test)]
-    pub fn is_compressed(&self) -> bool {
-        self.compressed.is_some()
-    }
-
-    /// Compresses the hot buffer values.
-    ///
-    /// This merges the hot buffer into the compressed data, selecting the
-    /// best codec based on the value types.
-    ///
-    /// Note: If compressed data already exists, this is a no-op to avoid
-    /// losing previously compressed values. Use `force_compress()` after
-    /// decompressing to re-compress with all values.
-    pub fn compress(&mut self) {
-        if self.values.is_empty() {
-            return;
-        }
-
-        // Don't re-compress if we already have compressed data
-        // (would need to decompress and merge first)
-        if self.compressed.is_some() {
-            return;
-        }
-
-        // Determine the dominant type
-        let (int_count, str_count, bool_count) = self.count_types();
-        let total = self.values.len();
-
-        if int_count > total / 2 {
-            self.compress_as_integers();
-        } else if str_count > total / 2 {
-            self.compress_as_strings();
-        } else if bool_count > total / 2 {
-            self.compress_as_booleans();
-        }
-        // If no dominant type, don't compress (mixed types don't compress well)
-    }
-
-    /// Counts values by type.
-    fn count_types(&self) -> (usize, usize, usize) {
-        let mut int_count = 0;
-        let mut str_count = 0;
-        let mut bool_count = 0;
-
-        for value in self.values.values() {
-            match value {
-                Value::Int64(_) => int_count += 1,
-                Value::String(_) => str_count += 1,
-                Value::Bool(_) => bool_count += 1,
-                _ => {}
-            }
-        }
-
-        (int_count, str_count, bool_count)
-    }
-
-    /// Compresses integer values.
-    fn compress_as_integers(&mut self) {
-        // Extract integer values and their IDs
-        let mut values: Vec<(u64, i64)> = Vec::new();
-        let mut non_int_values: FxHashMap<Id, Value> = FxHashMap::default();
-
-        for (&id, value) in &self.values {
-            match value {
-                Value::Int64(v) => {
-                    let id_u64 = id.as_u64();
-                    values.push((id_u64, *v));
-                }
-                _ => {
-                    non_int_values.insert(id, value.clone());
-                }
-            }
-        }
-
-        if values.len() < 8 {
-            // Not worth compressing
-            return;
-        }
-
-        // Sort by ID for better compression
-        values.sort_by_key(|(id, _)| *id);
-
-        let id_to_index: Vec<u64> = values.iter().map(|(id, _)| *id).collect();
-        let index_to_id: Vec<u64> = id_to_index.clone();
-        let int_values: Vec<i64> = values.iter().map(|(_, v)| *v).collect();
-
-        // Compress using the optimal codec
-        let Ok(compressed) = TypeSpecificCompressor::compress_signed_integers(&int_values) else {
-            return;
-        };
-
-        // Only use compression if it actually saves space
-        if compressed.compression_ratio() > 1.2 {
-            self.block_zone_maps =
-                compute_block_zone_maps(int_values.iter().map(|v| Value::Int64(*v)));
-            self.compressed = Some(CompressedColumnData::Integers {
-                data: compressed,
-                id_to_index,
-                index_to_id,
-            });
-            self.compressed_count = values.len();
-            self.values = non_int_values;
-        }
-    }
-
-    /// Compresses string values using dictionary encoding.
-    fn compress_as_strings(&mut self) {
-        let mut values: Vec<(u64, ArcStr)> = Vec::new();
-        let mut non_str_values: FxHashMap<Id, Value> = FxHashMap::default();
-
-        for (&id, value) in &self.values {
-            match value {
-                Value::String(s) => {
-                    values.push((id.as_u64(), s.clone()));
-                }
-                _ => {
-                    non_str_values.insert(id, value.clone());
-                }
-            }
-        }
-
-        if values.len() < 8 {
-            return;
-        }
-
-        // Sort by ID
-        values.sort_by_key(|(id, _)| *id);
-
-        let id_to_index: Vec<u64> = values.iter().map(|(id, _)| *id).collect();
-        let index_to_id: Vec<u64> = id_to_index.clone();
-
-        // Build dictionary
-        let mut builder = DictionaryBuilder::new();
-        for (_, s) in &values {
-            builder.add(s.as_ref());
-        }
-        let encoding = builder.build();
-
-        // Only use compression if it actually saves space
-        if encoding.compression_ratio() > 1.2 {
-            self.block_zone_maps =
-                compute_block_zone_maps(values.iter().map(|(_, s)| Value::String(s.clone())));
-            self.compressed = Some(CompressedColumnData::Strings {
-                encoding,
-                id_to_index,
-                index_to_id,
-            });
-            self.compressed_count = values.len();
-            self.values = non_str_values;
-        }
-    }
-
-    /// Compresses boolean values.
-    fn compress_as_booleans(&mut self) {
-        let mut values: Vec<(u64, bool)> = Vec::new();
-        let mut non_bool_values: FxHashMap<Id, Value> = FxHashMap::default();
-
-        for (&id, value) in &self.values {
-            match value {
-                Value::Bool(b) => {
-                    values.push((id.as_u64(), *b));
-                }
-                _ => {
-                    non_bool_values.insert(id, value.clone());
-                }
-            }
-        }
-
-        if values.len() < 8 {
-            return;
-        }
-
-        // Sort by ID
-        values.sort_by_key(|(id, _)| *id);
-
-        let id_to_index: Vec<u64> = values.iter().map(|(id, _)| *id).collect();
-        let index_to_id: Vec<u64> = id_to_index.clone();
-        let bool_values: Vec<bool> = values.iter().map(|(_, v)| *v).collect();
-
-        let Ok(compressed) = TypeSpecificCompressor::compress_booleans(&bool_values) else {
-            return;
-        };
-
-        // Booleans always compress well (8x)
-        self.block_zone_maps = compute_block_zone_maps(bool_values.iter().map(|b| Value::Bool(*b)));
-        self.compressed = Some(CompressedColumnData::Booleans {
-            data: compressed,
-            id_to_index,
-            index_to_id,
-        });
-        self.compressed_count = values.len();
-        self.values = non_bool_values;
-    }
-
-    /// Decompresses all values back to the hot buffer.
-    fn decompress_all(&mut self) {
-        let Some(compressed) = self.compressed.take() else {
-            return;
-        };
-
-        match compressed {
-            CompressedColumnData::Integers {
-                data, index_to_id, ..
-            } => {
-                if let Ok(values) = TypeSpecificCompressor::decompress_integers(&data) {
-                    // Convert back to signed using zigzag decoding
-                    let signed: Vec<i64> = values
-                        .iter()
-                        .map(|&v| crate::codec::zigzag_decode(v))
-                        .collect();
-
-                    for (i, id_u64) in index_to_id.iter().enumerate() {
-                        if let Some(&value) = signed.get(i) {
-                            let id = Id::from_u64(*id_u64);
-                            self.values.insert(id, Value::Int64(value));
-                        }
-                    }
-                }
-            }
-            CompressedColumnData::Strings {
-                encoding,
-                index_to_id,
-                ..
-            } => {
-                for (i, id_u64) in index_to_id.iter().enumerate() {
-                    if let Some(s) = encoding.get(i) {
-                        let id = Id::from_u64(*id_u64);
-                        self.values.insert(id, Value::String(ArcStr::from(s)));
-                    }
-                }
-            }
-            CompressedColumnData::Booleans {
-                data, index_to_id, ..
-            } => {
-                if let Ok(values) = TypeSpecificCompressor::decompress_booleans(&data) {
-                    for (i, id_u64) in index_to_id.iter().enumerate() {
-                        if let Some(&value) = values.get(i) {
-                            let id = Id::from_u64(*id_u64);
-                            self.values.insert(id, Value::Bool(value));
-                        }
-                    }
-                }
-            }
-        }
-
-        self.compressed_count = 0;
-        self.block_zone_maps.clear();
-    }
-
-    /// Forces compression regardless of thresholds.
-    ///
-    /// Useful for bulk loading or when you know the column is complete.
-    pub fn force_compress(&mut self) {
-        self.compress();
-    }
-
-    /// Returns the zone map for this column.
-    #[must_use]
-    pub fn zone_map(&self) -> &ZoneMapEntry {
-        &self.zone_map
-    }
-
-    /// Returns the per-block zone maps populated when the column was
-    /// compressed.
-    ///
-    /// Each entry covers a contiguous slice of `DEFAULT_BLOCK_ROWS` rows
-    /// of the sorted compressed array. Returns an empty slice when the
-    /// column is uncompressed (the hot buffer is unordered, so per-block
-    /// pruning would be meaningless). Phase 4 consumes these for lazy
-    /// `range_iter`-style scans.
-    #[must_use]
-    pub fn block_zone_maps(&self) -> &[ZoneMapEntry] {
-        &self.block_zone_maps
-    }
-
-    /// Returns the number of compressed blocks. Equal to
-    /// `block_zone_maps().len()`. Returns 0 for uncompressed columns.
-    #[must_use]
-    pub fn block_count(&self) -> usize {
-        self.block_zone_maps.len()
-    }
-
-    /// Decodes a single compressed block into `(id, value)` pairs.
-    ///
-    /// Returns `None` when the column is uncompressed or when `block_idx`
-    /// is out of range. The block contains exactly the rows that
-    /// [`block_zone_maps`](Self::block_zone_maps) at the same index
-    /// describes (`row_count` entries).
-    ///
-    /// **Today** the implementation decodes the full compressed array
-    /// once and slices the result; both calls are O(N). When Phase 5/6
-    /// makes blocks independently decodable on-disk, the API contract
-    /// stays the same and the implementation becomes per-block.
-    #[must_use]
-    pub fn decode_block(&self, block_idx: usize) -> Option<DecodedBlock<Id>> {
-        let zone_map = self.block_zone_maps.get(block_idx)?.clone();
-        let compressed = self.compressed.as_ref()?;
-
-        let block_size = DEFAULT_BLOCK_ROWS as usize;
-        let start = block_idx * block_size;
-        let end = match self.compressed_count.min(start + block_size) {
-            // Bounds-check: the last block may be short.
-            n if n > start => n,
-            _ => return None,
-        };
-
-        let entries = match compressed {
-            CompressedColumnData::Integers {
-                data, index_to_id, ..
-            } => {
-                let raw = TypeSpecificCompressor::decompress_integers(data).ok()?;
-                let signed: Vec<i64> = raw
-                    .iter()
-                    .map(|&v| crate::codec::zigzag_decode(v))
-                    .collect();
-                index_to_id
-                    .iter()
-                    .zip(signed.iter())
-                    .skip(start)
-                    .take(end - start)
-                    .map(|(&id_u64, &value)| (Id::from_u64(id_u64), Value::Int64(value)))
-                    .collect()
-            }
-            CompressedColumnData::Strings {
-                encoding,
-                index_to_id,
-                ..
-            } => index_to_id
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(end - start)
-                .filter_map(|(i, &id_u64)| {
-                    encoding
-                        .get(i)
-                        .map(|s| (Id::from_u64(id_u64), Value::String(ArcStr::from(s))))
-                })
-                .collect(),
-            CompressedColumnData::Booleans {
-                data, index_to_id, ..
-            } => {
-                let raw = TypeSpecificCompressor::decompress_booleans(data).ok()?;
-                index_to_id
-                    .iter()
-                    .zip(raw.iter())
-                    .skip(start)
-                    .take(end - start)
-                    .map(|(&id_u64, &value)| (Id::from_u64(id_u64), Value::Bool(value)))
-                    .collect()
-            }
-        };
-
-        Some(DecodedBlock { zone_map, entries })
-    }
-
-    /// Iterates all compressed blocks, decoding each in turn.
-    ///
-    /// Empty for uncompressed columns. Phase 4's iterator-bounds operator
-    /// will prefer `decode_block(idx)` after pruning via
-    /// [`block_zone_maps`](Self::block_zone_maps); this iterator is the
-    /// "decode everything" fallback.
-    pub fn iter_decoded_blocks(&self) -> impl Iterator<Item = DecodedBlock<Id>> + '_ {
-        (0..self.block_count()).filter_map(|idx| self.decode_block(idx))
-    }
-
-    /// Uses zone map to check if any values could satisfy the predicate.
-    ///
-    /// Returns `false` when we can prove no values match (so the column
-    /// can be skipped entirely). Returns `true` if values might match.
-    #[must_use]
-    pub fn might_match(&self, op: CompareOp, value: &Value) -> bool {
-        if self.zone_map_dirty {
-            // Conservative: can't skip if zone map is stale
-            return true;
-        }
-
-        match op {
-            CompareOp::Eq => self.zone_map.might_contain_equal(value),
-            CompareOp::Ne => {
-                // Can only skip if all values are equal to the value
-                // (which means min == max == value)
-                match (&self.zone_map.min, &self.zone_map.max) {
-                    (Some(min), Some(max)) => {
-                        !(compare_values(min, value) == Some(Ordering::Equal)
-                            && compare_values(max, value) == Some(Ordering::Equal))
-                    }
-                    _ => true,
-                }
-            }
-            CompareOp::Lt => self.zone_map.might_contain_less_than(value, false),
-            CompareOp::Le => self.zone_map.might_contain_less_than(value, true),
-            CompareOp::Gt => self.zone_map.might_contain_greater_than(value, false),
-            CompareOp::Ge => self.zone_map.might_contain_greater_than(value, true),
-        }
-    }
-
-    /// Rebuilds zone map from current values.
-    pub fn rebuild_zone_map(&mut self) {
-        let mut zone_map = ZoneMapEntry::new();
-
-        for value in self.values.values() {
-            zone_map.row_count += 1;
-
-            if matches!(value, Value::Null) {
-                zone_map.null_count += 1;
-                continue;
-            }
-
-            // Update min
-            match &zone_map.min {
-                None => zone_map.min = Some(value.clone()),
-                Some(current) => {
-                    if compare_values(value, current) == Some(Ordering::Less) {
-                        zone_map.min = Some(value.clone());
-                    }
-                }
-            }
-
-            // Update max
-            match &zone_map.max {
-                None => zone_map.max = Some(value.clone()),
-                Some(current) => {
-                    if compare_values(value, current) == Some(Ordering::Greater) {
-                        zone_map.max = Some(value.clone());
-                    }
-                }
-            }
-        }
-
-        self.zone_map = zone_map;
-        self.zone_map_dirty = false;
-    }
 }
 
 // === Temporal implementation: VersionLog-backed property column ===
@@ -1591,7 +874,6 @@ impl<Id: EntityId> PropertyColumn<Id> {
 // (DeltaBitPacked, Dictionary, BitVector) operate on flat `FxHashMap<Id, Value>`
 // arrays, not `FxHashMap<Id, VersionLog<Value>>`. Per-epoch compression is a
 // potential future optimization.
-#[cfg(feature = "temporal")]
 impl<Id: EntityId> PropertyColumn<Id> {
     /// Creates a new empty column.
     #[must_use]
@@ -1846,6 +1128,7 @@ impl<Id: EntityId> PropertyColumn<Id> {
     }
 
     /// Removes PENDING entries for a specific entity (targeted rollback).
+    #[cfg(feature = "lpg")]
     pub fn remove_pending_for(&mut self, id: Id) {
         if let Some(log) = self.values.get_mut(&id) {
             log.remove_pending();
@@ -1859,6 +1142,7 @@ impl<Id: EntityId> PropertyColumn<Id> {
     ///
     /// Used by savepoint rollback to pop only the entries added after the
     /// savepoint, leaving earlier PENDING entries intact.
+    #[cfg(feature = "lpg")]
     pub fn pop_n_pending_for(&mut self, id: Id, n: usize) {
         if let Some(log) = self.values.get_mut(&id) {
             log.pop_n_pending(n);
@@ -1867,66 +1151,6 @@ impl<Id: EntityId> PropertyColumn<Id> {
             }
         }
     }
-}
-
-/// Computes per-block zone maps for a sorted column by chunking the values
-/// into blocks of [`DEFAULT_BLOCK_ROWS`] rows.
-///
-/// Used by `compress_as_*` to populate `PropertyColumn::block_zone_maps`.
-/// The values must already be in the order in which they will be stored
-/// (sorted by entity id today). Each block records min/max/null/row counts;
-/// `Float64` and other variants without a defined `Ord` impl skip min/max
-/// updates and contribute only to row/null counts (matching the column-
-/// level zone map's behavior).
-#[cfg(not(feature = "temporal"))]
-fn compute_block_zone_maps(values: impl IntoIterator<Item = Value>) -> Vec<ZoneMapEntry> {
-    let block_size = DEFAULT_BLOCK_ROWS as usize;
-    let mut blocks: Vec<ZoneMapEntry> = Vec::new();
-    let mut current = ZoneMapEntry::new();
-    let mut current_rows: usize = 0;
-
-    for value in values {
-        if current_rows == block_size {
-            blocks.push(current);
-            current = ZoneMapEntry::new();
-            current_rows = 0;
-        }
-        current.row_count += 1;
-        current_rows += 1;
-
-        if matches!(value, Value::Null) {
-            current.null_count += 1;
-            continue;
-        }
-
-        // Reflexive-comparison guard: only seed/update min/max with values
-        // that have a defined ordering against themselves. This filters out
-        // `Float64(NaN)` (and any future variant whose `compare_values` arm
-        // returns `None`) so a NaN can never poison the running min/max.
-        if compare_values(&value, &value) != Some(Ordering::Equal) {
-            continue;
-        }
-
-        let is_less_than_min = match &current.min {
-            None => true,
-            Some(existing) => compare_values(&value, existing) == Some(Ordering::Less),
-        };
-        let is_greater_than_max = match &current.max {
-            None => true,
-            Some(existing) => compare_values(&value, existing) == Some(Ordering::Greater),
-        };
-        if is_less_than_min {
-            current.min = Some(value.clone());
-        }
-        if is_greater_than_max {
-            current.max = Some(value);
-        }
-    }
-
-    if current_rows > 0 {
-        blocks.push(current);
-    }
-    blocks
 }
 
 /// Compares two values for ordering.
@@ -1960,640 +1184,80 @@ pub struct PropertyColumnRef<'a, Id: EntityId = NodeId> {
     _marker: PhantomData<Id>,
 }
 
-#[cfg(test)]
-#[cfg(not(feature = "temporal"))]
-mod tests {
+#[cfg(all(test, feature = "lpg"))]
+mod gc_tests {
     use super::*;
-    use arcstr::ArcStr;
 
     #[test]
-    fn test_property_storage_basic() {
-        let storage = PropertyStorage::new();
-
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
-        let name_key = PropertyKey::new("name");
-        let age_key = PropertyKey::new("age");
-
-        storage.set(node1, name_key.clone(), "Alix".into());
-        storage.set(node1, age_key.clone(), 30i64.into());
-        storage.set(node2, name_key.clone(), "Gus".into());
-
-        assert_eq!(
-            storage.get(node1, &name_key),
-            Some(Value::String("Alix".into()))
-        );
-        assert_eq!(storage.get(node1, &age_key), Some(Value::Int64(30)));
-        assert_eq!(
-            storage.get(node2, &name_key),
-            Some(Value::String("Gus".into()))
-        );
-        assert!(storage.get(node2, &age_key).is_none());
-    }
-
-    #[test]
-    fn test_property_storage_remove() {
-        let storage = PropertyStorage::new();
-
-        let node = NodeId::new(1);
-        let key = PropertyKey::new("name");
-
-        storage.set(node, key.clone(), "Alix".into());
-        assert!(storage.get(node, &key).is_some());
-
-        let removed = storage.remove(node, &key);
-        assert!(removed.is_some());
-        assert!(storage.get(node, &key).is_none());
-    }
-
-    #[test]
-    fn test_property_storage_get_all() {
-        let storage = PropertyStorage::new();
-
-        let node = NodeId::new(1);
-        storage.set(node, PropertyKey::new("name"), "Alix".into());
-        storage.set(node, PropertyKey::new("age"), 30i64.into());
-        storage.set(node, PropertyKey::new("active"), true.into());
-
-        let props = storage.get_all(node);
-        assert_eq!(props.len(), 3);
-    }
-
-    #[test]
-    fn test_property_storage_remove_all() {
-        let storage = PropertyStorage::new();
-
-        let node = NodeId::new(1);
-        storage.set(node, PropertyKey::new("name"), "Alix".into());
-        storage.set(node, PropertyKey::new("age"), 30i64.into());
-
-        storage.remove_all(node);
-
-        assert!(storage.get(node, &PropertyKey::new("name")).is_none());
-        assert!(storage.get(node, &PropertyKey::new("age")).is_none());
-    }
-
-    #[test]
-    fn test_property_column() {
-        let mut col = PropertyColumn::new();
-
-        col.set(NodeId::new(1), "Alix".into());
-        col.set(NodeId::new(2), "Gus".into());
-
-        assert_eq!(col.len(), 2);
-        assert!(!col.is_empty());
-
-        assert_eq!(col.get(NodeId::new(1)), Some(Value::String("Alix".into())));
-
-        col.remove(NodeId::new(1));
-        assert!(col.get(NodeId::new(1)).is_none());
-        assert_eq!(col.len(), 1);
-    }
-
-    #[test]
-    fn test_compression_mode() {
-        let col: PropertyColumn<NodeId> = PropertyColumn::new();
-        assert_eq!(col.compression_mode(), CompressionMode::None);
-
-        let col: PropertyColumn<NodeId> = PropertyColumn::with_compression(CompressionMode::Auto);
-        assert_eq!(col.compression_mode(), CompressionMode::Auto);
-    }
-
-    #[test]
-    fn test_property_storage_with_compression() {
-        let storage = PropertyStorage::with_compression(CompressionMode::Auto);
-
-        for i in 0u64..100 {
-            let age = 20 + i64::try_from(i % 50).unwrap();
-            storage.set(NodeId::new(i), PropertyKey::new("age"), Value::Int64(age));
-        }
-
-        // Values should still be readable
-        assert_eq!(
-            storage.get(NodeId::new(0), &PropertyKey::new("age")),
-            Some(Value::Int64(20))
-        );
-        assert_eq!(
-            storage.get(NodeId::new(50), &PropertyKey::new("age")),
-            Some(Value::Int64(20))
-        );
-    }
-
-    #[test]
-    fn test_compress_integer_column() {
-        let mut col: PropertyColumn<NodeId> =
-            PropertyColumn::with_compression(CompressionMode::Auto);
-
-        // Add many sequential integers
-        for i in 0u64..2000 {
-            col.set(
-                NodeId::new(i),
-                Value::Int64(1000 + i64::try_from(i).unwrap()),
-            );
-        }
-
-        // Should have triggered compression at some point
-        // Total count should include both compressed and hot buffer values
-        let stats = col.compression_stats();
-        assert_eq!(stats.value_count, 2000);
-
-        // Values from the hot buffer should be readable
-        // Note: Compressed values are not accessible via get() - see design note
-        let last_value = col.get(NodeId::new(1999));
-        assert!(last_value.is_some() || col.is_compressed());
-    }
-
-    #[test]
-    fn test_compress_string_column() {
-        let mut col: PropertyColumn<NodeId> =
-            PropertyColumn::with_compression(CompressionMode::Auto);
-
-        // Add repeated strings (good for dictionary compression)
-        let categories = ["Person", "Company", "Product", "Location"];
-        for i in 0..2000 {
-            let cat = categories[i % 4];
-            col.set(NodeId::new(i as u64), Value::String(ArcStr::from(cat)));
-        }
-
-        // Total count should be correct
-        assert_eq!(col.len(), 2000);
-
-        // Late values should be in hot buffer and readable
-        let last_value = col.get(NodeId::new(1999));
-        assert!(last_value.is_some() || col.is_compressed());
-    }
-
-    #[test]
-    fn test_compress_boolean_column() {
-        let mut col: PropertyColumn<NodeId> =
-            PropertyColumn::with_compression(CompressionMode::Auto);
-
-        // Add booleans
-        for i in 0u64..2000 {
-            col.set(NodeId::new(i), Value::Bool(i % 2 == 0));
-        }
-
-        // Verify total count
-        assert_eq!(col.len(), 2000);
-
-        // Late values should be readable
-        let last_value = col.get(NodeId::new(1999));
-        assert!(last_value.is_some() || col.is_compressed());
-    }
-
-    #[test]
-    fn test_force_compress() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-
-        // Add fewer values than the threshold
-        for i in 0u64..100 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-
-        // Force compression
-        col.force_compress();
-
-        // Stats should show compression was applied if beneficial
-        let stats = col.compression_stats();
-        assert_eq!(stats.value_count, 100);
-    }
-
-    #[test]
-    fn test_compression_stats() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-
-        for i in 0u64..50 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-
-        let stats = col.compression_stats();
-        assert_eq!(stats.value_count, 50);
-        assert!(stats.uncompressed_size > 0);
-    }
-
-    #[test]
-    fn test_storage_compression_stats() {
-        let storage = PropertyStorage::with_compression(CompressionMode::Auto);
-
-        for i in 0u64..100 {
+    fn expired_tombstones_respect_floor_pending_and_live_values() {
+        let storage = PropertyStorage::<NodeId>::new();
+        let key = PropertyKey::new("value");
+        for id in 0..4 {
             storage.set(
-                NodeId::new(i),
-                PropertyKey::new("age"),
-                Value::Int64(i64::try_from(i).unwrap()),
-            );
-            storage.set(
-                NodeId::new(i),
-                PropertyKey::new("name"),
-                Value::String(ArcStr::from("Alix")),
+                NodeId::new(id),
+                key.clone(),
+                Value::Int64(7),
+                EpochId::new(1),
             );
         }
+        storage.remove(NodeId::new(0), &key, EpochId::new(5));
+        storage.remove(NodeId::new(1), &key, EpochId::new(6));
+        storage.remove(NodeId::new(2), &key, EpochId::PENDING);
 
-        let stats = storage.compression_stats();
-        assert_eq!(stats.len(), 2); // Two columns
-        assert!(stats.contains_key(&PropertyKey::new("age")));
-        assert!(stats.contains_key(&PropertyKey::new("name")));
-    }
-
-    #[test]
-    fn test_memory_usage() {
-        let storage = PropertyStorage::new();
-
-        for i in 0u64..100 {
-            storage.set(
-                NodeId::new(i),
-                PropertyKey::new("value"),
-                Value::Int64(i64::try_from(i).unwrap()),
+        storage.gc_expired_tombstones(EpochId::PENDING);
+        storage.gc_expired_tombstones(EpochId::new(4));
+        for id in 0..4 {
+            assert_eq!(
+                storage.get_at(NodeId::new(id), &key, EpochId::new(4)),
+                Some(Value::Int64(7))
             );
         }
-
-        let usage = storage.memory_usage();
-        assert!(usage > 0);
-    }
-
-    #[test]
-    fn test_get_batch_single_property() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
-        let node3 = NodeId::new(3);
-        let age_key = PropertyKey::new("age");
-
-        storage.set(node1, age_key.clone(), 25i64.into());
-        storage.set(node2, age_key.clone(), 30i64.into());
-        // node3 has no age property
-
-        let ids = vec![node1, node2, node3];
-        let values = storage.get_batch(&ids, &age_key);
-
-        assert_eq!(values.len(), 3);
-        assert_eq!(values[0], Some(Value::Int64(25)));
-        assert_eq!(values[1], Some(Value::Int64(30)));
-        assert_eq!(values[2], None);
-    }
-
-    #[test]
-    fn test_get_batch_missing_column() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
-        let missing_key = PropertyKey::new("nonexistent");
-
-        let ids = vec![node1, node2];
-        let values = storage.get_batch(&ids, &missing_key);
-
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0], None);
-        assert_eq!(values[1], None);
-    }
-
-    #[test]
-    fn test_get_batch_empty_ids() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-        let key = PropertyKey::new("any");
-
-        let values = storage.get_batch(&[], &key);
-        assert!(values.is_empty());
-    }
-
-    #[test]
-    fn test_get_all_batch() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
-        let node3 = NodeId::new(3);
-
-        storage.set(node1, PropertyKey::new("name"), "Alix".into());
-        storage.set(node1, PropertyKey::new("age"), 25i64.into());
-        storage.set(node2, PropertyKey::new("name"), "Gus".into());
-        // node3 has no properties
-
-        let ids = vec![node1, node2, node3];
-        let all_props = storage.get_all_batch(&ids);
-
-        assert_eq!(all_props.len(), 3);
-        assert_eq!(all_props[0].len(), 2); // name and age
-        assert_eq!(all_props[1].len(), 1); // name only
-        assert_eq!(all_props[2].len(), 0); // no properties
-
+        storage.gc_expired_tombstones(EpochId::new(5));
+        assert!(storage.get_history(NodeId::new(0), &key).is_empty());
         assert_eq!(
-            all_props[0].get(&PropertyKey::new("name")),
-            Some(&Value::String("Alix".into()))
+            storage.get_at(NodeId::new(1), &key, EpochId::new(5)),
+            Some(Value::Int64(7))
         );
         assert_eq!(
-            all_props[1].get(&PropertyKey::new("name")),
-            Some(&Value::String("Gus".into()))
+            storage.get_at(NodeId::new(2), &key, EpochId::new(5)),
+            Some(Value::Int64(7))
         );
-    }
-
-    #[test]
-    fn test_get_all_batch_empty_ids() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-
-        let all_props = storage.get_all_batch(&[]);
-        assert!(all_props.is_empty());
-    }
-
-    // ── Phase 2d: per-block zone maps ─────────────────────────────────
-
-    #[test]
-    fn test_block_zone_maps_empty_for_uncompressed_column() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..50 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        assert!(col.block_zone_maps().is_empty());
-    }
-
-    #[test]
-    fn test_block_zone_maps_integer_compressed() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        // 2500 sequential integers → 1024 + 1024 + 452 = 3 blocks at default size
-        for i in 0u64..2500 {
-            col.set(
-                NodeId::new(i),
-                Value::Int64(1000 + i64::try_from(i).unwrap()),
-            );
-        }
-        col.force_compress();
-
-        let blocks = col.block_zone_maps();
-        assert_eq!(blocks.len(), 3, "2500 rows / 1024 = 3 blocks");
-
-        assert_eq!(blocks[0].row_count, 1024);
-        assert_eq!(blocks[0].min, Some(Value::Int64(1000)));
-        assert_eq!(blocks[0].max, Some(Value::Int64(2023)));
-
-        assert_eq!(blocks[1].row_count, 1024);
-        assert_eq!(blocks[1].min, Some(Value::Int64(2024)));
-        assert_eq!(blocks[1].max, Some(Value::Int64(3047)));
-
-        assert_eq!(blocks[2].row_count, 452);
-        assert_eq!(blocks[2].min, Some(Value::Int64(3048)));
-        assert_eq!(blocks[2].max, Some(Value::Int64(3499)));
-    }
-
-    #[test]
-    fn test_block_zone_maps_string_compressed() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        // Low-cardinality cycle (good for dictionary compression). Every
-        // block contains all four strings, so per-block min/max match the
-        // overall range, but row counts still segment into 1024+1024+rest.
-        let strings = ["alpha", "bravo", "charlie", "delta"];
-        for i in 0u64..2500 {
-            col.set(
-                NodeId::new(i),
-                Value::String(ArcStr::from(strings[(i % 4) as usize])),
-            );
-        }
-        col.force_compress();
-
-        let blocks = col.block_zone_maps();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].row_count, 1024);
-        assert_eq!(blocks[1].row_count, 1024);
-        assert_eq!(blocks[2].row_count, 452);
-        for block in blocks {
-            assert_eq!(block.min, Some(Value::String(ArcStr::from("alpha"))));
-            assert_eq!(block.max, Some(Value::String(ArcStr::from("delta"))));
-        }
-    }
-
-    #[test]
-    fn test_block_zone_maps_boolean_compressed() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        // 2500 alternating bools sorted by id: every block contains both true and false.
-        for i in 0u64..2500 {
-            col.set(NodeId::new(i), Value::Bool(i % 2 == 0));
-        }
-        col.force_compress();
-
-        let blocks = col.block_zone_maps();
-        assert_eq!(blocks.len(), 3);
-        for block in blocks {
-            assert_eq!(block.min, Some(Value::Bool(false)));
-            assert_eq!(block.max, Some(Value::Bool(true)));
-            assert_eq!(block.null_count, 0);
-        }
-    }
-
-    #[test]
-    fn test_block_zone_maps_cleared_after_evict() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        col.force_compress();
-        assert!(!col.block_zone_maps().is_empty());
-
-        col.evict_values();
-        assert!(
-            col.block_zone_maps().is_empty(),
-            "evict drops compressed data, so per-block stats must reset"
+        assert_eq!(storage.get(NodeId::new(3), &key), Some(Value::Int64(7)));
+        storage.gc_expired_tombstones(EpochId::new(6));
+        assert!(storage.get_history(NodeId::new(1), &key).is_empty());
+        assert_eq!(storage.get_history(NodeId::new(2), &key).len(), 2);
+        storage.set(
+            NodeId::new(0),
+            key.clone(),
+            Value::Int64(9),
+            EpochId::new(7),
         );
+        assert_eq!(storage.get(NodeId::new(0), &key), Some(Value::Int64(9)));
     }
+}
+
+#[cfg(all(test, feature = "lpg", feature = "compact-store"))]
+mod rollback_tests {
+    use super::*;
 
     #[test]
-    fn test_block_might_match_prunes_disjoint_range() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(
-                NodeId::new(i),
-                Value::Int64(1000 + i64::try_from(i).unwrap()),
-            );
-        }
-        col.force_compress();
-
-        // Block 0 covers values 1000..=2023; querying for 5000 must prune all blocks.
-        let target = Value::Int64(5000);
-        let blocks = col.block_zone_maps();
-        let any_match = blocks.iter().any(|zm| zm.might_contain_equal(&target));
-        assert!(!any_match, "no block should claim to contain 5000");
-    }
-
-    #[test]
-    fn test_storage_block_zone_maps_for_returns_blocks() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-        for i in 0u64..2500 {
-            storage.set(
-                NodeId::new(i),
-                PropertyKey::new("age"),
-                Value::Int64(20 + i64::try_from(i).unwrap()),
-            );
-        }
-        storage.force_compress_all();
-
-        let blocks = storage
-            .block_zone_maps_for(&PropertyKey::new("age"))
-            .expect("compressed column must expose block stats");
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].min, Some(Value::Int64(20)));
-        assert_eq!(blocks.last().unwrap().max, Some(Value::Int64(2519)));
-    }
-
-    #[test]
-    fn test_storage_block_zone_maps_for_missing_column_returns_none() {
-        let storage: PropertyStorage<NodeId> = PropertyStorage::new();
-        assert!(
-            storage
-                .block_zone_maps_for(&PropertyKey::new("missing"))
-                .is_none()
+    fn in_place_identity_purge_removes_all_history_and_preserves_other_rows() {
+        let storage = PropertyStorage::<NodeId>::new();
+        let removed = NodeId::new(41);
+        let retained = NodeId::new(42);
+        let key = PropertyKey::new("proof");
+        storage.set(removed, key.clone(), Value::from("old"), EpochId::new(1));
+        storage.set(removed, key.clone(), Value::from("new"), EpochId::new(2));
+        storage.set(
+            retained,
+            key.clone(),
+            Value::from("retained"),
+            EpochId::new(1),
         );
-    }
 
-    #[test]
-    fn test_compute_block_zone_maps_float64_finite_min_max() {
-        // Direct test of the helper: Float64 isn't dispatched by compress_as_*
-        // today, but the helper must handle Float64 correctly so a future
-        // compression path can feed Float64 streams without a behavior change.
-        let values: Vec<Value> = (0u32..2500)
-            .map(|i| Value::Float64(f64::from(i) * 0.5))
-            .collect();
-        let blocks = compute_block_zone_maps(values);
-
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].row_count, 1024);
-        assert_eq!(blocks[0].min, Some(Value::Float64(0.0)));
-        assert_eq!(blocks[0].max, Some(Value::Float64(1023.0 * 0.5)));
-        assert_eq!(blocks[1].min, Some(Value::Float64(1024.0 * 0.5)));
-    }
-
-    // ── Phase 2e: vectorized batch decoders ──────────────────────────
-
-    #[test]
-    fn test_block_count_zero_for_uncompressed_column() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..50 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        assert_eq!(col.block_count(), 0);
-    }
-
-    #[test]
-    fn test_block_count_matches_zone_maps_after_compression() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        col.force_compress();
-        assert_eq!(col.block_count(), col.block_zone_maps().len());
-        assert_eq!(col.block_count(), 3);
-    }
-
-    #[test]
-    fn test_decode_block_returns_correct_pairs_integer() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(
-                NodeId::new(i),
-                Value::Int64(1000 + i64::try_from(i).unwrap()),
-            );
-        }
-        col.force_compress();
-
-        let block0 = col.decode_block(0).expect("block 0 must exist");
-        assert_eq!(block0.entries.len(), 1024);
-        assert_eq!(block0.entries[0], (NodeId::new(0), Value::Int64(1000)));
-        assert_eq!(
-            block0.entries[1023],
-            (NodeId::new(1023), Value::Int64(2023))
-        );
-        assert_eq!(block0.zone_map.row_count, 1024);
-
-        let block2 = col.decode_block(2).expect("block 2 must exist");
-        assert_eq!(block2.entries.len(), 452);
-        assert_eq!(block2.entries[0], (NodeId::new(2048), Value::Int64(3048)));
-    }
-
-    #[test]
-    fn test_decode_block_returns_correct_pairs_boolean() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(NodeId::new(i), Value::Bool(i % 2 == 0));
-        }
-        col.force_compress();
-
-        let block0 = col.decode_block(0).expect("block 0 must exist");
-        assert_eq!(block0.entries.len(), 1024);
-        assert_eq!(block0.entries[0], (NodeId::new(0), Value::Bool(true)));
-        assert_eq!(block0.entries[1], (NodeId::new(1), Value::Bool(false)));
-    }
-
-    #[test]
-    fn test_decode_block_returns_correct_pairs_string() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        let strings = ["alpha", "bravo", "charlie", "delta"];
-        for i in 0u64..2500 {
-            col.set(
-                NodeId::new(i),
-                Value::String(ArcStr::from(strings[(i % 4) as usize])),
-            );
-        }
-        col.force_compress();
-
-        let block0 = col.decode_block(0).expect("block 0 must exist");
-        assert_eq!(block0.entries.len(), 1024);
-        assert_eq!(
-            block0.entries[0],
-            (NodeId::new(0), Value::String(ArcStr::from("alpha")))
-        );
-        assert_eq!(
-            block0.entries[3],
-            (NodeId::new(3), Value::String(ArcStr::from("delta")))
-        );
-    }
-
-    #[test]
-    fn test_decode_block_out_of_range_returns_none() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        col.force_compress();
-
-        assert!(col.decode_block(99).is_none());
-    }
-
-    #[test]
-    fn test_decode_block_uncompressed_returns_none() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..50 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        // No force_compress — column is uncompressed.
-        assert!(col.decode_block(0).is_none());
-    }
-
-    #[test]
-    fn test_iter_decoded_blocks_yields_all_blocks() {
-        let mut col: PropertyColumn<NodeId> = PropertyColumn::new();
-        for i in 0u64..2500 {
-            col.set(NodeId::new(i), Value::Int64(i64::try_from(i).unwrap()));
-        }
-        col.force_compress();
-
-        let blocks: Vec<_> = col.iter_decoded_blocks().collect();
-        assert_eq!(blocks.len(), 3);
-        let total_rows: usize = blocks.iter().map(|b| b.entries.len()).sum();
-        assert_eq!(total_rows, 2500);
-    }
-
-    #[test]
-    fn test_compute_block_zone_maps_float64_nan_does_not_poison() {
-        // NaN must never seed or displace min/max: comparisons against NaN
-        // return None, which would otherwise leave min/max permanently
-        // unrecoverable. Reflexive-comparison guard catches this.
-        let mut values: Vec<Value> = vec![Value::Float64(f64::NAN)];
-        values.extend((0u32..50).map(|i| Value::Float64(f64::from(i))));
-        values.push(Value::Float64(f64::NAN));
-
-        let blocks = compute_block_zone_maps(values);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].row_count, 52, "NaN values still count as rows");
-        assert_eq!(blocks[0].null_count, 0, "NaN is not null");
-        assert_eq!(blocks[0].min, Some(Value::Float64(0.0)));
-        assert_eq!(blocks[0].max, Some(Value::Float64(49.0)));
+        assert!(storage.purge_identity_in_place(removed));
+        assert!(storage.get_history(removed, &key).is_empty());
+        assert_eq!(storage.get(retained, &key), Some(Value::from("retained")));
+        assert!(!storage.purge_identity_in_place(removed));
     }
 }

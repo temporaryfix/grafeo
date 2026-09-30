@@ -12,6 +12,7 @@ impl LpgStore {
     /// inconsistent if mutations are in progress.
     #[must_use]
     pub fn memory_breakdown(&self) -> (StoreMemory, IndexMemory, MvccMemory, StringPoolMemory) {
+        let _read = self.pin_read();
         let store = self.store_memory();
         let (mvcc, _) = self.mvcc_memory();
         let indexes = self.index_memory();
@@ -155,16 +156,6 @@ impl LpgStore {
 
         // Node labels
         let node_labels = self.node_labels.read();
-        #[cfg(not(feature = "temporal"))]
-        let node_labels_bytes = node_labels.capacity()
-            * (size_of::<grafeo_common::types::NodeId>()
-                + size_of::<grafeo_common::utils::hash::FxHashSet<u32>>()
-                + 1)
-            + node_labels
-                .values()
-                .map(|set| set.capacity() * (size_of::<u32>() + 1))
-                .sum::<usize>();
-        #[cfg(feature = "temporal")]
         let node_labels_bytes = node_labels.capacity()
             * (size_of::<grafeo_common::types::NodeId>()
                 + size_of::<

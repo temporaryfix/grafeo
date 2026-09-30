@@ -13,7 +13,10 @@
 
 pub mod lpg;
 pub mod projection;
+pub mod snapshot_view;
 pub mod traits;
+pub mod work_counters;
+pub mod write_permit;
 
 #[cfg(feature = "compact-store")]
 pub mod compact;
@@ -22,7 +25,12 @@ pub mod compact;
 pub mod rdf;
 
 pub use projection::{GraphProjection, ProjectionSpec};
-pub use traits::{GraphStore, GraphStoreMut, GraphStoreSearch, NullGraphStore};
+pub use snapshot_view::SnapshotView;
+pub use traits::{
+    GraphStore, GraphStoreMut, GraphStoreSearch, NullGraphStore, PropertyIndexPredicate,
+    PropertyIndexRequest, TxStructuralSnapshot,
+};
+pub use work_counters::{WorkCounters, WorkSnapshot};
 
 /// Controls which edges to follow during traversal.
 ///

@@ -10,10 +10,31 @@
 //! - **Compression** - cold chunks can be compressed using DeltaBitPacked
 
 use crate::codec::{BitPackedInts, DeltaBitPacked};
+#[cfg(all(feature = "lpg", feature = "compact-store"))]
+use grafeo_common::memory::AllocError;
 use grafeo_common::types::{EdgeId, NodeId};
 use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
+#[cfg(feature = "lpg")]
+use parking_lot::RwLockWriteGuard;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(all(test, feature = "lpg"))]
+std::thread_local! {
+    static LAST_EDGE_BUFFER: std::cell::Cell<Option<(usize, usize, usize)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, feature = "lpg"))]
+pub(crate) fn take_edge_buffer_capture() -> Option<(usize, usize, usize)> {
+    LAST_EDGE_BUFFER.with(|capture| capture.replace(None))
+}
+
+#[cfg(feature = "lpg")]
+mod commit;
+#[cfg(feature = "lpg")]
+pub(crate) use commit::{AdjacencyCommitWorkspace, AdjacencyDataGuards};
 
 /// Default chunk capacity (number of edges per chunk).
 const DEFAULT_CHUNK_CAPACITY: usize = 64;
@@ -266,6 +287,40 @@ impl AdjacencyList {
         self.deleted.insert(edge_id);
     }
 
+    /// Builds the complete replacement for a qualified physical purge without
+    /// changing this list. Every allocation occurs here, before publication.
+    #[cfg(feature = "lpg")]
+    fn prepare_purge_edges(
+        &self,
+        edge_ids: &FxHashSet<EdgeId>,
+        chunk_capacity: usize,
+    ) -> Option<Self> {
+        let mut retained = Vec::with_capacity(self.physical_count());
+        let mut counts: FxHashMap<EdgeId, usize> = FxHashMap::default();
+        for entry @ (_, candidate) in self.iter_including_deleted() {
+            if edge_ids.contains(&candidate) {
+                *counts.entry(candidate).or_default() += 1;
+            } else {
+                retained.push(entry);
+            }
+        }
+        if edge_ids
+            .iter()
+            .any(|edge_id| !self.deleted.contains(edge_id) || counts.get(edge_id) != Some(&1))
+        {
+            return None;
+        }
+
+        let mut replacement = Self::new();
+        let mut deleted = self.deleted.clone();
+        deleted.retain(|edge_id| !edge_ids.contains(edge_id));
+        for (dst, retained_id) in retained {
+            replacement.add_edge(dst, retained_id, chunk_capacity);
+        }
+        replacement.deleted = deleted;
+        Some(replacement)
+    }
+
     fn compact(&mut self, chunk_capacity: usize) {
         if self.delta_inserts.is_empty() {
             return;
@@ -364,6 +419,20 @@ impl AdjacencyList {
             .chain(hot_iter)
             .chain(delta_iter)
             .filter(move |(_, edge_id)| !deleted.contains(edge_id))
+    }
+
+    /// Like `iter()` but includes soft-deleted entries.
+    ///
+    /// Used by snapshot-aware traversal: an edge deleted *after* a transaction's
+    /// snapshot start must still be visible to that snapshot.  The soft-delete
+    /// tombstone in `deleted` is applied at commit time, so simply skipping the
+    /// filter lets the MVCC version chain (consulted by `is_edge_visible_versioned`)
+    /// make the correct per-snapshot decision.
+    fn iter_including_deleted(&self) -> impl Iterator<Item = (NodeId, EdgeId)> + '_ {
+        let cold_iter = self.cold_chunks.iter().flat_map(|c| c.iter());
+        let hot_iter = self.hot_chunks.iter().flat_map(|c| c.iter());
+        let delta_iter = self.delta_inserts.iter().copied();
+        cold_iter.chain(hot_iter).chain(delta_iter)
     }
 
     /// Checks whether a specific destination node exists in this list.
@@ -481,6 +550,14 @@ impl AdjacencyList {
         self.cold_chunks.iter().map(|c| c.len()).sum()
     }
 
+    /// Returns the number of physical entries across hot, delta, and cold
+    /// storage. In particular, this must not treat a rebuilt low-degree list
+    /// whose retained entries are still in the delta buffer as empty.
+    #[cfg(feature = "lpg")]
+    fn physical_count(&self) -> usize {
+        self.hot_count() + self.cold_count()
+    }
+
     /// Returns the approximate memory size in bytes.
     #[cfg(test)]
     fn memory_size(&self) -> usize {
@@ -537,9 +614,203 @@ pub struct ChunkedAdjacency {
     edge_count: AtomicUsize,
     /// Number of deleted edges.
     deleted_count: AtomicUsize,
+    /// Test-only proof that transport batch qualification visits each affected
+    /// adjacency list a constant number of times rather than once per edge.
+    #[cfg(all(test, feature = "lpg"))]
+    transport_list_scans: AtomicUsize,
+    /// Test-only count of physical list rebuilds during transport purge.
+    #[cfg(all(test, feature = "lpg"))]
+    transport_list_rebuilds: AtomicUsize,
+}
+
+/// Paired complete adjacency image with retirement owned by the source.
+#[cfg(feature = "lpg")]
+pub(crate) struct PreparedAdjacencyRestore<'target, 'source> {
+    target: &'target ChunkedAdjacency,
+    lists: RwLockWriteGuard<'target, FxHashMap<NodeId, AdjacencyList>>,
+    source: &'source mut ChunkedAdjacency,
+}
+
+#[cfg(feature = "lpg")]
+impl PreparedAdjacencyRestore<'_, '_> {
+    pub(crate) fn install(&mut self) {
+        std::mem::swap(&mut *self.lists, self.source.lists.get_mut());
+        let edges = self.source.edge_count.load(Ordering::Relaxed);
+        let deleted = self.source.deleted_count.load(Ordering::Relaxed);
+        let old_edges = self.target.edge_count.swap(edges, Ordering::AcqRel);
+        let old_deleted = self.target.deleted_count.swap(deleted, Ordering::AcqRel);
+        self.source.edge_count.store(old_edges, Ordering::Relaxed);
+        self.source
+            .deleted_count
+            .store(old_deleted, Ordering::Relaxed);
+    }
+}
+
+/// Unwind-atomic publication of one private compact-promotion edge.
+///
+/// The write guard prevents compaction or retained aliases from moving the
+/// new entry while graph property replay remains private. All capacity is
+/// reserved before publication. Drop removes the exact delta entry and
+/// reverses its counter only if that counter step completed.
+#[cfg(all(feature = "lpg", feature = "compact-store"))]
+#[must_use = "private adjacency publication must be committed after graph routing"]
+pub(crate) struct AdjacencyUnpublishedMutation<'a> {
+    owner: &'a ChunkedAdjacency,
+    lists: RwLockWriteGuard<'a, FxHashMap<NodeId, AdjacencyList>>,
+    src: NodeId,
+    edge_id: EdgeId,
+    prepared_list: Option<AdjacencyList>,
+    state: AdjacencyPublicationState,
+}
+
+#[cfg(all(feature = "lpg", feature = "compact-store"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdjacencyPublicationState {
+    Prepared,
+    PublishingExisting,
+    PublishingNew,
+    CountedExisting,
+    CountedNew,
+    Committed,
+}
+
+#[cfg(all(feature = "lpg", feature = "compact-store"))]
+impl AdjacencyUnpublishedMutation<'_> {
+    fn publish_inner(&mut self, dst: NodeId, after_physical: impl FnOnce()) {
+        if self.state != AdjacencyPublicationState::Prepared {
+            return;
+        }
+        // Arm physical rollback before the first infallible write so even an
+        // injected post-write panic is covered.
+        let publishes_new_list = self.prepared_list.is_some();
+        self.state = if publishes_new_list {
+            AdjacencyPublicationState::PublishingNew
+        } else {
+            AdjacencyPublicationState::PublishingExisting
+        };
+        if let Some(mut list) = self.prepared_list.take() {
+            list.delta_inserts.push((dst, self.edge_id));
+            self.lists.insert(self.src, list);
+        } else if let Some(list) = self.lists.get_mut(&self.src) {
+            list.delta_inserts.push((dst, self.edge_id));
+        }
+        after_physical();
+        self.owner.edge_count.fetch_add(1, Ordering::Relaxed);
+        self.state = if publishes_new_list {
+            AdjacencyPublicationState::CountedNew
+        } else {
+            AdjacencyPublicationState::CountedExisting
+        };
+    }
+
+    pub(crate) fn publish(&mut self, dst: NodeId) {
+        self.publish_inner(dst, || {});
+    }
+
+    #[cfg(test)]
+    fn publish_with_hook(&mut self, dst: NodeId, after_physical: impl FnOnce()) {
+        self.publish_inner(dst, after_physical);
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.state = AdjacencyPublicationState::Committed;
+    }
+}
+
+#[cfg(all(feature = "lpg", feature = "compact-store"))]
+impl Drop for AdjacencyUnpublishedMutation<'_> {
+    fn drop(&mut self) {
+        let (inserted_new_list, counted) = match self.state {
+            AdjacencyPublicationState::Prepared | AdjacencyPublicationState::Committed => return,
+            AdjacencyPublicationState::PublishingExisting => (false, false),
+            AdjacencyPublicationState::PublishingNew => (true, false),
+            AdjacencyPublicationState::CountedExisting => (false, true),
+            AdjacencyPublicationState::CountedNew => (true, true),
+        };
+        if let Some(list) = self.lists.get_mut(&self.src) {
+            list.delta_inserts
+                .retain(|(_, candidate)| *candidate != self.edge_id);
+        }
+        if inserted_new_list
+            && self
+                .lists
+                .get(&self.src)
+                .is_some_and(|list| list.physical_count() == 0)
+        {
+            self.lists.remove(&self.src);
+        }
+        if counted {
+            self.owner.edge_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Fully allocated, write-locked adjacency replacement for one purge batch.
+/// Dropping it aborts without mutation; `commit` only swaps/removes entries and
+/// updates counters, with no allocation or user-controlled code.
+#[cfg(feature = "lpg")]
+pub(crate) struct PreparedAdjacencyPurge<'a> {
+    owner: &'a ChunkedAdjacency,
+    lists: RwLockWriteGuard<'a, FxHashMap<NodeId, AdjacencyList>>,
+    replacements: Vec<(NodeId, AdjacencyList)>,
+    removed: usize,
+}
+
+#[cfg(feature = "lpg")]
+impl PreparedAdjacencyPurge<'_> {
+    pub(crate) fn commit(mut self) {
+        for (src, replacement) in self.replacements.drain(..) {
+            if replacement.physical_count() == 0 {
+                self.lists.remove(&src);
+            } else {
+                // The key already exists under this retained write guard, so
+                // replacement cannot grow/reallocate the hash table.
+                drop(self.lists.insert(src, replacement));
+            }
+        }
+        self.owner
+            .edge_count
+            .fetch_sub(self.removed, Ordering::Relaxed);
+        self.owner
+            .deleted_count
+            .fetch_sub(self.removed, Ordering::Relaxed);
+    }
 }
 
 impl ChunkedAdjacency {
+    /// Acquires an empty target without waiting beneath another final writer.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn prepare_pristine_restore<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedAdjacencyRestore<'target, 'source>> {
+        let prepared = self.prepare_replacement(source)?;
+        if !prepared.lists.is_empty()
+            || self.edge_count.load(Ordering::Acquire) != 0
+            || self.deleted_count.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        Some(prepared)
+    }
+
+    /// Retains the populated directory while its complete backing is replaced.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn prepare_replacement<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedAdjacencyRestore<'target, 'source>> {
+        let lists = self.lists.try_write()?;
+        if self.chunk_capacity != source.chunk_capacity {
+            return None;
+        }
+        Some(PreparedAdjacencyRestore {
+            target: self,
+            lists,
+            source,
+        })
+    }
+
     /// Creates a new chunked adjacency structure.
     #[must_use]
     pub fn new() -> Self {
@@ -554,7 +825,52 @@ impl ChunkedAdjacency {
             chunk_capacity: capacity,
             edge_count: AtomicUsize::new(0),
             deleted_count: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "lpg"))]
+            transport_list_scans: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "lpg"))]
+            transport_list_rebuilds: AtomicUsize::new(0),
         }
+    }
+
+    /// Prepares an allocation-complete, exact private edge publication.
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    pub(crate) fn begin_unpublished_edge(
+        &self,
+        src: NodeId,
+        edge_id: EdgeId,
+    ) -> Result<Option<AdjacencyUnpublishedMutation<'_>>, AllocError> {
+        let mut lists = self.lists.write();
+        if let Some(list) = lists.get(&src)
+            && list
+                .iter_including_deleted()
+                .any(|(_, candidate)| candidate == edge_id)
+        {
+            return Ok(None);
+        }
+
+        let prepared_list = if let Some(list) = lists.get_mut(&src) {
+            list.delta_inserts
+                .try_reserve(1)
+                .map_err(|_| AllocError::InsufficientSpace)?;
+            None
+        } else {
+            lists
+                .try_reserve(1)
+                .map_err(|_| AllocError::InsufficientSpace)?;
+            let mut list = AdjacencyList::new();
+            list.delta_inserts
+                .try_reserve(1)
+                .map_err(|_| AllocError::InsufficientSpace)?;
+            Some(list)
+        };
+        Ok(Some(AdjacencyUnpublishedMutation {
+            owner: self,
+            lists,
+            src,
+            edge_id,
+            prepared_list,
+            state: AdjacencyPublicationState::Prepared,
+        }))
     }
 
     /// Adds an edge from src to dst.
@@ -626,6 +942,112 @@ impl ChunkedAdjacency {
         }
     }
 
+    /// Allocates and validates a physical purge while retaining the adjacency
+    /// write guard. No list or counter changes until [`PreparedAdjacencyPurge::commit`].
+    #[cfg(feature = "lpg")]
+    pub(crate) fn prepare_purge_edges(
+        &self,
+        edges: &[(NodeId, EdgeId)],
+    ) -> Option<PreparedAdjacencyPurge<'_>> {
+        if edges.is_empty() {
+            return Some(PreparedAdjacencyPurge {
+                owner: self,
+                lists: self.lists.write(),
+                replacements: Vec::new(),
+                removed: 0,
+            });
+        }
+        let mut grouped: FxHashMap<NodeId, FxHashSet<EdgeId>> = FxHashMap::default();
+        for &(src, edge_id) in edges {
+            if edge_id == EdgeId::INVALID || !grouped.entry(src).or_default().insert(edge_id) {
+                return None;
+            }
+        }
+
+        let lists = self.lists.write();
+        let mut replacements = Vec::with_capacity(grouped.len());
+        for (src, targets) in &grouped {
+            let list = lists.get(src)?;
+            #[cfg(all(test, feature = "lpg"))]
+            self.transport_list_scans.fetch_add(1, Ordering::Relaxed);
+            let replacement = list.prepare_purge_edges(targets, self.chunk_capacity)?;
+            replacements.push((*src, replacement));
+        }
+        #[cfg(all(test, feature = "lpg"))]
+        self.transport_list_rebuilds
+            .fetch_add(grouped.len(), Ordering::Relaxed);
+        Some(PreparedAdjacencyPurge {
+            owner: self,
+            lists,
+            replacements,
+            removed: edges.len(),
+        })
+    }
+
+    /// Returns whether exactly one physical entry and its soft-delete tombstone
+    /// exist for this identity.
+    #[must_use]
+    #[cfg(feature = "lpg")]
+    pub(crate) fn is_exact_deleted_edge(&self, src: NodeId, edge_id: EdgeId) -> bool {
+        self.lists.read().get(&src).is_some_and(|list| {
+            list.deleted.contains(&edge_id)
+                && list
+                    .iter_including_deleted()
+                    .filter(|(_, candidate)| *candidate == edge_id)
+                    .count()
+                    == 1
+        })
+    }
+
+    /// Returns the subset of requested identities that have exactly one
+    /// physical entry and one soft-delete tombstone. Each affected adjacency
+    /// list is scanned once, so a star-shaped batch is linear in list size.
+    #[must_use]
+    #[cfg(feature = "lpg")]
+    pub(crate) fn exact_deleted_edges(&self, edges: &[(NodeId, EdgeId)]) -> FxHashSet<EdgeId> {
+        let mut grouped: FxHashMap<NodeId, FxHashSet<EdgeId>> = FxHashMap::default();
+        for &(src, edge_id) in edges {
+            if edge_id != EdgeId::INVALID {
+                grouped.entry(src).or_default().insert(edge_id);
+            }
+        }
+        let lists = self.lists.read();
+        let mut qualified = FxHashSet::default();
+        for (src, targets) in grouped {
+            let Some(list) = lists.get(&src) else {
+                continue;
+            };
+            #[cfg(all(test, feature = "lpg"))]
+            self.transport_list_scans.fetch_add(1, Ordering::Relaxed);
+            let mut counts: FxHashMap<EdgeId, usize> = FxHashMap::default();
+            for (_, edge_id) in list.iter_including_deleted() {
+                if targets.contains(&edge_id) {
+                    *counts.entry(edge_id).or_default() += 1;
+                }
+            }
+            qualified.extend(targets.into_iter().filter(|edge_id| {
+                list.deleted.contains(edge_id) && counts.get(edge_id) == Some(&1)
+            }));
+        }
+        qualified
+    }
+
+    /// Resets and snapshots the exact-list work counters used by transport
+    /// scale regressions.
+    #[cfg(all(test, feature = "lpg"))]
+    pub(crate) fn reset_transport_work_for_test(&self) {
+        self.transport_list_scans.store(0, Ordering::Relaxed);
+        self.transport_list_rebuilds.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(all(test, feature = "lpg"))]
+    pub(crate) fn transport_work_for_test(&self) -> (usize, usize) {
+        (
+            self.transport_list_scans.load(Ordering::Relaxed),
+            self.transport_list_rebuilds.load(Ordering::Relaxed),
+        )
+    }
+
     /// Returns all neighbors of a node.
     ///
     /// Note: This allocates a Vec to collect neighbors while the internal lock
@@ -633,11 +1055,31 @@ impl ChunkedAdjacency {
     /// `edges_from` if you also need edge IDs, to avoid multiple lookups.
     #[must_use]
     pub fn neighbors(&self, src: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        self.fill_neighbors(src, &mut out);
+        out
+    }
+
+    /// Append dests of `src` to `out` under the adjacency lock. No extra Vec.
+    pub fn fill_neighbors(&self, src: NodeId, out: &mut Vec<NodeId>) {
         let lists = self.lists.read();
-        lists
-            .get(&src)
-            .map(|list| list.neighbors().collect())
-            .unwrap_or_default()
+        if let Some(list) = lists.get(&src) {
+            out.extend(list.neighbors());
+        }
+    }
+
+    /// Dest lists for every source, one lock.
+    #[must_use]
+    pub fn snapshot_neighbors(&self) -> Vec<(NodeId, Vec<NodeId>)> {
+        let lists = self.lists.read();
+        let mut out = Vec::with_capacity(lists.len());
+        for (src, list) in lists.iter() {
+            let dests: Vec<NodeId> = list.neighbors().collect();
+            if !dests.is_empty() {
+                out.push((*src, dests));
+            }
+        }
+        out
     }
 
     /// Returns all (neighbor, edge_id) pairs for outgoing edges from a node.
@@ -648,9 +1090,34 @@ impl ChunkedAdjacency {
     #[must_use]
     pub fn edges_from(&self, src: NodeId) -> Vec<(NodeId, EdgeId)> {
         let lists = self.lists.read();
-        lists
+        let edges: Vec<(NodeId, EdgeId)> = lists
             .get(&src)
             .map(|list| list.iter().collect())
+            .unwrap_or_default();
+        #[cfg(all(test, feature = "lpg"))]
+        LAST_EDGE_BUFFER.with(|capture| {
+            capture.set(Some((
+                edges.as_ptr() as usize,
+                edges.len(),
+                edges.capacity(),
+            )));
+        });
+        edges
+    }
+
+    /// Returns all `(neighbor, edge_id)` pairs including soft-deleted entries.
+    ///
+    /// Unlike `edges_from`, this does **not** filter out edges in the `deleted`
+    /// set.  Use this as the raw adjacency source for snapshot-aware traversal:
+    /// an edge soft-deleted after a transaction's snapshot start is still present
+    /// in the chunks and must be handed to the MVCC version-chain check
+    /// (`is_edge_visible_versioned`) rather than being silently dropped here.
+    #[must_use]
+    pub fn edges_from_including_deleted(&self, src: NodeId) -> Vec<(NodeId, EdgeId)> {
+        let lists = self.lists.read();
+        lists
+            .get(&src)
+            .map(|list| list.iter_including_deleted().collect())
             .unwrap_or_default()
     }
 
@@ -1153,7 +1620,7 @@ mod tests {
 
         // Verify only odd-numbered destinations remain
         for neighbor in neighbors {
-            assert!(neighbor.as_u64() % 2 == 0); // Original IDs were i+1, so even means odd i
+            assert_eq!(neighbor.as_u64() % 2, 0); // Original IDs were i+1, so even means odd i
         }
     }
 
@@ -1386,7 +1853,7 @@ mod tests {
 
         // Verify all results are in range
         for (dst, _) in &results {
-            assert!(dst.as_u64() >= 130 && dst.as_u64() <= 140);
+            assert!((130..=140).contains(&dst.as_u64()));
         }
 
         // Out-of-range query should return empty
@@ -1453,6 +1920,35 @@ mod tests {
                 "Should find destination {} after freeze_all",
                 i + 1
             );
+        }
+    }
+
+    #[cfg(all(feature = "lpg", feature = "compact-store"))]
+    #[test]
+    fn unpublished_edge_receipt_rolls_back_post_physical_pre_counter_panic() {
+        for adjacency in [ChunkedAdjacency::new(), ChunkedAdjacency::new()] {
+            let src = NodeId::new(7);
+            let dst = NodeId::new(8);
+            let edge = EdgeId::new(9);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut publication = adjacency
+                    .begin_unpublished_edge(src, edge)
+                    .expect("capacity")
+                    .expect("vacant identity");
+                publication.publish_with_hook(dst, || panic!("injected adjacency panic"));
+            }));
+            assert!(caught.is_err());
+            assert_eq!(adjacency.total_edge_count(), 0);
+            assert!(adjacency.neighbors(src).is_empty());
+
+            let mut retry = adjacency
+                .begin_unpublished_edge(src, edge)
+                .expect("capacity")
+                .expect("rollback restored exact vacancy");
+            retry.publish(dst);
+            retry.commit();
+            assert_eq!(adjacency.total_edge_count(), 1);
+            assert_eq!(adjacency.neighbors(src), vec![dst]);
         }
     }
 }

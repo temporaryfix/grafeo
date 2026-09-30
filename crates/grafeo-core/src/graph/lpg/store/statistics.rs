@@ -18,7 +18,7 @@ impl LpgStore {
     /// Avoids redundant recomputation if no mutations occurred.
     #[doc(hidden)]
     pub fn ensure_statistics_fresh(&self) {
-        if self.needs_stats_recompute.swap(false, Ordering::Relaxed) {
+        if self.needs_stats_recompute.load(Ordering::Acquire) {
             self.recompute_statistics_full();
         } else {
             self.compute_statistics();
@@ -31,6 +31,11 @@ impl LpgStore {
     /// from the label index. This is O(|labels| + |edge_types|) instead of
     /// O(n + m) for a full scan.
     pub(crate) fn compute_statistics(&self) {
+        let _maintenance = self.pin_maintenance();
+        self.compute_statistics_inner();
+    }
+
+    fn compute_statistics_inner(&self) {
         let mut stats = Statistics::new();
 
         // Read total counts from atomic counters
@@ -94,6 +99,12 @@ impl LpgStore {
     /// may be out of sync. Also resyncs the atomic counters.
     #[cfg(not(feature = "tiered-storage"))]
     fn recompute_statistics_full(&self) {
+        // Counter repair is derived maintenance, not mutation authority, but
+        // its scan-and-store cut must exclude ordinary writers. Otherwise a
+        // creator can publish structure, pause before its atomic increment,
+        // and double-count after this method overwrites the counter.
+        let _maintenance = self.pin_exclusive_maintenance();
+        self.needs_stats_recompute.store(false, Ordering::Release);
         let epoch = self.current_epoch();
 
         // Full-scan node count
@@ -134,7 +145,7 @@ impl LpgStore {
         drop(id_to_edge_type);
 
         // Now use the normal incremental path to build statistics
-        self.compute_statistics();
+        self.compute_statistics_inner();
     }
 
     /// Full recomputation from storage: used after rollback when counters
@@ -142,6 +153,8 @@ impl LpgStore {
     /// (Tiered storage version)
     #[cfg(feature = "tiered-storage")]
     fn recompute_statistics_full(&self) {
+        let _maintenance = self.pin_exclusive_maintenance();
+        self.needs_stats_recompute.store(false, Ordering::Release);
         let epoch = self.current_epoch();
 
         // Full-scan node count
@@ -187,7 +200,7 @@ impl LpgStore {
         drop(id_to_edge_type);
 
         // Now use the normal incremental path to build statistics
-        self.compute_statistics();
+        self.compute_statistics_inner();
     }
 
     /// Estimates cardinality for a label scan.
@@ -254,6 +267,26 @@ mod tests {
         store.ensure_statistics_fresh();
         assert_eq!(store.statistics().total_nodes, 1);
         // Flag should now be cleared
+        assert!(
+            !store
+                .needs_stats_recompute
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn sealed_read_paths_can_refresh_derived_statistics_without_write_authority() {
+        let store = make_store();
+        store.create_node(&["Readable"]);
+        let authority = crate::graph::write_permit::WriteAuthority::new();
+        assert!(store.seal_unframed_writes(&authority));
+        store
+            .needs_stats_recompute
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        store.ensure_statistics_fresh();
+
+        assert_eq!(store.statistics().total_nodes, 1);
         assert!(
             !store
                 .needs_stats_recompute

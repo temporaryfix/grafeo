@@ -131,6 +131,7 @@ impl Default for TrieIndex {
 }
 
 /// An iterator over trie children at a single level.
+#[derive(Clone)]
 pub struct TrieIterator<'a> {
     node: &'a TrieNode,
     keys: Vec<NodeId>,
@@ -185,6 +186,14 @@ impl<'a> TrieIterator<'a> {
     /// Returns whether the iterator is at a valid position.
     pub fn is_valid(&self) -> bool {
         self.pos < self.keys.len()
+    }
+
+    /// Returns the edge IDs stored at this node (leaf-level row-id payloads).
+    ///
+    /// Used by the leapfrog operator to collect row-ids once all trie levels
+    /// for a given input have been descended.
+    pub fn edges(&self) -> &[EdgeId] {
+        &self.node.edges
     }
 }
 

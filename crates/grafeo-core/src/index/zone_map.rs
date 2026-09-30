@@ -570,7 +570,9 @@ fn value_hash(value: &Value) -> u64 {
         Value::Null => 0u64.hash(&mut hasher),
         Value::Bool(b) => b.hash(&mut hasher),
         Value::Int64(i) => i.hash(&mut hasher),
-        Value::Float64(f) => f.to_bits().hash(&mut hasher),
+        // Canonicalize -0.0 to +0.0 so an equality probe for one zero is not
+        // pruned against a block containing the other.
+        Value::Float64(f) => grafeo_common::types::canonical_f64_bits(*f).hash(&mut hasher),
         Value::String(s) => s.hash(&mut hasher),
         Value::Bytes(b) => b.hash(&mut hasher),
         _ => format!("{value:?}").hash(&mut hasher),

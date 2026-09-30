@@ -27,7 +27,7 @@ use grafeo_common::utils::hash::FxHashMap;
 
 use super::Direction;
 use super::lpg::{CompareOp, Edge, Node};
-use super::traits::{GraphStore, GraphStoreSearch};
+use super::traits::{GraphStore, GraphStoreSearch, PropertyIndexRequest};
 use crate::statistics::Statistics;
 
 /// Defines which nodes and edges are included in a projection.
@@ -126,6 +126,18 @@ impl GraphProjection {
 
 impl GraphStore for GraphProjection {
     // --- Point lookups ---
+
+    fn record_label_predicate_read(&self, tx: TransactionId, label: &str) {
+        self.inner.record_label_predicate_read(tx, label);
+    }
+
+    fn record_rel_type_predicate_read(&self, tx: TransactionId, rel_type: &str) {
+        self.inner.record_rel_type_predicate_read(tx, rel_type);
+    }
+
+    fn record_lpg_dataset_read(&self, tx: TransactionId) {
+        self.inner.record_lpg_dataset_read(tx);
+    }
 
     fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.get_node(id).filter(|n| self.node_matches(n))
@@ -336,6 +348,61 @@ impl GraphStore for GraphProjection {
         self.inner.nodes_by_label(label)
     }
 
+    /// A label the projection excludes matches nothing, exactly as
+    /// `nodes_by_label` returns nothing for it — a node kept by one of its other
+    /// labels must not be reachable through a label this projection hides.
+    fn nodes_with_buffered_property(
+        &self,
+        transaction_id: TransactionId,
+        key: &PropertyKey,
+    ) -> Option<Vec<NodeId>> {
+        self.inner.nodes_with_buffered_property(transaction_id, key)
+    }
+
+    fn node_has_label(&self, id: NodeId, label: &str) -> bool {
+        if self.spec.filters_labels() && !self.spec.node_labels.contains(label) {
+            return false;
+        }
+        self.inner.node_has_label(id, label)
+    }
+
+    fn node_has_label_visible(
+        &self,
+        id: NodeId,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> bool {
+        if self.spec.filters_labels() && !self.spec.node_labels.contains(label) {
+            return false;
+        }
+        self.inner.node_has_label_visible(id, label, transaction_id)
+    }
+
+    fn node_has_label_at_epoch(
+        &self,
+        id: NodeId,
+        label: &str,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> bool {
+        if self.spec.filters_labels() && !self.spec.node_labels.contains(label) {
+            return false;
+        }
+        self.inner
+            .node_has_label_at_epoch(id, label, epoch, transaction_id)
+    }
+
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        if self.spec.filters_labels() && !self.spec.node_labels.contains(label) {
+            return Vec::new();
+        }
+        self.inner.nodes_by_label_visible(label, transaction_id)
+    }
+
     fn nodes_by_label_count(&self, label: &str) -> usize {
         if self.spec.filters_labels() && !self.spec.node_labels.contains(label) {
             return 0;
@@ -505,7 +572,28 @@ impl GraphStore for GraphProjection {
     }
 }
 
-impl GraphStoreSearch for GraphProjection {}
+impl GraphStoreSearch for GraphProjection {
+    fn lookup_nodes_indexed(
+        &self,
+        request: PropertyIndexRequest<'_>,
+    ) -> grafeo_common::utils::error::Result<Option<Vec<NodeId>>> {
+        let tx = request.transaction_id.unwrap_or(TransactionId::SYSTEM);
+        let Some(ids) = self.inner.lookup_nodes_indexed(request)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            ids.into_iter()
+                .filter(|&id| {
+                    !self.spec.filters_labels()
+                        || self.spec.node_labels.iter().any(|label| {
+                            self.inner
+                                .node_has_label_at_epoch(id, label, request.epoch, tx)
+                        })
+                })
+                .collect(),
+        ))
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "lpg")]
@@ -551,6 +639,32 @@ mod tests {
         assert_eq!(proj.nodes_by_label("Person").len(), 2);
         assert!(proj.nodes_by_label("City").is_empty());
         assert!(proj.nodes_by_label("Software").is_empty());
+    }
+
+    #[test]
+    fn node_has_label_hides_excluded_labels_of_included_nodes() {
+        let store = setup_social_graph();
+        let commuter = store.create_node(&["Person", "City"]);
+        let spec = ProjectionSpec::new().with_node_labels(["Person"]);
+        let proj = GraphProjection::new(store, spec);
+
+        // The node is in the projection by its :Person label...
+        assert!(proj.node_has_label(commuter, "Person"));
+        assert!(proj.get_node(commuter).is_some());
+        // ...but :City is outside the projection, so it must not be a way in.
+        // `nodes_by_label("City")` already returns nothing; a point lookup that
+        // asked the node itself instead would read the label straight off it.
+        assert!(!proj.node_has_label(commuter, "City"));
+        assert!(proj.nodes_by_label("City").is_empty());
+
+        let tx = TransactionId::new(1);
+        assert!(proj.node_has_label_visible(commuter, "Person", Some(tx)));
+        assert!(!proj.node_has_label_visible(commuter, "City", Some(tx)));
+        assert!(
+            proj.nodes_by_label_visible("Person", Some(tx))
+                .contains(&commuter)
+        );
+        assert!(proj.nodes_by_label_visible("City", Some(tx)).is_empty());
     }
 
     #[test]
@@ -657,8 +771,8 @@ mod tests {
             .with_edge_types(["KNOWS"]);
         let proj = GraphProjection::new(store, spec);
 
-        assert!(proj.estimate_label_cardinality("City") == 0.0);
-        assert!(proj.estimate_avg_degree("LIVES_IN", true) == 0.0);
+        assert_eq!(proj.estimate_label_cardinality("City"), 0.0);
+        assert_eq!(proj.estimate_avg_degree("LIVES_IN", true), 0.0);
     }
 
     #[test]
@@ -1179,6 +1293,96 @@ mod tests {
         assert_eq!(
             proj.has_property_index("name"),
             store.has_property_index("name")
+        );
+    }
+
+    #[test]
+    fn property_index_projection_preserves_retained_and_current_visibility() {
+        use crate::graph::{GraphStoreSearch, PropertyIndexPredicate, PropertyIndexRequest};
+
+        let store = Arc::new(LpgStore::new().unwrap());
+        let retained = EpochId::new(1);
+        let current = EpochId::new(2);
+        store.set_epoch(retained);
+        let included = store.create_node(&["Visible"]);
+        let unchanged = store.create_node(&["Visible"]);
+        let excluded = store.create_node(&["Hidden"]);
+        store.set_node_property(included, "score", Value::Int64(1));
+        store.set_node_property(unchanged, "score", Value::Int64(2));
+        store.set_node_property(excluded, "score", Value::Int64(1));
+        store.create_property_index("score");
+
+        store.set_epoch(current);
+        store.set_node_property(included, "score", Value::Int64(3));
+
+        let projection = GraphProjection::new(
+            store as Arc<dyn GraphStoreSearch>,
+            ProjectionSpec::new().with_node_labels(["Visible"]),
+        );
+        let lookup = |epoch, predicate| {
+            let mut ids = projection
+                .lookup_nodes_indexed(PropertyIndexRequest {
+                    property: "score",
+                    predicate,
+                    epoch,
+                    transaction_id: None,
+                })
+                .unwrap()
+                .unwrap();
+            ids.sort_unstable();
+            ids
+        };
+
+        assert_eq!(
+            lookup(retained, PropertyIndexPredicate::Equal(&Value::Int64(1))),
+            vec![included]
+        );
+        assert_eq!(
+            lookup(
+                retained,
+                PropertyIndexPredicate::In(&[Value::Int64(1), Value::Int64(9)])
+            ),
+            vec![included]
+        );
+        assert_eq!(
+            lookup(
+                retained,
+                PropertyIndexPredicate::Range {
+                    min: Some(&Value::Int64(1)),
+                    max: Some(&Value::Int64(1)),
+                    min_inclusive: true,
+                    max_inclusive: true,
+                }
+            ),
+            vec![included]
+        );
+
+        assert!(lookup(current, PropertyIndexPredicate::Equal(&Value::Int64(1))).is_empty());
+        assert_eq!(
+            lookup(
+                current,
+                PropertyIndexPredicate::In(&[Value::Int64(3), Value::Int64(9)])
+            ),
+            vec![included]
+        );
+        assert_eq!(
+            lookup(
+                current,
+                PropertyIndexPredicate::Range {
+                    min: Some(&Value::Int64(3)),
+                    max: Some(&Value::Int64(3)),
+                    min_inclusive: true,
+                    max_inclusive: true,
+                }
+            ),
+            vec![included]
+        );
+        assert!(
+            !lookup(current, PropertyIndexPredicate::Equal(&Value::Int64(1))).contains(&excluded)
+        );
+        assert_eq!(
+            lookup(current, PropertyIndexPredicate::Equal(&Value::Int64(2))),
+            vec![unchanged]
         );
     }
 }

@@ -59,8 +59,11 @@ impl LpgStore {
             return Vec::new();
         }
 
-        // Scan all nodes and filter by range
-        self.node_ids()
+        // Count the full identity scan, including identities whose property
+        // does not match. The result size alone would hide this work.
+        let candidates = self.node_ids();
+        self.work_counters.record_full_scan(candidates.len());
+        candidates
             .into_iter()
             .filter(|&node_id| {
                 self.node_properties
@@ -184,6 +187,7 @@ impl LpgStore {
     /// ```
     #[must_use]
     pub fn find_nodes_by_property(&self, property: &str, value: &Value) -> Vec<NodeId> {
+        let _read = self.pin_read();
         let key = PropertyKey::new(property);
         let hv = HashableValue::new(value.clone());
 
@@ -214,6 +218,7 @@ impl LpgStore {
     /// `$`-prefixed operator keys like `$gt`, `$lt`, `$gte`, `$lte`, `$in`,
     /// `$nin`, `$ne`, `$contains`.
     pub fn find_nodes_matching_filter(&self, property: &str, filter_value: &Value) -> Vec<NodeId> {
+        let _read = self.pin_read();
         let key = PropertyKey::new(property);
         self.node_ids()
             .into_iter()
@@ -357,52 +362,10 @@ impl LpgStore {
         self.edge_properties.block_zone_maps_for(property)
     }
 
-    /// Returns the number of compressed blocks for a node property.
-    ///
-    /// Phase 4's iterator-bounds operator uses this together with
-    /// [`Self::node_property_block_zone_maps`] to walk blocks and prune
-    /// by zone map before decoding.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn node_property_block_count(&self, property: &PropertyKey) -> Option<usize> {
-        self.node_properties.block_count_for(property)
-    }
-
-    /// Returns the number of compressed blocks for an edge property.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn edge_property_block_count(&self, property: &PropertyKey) -> Option<usize> {
-        self.edge_properties.block_count_for(property)
-    }
-
-    /// Decodes a single compressed block of a node property.
-    ///
-    /// Returns `None` when the property is missing, uncompressed, or
-    /// `block_idx` is out of range.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn decode_node_property_block(
-        &self,
-        property: &PropertyKey,
-        block_idx: usize,
-    ) -> Option<crate::graph::lpg::DecodedBlock<grafeo_common::types::NodeId>> {
-        self.node_properties.decode_block_for(property, block_idx)
-    }
-
-    /// Decodes a single compressed block of an edge property.
-    #[cfg(not(feature = "temporal"))]
-    #[must_use]
-    pub fn decode_edge_property_block(
-        &self,
-        property: &PropertyKey,
-        block_idx: usize,
-    ) -> Option<crate::graph::lpg::DecodedBlock<grafeo_common::types::EdgeId>> {
-        self.edge_properties.decode_block_for(property, block_idx)
-    }
-
     /// Rebuilds zone maps for all properties.
     #[doc(hidden)]
     pub fn rebuild_zone_maps(&self) {
+        let _maintenance = self.pin_maintenance();
         self.node_properties.rebuild_zone_maps();
         self.edge_properties.rebuild_zone_maps();
     }

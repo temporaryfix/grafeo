@@ -26,6 +26,10 @@ pub mod index;
 pub mod statistics;
 pub mod testing;
 
+#[cfg(all(test, feature = "lpg"))]
+#[path = "../tests/support/allocation.rs"]
+pub(crate) mod allocation_test;
+
 // Re-export the types you'll use most often
 pub use codec::{DictionaryBuilder, DictionaryEncoding};
 #[cfg(feature = "lpg")]
