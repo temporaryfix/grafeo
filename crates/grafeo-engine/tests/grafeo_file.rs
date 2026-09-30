@@ -1,5 +1,6 @@
 //! Integration tests for the single-file `.grafeo` database format.
 
+#![cfg(feature = "lpg")]
 #![cfg(feature = "grafeo-file")]
 
 use grafeo_common::types::Value;
@@ -94,6 +95,7 @@ fn insert_close_reopen_persists_data() {
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn save_as_grafeo_file_from_in_memory() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("exported.grafeo");
@@ -120,6 +122,136 @@ fn save_as_grafeo_file_from_in_memory() {
         .unwrap();
     assert_eq!(extract_strings(result.rows()), vec!["Amsterdam", "Berlin"]);
     db2.close().unwrap();
+}
+
+#[cfg(all(feature = "wal", feature = "gql"))]
+#[test]
+fn monolithic_save_restores_authoritative_catalog_and_graph_scoped_indexes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("catalog-and-indexes.grafeo");
+    let source = GrafeoDB::new_in_memory();
+    let session = source.session();
+    session
+        .execute("INSERT (:Person {email: 'first@example.com'})")
+        .unwrap();
+    session
+        .execute("CREATE CONSTRAINT unique_email FOR (n:Person) ON (n.email) UNIQUE")
+        .unwrap();
+    session
+        .execute("CREATE INDEX idx_default_email FOR (n:Person) ON (n.email)")
+        .unwrap();
+    session.execute("CREATE GRAPH analytics").unwrap();
+    session.execute("USE GRAPH analytics").unwrap();
+    session.execute("INSERT (:Event {code: 'launch'})").unwrap();
+    session
+        .execute("CREATE INDEX idx_analytics_code FOR (n:Event) ON (n.code)")
+        .unwrap();
+    session.execute("USE GRAPH DEFAULT").unwrap();
+    drop(session);
+
+    // An un-compacted in-memory source takes the monolithic snapshot branch,
+    // not the section/container checkpoint path.
+    source.save(&path).unwrap();
+
+    let reopened = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+    let session = reopened.session();
+    assert_eq!(
+        extract_strings(session.execute("SHOW CONSTRAINTS").unwrap().rows()),
+        vec!["unique_email"]
+    );
+    assert_eq!(
+        extract_strings(session.execute("SHOW INDEXES").unwrap().rows()),
+        vec!["idx_analytics_code", "idx_default_email"]
+    );
+    assert!(reopened.has_property_index("email"));
+    assert!(
+        session
+            .execute("INSERT (:Person {email: 'first@example.com'})")
+            .is_err(),
+        "the named unique constraint must still enforce after reopen"
+    );
+
+    session.execute("USE GRAPH analytics").unwrap();
+    assert_eq!(
+        session
+            .execute("MATCH (n:Event {code: 'launch'}) RETURN count(n)")
+            .unwrap()
+            .rows()[0][0],
+        Value::Int64(1)
+    );
+    session.execute("DROP INDEX idx_analytics_code").unwrap();
+    assert_eq!(
+        extract_strings(session.execute("SHOW INDEXES").unwrap().rows()),
+        vec!["idx_default_email"]
+    );
+
+    session.execute("USE GRAPH DEFAULT").unwrap();
+    assert!(
+        reopened.has_property_index("email"),
+        "dropping the named-graph index must not remove the default registry"
+    );
+    session.execute("DROP INDEX idx_default_email").unwrap();
+    assert!(!reopened.has_property_index("email"));
+    session.execute("DROP CONSTRAINT unique_email").unwrap();
+    session
+        .execute("INSERT (:Person {email: 'first@example.com'})")
+        .expect("dropping the restored constraint removes enforcement");
+    drop(session);
+    reopened.close().unwrap();
+}
+
+#[cfg(feature = "wal")]
+#[test]
+fn monolithic_save_capture_failure_leaves_no_destination() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("must-not-exist.grafeo");
+    let db = GrafeoDB::new_in_memory();
+    let mut transaction = db.session();
+    transaction.begin_transaction().unwrap();
+
+    let error = db.save(&path).unwrap_err().to_string();
+    assert!(error.contains("quiescent committed cut"), "{error}");
+    assert!(
+        std::fs::symlink_metadata(&path).is_err(),
+        "capture failure must not leave an empty or partial destination"
+    );
+    transaction.rollback().unwrap();
+}
+
+#[cfg(feature = "wal")]
+#[test]
+fn monolithic_save_never_clobbers_an_existing_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("owned.grafeo");
+    {
+        let existing = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        existing.session().execute("INSERT (:Existing)").unwrap();
+        existing.close().unwrap();
+    }
+
+    let source = GrafeoDB::new_in_memory();
+    source.session().execute("INSERT (:Replacement)").unwrap();
+    let error = source.save(&path).unwrap_err().to_string();
+    assert!(error.contains("existing destination"), "{error}");
+
+    let reopened = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+    assert_eq!(
+        reopened
+            .session()
+            .execute("MATCH (n:Existing) RETURN count(n)")
+            .unwrap()
+            .rows()[0][0],
+        Value::Int64(1)
+    );
+    assert_eq!(
+        reopened
+            .session()
+            .execute("MATCH (n:Replacement) RETURN count(n)")
+            .unwrap()
+            .rows()[0][0],
+        Value::Int64(0)
+    );
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -176,6 +308,7 @@ fn multiple_checkpoints_alternate_headers() {
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn auto_detect_does_not_use_grafeo_file_for_directory_path() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_legacy");
@@ -472,7 +605,8 @@ fn open_nonexistent_creates_new() {
 }
 
 #[test]
-fn file_grows_and_shrinks_with_data() {
+#[cfg(feature = "wal")]
+fn file_grows_and_preserves_deleted_history_across_checkpoint() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("size.grafeo");
 
@@ -493,22 +627,44 @@ fn file_grows_and_shrinks_with_data() {
     db.wal_checkpoint().unwrap();
     let large_size = fm.file_size().unwrap();
     assert!(large_size > initial_size, "file should grow with data");
+    let before_delete = db.current_epoch();
+    let deleted = db
+        .iter_nodes()
+        .find(|node| node.get_property("idx") == Some(&grafeo_common::types::Value::Int64(99)))
+        .unwrap();
+    let deleted_id = deleted.id;
 
     // Delete most data
     session
         .execute("MATCH (n:Node) WHERE n.idx > 5 DELETE n")
         .unwrap();
     db.wal_checkpoint().unwrap();
-    let small_size = fm.file_size().unwrap();
-    assert!(
-        small_size < large_size,
-        "file should shrink after deleting data: {small_size} >= {large_size}"
+    assert_eq!(db.node_count(), 6);
+    assert!(db.get_node(deleted_id).is_none());
+    let historical = db.get_node_at_epoch(deleted_id, before_delete).unwrap();
+    assert_eq!(historical.id, deleted_id);
+    assert_eq!(
+        historical.get_property("data"),
+        deleted.get_property("data")
     );
-
     db.close().unwrap();
+    let reopened = GrafeoDB::open(&path).unwrap();
+    assert_eq!(reopened.node_count(), 6);
+    assert!(reopened.get_node(deleted_id).is_none());
+    let historical = reopened
+        .get_node_at_epoch(deleted_id, before_delete)
+        .unwrap();
+    assert_eq!(historical.id, deleted_id);
+    assert_eq!(historical.get_property("idx"), deleted.get_property("idx"));
+    assert_eq!(
+        historical.get_property("data"),
+        deleted.get_property("data")
+    );
+    reopened.close().unwrap();
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn sidecar_wal_exists_during_operation() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("wal_lifecycle.grafeo");
@@ -713,6 +869,7 @@ fn validate_reports_clean_state() {
 // =========================================================================
 
 #[test]
+#[cfg(feature = "wal")]
 fn wal_status_reflects_single_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("wal_status.grafeo");
@@ -721,7 +878,7 @@ fn wal_status_reflects_single_file() {
     let session = db.session();
     session.execute("INSERT (:Person {name: 'Alix'})").unwrap();
 
-    let status = db.wal_status();
+    let status = db.wal_status().unwrap();
     assert!(status.enabled);
 
     db.close().unwrap();
@@ -753,6 +910,7 @@ fn detailed_stats_with_grafeo_file() {
 // =========================================================================
 
 #[test]
+#[cfg(feature = "wal")]
 fn second_open_of_same_file_is_rejected() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("locked.grafeo");
@@ -774,6 +932,7 @@ fn second_open_of_same_file_is_rejected() {
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn lock_released_on_drop() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("drop_lock.grafeo");
@@ -795,6 +954,7 @@ fn lock_released_on_drop() {
 // =========================================================================
 
 #[test]
+#[cfg(feature = "wal")]
 fn node_type_definitions_persist() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("schema.grafeo");
@@ -841,6 +1001,7 @@ fn node_type_definitions_persist() {
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn edge_type_definitions_persist() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("edge_types.grafeo");
@@ -877,6 +1038,7 @@ fn edge_type_definitions_persist() {
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn graph_type_definitions_persist() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("graph_types.grafeo");
@@ -978,6 +1140,7 @@ fn stored_procedures_persist() {
 }
 
 #[test]
+#[cfg(feature = "wal")]
 fn schema_with_data_across_multiple_cycles() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("schema_cycles.grafeo");
@@ -1041,10 +1204,8 @@ fn wal_disabled_single_file_persists_on_close() {
     let path = dir.path().join("no_wal.grafeo");
 
     {
-        let config = Config {
-            wal_enabled: false,
-            ..Config::persistent(&path).with_storage_format(StorageFormat::SingleFile)
-        };
+        let mut config = Config::persistent(&path).with_storage_format(StorageFormat::SingleFile);
+        config.wal_enabled = false;
         let db = GrafeoDB::with_config(config).unwrap();
         let session = db.session();
         session
@@ -1074,10 +1235,8 @@ fn wal_disabled_single_file_persists_on_close() {
     assert!(path.exists() && path.is_file());
 
     {
-        let config = Config {
-            wal_enabled: false,
-            ..Config::persistent(&path).with_storage_format(StorageFormat::SingleFile)
-        };
+        let mut config = Config::persistent(&path).with_storage_format(StorageFormat::SingleFile);
+        config.wal_enabled = false;
         let db = GrafeoDB::with_config(config).unwrap();
         assert_eq!(
             db.node_count(),
@@ -1223,6 +1382,7 @@ fn read_only_blocked_while_writer_holds_lock() {
 /// This covers the case where the process exits between a checkpoint and
 /// the subsequent close (e.g. a crash or ungraceful shutdown).
 #[test]
+#[cfg(feature = "wal")]
 fn wal_data_after_checkpoint_survives_drop() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("wal_after_checkpoint.grafeo");
@@ -1307,8 +1467,14 @@ fn save_from_read_only_database() {
     }
 
     let db = GrafeoDB::open_read_only(&src_path).unwrap();
+    let source_before = std::fs::read(&src_path).unwrap();
+    let sidecar = dir.path().join("ro_save_src.grafeo.wal");
+    assert!(!sidecar.exists());
     db.save(&dest_path)
         .expect("save from read-only should succeed");
+    assert_eq!(std::fs::read(&src_path).unwrap(), source_before);
+    assert!(!sidecar.exists());
+    assert!(db.execute("INSERT (:Forbidden)").is_err());
 
     let restored = GrafeoDB::open(&dest_path).unwrap();
     assert_eq!(restored.node_count(), 2);
@@ -1318,6 +1484,286 @@ fn save_from_read_only_database() {
 // =========================================================================
 // Layered overlay deletion durability (#323 follow-up)
 // =========================================================================
+
+#[cfg(feature = "compact-store")]
+fn assert_compact_section_reopen_rejected(
+    section_type: grafeo_common::storage::SectionType,
+    rewrite: impl Fn(&mut u8, &mut Vec<u8>, grafeo_common::types::NodeId, grafeo_common::types::EdgeId),
+    reseal_world: bool,
+    expected_error: &str,
+) {
+    use grafeo_common::storage::{Section, SectionType};
+    use grafeo_common::utils::error::{Error, StorageError};
+    use grafeo_core::graph::compact::deletions_section::OverlayDeletionsSection;
+    use grafeo_storage::file::{GrafeoFileManager, SectionWrite};
+
+    for read_only in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay-deletions-version.grafeo");
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        let deleted_node = db.create_node(&["Deleted"]);
+        let survivor = db.create_node(&["Survivor"]);
+        let deleted_edge = db.create_edge(deleted_node, survivor, "LINK");
+        db.compact().unwrap();
+        assert!(db.delete_edge(deleted_edge));
+        assert!(db.delete_node(deleted_node));
+        db.close().unwrap();
+        drop(db);
+
+        // Use the container writer to retain header coordinates and renew
+        // section/directory checksums, as in the other hostile-image tests.
+        let file = GrafeoFileManager::open(&path).unwrap();
+        let header = file.active_header();
+        let directory = file.read_section_directory().unwrap().unwrap();
+        let mut sections: Vec<_> = directory
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.section_type,
+                    entry.version,
+                    file.read_section_data(entry).unwrap(),
+                )
+            })
+            .collect();
+        let compact = sections
+            .iter()
+            .find(|entry| entry.0 == SectionType::CompactStore)
+            .expect("fixture must retain its compact base");
+        assert_eq!(compact.1, 9);
+        assert!(compact.2.starts_with(b"GCST\x09"));
+        let deletion = sections
+            .iter()
+            .find(|entry| entry.0 == SectionType::OverlayDeletions)
+            .expect("fixture must persist its base-node and base-edge deletions");
+        assert_eq!(deletion.1, 2);
+        assert!(deletion.2.starts_with(b"GODL\x02"));
+        let mut current = OverlayDeletionsSection::empty();
+        current.deserialize(&deletion.2).unwrap();
+        assert_eq!(current.deleted_node_ids(), vec![deleted_node]);
+        assert_eq!(current.deleted_edge_ids(), vec![deleted_edge]);
+        let target = sections
+            .iter_mut()
+            .find(|entry| entry.0 == section_type)
+            .unwrap();
+        rewrite(&mut target.1, &mut target.2, deleted_node, deleted_edge);
+        let crc_offset = target.2.len() - 4;
+        let crc = crc32fast::hash(&target.2[..crc_offset]);
+        target.2[crc_offset..].copy_from_slice(&crc.to_le_bytes());
+        if reseal_world {
+            reseal_current_compact_sections(&file, &mut sections);
+        }
+        let writes: Vec<_> = sections
+            .iter()
+            .map(|entry| SectionWrite::new(entry.0, entry.1, &entry.2))
+            .collect();
+        file.write_versioned_sections(
+            &writes,
+            header.epoch,
+            header.transaction_id,
+            header.node_count,
+            header.edge_count,
+        )
+        .unwrap();
+        // Explicitly verify both directory and section CRCs before asking the
+        // engine to reject the format. Version/framing controls retain the
+        // source world seal and must fail before its digest; unknown flags
+        // carry a fresh world seal so they reach the current decoder.
+        let directory = file.read_section_directory().unwrap().unwrap();
+        let entry = directory
+            .entries()
+            .iter()
+            .find(|entry| entry.section_type == section_type)
+            .unwrap();
+        let expected = sections
+            .iter()
+            .find(|entry| entry.0 == section_type)
+            .unwrap();
+        assert_eq!(entry.version, expected.1);
+        assert_eq!(file.read_section_data(entry).unwrap(), expected.2);
+        file.close().unwrap();
+        drop(file);
+
+        let before = std::fs::read(&path).unwrap();
+        let config = if read_only {
+            Config::read_only(&path)
+        } else {
+            Config::persistent(&path)
+        };
+        let error = GrafeoDB::with_config(config)
+            .err()
+            .expect("unsupported compact section must not reopen");
+        assert!(
+            if reseal_world {
+                matches!(&error, Error::Internal(message) if message.contains(expected_error))
+            } else {
+                matches!(
+                    &error,
+                    Error::Storage(StorageError::Corruption(message))
+                        if message.contains(expected_error)
+                )
+            },
+            "read_only={read_only}: expected exact format refusal, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "rejected open must leave the container unchanged (read_only={read_only})"
+        );
+    }
+}
+
+#[cfg(feature = "compact-store")]
+fn reseal_current_compact_sections(
+    file: &grafeo_storage::file::GrafeoFileManager,
+    sections: &mut [(grafeo_common::storage::SectionType, u8, Vec<u8>)],
+) {
+    use grafeo_common::storage::SectionType;
+    use grafeo_common::types::{
+        AuthoritativeFormat, GraphModelTag, RecoveryImageComponent, RecoveryImageCoordinatesV1,
+        WorldCut, WorldMetadataSectionV2,
+    };
+
+    let header = file.active_header();
+    let metadata_index = sections
+        .iter()
+        .position(|entry| entry.0 == SectionType::WorldMetadata)
+        .unwrap();
+    let metadata = WorldMetadataSectionV2::decode(&sections[metadata_index].2).unwrap();
+    let descriptor = metadata.cut().descriptor().clone();
+    let logical: Vec<_> = descriptor
+        .formats()
+        .iter()
+        .map(|format| {
+            let kind = match format.format() {
+                AuthoritativeFormat::Lpg => SectionType::LpgStore,
+                AuthoritativeFormat::Catalog => SectionType::Catalog,
+                AuthoritativeFormat::Cdc => SectionType::Cdc,
+                AuthoritativeFormat::Compact => SectionType::CompactStore,
+                AuthoritativeFormat::OverlayDeletions => SectionType::OverlayDeletions,
+                other => panic!("unexpected format in compact fixture: {other:?}"),
+            };
+            let entry = sections.iter().find(|entry| entry.0 == kind).unwrap();
+            assert_eq!(u16::from(entry.1), format.version());
+            (*format, entry.2.as_slice())
+        })
+        .collect();
+    let cut = WorldCut::seal_components(descriptor.clone(), &logical).unwrap();
+    let coordinates = RecoveryImageCoordinatesV1::new(
+        header.epoch,
+        header.transaction_id,
+        GraphModelTag::Lpg,
+        header.node_count,
+        header.edge_count,
+    );
+    let mut physical: Vec<_> = sections
+        .iter()
+        .filter(|entry| entry.0 != SectionType::WorldMetadata)
+        .map(|entry| {
+            RecoveryImageComponent::new(entry.0 as u32, u16::from(entry.1), &entry.2).unwrap()
+        })
+        .collect();
+    physical.push(coordinates.component());
+    sections[metadata_index].2 = WorldMetadataSectionV2::seal(cut, &physical)
+        .unwrap()
+        .encode()
+        .unwrap();
+}
+
+#[cfg(feature = "compact-store")]
+#[test]
+fn overlay_deletions_v1_directory_and_payload_are_rejected_on_reopen() {
+    assert_compact_section_reopen_rejected(
+        grafeo_common::storage::SectionType::OverlayDeletions,
+        |version, bytes, node, edge| {
+            // Authentic v1 layout: reserved header bytes, node count and IDs,
+            // then edge count and IDs. It carries no deletion epochs.
+            let mut predecessor = b"GODL\x01\0\0\0".to_vec();
+            predecessor.extend_from_slice(&1_u64.to_le_bytes());
+            predecessor.extend_from_slice(&node.0.to_le_bytes());
+            predecessor.extend_from_slice(&1_u64.to_le_bytes());
+            predecessor.extend_from_slice(&edge.0.to_le_bytes());
+            predecessor.extend_from_slice(&[0; 4]); // Replaced with a valid CRC.
+            *version = 1;
+            *bytes = predecessor;
+        },
+        false,
+        "unsupported OverlayDeletions section directory version 1",
+    );
+}
+
+#[cfg(feature = "compact-store")]
+#[test]
+fn overlay_deletions_current_directory_rejects_altered_payload_header_on_reopen() {
+    assert_compact_section_reopen_rejected(
+        grafeo_common::storage::SectionType::OverlayDeletions,
+        |version, bytes, _, _| {
+            assert_eq!(*version, 2);
+            // Keep all current `(id, delete_epoch)` records and the current
+            // directory version, but claim v1 in the sealed payload header.
+            bytes[4] = 1;
+        },
+        false,
+        "OverlayDeletions directory version 2 disagrees with its payload framing",
+    );
+}
+
+#[cfg(feature = "compact-store")]
+#[test]
+fn compact_store_predecessor_directories_and_payloads_are_rejected_on_reopen() {
+    let fixtures: [&[u8]; 8] = [
+        include_bytes!("fixtures/gcst/rejected_gcst_v1.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v2.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v3.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v4.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v5.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v6.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v7.bin"),
+        include_bytes!("fixtures/gcst/rejected_gcst_v8.bin"),
+    ];
+    for bytes in fixtures {
+        let version = bytes[4];
+        assert_compact_section_reopen_rejected(
+            grafeo_common::storage::SectionType::CompactStore,
+            |directory_version, payload, _, _| {
+                *directory_version = version;
+                *payload = bytes.to_vec();
+            },
+            false,
+            &format!("unsupported CompactStore section directory version {version}"),
+        );
+    }
+}
+
+#[cfg(feature = "compact-store")]
+#[test]
+fn compact_store_current_directory_rejects_altered_payload_header_on_reopen() {
+    assert_compact_section_reopen_rejected(
+        grafeo_common::storage::SectionType::CompactStore,
+        |version, bytes, _, _| {
+            assert_eq!(*version, 9);
+            bytes[4] = 8;
+        },
+        false,
+        "CompactStore directory version 9 disagrees with its payload framing",
+    );
+}
+
+#[cfg(feature = "compact-store")]
+#[test]
+fn compact_store_unknown_flags_are_rejected_after_world_verification_on_reopen() {
+    for flag in [0x04, 0x80] {
+        assert_compact_section_reopen_rejected(
+            grafeo_common::storage::SectionType::CompactStore,
+            |version, bytes, _, _| {
+                assert_eq!(*version, 9);
+                bytes[5] |= flag;
+            },
+            true,
+            "unsupported CompactStore flags",
+        );
+    }
+}
 
 /// Regression test: when a database has been compacted (so deletes go
 /// through the LayeredStore's `deleted_from_base_*` sets rather than

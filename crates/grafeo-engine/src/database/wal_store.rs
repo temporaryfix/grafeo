@@ -6,81 +6,64 @@
 
 use std::sync::Arc;
 
-use grafeo_common::grafeo_warn;
-use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
+use grafeo_common::types::{EdgeId, EpochId, GraphPath, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
-use grafeo_core::graph::lpg::{CompareOp, Edge, LpgStore, Node};
-use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
+use grafeo_core::execution::operators::{SharedReadTracker, SharedWriteTracker};
+#[cfg(test)]
+use grafeo_core::graph::lpg::LpgStore;
+use grafeo_core::graph::lpg::{CompareOp, Edge, Node};
+use grafeo_core::graph::{
+    Direction, GraphStore, GraphStoreMut, GraphStoreSearch, PropertyIndexRequest,
+    TxStructuralSnapshot,
+};
 use grafeo_core::statistics::Statistics;
-use grafeo_storage::wal::{LpgWal, WalRecord};
+use grafeo_storage::wal::{LpgMutationOp, LpgWal, WalRecord};
 
 use arcstr::ArcStr;
 
-/// A [`GraphStoreMut`] decorator that delegates every call to an inner
-/// [`LpgStore`] and additionally logs mutation operations to the WAL.
+/// A [`GraphStoreMut`] decorator that delegates every call to an inner store
+/// and additionally logs mutation operations to the WAL.
 ///
 /// Read-only methods are forwarded without any WAL interaction.
 ///
-/// For named graphs, emits a [`WalRecord::SwitchGraph`] before data mutations
-/// when the WAL context differs from this store's graph. The shared
-/// `wal_graph_context` mutex ensures atomicity of context-switch + mutation
-/// pairs across concurrent sessions.
+/// Every mutation carries the exact root-relative GraphPath; no replay cursor.
 pub(crate) struct WalGraphStore {
-    inner: Arc<LpgStore>,
+    inner: Arc<dyn GraphStoreMut>,
     wal: Arc<LpgWal>,
-    /// Which named graph this store represents (`None` = default graph).
-    graph_name: Option<String>,
-    /// Shared tracker: the last graph context emitted to the WAL.
-    /// Held across a (SwitchGraph + mutation) pair to prevent interleaving.
-    wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
+    graph: GraphPath,
+    /// Shared durability poison flag (None in unit tests).
+    poison: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl WalGraphStore {
-    /// Creates a new WAL-aware store wrapper for the default graph.
-    pub fn new(
-        inner: Arc<LpgStore>,
-        wal: Arc<LpgWal>,
-        wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
-    ) -> Self {
+    /// Wraps one exact graph incarnation and its canonical durable coordinate.
+    pub fn new(inner: Arc<dyn GraphStoreMut>, wal: Arc<LpgWal>, graph: GraphPath) -> Self {
         Self {
             inner,
             wal,
-            graph_name: None,
-            wal_graph_context,
+            graph,
+            poison: None,
         }
     }
 
-    /// Creates a new WAL-aware store wrapper for a named graph.
-    pub fn new_for_graph(
-        inner: Arc<LpgStore>,
-        wal: Arc<LpgWal>,
-        graph_name: String,
-        wal_graph_context: Arc<parking_lot::Mutex<Option<String>>>,
-    ) -> Self {
-        Self {
-            inner,
-            wal,
-            graph_name: Some(graph_name),
-            wal_graph_context,
+    /// Attach the database durability poison flag.
+    pub fn with_poison(mut self, poison: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.poison = Some(poison);
+        self
+    }
+
+    fn poison(&self) {
+        if let Some(p) = &self.poison {
+            p.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
-    /// Logs a WAL record with graph context tracking.
-    ///
-    /// Acquires the shared context lock, emits a `SwitchGraph` record if the
-    /// WAL context differs from this store's graph, then logs the data record.
-    /// Both writes happen under the same lock to prevent concurrent sessions
-    /// from interleaving context switches with unrelated mutations.
-    fn log_with_context(&self, record: &WalRecord) {
-        let mut ctx = self.wal_graph_context.lock();
-        if *ctx != self.graph_name {
-            let _ = self.wal.log(&WalRecord::SwitchGraph {
-                name: self.graph_name.clone(),
-            });
-            (*ctx).clone_from(&self.graph_name);
-        }
-        if let Err(e) = self.wal.log(record) {
-            grafeo_warn!("WAL log failed: {e}");
+    fn log_lpg(&self, transaction_id: TransactionId, op: LpgMutationOp) {
+        if let Err(_e) = self
+            .wal
+            .log(&WalRecord::lpg(transaction_id, self.graph.clone(), op))
+        {
+            self.poison();
         }
     }
 }
@@ -90,6 +73,12 @@ impl WalGraphStore {
 // ---------------------------------------------------------------------------
 
 impl GraphStore for WalGraphStore {
+    fn lpg_commit_target(
+        &self,
+    ) -> grafeo_common::utils::error::Result<grafeo_core::graph::traits::LpgCommitTarget<'_>> {
+        self.inner.lpg_commit_target()
+    }
+
     fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.get_node(id)
     }
@@ -105,6 +94,25 @@ impl GraphStore for WalGraphStore {
         transaction_id: TransactionId,
     ) -> Option<Node> {
         self.inner.get_node_versioned(id, epoch, transaction_id)
+    }
+
+    fn prepare_index_node_rows(
+        &self,
+        publication_epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::error::Result<Vec<Node>> {
+        self.inner
+            .prepare_index_node_rows(publication_epoch, transaction_id)
+    }
+
+    fn prepare_index_node_rows_by_id(
+        &self,
+        publication_epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+        ids: &[NodeId],
+    ) -> grafeo_common::utils::error::Result<Vec<Node>> {
+        self.inner
+            .prepare_index_node_rows_by_id(publication_epoch, transaction_id, ids)
     }
 
     fn get_edge_versioned(
@@ -160,8 +168,73 @@ impl GraphStore for WalGraphStore {
         GraphStore::neighbors(self.inner.as_ref(), node, direction)
     }
 
+    fn fill_neighbors(&self, node: NodeId, direction: Direction, out: &mut Vec<NodeId>) {
+        self.inner.fill_neighbors(node, direction, out);
+    }
+
+    fn snapshot_neighbors(&self, direction: Direction) -> Vec<(NodeId, Vec<NodeId>)> {
+        self.inner.snapshot_neighbors(direction)
+    }
+
+    fn try_count_directed_triangles(
+        &self,
+        starts: &[NodeId],
+        dest_label: Option<&str>,
+    ) -> Option<u64> {
+        self.inner.try_count_directed_triangles(starts, dest_label)
+    }
+
+    fn try_count_all_directed_triangles(&self, dest_label: Option<&str>) -> Option<u64> {
+        self.inner.try_count_all_directed_triangles(dest_label)
+    }
+
+    fn fill_neighbors_at_epoch(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        out: &mut Vec<NodeId>,
+    ) {
+        self.inner
+            .fill_neighbors_at_epoch(node, direction, epoch, out);
+    }
+
+    fn fill_neighbors_of_types_at_epoch(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        types: &[String],
+        out: &mut Vec<NodeId>,
+    ) {
+        self.inner
+            .fill_neighbors_of_types_at_epoch(node, direction, epoch, types, out);
+    }
+
     fn edges_from(&self, node: NodeId, direction: Direction) -> Vec<(NodeId, EdgeId)> {
         GraphStore::edges_from(self.inner.as_ref(), node, direction)
+    }
+
+    fn edges_from_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId)> {
+        self.inner
+            .edges_from_versioned(node, direction, epoch, transaction_id)
+    }
+
+    fn neighbors_versioned(
+        &self,
+        node: NodeId,
+        direction: Direction,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> Vec<NodeId> {
+        self.inner
+            .neighbors_versioned(node, direction, epoch, transaction_id)
     }
 
     fn out_degree(&self, node: NodeId) -> usize {
@@ -186,6 +259,38 @@ impl GraphStore for WalGraphStore {
 
     fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
         self.inner.nodes_by_label(label)
+    }
+
+    fn nodes_with_buffered_property(
+        &self,
+        transaction_id: TransactionId,
+        key: &PropertyKey,
+    ) -> Option<Vec<NodeId>> {
+        self.inner.nodes_with_buffered_property(transaction_id, key)
+    }
+
+    fn node_has_label(&self, id: NodeId, label: &str) -> bool {
+        self.inner.node_has_label(id, label)
+    }
+
+    fn node_has_label_visible(
+        &self,
+        id: NodeId,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> bool {
+        self.inner.node_has_label_visible(id, label, transaction_id)
+    }
+
+    fn node_has_label_at_epoch(
+        &self,
+        id: NodeId,
+        label: &str,
+        epoch: EpochId,
+        transaction_id: TransactionId,
+    ) -> bool {
+        self.inner
+            .node_has_label_at_epoch(id, label, epoch, transaction_id)
     }
 
     fn nodes_by_label_count(&self, label: &str) -> usize {
@@ -323,6 +428,139 @@ impl GraphStore for WalGraphStore {
     fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
         self.inner.get_edge_history(id)
     }
+
+    // --- Task 6: snapshot-aware read delegation (unified-MVCC) ---
+    //
+    // Reads have no WAL log side effects, so we can safely delegate to the
+    // inner LpgStore's snapshot-aware accessors. The per-transaction property
+    // delta lives in the inner LpgStore.
+
+    fn pending_node_creates(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.inner.pending_node_creates(transaction_id)
+    }
+
+    fn pending_edge_creates(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        self.inner.pending_edge_creates(transaction_id)
+    }
+
+    fn register_read_tracker(&self, tx: TransactionId, tracker: SharedReadTracker) {
+        self.inner.register_read_tracker(tx, tracker);
+    }
+
+    fn unregister_read_tracker(&self, tx: TransactionId) {
+        self.inner.unregister_read_tracker(tx);
+    }
+
+    fn record_label_predicate_read(&self, tx: TransactionId, label: &str) {
+        self.inner.record_label_predicate_read(tx, label);
+    }
+
+    fn record_rel_type_predicate_read(&self, tx: TransactionId, rel_type: &str) {
+        self.inner.record_rel_type_predicate_read(tx, rel_type);
+    }
+
+    fn record_lpg_dataset_read(&self, tx: TransactionId) {
+        self.inner.record_lpg_dataset_read(tx);
+    }
+
+    fn register_write_tracker(&self, tx: TransactionId, tracker: SharedWriteTracker) {
+        self.inner.register_write_tracker(tx, tracker);
+    }
+
+    fn unregister_write_tracker(&self, tx: TransactionId) {
+        self.inner.unregister_write_tracker(tx);
+    }
+
+    fn pending_node_deletes_peek(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.inner.pending_node_deletes_peek(transaction_id)
+    }
+
+    fn pending_edge_deletes_peek(&self, transaction_id: TransactionId) -> Vec<EdgeId> {
+        self.inner.pending_edge_deletes_peek(transaction_id)
+    }
+
+    fn overlay_touched_entities(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<NodeId>, Vec<EdgeId>) {
+        self.inner.overlay_touched_entities(transaction_id)
+    }
+
+    fn overlay_touched_properties(
+        &self,
+        transaction_id: TransactionId,
+    ) -> (Vec<(NodeId, Option<String>)>, Vec<(EdgeId, Option<String>)>) {
+        self.inner.overlay_touched_properties(transaction_id)
+    }
+
+    fn read_node_property_visible(
+        &self,
+        id: NodeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        self.inner
+            .read_node_property_visible(id, key, epoch, transaction_id)
+    }
+
+    fn read_edge_property_visible(
+        &self,
+        id: EdgeId,
+        key: &PropertyKey,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Option<Value> {
+        self.inner
+            .read_edge_property_visible(id, key, epoch, transaction_id)
+    }
+
+    fn read_node_properties_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::hash::FxHashMap<PropertyKey, Value> {
+        self.inner
+            .read_node_properties_visible(id, epoch, transaction_id)
+    }
+
+    fn read_edge_properties_visible(
+        &self,
+        id: EdgeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::hash::FxHashMap<PropertyKey, Value> {
+        self.inner
+            .read_edge_properties_visible(id, epoch, transaction_id)
+    }
+
+    // --- Task 5 (label reads, unified-MVCC) ---
+    //
+    // Label reads have no WAL log side effects, so delegate to the inner
+    // LpgStore's snapshot-aware label accessors. The per-transaction label
+    // delta lives in the inner LpgStore.
+    //
+    // Buffered label methods delegate to the same overlay delta below.
+    // Prepared commit logs complete images, not intermediate label intents.
+
+    fn read_node_labels_visible(
+        &self,
+        id: NodeId,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> grafeo_common::utils::hash::FxHashSet<arcstr::ArcStr> {
+        self.inner
+            .read_node_labels_visible(id, epoch, transaction_id)
+    }
+
+    fn nodes_by_label_visible(
+        &self,
+        label: &str,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<NodeId> {
+        self.inner.nodes_by_label_visible(label, transaction_id)
+    }
 }
 
 // Pure delegation: the WAL wrapper logs mutations but owns no index state,
@@ -332,14 +570,40 @@ impl GraphStore for WalGraphStore {
 // regressed hybrid queries on persistent DBs until it was caught by the
 // `_persistent` spec variants — see issue #308.
 impl GraphStoreSearch for WalGraphStore {
+    fn lookup_nodes_indexed(
+        &self,
+        request: PropertyIndexRequest<'_>,
+    ) -> grafeo_common::utils::error::Result<Option<Vec<NodeId>>> {
+        self.inner.lookup_nodes_indexed(request)
+    }
+
     #[cfg(feature = "text-index")]
     fn has_text_index(&self, label: &str, property: &str) -> bool {
         self.inner.has_text_index(label, property)
     }
 
     #[cfg(feature = "text-index")]
+    fn text_index_labels_for_property(&self, property: &str) -> Vec<String> {
+        self.inner.text_index_labels_for_property(property)
+    }
+
+    #[cfg(feature = "text-index")]
     fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
         self.inner.score_text(node_id, label, property, query)
+    }
+
+    #[cfg(feature = "text-index")]
+    fn score_text_visible(
+        &self,
+        node_id: NodeId,
+        label: &str,
+        property: &str,
+        query: &str,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> grafeo_common::utils::error::Result<Option<f64>> {
+        self.inner
+            .score_text_visible(node_id, label, property, query, epoch, tx)
     }
 
     #[cfg(feature = "text-index")]
@@ -363,6 +627,34 @@ impl GraphStoreSearch for WalGraphStore {
     ) -> Vec<(NodeId, f64)> {
         self.inner
             .text_search_with_threshold(label, property, query, threshold)
+    }
+
+    #[cfg(feature = "text-index")]
+    fn text_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> grafeo_common::utils::error::Result<Vec<(NodeId, f64)>> {
+        self.inner
+            .text_search_visible(label, property, query, k, epoch, tx)
+    }
+
+    #[cfg(feature = "text-index")]
+    fn text_search_with_threshold_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> grafeo_common::utils::error::Result<Vec<(NodeId, f64)>> {
+        self.inner
+            .text_search_with_threshold_visible(label, property, query, threshold, epoch, tx)
     }
 
     #[cfg(feature = "vector-index")]
@@ -403,6 +695,20 @@ impl GraphStoreSearch for WalGraphStore {
         self.inner
             .vector_search_with_threshold(label, property, query, threshold, metric)
     }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search_visible(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        epoch: grafeo_common::types::EpochId,
+        tx: grafeo_common::types::TransactionId,
+    ) -> Vec<(NodeId, f64)> {
+        self.inner
+            .vector_search_visible(label, property, query, k, epoch, tx)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,12 +716,19 @@ impl GraphStoreSearch for WalGraphStore {
 // ---------------------------------------------------------------------------
 
 impl GraphStoreMut for WalGraphStore {
+    fn lpg_commit_store(self: Arc<Self>) -> Option<Arc<grafeo_core::graph::lpg::LpgStore>> {
+        Arc::clone(&self.inner).lpg_commit_store()
+    }
+
     fn create_node(&self, labels: &[&str]) -> NodeId {
         let id = self.inner.create_node(labels);
-        self.log_with_context(&WalRecord::CreateNode {
-            id,
-            labels: labels.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.log_lpg(
+            TransactionId::SYSTEM,
+            LpgMutationOp::CreateNode {
+                id,
+                labels: labels.iter().map(|s| (*s).to_string()).collect(),
+            },
+        );
         id
     }
 
@@ -428,21 +741,30 @@ impl GraphStoreMut for WalGraphStore {
         let id = self
             .inner
             .create_node_versioned(labels, epoch, transaction_id);
-        self.log_with_context(&WalRecord::CreateNode {
-            id,
-            labels: labels.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.log_lpg(
+            transaction_id,
+            LpgMutationOp::CreateNode {
+                id,
+                labels: labels.iter().map(|s| (*s).to_string()).collect(),
+            },
+        );
         id
     }
 
     fn create_edge(&self, src: NodeId, dst: NodeId, edge_type: &str) -> EdgeId {
         let id = self.inner.create_edge(src, dst, edge_type);
-        self.log_with_context(&WalRecord::CreateEdge {
-            id,
-            src,
-            dst,
-            edge_type: edge_type.to_string(),
-        });
+        if !id.is_valid() {
+            return id;
+        }
+        self.log_lpg(
+            TransactionId::SYSTEM,
+            LpgMutationOp::CreateEdge {
+                id,
+                src,
+                dst,
+                edge_type: edge_type.to_string(),
+            },
+        );
         id
     }
 
@@ -457,24 +779,33 @@ impl GraphStoreMut for WalGraphStore {
         let id = self
             .inner
             .create_edge_versioned(src, dst, edge_type, epoch, transaction_id);
-        self.log_with_context(&WalRecord::CreateEdge {
-            id,
-            src,
-            dst,
-            edge_type: edge_type.to_string(),
-        });
+        if !id.is_valid() {
+            return id;
+        }
+        self.log_lpg(
+            transaction_id,
+            LpgMutationOp::CreateEdge {
+                id,
+                src,
+                dst,
+                edge_type: edge_type.to_string(),
+            },
+        );
         id
     }
 
     fn batch_create_edges(&self, edges: &[(NodeId, NodeId, &str)]) -> Vec<EdgeId> {
         let ids = self.inner.batch_create_edges(edges);
         for (id, (src, dst, edge_type)) in ids.iter().zip(edges) {
-            self.log_with_context(&WalRecord::CreateEdge {
-                id: *id,
-                src: *src,
-                dst: *dst,
-                edge_type: (*edge_type).to_string(),
-            });
+            self.log_lpg(
+                TransactionId::SYSTEM,
+                LpgMutationOp::CreateEdge {
+                    id: *id,
+                    src: *src,
+                    dst: *dst,
+                    edge_type: (*edge_type).to_string(),
+                },
+            );
         }
         ids
     }
@@ -482,7 +813,7 @@ impl GraphStoreMut for WalGraphStore {
     fn delete_node(&self, id: NodeId) -> bool {
         let deleted = self.inner.delete_node(id);
         if deleted {
-            self.log_with_context(&WalRecord::DeleteNode { id });
+            self.log_lpg(TransactionId::SYSTEM, LpgMutationOp::DeleteNode { id });
         }
         deleted
     }
@@ -495,7 +826,7 @@ impl GraphStoreMut for WalGraphStore {
     ) -> bool {
         let deleted = self.inner.delete_node_versioned(id, epoch, transaction_id);
         if deleted {
-            self.log_with_context(&WalRecord::DeleteNode { id });
+            self.log_lpg(transaction_id, LpgMutationOp::DeleteNode { id });
         }
         deleted
     }
@@ -505,25 +836,27 @@ impl GraphStoreMut for WalGraphStore {
         let outgoing: Vec<EdgeId> = self
             .inner
             .edges_from(node_id, Direction::Outgoing)
+            .into_iter()
             .map(|(_, eid)| eid)
             .collect();
         let incoming: Vec<EdgeId> = self
             .inner
             .edges_from(node_id, Direction::Incoming)
+            .into_iter()
             .map(|(_, eid)| eid)
             .collect();
 
         self.inner.delete_node_edges(node_id);
 
         for id in outgoing.into_iter().chain(incoming) {
-            self.log_with_context(&WalRecord::DeleteEdge { id });
+            self.log_lpg(TransactionId::SYSTEM, LpgMutationOp::DeleteEdge { id });
         }
     }
 
     fn delete_edge(&self, id: EdgeId) -> bool {
         let deleted = self.inner.delete_edge(id);
         if deleted {
-            self.log_with_context(&WalRecord::DeleteEdge { id });
+            self.log_lpg(TransactionId::SYSTEM, LpgMutationOp::DeleteEdge { id });
         }
         deleted
     }
@@ -536,7 +869,7 @@ impl GraphStoreMut for WalGraphStore {
     ) -> bool {
         let deleted = self.inner.delete_edge_versioned(id, epoch, transaction_id);
         if deleted {
-            self.log_with_context(&WalRecord::DeleteEdge { id });
+            self.log_lpg(transaction_id, LpgMutationOp::DeleteEdge { id });
         }
         deleted
     }
@@ -545,29 +878,38 @@ impl GraphStoreMut for WalGraphStore {
         // Store first, WAL second: consistent lock ordering with create/delete
         // methods to prevent ABBA deadlock between store locks and WAL locks.
         self.inner.set_node_property(id, key, value.clone());
-        self.log_with_context(&WalRecord::SetNodeProperty {
-            id,
-            key: key.to_string(),
-            value,
-        });
+        self.log_lpg(
+            TransactionId::SYSTEM,
+            LpgMutationOp::SetNodeProperty {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        );
     }
 
     fn set_edge_property(&self, id: EdgeId, key: &str, value: Value) {
         self.inner.set_edge_property(id, key, value.clone());
-        self.log_with_context(&WalRecord::SetEdgeProperty {
-            id,
-            key: key.to_string(),
-            value,
-        });
+        self.log_lpg(
+            TransactionId::SYSTEM,
+            LpgMutationOp::SetEdgeProperty {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        );
     }
 
     fn remove_node_property(&self, id: NodeId, key: &str) -> Option<Value> {
         let removed = self.inner.remove_node_property(id, key);
         if removed.is_some() {
-            self.log_with_context(&WalRecord::RemoveNodeProperty {
-                id,
-                key: key.to_string(),
-            });
+            self.log_lpg(
+                TransactionId::SYSTEM,
+                LpgMutationOp::RemoveNodeProperty {
+                    id,
+                    key: key.to_string(),
+                },
+            );
         }
         removed
     }
@@ -575,10 +917,13 @@ impl GraphStoreMut for WalGraphStore {
     fn remove_edge_property(&self, id: EdgeId, key: &str) -> Option<Value> {
         let removed = self.inner.remove_edge_property(id, key);
         if removed.is_some() {
-            self.log_with_context(&WalRecord::RemoveEdgeProperty {
-                id,
-                key: key.to_string(),
-            });
+            self.log_lpg(
+                TransactionId::SYSTEM,
+                LpgMutationOp::RemoveEdgeProperty {
+                    id,
+                    key: key.to_string(),
+                },
+            );
         }
         removed
     }
@@ -586,10 +931,13 @@ impl GraphStoreMut for WalGraphStore {
     fn add_label(&self, node_id: NodeId, label: &str) -> bool {
         let added = self.inner.add_label(node_id, label);
         if added {
-            self.log_with_context(&WalRecord::AddNodeLabel {
-                id: node_id,
-                label: label.to_string(),
-            });
+            self.log_lpg(
+                TransactionId::SYSTEM,
+                LpgMutationOp::AddNodeLabel {
+                    id: node_id,
+                    label: label.to_string(),
+                },
+            );
         }
         added
     }
@@ -597,32 +945,275 @@ impl GraphStoreMut for WalGraphStore {
     fn remove_label(&self, node_id: NodeId, label: &str) -> bool {
         let removed = self.inner.remove_label(node_id, label);
         if removed {
-            self.log_with_context(&WalRecord::RemoveNodeLabel {
-                id: node_id,
-                label: label.to_string(),
-            });
+            self.log_lpg(
+                TransactionId::SYSTEM,
+                LpgMutationOp::RemoveNodeLabel {
+                    id: node_id,
+                    label: label.to_string(),
+                },
+            );
         }
         removed
+    }
+
+    // --- Transactional buffered writes (unified-MVCC) ---
+    //
+    // Override `*_buffered` to delegate to the inner `LpgStore`'s buffered path,
+    // which records the mutation in the transaction's overlay delta instead of
+    // writing through to the committed column. This is what gives WAL-wrapped
+    // persistent stores the same uncommitted-write isolation as a bare
+    // `LpgStore`: other sessions no longer observe a transaction's uncommitted
+    // Cypher writes (see `tests/wal_mvcc_isolation.rs`).
+    //
+    // WAL logging is intentionally unchanged from the non-buffered overrides
+    // above: each mutation is logged immediately (store-first, WAL-second for
+    // lock ordering). Durability is governed by the WAL's positional
+    // transaction framing — the session emits `TransactionCommit` /
+    // `TransactionAbort` markers around the record stream, and recovery
+    // (`WalRecovery::recover`) flushes a pending transaction's records to the
+    // committed set only on commit, discarding them on abort or an incomplete
+    // tail. So only the in-memory routing changes (write-through -> overlay);
+    // the WAL byte stream and recovery semantics are unchanged.
+
+    fn set_node_property_buffered(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.inner
+            .set_node_property_buffered(id, key, value.clone(), transaction_id);
+        self.log_lpg(
+            transaction_id,
+            LpgMutationOp::SetNodeProperty {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        );
+    }
+
+    fn remove_node_property_buffered(&self, id: NodeId, key: &str, transaction_id: TransactionId) {
+        self.inner
+            .remove_node_property_buffered(id, key, transaction_id);
+        self.log_lpg(
+            transaction_id,
+            LpgMutationOp::RemoveNodeProperty {
+                id,
+                key: key.to_string(),
+            },
+        );
+    }
+
+    fn set_edge_property_buffered(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: Value,
+        transaction_id: TransactionId,
+    ) {
+        self.inner
+            .set_edge_property_buffered(id, key, value.clone(), transaction_id);
+        self.log_lpg(
+            transaction_id,
+            LpgMutationOp::SetEdgeProperty {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        );
+    }
+
+    fn remove_edge_property_buffered(&self, id: EdgeId, key: &str, transaction_id: TransactionId) {
+        self.inner
+            .remove_edge_property_buffered(id, key, transaction_id);
+        self.log_lpg(
+            transaction_id,
+            LpgMutationOp::RemoveEdgeProperty {
+                id,
+                key: key.to_string(),
+            },
+        );
+    }
+
+    fn add_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        self.inner
+            .add_label_buffered(node_id, label, transaction_id);
+        // Prepared commit logs the exact final images. Logging each buffered
+        // intent would invent intermediate committed label-history entries.
+    }
+
+    fn remove_label_buffered(&self, node_id: NodeId, label: &str, transaction_id: TransactionId) {
+        self.inner
+            .remove_label_buffered(node_id, label, transaction_id);
+    }
+
+    // Overlay lifecycle (apply/drop) is delegated to the inner `LpgStore`: the
+    // property mutations were logged at buffer time; exact label images are
+    // logged by prepared commit. These have no WAL side effects and must reach
+    // the inner store so the delta is committed or discarded.
+
+    fn apply_tx_overlay(&self, transaction_id: TransactionId) {
+        self.inner.apply_tx_overlay(transaction_id);
+    }
+
+    fn drop_tx_overlay(&self, transaction_id: TransactionId) {
+        self.inner.drop_tx_overlay(transaction_id);
+    }
+
+    fn finalize_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        node_ids: &[NodeId],
+    ) {
+        self.inner
+            .finalize_deletes_by_id(transaction_id, commit_epoch, node_ids);
+    }
+
+    fn take_pending_deletes(&self, transaction_id: TransactionId) -> Vec<NodeId> {
+        self.inner.take_pending_deletes(transaction_id)
+    }
+
+    fn finalize_edge_deletes_by_id(
+        &self,
+        transaction_id: TransactionId,
+        commit_epoch: EpochId,
+        edges: &[(NodeId, EdgeId, NodeId)],
+    ) {
+        self.inner
+            .finalize_edge_deletes_by_id(transaction_id, commit_epoch, edges);
+    }
+
+    fn take_pending_edge_deletes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<(NodeId, EdgeId, NodeId)> {
+        self.inner.take_pending_edge_deletes(transaction_id)
+    }
+
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_snapshot(
+        &self,
+        transaction_id: TransactionId,
+    ) -> grafeo_core::graph::lpg::TxDelta {
+        self.inner.tx_overlay_snapshot(transaction_id)
+    }
+
+    #[cfg(feature = "lpg")]
+    fn tx_overlay_restore(
+        &self,
+        transaction_id: TransactionId,
+        snapshot: grafeo_core::graph::lpg::TxDelta,
+    ) {
+        self.inner.tx_overlay_restore(transaction_id, snapshot);
+    }
+
+    fn tx_structural_snapshot(&self, transaction_id: TransactionId) -> TxStructuralSnapshot {
+        self.inner.tx_structural_snapshot(transaction_id)
+    }
+
+    fn tx_structural_restore(
+        &self,
+        transaction_id: TransactionId,
+        snapshot: TxStructuralSnapshot,
+    ) -> std::result::Result<(), String> {
+        self.inner.tx_structural_restore(transaction_id, snapshot)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grafeo_storage::wal::TypedWal;
+    use grafeo_storage::wal::{TypedWal, WalRecovery};
 
-    fn setup() -> (WalGraphStore, Arc<LpgWal>) {
+    #[test]
+    fn index_preparation_forwards_epoch_and_transaction_without_wal_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(LpgStore::new()?);
+        let id = store.create_node(&["Doc"]);
+        store.set_node_property(id, "value", Value::Int64(1));
+        let frontier = EpochId::new(5);
+        store.sync_epoch(frontier);
+        store.set_node_property(id, "value", Value::Int64(2));
+        let own = TransactionId::new(11);
+        let foreign = TransactionId::new(12);
+        store.set_node_property_buffered(id, "value", Value::Int64(3), own);
+        store.set_node_property_buffered(id, "value", Value::Int64(4), foreign);
+        let wal = Arc::new(TypedWal::open(dir.path().join("wal"))?);
+        let wrapper =
+            WalGraphStore::new(store, Arc::clone(&wal), GraphPath::from_components(&[""])?);
+        for (epoch, transaction, expected) in [
+            (EpochId::INITIAL, None, 1),
+            (frontier, None, 2),
+            (frontier, Some(own), 3),
+        ] {
+            let rows = wrapper.prepare_index_node_rows(epoch, transaction)?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, id);
+            assert_eq!(rows[0].get_property("value"), Some(&Value::Int64(expected)));
+        }
+        assert!(matches!(
+            wrapper.prepare_index_node_rows(EpochId::PENDING, None),
+            Err(grafeo_common::utils::error::Error::Transaction(
+                grafeo_common::utils::error::TransactionError::InvalidState(_)
+            ))
+        ));
+        assert_eq!(wal.record_count(), 0);
+        assert!(!wal.is_poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn compact_edge_creation_rejection_emits_no_wal_operation() {
+        for versioned in [false, true] {
+            let (_dir, writer, wal) = setup();
+            let src = writer.create_node(&["Existing"]);
+            let before = wal.record_count();
+            assert_eq!(before, 1, "the accepted node must reach a healthy WAL");
+            assert!(!wal.is_poisoned());
+            let edge = if versioned {
+                writer.create_edge_versioned(
+                    src,
+                    NodeId::new(999),
+                    "MISSING",
+                    EpochId::INITIAL,
+                    TransactionId::SYSTEM,
+                )
+            } else {
+                writer.create_edge(src, NodeId::new(999), "MISSING")
+            };
+            assert!(
+                !edge.is_valid(),
+                "real inner store rejects missing endpoint"
+            );
+            assert_eq!(writer.edge_count(), 0);
+            assert_eq!(
+                wal.record_count(),
+                before,
+                "rejected ID must never enter WAL"
+            );
+            assert!(!wal.is_poisoned());
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, WalGraphStore, Arc<LpgWal>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(LpgStore::new().unwrap());
-        let wal = Arc::new(TypedWal::open(dir.path()).unwrap());
+        let wal = Arc::new(TypedWal::open(dir.path().join("wal")).unwrap());
         let wal_ref = Arc::clone(&wal);
-        let ctx = Arc::new(parking_lot::Mutex::new(None));
-        (WalGraphStore::new(store, wal, ctx), wal_ref)
+        (
+            dir,
+            WalGraphStore::new(store, wal, GraphPath::root()),
+            wal_ref,
+        )
     }
 
     #[test]
     fn create_node_delegates_and_logs() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let id = ws.create_node(&["Person", "Employee"]);
 
         assert!(ws.get_node(id).is_some());
@@ -632,7 +1223,7 @@ mod tests {
 
     #[test]
     fn create_edge_delegates_and_logs() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let a = ws.create_node(&["Node"]);
         let b = ws.create_node(&["Node"]);
         let eid = ws.create_edge(a, b, "KNOWS");
@@ -645,7 +1236,7 @@ mod tests {
 
     #[test]
     fn set_property_delegates_and_logs() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let nid = ws.create_node(&["Person"]);
         ws.set_node_property(nid, "name", Value::String("Alix".into()));
 
@@ -671,7 +1262,7 @@ mod tests {
 
     #[test]
     fn delete_node_only_logs_on_success() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let id = ws.create_node(&["Person"]);
         assert_eq!(wal.record_count(), 1);
 
@@ -687,7 +1278,7 @@ mod tests {
 
     #[test]
     fn delete_edge_only_logs_on_success() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let a = ws.create_node(&["Node"]);
         let b = ws.create_node(&["Node"]);
         let eid = ws.create_edge(a, b, "LINK");
@@ -705,7 +1296,7 @@ mod tests {
 
     #[test]
     fn remove_property_only_logs_on_success() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let id = ws.create_node(&["Person"]);
         ws.set_node_property(id, "age", Value::Int64(30));
         assert_eq!(wal.record_count(), 2);
@@ -734,7 +1325,7 @@ mod tests {
 
     #[test]
     fn add_remove_label_conditional_logging() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let id = ws.create_node(&["Person"]);
         assert_eq!(wal.record_count(), 1);
 
@@ -757,7 +1348,7 @@ mod tests {
 
     #[test]
     fn batch_create_edges_logs_each() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let a = ws.create_node(&["Node"]);
         let b = ws.create_node(&["Node"]);
         let c = ws.create_node(&["Node"]);
@@ -772,7 +1363,7 @@ mod tests {
 
     #[test]
     fn delete_node_edges_logs_each_edge() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let a = ws.create_node(&["Node"]);
         let b = ws.create_node(&["Node"]);
         let c = ws.create_node(&["Node"]);
@@ -786,42 +1377,123 @@ mod tests {
         assert_eq!(ws.edge_count(), 0);
     }
 
-    fn setup_named_graph() -> (WalGraphStore, Arc<LpgWal>) {
+    fn setup_named_graph(name: &str) -> (tempfile::TempDir, WalGraphStore, Arc<LpgWal>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(LpgStore::new().unwrap());
-        let wal = Arc::new(TypedWal::open(dir.path()).unwrap());
+        let wal = Arc::new(TypedWal::open(dir.path().join("wal")).unwrap());
         let wal_ref = Arc::clone(&wal);
-        let ctx = Arc::new(parking_lot::Mutex::new(None));
         (
-            WalGraphStore::new_for_graph(store, wal, "social".to_string(), ctx),
+            dir,
+            WalGraphStore::new(store, wal, GraphPath::from_components(&[name]).unwrap()),
             wal_ref,
         )
     }
 
     #[test]
-    fn named_graph_emits_switch_graph_record() {
-        let (ws, wal) = setup_named_graph();
+    fn named_graph_emits_graph_tagged_mutation() {
+        let (_dir, ws, wal) = setup_named_graph("social");
         let _id = ws.create_node(&["Person"]);
 
-        // Should have SwitchGraph + CreateNode = 2 records
+        assert_eq!(wal.record_count(), 1, "graph identity is on the mutation");
+    }
+
+    #[test]
+    fn named_graph_each_mutation_is_self_describing() {
+        let (_dir, ws, wal) = setup_named_graph("social");
+        ws.create_node(&["Person"]);
+        assert_eq!(wal.record_count(), 1);
+
+        ws.create_node(&["Person"]);
         assert_eq!(wal.record_count(), 2);
     }
 
     #[test]
-    fn named_graph_context_not_repeated() {
-        let (ws, wal) = setup_named_graph();
-        // First mutation: emits SwitchGraph + CreateNode
-        ws.create_node(&["Person"]);
-        assert_eq!(wal.record_count(), 2);
+    fn empty_named_graph_writer_preserves_empty_component() {
+        let (_dir, ws, wal) = setup_named_graph("");
+        ws.create_node(&["EmptyNamed"]);
+        wal.log(&WalRecord::TransactionCommit {
+            transaction_id: TransactionId::SYSTEM,
+        })
+        .unwrap();
+        wal.sync().unwrap();
 
-        // Second mutation: context already set, no extra SwitchGraph
-        ws.create_node(&["Person"]);
-        assert_eq!(wal.record_count(), 3); // just CreateNode
+        wal.close().unwrap();
+        let records = WalRecovery::new(wal.dir()).unwrap().recover().unwrap();
+        assert!(records.iter().any(|record| matches!(
+            record,
+            WalRecord::LpgMutation {
+                graph,
+                op: LpgMutationOp::CreateNode { labels, .. },
+                ..
+            } if graph.components() == [""] && labels == &["EmptyNamed"]
+        )));
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            WalRecord::LpgMutation { graph, .. } if graph.components().is_empty()
+        )));
+    }
+
+    #[test]
+    fn default_graph_writer_preserves_root_coordinate() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, ws, wal) = setup();
+        let src = ws.create_node(&["Default"]);
+        let dst = ws.create_node(&["Destination"]);
+        ws.set_node_property(src, "name", Value::String("Alix".into()));
+        let edge = ws.create_edge(src, dst, "KNOWS");
+        ws.set_edge_property(edge, "since", Value::Int64(2020));
+        assert!(src.is_valid() && dst.is_valid() && edge.is_valid());
+        assert_eq!(wal.record_count(), 5);
+        assert!(!wal.is_poisoned());
+        wal.log(&WalRecord::TransactionCommit {
+            transaction_id: TransactionId::SYSTEM,
+        })?;
+        wal.sync()?;
+
+        wal.close()?;
+        let records = WalRecovery::new(wal.dir())?.recover()?;
+        assert_eq!(records.len(), 6, "five exact mutations and their commit");
+        assert!(matches!(
+            records.last(),
+            Some(WalRecord::TransactionCommit { transaction_id })
+                if *transaction_id == TransactionId::SYSTEM
+        ));
+        let operations: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                WalRecord::LpgMutation {
+                    transaction_id,
+                    graph,
+                    op,
+                } => {
+                    assert_eq!(*transaction_id, TransactionId::SYSTEM);
+                    assert_eq!(graph, &GraphPath::root());
+                    Some(op)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(
+            operations.as_slice(),
+            [
+                LpgMutationOp::CreateNode { id: src_id, labels: src_labels },
+                LpgMutationOp::CreateNode { id: dst_id, labels: dst_labels },
+                LpgMutationOp::SetNodeProperty { id: property_node, key: node_key, value: node_value },
+                LpgMutationOp::CreateEdge { id: edge_id, src: edge_src, dst: edge_dst, edge_type },
+                LpgMutationOp::SetEdgeProperty { id: property_edge, key: edge_key, value: edge_value },
+            ] if *src_id == src && src_labels == &["Default"]
+                && *dst_id == dst && dst_labels == &["Destination"]
+                && *property_node == src && node_key == "name"
+                && *node_value == Value::String("Alix".into())
+                && *edge_id == edge && *edge_src == src && *edge_dst == dst
+                && edge_type == "KNOWS" && *property_edge == edge
+                && edge_key == "since" && *edge_value == Value::Int64(2020)
+        ));
+        Ok(())
     }
 
     #[test]
     fn create_node_versioned_delegates_and_logs() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let epoch = ws.current_epoch();
         let tx = TransactionId::new(1);
         let id = ws.create_node_versioned(&["Person"], epoch, tx);
@@ -832,7 +1504,7 @@ mod tests {
 
     #[test]
     fn create_edge_versioned_delegates_and_logs() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let epoch = ws.current_epoch();
         let tx = TransactionId::new(1);
         let a = ws.create_node(&["Node"]);
@@ -846,7 +1518,7 @@ mod tests {
 
     #[test]
     fn delete_node_versioned_only_logs_on_success() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let epoch = ws.current_epoch();
         let tx = TransactionId::new(1);
         let id = ws.create_node_versioned(&["Person"], epoch, tx);
@@ -863,7 +1535,7 @@ mod tests {
 
     #[test]
     fn delete_edge_versioned_only_logs_on_success() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let epoch = ws.current_epoch();
         let tx = TransactionId::new(1);
         let a = ws.create_node(&["Node"]);
@@ -884,7 +1556,7 @@ mod tests {
     fn create_node_with_props_via_trait_default() {
         use grafeo_core::graph::GraphStoreMut;
 
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let store: &dyn GraphStoreMut = &ws;
         let id = store.create_node_with_props(
             &["Person"],
@@ -912,7 +1584,7 @@ mod tests {
     fn create_edge_with_props_via_trait_default() {
         use grafeo_core::graph::GraphStoreMut;
 
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let store: &dyn GraphStoreMut = &ws;
         let a = store.create_node(&["Node"]);
         let b = store.create_node(&["Node"]);
@@ -935,7 +1607,7 @@ mod tests {
 
     #[test]
     fn read_operations_do_not_log() {
-        let (ws, wal) = setup();
+        let (_dir, ws, wal) = setup();
         let id = ws.create_node(&["Person"]);
         ws.set_node_property(id, "name", Value::String("Alix".into()));
         assert_eq!(wal.record_count(), 2);
