@@ -8,8 +8,18 @@
 //! a creation we need the creation to happen at epoch > 0 by committing
 //! a preliminary transaction first.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::{EpochId, Value};
 use grafeo_engine::GrafeoDB;
+
+#[cfg(all(
+    feature = "lpg",
+    feature = "gql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+use grafeo_engine::{Config, DurabilityMode, GraphModel};
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -30,6 +40,7 @@ fn bump_epoch(session: &mut grafeo_engine::Session) {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "gql")]
 fn test_execute_at_epoch_sees_old_state() {
     let db = setup_db();
     let mut session = db.session();
@@ -69,6 +80,7 @@ fn test_execute_at_epoch_sees_old_state() {
 }
 
 #[test]
+#[cfg(feature = "gql")]
 fn test_execute_at_epoch_before_creation_returns_empty() {
     let db = setup_db();
     let mut session = db.session();
@@ -96,6 +108,258 @@ fn test_execute_at_epoch_before_creation_returns_empty() {
         result.rows().is_empty(),
         "Node should not be visible before its creation epoch"
     );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn execute_at_epoch_rejects_mutation_without_residue() {
+    let db = setup_db();
+    let session = db.session();
+    let epoch = db.current_epoch();
+
+    let error = session
+        .execute_at_epoch("INSERT (:Person {name: 'Escape'})", epoch)
+        .expect_err("a historical view must be read-only");
+
+    assert!(
+        error.to_string().contains("historical view is read-only"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(db.node_count(), 0, "the rejected write must leave no node");
+    assert!(
+        !session.in_transaction(),
+        "the rejected write must not open an implicit transaction"
+    );
+    assert_eq!(
+        db.current_epoch(),
+        epoch,
+        "the rejected write must not publish an epoch"
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "lpg",
+    feature = "gql",
+    feature = "wal",
+    feature = "grafeo-file"
+))]
+fn rejected_historical_mutation_is_absent_after_sync_wal_reopen() {
+    let directory = tempfile::TempDir::new().expect("create temporary database directory");
+    let path = directory.path().join("historical-rejection.grafeo");
+    let committed_epoch;
+
+    {
+        let db = GrafeoDB::with_config(
+            Config::persistent(&path)
+                .with_graph_model(GraphModel::Lpg)
+                .with_wal_durability(DurabilityMode::Sync),
+        )
+        .expect("open persistent database");
+        let session = db.session();
+        committed_epoch = db.current_epoch();
+        let wal_records_before = db.wal().expect("sync WAL must be present").record_count();
+
+        session
+            .execute_at_epoch("INSERT (:Escape)", committed_epoch)
+            .expect_err("historical mutation must be rejected before WAL framing");
+
+        assert_eq!(
+            db.wal()
+                .expect("sync WAL must remain present")
+                .record_count(),
+            wal_records_before,
+            "rejection must happen before BEGIN or ABORT reaches the WAL"
+        );
+        assert_eq!(db.current_epoch(), committed_epoch);
+        assert_eq!(db.node_count(), 0);
+        assert!(!session.in_transaction());
+        db.close().expect("close persistent database");
+    }
+
+    let reopened = GrafeoDB::with_config(
+        Config::persistent(&path)
+            .with_graph_model(GraphModel::Lpg)
+            .with_wal_durability(DurabilityMode::Sync),
+    )
+    .expect("reopen persistent database");
+    assert_eq!(reopened.current_epoch(), committed_epoch);
+    assert_eq!(reopened.node_count(), 0);
+    assert_eq!(
+        reopened
+            .execute("MATCH (n:Escape) RETURN count(n)")
+            .expect("query reopened database")
+            .rows()[0][0]
+            .as_int64(),
+        Some(0),
+        "recovery must not materialize the rejected mutation"
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn execute_at_epoch_with_params_uses_the_requested_cut() {
+    let db = setup_db();
+    let mut session = db.session();
+    let before_creation = db.current_epoch();
+    bump_epoch(&mut session);
+    session
+        .execute("INSERT (:Person {name: 'Future'})")
+        .unwrap();
+
+    let params =
+        std::collections::HashMap::from([("name".to_string(), Value::String("Future".into()))]);
+    let result = session
+        .execute_at_epoch_with_params(
+            "MATCH (p:Person) WHERE p.name = $name RETURN p.name",
+            before_creation,
+            Some(params),
+        )
+        .expect("parameterized historical query");
+
+    assert!(
+        result.rows().is_empty(),
+        "the parameterized path must not silently fall back to the current epoch"
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn execute_at_epoch_rejects_an_active_transaction_without_disturbing_it() {
+    let db = setup_db();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    session
+        .execute("INSERT (:Person {name: 'Pending'})")
+        .unwrap();
+
+    let error = session
+        .execute_at_epoch(
+            "MATCH (p:Person {name: 'Pending'}) RETURN p.name",
+            db.current_epoch(),
+        )
+        .expect_err("an explicit historical cut cannot replace a transaction snapshot");
+    assert!(
+        error.to_string().contains("active transaction"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        session.in_transaction(),
+        "the transaction must remain active"
+    );
+
+    let result = session
+        .execute("MATCH (p:Person {name: 'Pending'}) RETURN p.name")
+        .expect("the original transaction context must remain usable");
+    assert_eq!(result.rows().len(), 1);
+    session.rollback().unwrap();
+    assert_eq!(db.node_count(), 0);
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn execute_at_epoch_rejects_graph_lifecycle_commands() {
+    let db = setup_db();
+    let session = db.session();
+
+    let error = session
+        .execute_at_epoch("CREATE GRAPH escaped", db.current_epoch())
+        .expect_err("historical execution must accept read queries only");
+    assert!(
+        error
+            .to_string()
+            .contains("historical execution accepts read queries only"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !db.list_graphs().iter().any(|name| name == "escaped"),
+        "the rejected lifecycle command must leave no graph"
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn historical_execution_rejects_unclassified_procedure_effects() {
+    let db = setup_db();
+    let session = db.session();
+    session
+        .execute(
+            "CREATE PROCEDURE plant() RETURNS (n NODE) \
+             AS { INSERT (n:Secret) RETURN n }",
+        )
+        .expect("create mutating procedure fixture");
+    session
+        .execute("CALL plant()")
+        .expect("warm a current procedure call");
+
+    let error = session
+        .execute_at_epoch("CALL plant()", db.current_epoch())
+        .expect_err("procedure effects are not yet safe in a historical view");
+    assert!(
+        error
+            .to_string()
+            .contains("procedure calls are not qualified for historical execution"),
+        "unexpected error: {error}"
+    );
+    let result = session
+        .execute("MATCH (n:Secret) RETURN n")
+        .expect("check for escaped mutation");
+    assert_eq!(
+        result.row_count(),
+        1,
+        "historical CALL must not repeat the warmed mutation"
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn pending_epoch_means_current_committed_cut_not_uncommitted_state() {
+    let db = setup_db();
+    let mut writer = db.session();
+    let reader = db.session();
+    writer.begin_transaction().unwrap();
+    writer
+        .execute("INSERT (:Person {name: 'Uncommitted'})")
+        .unwrap();
+
+    let result = reader
+        .execute_at_epoch(
+            "MATCH (p:Person {name: 'Uncommitted'}) RETURN p.name",
+            EpochId::PENDING,
+        )
+        .expect("PENDING must normalize to the committed publication cut");
+    assert!(
+        result.rows().is_empty(),
+        "an internal PENDING sentinel must not expose another transaction"
+    );
+
+    writer.rollback().unwrap();
+}
+
+#[test]
+#[cfg(all(feature = "gql", feature = "cdc"))]
+fn rejected_historical_mutation_emits_no_cdc_event() {
+    use grafeo_engine::Config;
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_cdc()).expect("open CDC database");
+    let session = db.session();
+    let epoch = db.current_epoch();
+    let before = db
+        .fixture_changes(EpochId::INITIAL..=EpochId::PENDING)
+        .expect("read initial CDC log");
+    session.set_viewing_epoch(epoch);
+
+    session
+        .execute("INSERT (:Person {name: 'Escape'})")
+        .expect_err("historical mutation must fail before CDC staging");
+
+    let after = db
+        .fixture_changes(EpochId::INITIAL..=EpochId::PENDING)
+        .expect("read final CDC log");
+    assert_eq!(after.len(), before.len());
+    assert_eq!(db.current_epoch(), epoch);
+    assert!(!session.in_transaction());
+    assert_eq!(db.node_count(), 0);
 }
 
 #[test]
@@ -206,6 +470,157 @@ fn test_session_set_viewing_epoch() {
 }
 
 #[test]
+#[cfg(feature = "gql")]
+fn persistent_viewing_epoch_rejects_mutation_until_cleared() {
+    let db = setup_db();
+    let session = db.session();
+    let epoch = db.current_epoch();
+    session.set_viewing_epoch(epoch);
+
+    let error = session
+        .execute("INSERT (:Person {name: 'Escape'})")
+        .expect_err("a persistent historical view must be read-only");
+    assert!(
+        error.to_string().contains("historical view is read-only"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(db.node_count(), 0, "the rejected write must leave no node");
+    assert!(
+        !session.in_transaction(),
+        "the rejected write must not open an implicit transaction"
+    );
+    assert_eq!(
+        db.current_epoch(),
+        epoch,
+        "the rejected write must not publish an epoch"
+    );
+
+    session.clear_viewing_epoch();
+    session
+        .execute("INSERT (:Person {name: 'Allowed'})")
+        .expect("clearing the historical view must restore writes");
+    assert_eq!(db.node_count(), 1);
+}
+
+#[test]
+fn persistent_viewing_epoch_rejects_direct_mutation_without_residue() {
+    let db = setup_db();
+    let session = db.session();
+    let epoch = db.current_epoch();
+    session.set_viewing_epoch(epoch);
+
+    let error = session
+        .create_node_with_props(&["Person"], [("name", Value::String("Escape".into()))])
+        .expect_err("direct CRUD must honor the historical read-only fence");
+    assert!(
+        error.to_string().contains("historical view is read-only"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(db.node_count(), 0);
+    assert_eq!(db.current_epoch(), epoch);
+    assert!(!session.in_transaction());
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn persistent_override_cannot_replace_a_transaction_snapshot() {
+    let db = setup_db();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    session
+        .execute("INSERT (:Person {name: 'Pending'})")
+        .unwrap();
+    session.set_viewing_epoch(db.current_epoch());
+
+    let result = session
+        .execute("MATCH (p:Person {name: 'Pending'}) RETURN p.name")
+        .expect("the transaction must retain its BEGIN context");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "the persistent override must not discard read-your-writes"
+    );
+
+    let error = session
+        .execute("INSERT (:Person {name: 'Rejected'})")
+        .expect_err("historical mode must reject new writes inside a transaction");
+    assert!(
+        error.to_string().contains("historical view is read-only"),
+        "unexpected error: {error}"
+    );
+
+    session.clear_viewing_epoch();
+    session.rollback().unwrap();
+    assert_eq!(db.node_count(), 0, "rollback must discard the pending node");
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn transaction_begin_cut_temporarily_supersedes_persistent_override() {
+    let db = setup_db();
+    let mut session = db.session();
+    let before_creation = db.current_epoch();
+    bump_epoch(&mut session);
+    session
+        .execute("INSERT (:Person {name: 'Committed'})")
+        .unwrap();
+    session.set_viewing_epoch(before_creation);
+
+    let historical = session
+        .execute("MATCH (p:Person {name: 'Committed'}) RETURN p.name")
+        .unwrap();
+    assert!(historical.rows().is_empty());
+
+    session.begin_transaction().unwrap();
+    let transactional = session
+        .execute("MATCH (p:Person {name: 'Committed'}) RETURN p.name")
+        .unwrap();
+    assert_eq!(
+        transactional.rows().len(),
+        1,
+        "an active transaction must retain its own immutable BEGIN cut"
+    );
+    session.rollback().unwrap();
+
+    let historical_again = session
+        .execute("MATCH (p:Person {name: 'Committed'}) RETURN p.name")
+        .unwrap();
+    assert!(
+        historical_again.rows().is_empty(),
+        "the persistent override must resume after transaction closure"
+    );
+}
+
+#[test]
+#[cfg(all(feature = "gql", feature = "triple-store"))]
+fn lpg_viewing_epoch_does_not_disable_rdf_mutation_in_both_mode() {
+    use grafeo_core::graph::rdf::{Quad, Term, Triple};
+    use grafeo_engine::{Config, GraphModel};
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Both))
+        .expect("open dual-model database");
+    let session = db.session();
+    session.set_viewing_epoch(db.current_epoch());
+    let quad = Quad::new(Triple::new(
+        Term::iri("urn:subject"),
+        Term::iri("urn:predicate"),
+        Term::literal("object"),
+    ));
+
+    assert_eq!(
+        session
+            .insert_rdf_quads([quad.clone()])
+            .expect("LPG viewing_epoch must not redefine RDF temporal semantics"),
+        1
+    );
+    assert!(
+        session
+            .try_contains_rdf_quad(&quad)
+            .expect("read inserted RDF quad")
+    );
+}
+
+#[test]
 fn test_session_reset_clears_viewing_epoch() {
     let db = setup_db();
     let session = db.session();
@@ -213,7 +628,7 @@ fn test_session_reset_clears_viewing_epoch() {
     session.set_viewing_epoch(EpochId::new(1));
     assert!(session.viewing_epoch().is_some());
 
-    session.reset_session();
+    session.reset_session().unwrap();
     assert!(session.viewing_epoch().is_none());
 }
 
@@ -274,7 +689,8 @@ fn test_get_node_at_epoch() {
     bump_epoch(&mut session);
 
     let id = db.create_node(&["Person"]);
-    db.set_node_property(id, "name", Value::String("Alix".into()));
+    db.set_node_property(id, "name", Value::String("Alix".into()))
+        .expect("set node property");
     let epoch_after = db.current_epoch();
 
     // Node should exist at this epoch
@@ -315,7 +731,8 @@ fn test_node_history_single_version() {
     let db = setup_db();
 
     let id = db.create_node(&["Person"]);
-    db.set_node_property(id, "name", Value::String("Alix".into()));
+    db.set_node_property(id, "name", Value::String("Alix".into()))
+        .expect("set node property");
 
     let history = db.get_node_history(id);
     assert_eq!(history.len(), 1);
@@ -402,3 +819,9 @@ fn test_validity_ts_smoke() {
     assert_eq!(id, 42);
     assert_eq!(decoded, ts1);
 }
+
+#[cfg(feature = "cdc")]
+#[path = "support/cdc_pages.rs"]
+mod cdc_pages;
+#[cfg(feature = "cdc")]
+use cdc_pages::CdcFixtureChanges;

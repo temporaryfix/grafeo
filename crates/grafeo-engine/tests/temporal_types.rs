@@ -7,10 +7,17 @@
 //! cargo test -p grafeo-engine --features full --test temporal_types
 //! ```
 
+#[cfg(any(feature = "cypher", feature = "gql"))]
 use grafeo_common::types::Value;
+#[cfg(any(
+    feature = "cypher",
+    feature = "gql",
+    all(feature = "sparql", feature = "triple-store")
+))]
 use grafeo_engine::GrafeoDB;
 
 /// Creates 2 Person nodes (Alix birthday 1990-06-15, Gus birthday 2000-01-01).
+#[cfg(any(feature = "cypher", feature = "gql"))]
 fn create_test_db() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
     let mut session = db.session();
@@ -334,34 +341,42 @@ fn gql_date_json_param_roundtrip() {
 
 #[test]
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
-fn sparql_xsd_date_literal() {
-    let db = GrafeoDB::new_in_memory();
+fn sparql_xsd_date_literal() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_engine::config::{Config, GraphModel};
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))?;
     let result = db
         .execute_sparql(
             r#"SELECT ?d WHERE { BIND("2024-03-15"^^<http://www.w3.org/2001/XMLSchema#date> AS ?d) }"#,
         )
         .unwrap();
-    assert!(!result.rows().is_empty(), "expected at least one row");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.column_count(), 1);
     let d = result.rows()[0][0].as_date().expect("expected Date value");
     assert_eq!(d.year(), 2024);
     assert_eq!(d.month(), 3);
     assert_eq!(d.day(), 15);
+    Ok(())
 }
 
 #[test]
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
-fn sparql_xsd_duration_literal() {
-    let db = GrafeoDB::new_in_memory();
+fn sparql_xsd_duration_literal() -> Result<(), Box<dyn std::error::Error>> {
+    use grafeo_engine::config::{Config, GraphModel};
+
+    let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))?;
     let result = db
         .execute_sparql(
             r#"SELECT ?d WHERE { BIND("P1Y6M"^^<http://www.w3.org/2001/XMLSchema#duration> AS ?d) }"#,
         )
         .unwrap();
-    assert!(!result.rows().is_empty(), "expected at least one row");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.column_count(), 1);
     let d = result.rows()[0][0]
         .as_duration()
         .expect("expected Duration value");
     assert_eq!(d.months(), 18);
+    Ok(())
 }
 
 // ============================================================================
@@ -454,4 +469,154 @@ fn cypher_duration_map_with_weeks() {
         .as_duration()
         .expect("expected Duration value");
     assert_eq!(d.days(), 17); // 2 weeks + 3 days
+}
+
+/// Equality must reach the shared predicate evaluator, including the callers
+/// that use it for membership, CASE, NULLIF and mutation selection.
+#[cfg(feature = "gql")]
+fn assert_temporal_predicate_equality(value: Value, equal: Value, different: Value) {
+    let db = GrafeoDB::new_in_memory();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    for (id, stored) in [(1, value), (2, different), (3, Value::Null)] {
+        session
+            .create_node_with_props(
+                &["TemporalEquality"],
+                [("id", Value::Int64(id)), ("value", stored)],
+            )
+            .unwrap();
+    }
+    session.commit().unwrap();
+    for (predicate, expected) in [
+        ("n.value = $needle", vec![1]),
+        ("n.value <> $needle", vec![2]),
+        ("n.value IN [null, $needle]", vec![1]),
+        (
+            "CASE n.value WHEN $needle THEN true ELSE false END",
+            vec![1],
+        ),
+        (
+            "n.value IS NOT NULL AND NULLIF(n.value, $needle) IS NULL",
+            vec![1],
+        ),
+        ("n.value = null", vec![]),
+        ("n.value = '2024-11-01'", vec![]),
+    ] {
+        let result = db
+            .execute_with_params(
+                &format!("MATCH (n:TemporalEquality) WHERE {predicate} RETURN n.id ORDER BY n.id"),
+                std::collections::HashMap::from([("needle".to_owned(), equal.clone())]),
+            )
+            .unwrap();
+        let expected: Vec<Vec<Value>> = expected
+            .into_iter()
+            .map(|id| vec![Value::Int64(id)])
+            .collect();
+        assert_eq!(result.rows(), expected, "{predicate}, needle={equal:?}");
+    }
+    db.execute_with_params(
+        "MATCH (n:TemporalEquality) WHERE n.value = $needle SET n.selected = true",
+        std::collections::HashMap::from([("needle".to_owned(), equal)]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute("MATCH (n:TemporalEquality) WHERE n.selected = true RETURN n.id")
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn temporal_predicate_date_equality() {
+    use grafeo_common::types::Date;
+    let value = Value::Date(Date::parse("2024-11-01").unwrap());
+    assert_temporal_predicate_equality(
+        value.clone(),
+        value,
+        Value::Date(Date::parse("2024-11-02").unwrap()),
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn temporal_predicate_time_equality() {
+    use grafeo_common::types::Time;
+    let value = Value::Time(Time::parse("12:30:00.123456").unwrap());
+    assert_temporal_predicate_equality(
+        value.clone(),
+        value,
+        Value::Time(Time::parse("12:30:00.123457").unwrap()),
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn temporal_predicate_timestamp_equality() {
+    use grafeo_common::types::Timestamp;
+    let value = Value::Timestamp(Timestamp::from_micros(1_234_567));
+    assert_temporal_predicate_equality(
+        value.clone(),
+        value,
+        Value::Timestamp(Timestamp::from_micros(1_234_568)),
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn temporal_predicate_duration_equality() {
+    use grafeo_common::types::Duration;
+    let value = Value::Duration(Duration::parse("P1M").unwrap());
+    assert_temporal_predicate_equality(
+        value.clone(),
+        value,
+        Value::Duration(Duration::parse("P30D").unwrap()),
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn temporal_predicate_zoned_instant_equality() {
+    use grafeo_common::types::ZonedDatetime;
+    assert_temporal_predicate_equality(
+        Value::ZonedDatetime(ZonedDatetime::parse("2024-11-01T12:00:00+02:00").unwrap()),
+        Value::ZonedDatetime(ZonedDatetime::parse("2024-11-01T10:00:00Z").unwrap()),
+        Value::ZonedDatetime(ZonedDatetime::parse("2024-11-01T12:00:00Z").unwrap()),
+    );
+}
+
+#[test]
+#[cfg(feature = "gql")]
+fn temporal_predicate_date_index_and_retained_snapshot() {
+    for indexed in [false, true] {
+        let db = GrafeoDB::new_in_memory();
+        db.execute("INSERT (:Event {id: 1, date: DATE '2024-11-01'})")
+            .unwrap();
+        db.execute("INSERT (:Event {id: 2, date: DATE '2024-11-02'})")
+            .unwrap();
+        if indexed {
+            db.execute("CREATE INDEX event_date FOR (e:Event) ON (e.date)")
+                .unwrap();
+        }
+        let old_epoch = db.current_epoch();
+        let query = "MATCH (e:Event) WHERE e.date = DATE '2024-11-01' RETURN e.id";
+        assert_eq!(
+            db.execute(query).unwrap().rows(),
+            vec![vec![Value::Int64(1)]]
+        );
+        db.execute(
+            "MATCH (e:Event) WHERE e.date = DATE '2024-11-01' SET e.date = DATE '2024-11-03'",
+        )
+        .unwrap();
+        assert!(db.execute(query).unwrap().rows().is_empty());
+        assert_eq!(
+            db.session()
+                .execute_at_epoch(query, old_epoch)
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(1)]],
+            "indexed={indexed}"
+        );
+    }
 }

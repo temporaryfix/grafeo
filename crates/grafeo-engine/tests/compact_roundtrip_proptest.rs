@@ -93,10 +93,12 @@ fn apply_spec(spec: &GraphSpec, db: &GrafeoDB) {
     for n in &spec.nodes {
         let id = db.create_node(&[n.label]);
         if let Some(num) = n.num {
-            db.set_node_property(id, "num", Value::Int64(num));
+            db.set_node_property(id, "num", Value::Int64(num))
+                .expect("set node property");
         }
         if let Some(s) = &n.name {
-            db.set_node_property(id, "name", Value::String(s.clone().into()));
+            db.set_node_property(id, "name", Value::String(s.clone().into()))
+                .expect("set node property");
         }
         ids.push(id);
     }

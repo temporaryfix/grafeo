@@ -6,7 +6,7 @@
 //!
 //! When `temporal` is disabled, these tests are skipped.
 
-#![cfg(feature = "temporal")]
+#![cfg(feature = "gql")]
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
@@ -461,7 +461,7 @@ fn test_temporal_gc_does_not_break_current_state() {
     session.commit().unwrap();
 
     // Run GC
-    db.gc();
+    db.gc().expect("collect retained history");
 
     // Current state should still work
     let result = session
