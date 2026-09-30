@@ -155,51 +155,17 @@ impl ExpandOperator {
         let transaction_id = self.transaction_id;
         let use_versioned = !self.read_only;
 
-        // Get edges from this node
-        let edges: Vec<(NodeId, EdgeId)> = self
-            .store
-            .edges_from(source_id, self.direction)
-            .into_iter()
-            .filter(|(target_id, edge_id)| {
-                // Filter by edge type if specified
-                let type_matches = if self.edge_types.is_empty() {
-                    true
-                } else {
-                    // Use versioned type lookup only when we need to see
-                    // PENDING (uncommitted) edges created by this transaction.
-                    let actual_type =
-                        if use_versioned && let (Some(ep), Some(tx)) = (epoch, transaction_id) {
-                            self.store.edge_type_versioned(*edge_id, ep, tx)
-                        } else {
-                            self.store.edge_type(*edge_id)
-                        };
-                    actual_type.is_some_and(|t| {
-                        self.edge_types
-                            .iter()
-                            .any(|et| t.as_str().eq_ignore_ascii_case(et.as_str()))
-                    })
-                };
-
-                if !type_matches {
-                    return false;
-                }
-
-                // Filter by visibility if we have epoch context
-                if let Some(epoch) = epoch {
-                    if use_versioned && let Some(tx) = transaction_id {
-                        self.store.is_edge_visible_versioned(*edge_id, epoch, tx)
-                            && self.store.is_node_visible_versioned(*target_id, epoch, tx)
-                    } else {
-                        self.store.is_edge_visible_at_epoch(*edge_id, epoch)
-                            && self.store.is_node_visible_at_epoch(*target_id, epoch)
-                    }
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        self.current_edges = edges;
+        super::factorized_expand::fill_neighbors_for_expand(
+            self.store.as_ref(),
+            source_id,
+            self.direction,
+            &self.edge_types,
+            epoch,
+            transaction_id,
+            use_versioned,
+            None,
+            &mut self.current_edges,
+        );
         self.current_edge_idx = 0;
         Ok(true)
     }
