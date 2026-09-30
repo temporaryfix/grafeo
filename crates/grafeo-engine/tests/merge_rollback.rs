@@ -3,6 +3,8 @@
 //! Verifies that ON MATCH SET properties written by MERGE are correctly
 //! undone when a transaction is rolled back.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -123,6 +125,7 @@ fn test_merge_relationship_create_rolled_back_does_not_orphan_edge() {
 }
 
 #[test]
+#[cfg(feature = "cypher")]
 fn test_merge_two_phase_on_create_failure_rolls_back_node() {
     // When a UNIQUE constraint conflict on an ON CREATE expression
     // property triggers a phase-two validation failure, the partial
@@ -194,5 +197,49 @@ fn test_merge_on_match_committed_stays() {
         result.rows()[0][0],
         Value::Int64(100),
         "score should retain the committed value"
+    );
+}
+
+#[test]
+fn indexed_merge_reuses_same_transaction_create_and_set_then_rolls_back() {
+    let db = GrafeoDB::new_in_memory();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: Some("thing_k".into()),
+        label: None,
+        property: "k".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .unwrap();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+
+    let created = session
+        .execute("CREATE (n:Thing {k: 1}) RETURN id(n)")
+        .unwrap();
+    let created_id = created.rows()[0][0].clone();
+    session
+        .execute("MATCH (n:Thing {k: 1}) SET n.k = 2")
+        .unwrap();
+    let merged = session
+        .execute("MERGE (m:Thing {k: 2}) RETURN id(m)")
+        .unwrap();
+    assert_eq!(merged.row_count(), 1);
+    assert_eq!(merged.rows()[0][0], created_id);
+    assert_eq!(
+        session
+            .execute("MATCH (n:Thing {k: 2}) RETURN count(n)")
+            .unwrap()
+            .rows()[0][0],
+        Value::Int64(1)
+    );
+
+    session.rollback().unwrap();
+    assert_eq!(
+        session
+            .execute("MATCH (n:Thing) RETURN count(n)")
+            .unwrap()
+            .rows()[0][0],
+        Value::Int64(0)
     );
 }

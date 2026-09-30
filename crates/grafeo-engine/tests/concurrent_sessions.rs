@@ -6,11 +6,64 @@
 //! - Transaction isolation across sessions
 //! - Race condition handling
 
+#![cfg(feature = "lpg")]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use grafeo_engine::GrafeoDB;
+use grafeo_common::types::{PropertyKey, Value};
+use grafeo_common::utils::error::{Error, TransactionError};
+use grafeo_engine::{Config, GrafeoDB, Session};
+
+fn is_classified_write_conflict(error: &impl std::fmt::Display) -> bool {
+    let text = error.to_string();
+    text.contains("GRAFEO-T001") || text.contains("Write-write conflict")
+}
+
+fn execute_stress_write(db: &GrafeoDB, query: &str) {
+    const MAX_ATTEMPTS: usize = 128;
+    for attempt in 0..MAX_ATTEMPTS {
+        let session = db.session();
+        let result = session.execute(query);
+        assert!(
+            !session.in_transaction(),
+            "autocommit must close its transaction"
+        );
+        match result {
+            Ok(_) => return,
+            Err(Error::Transaction(TransactionError::WriteConflict(_))) => {
+                // Publication can reject a busy rebind. A fresh attempt must
+                // either complete this logical write or fail the bounded test.
+                thread::sleep(std::time::Duration::from_micros(1_u64 << attempt.min(10)));
+            }
+            Err(error) => panic!("unexpected stress write failure: {error}"),
+        }
+    }
+    panic!("stress write exhausted {MAX_ATTEMPTS} attempts: {query}");
+}
+
+fn unwind_rows(rows: Vec<Value>) -> HashMap<String, Value> {
+    HashMap::from([("rows".into(), Value::List(rows.into()))])
+}
+
+fn row_map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Map(
+        entries
+            .into_iter()
+            .map(|(key, value)| (PropertyKey::new(key), value))
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+    )
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
 // ============================================================================
 // Concurrent Session Access Tests
@@ -526,9 +579,8 @@ fn test_stress_concurrent_writers() {
             thread::spawn(move || {
                 barrier.wait();
                 for i in 0..writes_per_thread {
-                    let session = db.session();
                     let query = format!("INSERT (:Stress {{thread: {tid}, seq: {i}}})");
-                    session.execute(&query).unwrap();
+                    execute_stress_write(&db, &query);
                 }
                 success_count.fetch_add(1, Ordering::Relaxed);
             })
@@ -543,11 +595,31 @@ fn test_stress_concurrent_writers() {
 
     // Verify total node count
     let session = db.session();
-    let result = session.execute("MATCH (n:Stress) RETURN n").unwrap();
+    let result = session
+        .execute("MATCH (n:Stress) RETURN n.thread, n.seq")
+        .unwrap();
     assert_eq!(
         result.row_count(),
         num_threads * writes_per_thread,
         "All nodes should be created"
+    );
+    let actual: BTreeSet<_> = result
+        .rows()
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Int64(tid), Value::Int64(seq)) => (*tid, *seq),
+            other => panic!("invalid stress write identity: {other:?}"),
+        })
+        .collect();
+    let expected: BTreeSet<_> = (0..num_threads)
+        .flat_map(|tid| {
+            (0..writes_per_thread)
+                .map(move |seq| (i64::try_from(tid).unwrap(), i64::try_from(seq).unwrap()))
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "every logical write must commit exactly once"
     );
 }
 
@@ -685,6 +757,7 @@ fn test_stress_transaction_conflicts() {
 #[test]
 #[ignore = "stress test: slow in CI, run locally with --ignored"]
 fn test_stress_concurrent_epoch_pressure() {
+    const MAX_ATTEMPTS: usize = 128;
     // 4 threads each running 8 sequential transactions, creates many epochs
     let db = Arc::new(GrafeoDB::new_in_memory());
 
@@ -702,12 +775,40 @@ fn test_stress_concurrent_epoch_pressure() {
             thread::spawn(move || {
                 barrier.wait();
                 for i in 0..txns_per_thread {
-                    let mut session = db.session();
-                    session.begin_transaction().unwrap();
-                    session
-                        .execute(&format!("INSERT (:Epoch {{thread: {tid}, txn: {i}}})"))
-                        .unwrap();
-                    session.commit().unwrap();
+                    let query = format!("INSERT (:Epoch {{thread: {tid}, txn: {i}}})");
+                    let mut committed = false;
+                    for attempt in 0..MAX_ATTEMPTS {
+                        let mut session = db.session();
+                        let result = session
+                            .begin_transaction()
+                            .and_then(|()| session.execute(&query).map(drop))
+                            .and_then(|()| session.commit());
+                        match result {
+                            Ok(_) => {
+                                assert!(!session.in_transaction());
+                                committed = true;
+                                break;
+                            }
+                            Err(Error::Transaction(TransactionError::WriteConflict(_))) => {
+                                // A failed commit may already have aborted the transaction.
+                                if session.in_transaction() {
+                                    session
+                                        .rollback()
+                                        .expect("abort conflicted epoch transaction");
+                                }
+                                assert!(!session.in_transaction());
+                                drop(session);
+                                thread::sleep(std::time::Duration::from_micros(
+                                    1_u64 << attempt.min(10),
+                                ));
+                            }
+                            Err(error) => panic!("unexpected epoch transaction failure: {error}"),
+                        }
+                    }
+                    assert!(
+                        committed,
+                        "epoch transaction exhausted {MAX_ATTEMPTS} attempts: {query}"
+                    );
                 }
                 completed.fetch_add(1, Ordering::Relaxed);
             })
@@ -720,13 +821,33 @@ fn test_stress_concurrent_epoch_pressure() {
 
     assert_eq!(completed.load(Ordering::Relaxed), num_threads);
 
-    // All nodes should be visible
+    // Every committed identity must appear exactly once, including after retries.
     let session = db.session();
-    let result = session.execute("MATCH (n:Epoch) RETURN n").unwrap();
+    let result = session
+        .execute("MATCH (n:Epoch) RETURN n.thread, n.txn")
+        .unwrap();
     assert_eq!(
         result.row_count(),
         num_threads * txns_per_thread,
         "All epoch nodes should exist"
+    );
+    let actual: BTreeSet<_> = result
+        .rows()
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Int64(tid), Value::Int64(txn)) => (*tid, *txn),
+            other => panic!("invalid epoch transaction identity: {other:?}"),
+        })
+        .collect();
+    let expected: BTreeSet<_> = (0..num_threads)
+        .flat_map(|tid| {
+            (0..txns_per_thread)
+                .map(move |txn| (i64::try_from(tid).unwrap(), i64::try_from(txn).unwrap()))
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "Each epoch transaction must commit exactly once"
     );
 }
 
@@ -741,7 +862,7 @@ fn concurrent_merge_same_node() {
     let db = Arc::new(GrafeoDB::new_in_memory());
 
     let num_threads = 8;
-    let rounds = 10;
+    let rounds: usize = 10;
     let barrier = Arc::new(Barrier::new(num_threads));
 
     let handles: Vec<_> = (0..num_threads)
@@ -753,13 +874,12 @@ fn concurrent_merge_same_node() {
                 barrier.wait();
 
                 for round in 0..rounds {
-                    let session = db.session();
                     let query = format!(
                         "MERGE (n:Shared {{key: 'thread_{tid}'}}) \
                          ON CREATE SET n.thread_id = {tid} \
                          ON MATCH SET n.round = {round}"
                     );
-                    session.execute(&query).unwrap();
+                    execute_stress_write(&db, &query);
                 }
             })
         })
@@ -780,12 +900,21 @@ fn concurrent_merge_same_node() {
 
     // Verify each thread's node exists
     for tid in 0..num_threads {
-        let query = format!("MATCH (n:Shared {{key: 'thread_{tid}'}}) RETURN n");
+        let query = format!("MATCH (n:Shared {{key: 'thread_{tid}'}}) RETURN n.thread_id, n.round");
         let result = session.execute(&query).unwrap();
         assert_eq!(
             result.row_count(),
             1,
             "Thread {tid} should have exactly 1 node"
+        );
+        assert_eq!(
+            result.rows()[0][0],
+            Value::Int64(i64::try_from(tid).unwrap())
+        );
+        assert_eq!(
+            result.rows()[0][1],
+            Value::Int64(i64::try_from(rounds - 1).unwrap()),
+            "every MERGE round must complete"
         );
     }
 }
@@ -1469,6 +1598,581 @@ fn test_cross_session_visibility_multiple_mutations() {
         result.rows()[0][0],
         grafeo_common::types::Value::Int64(25),
         "New session should see the updated price"
+    );
+}
+
+/// Public Session shape of SF3 `lost_update`: workers use explicit transactions
+/// to increment one `:Node:Person` row, while the reset uses the public
+/// auto-commit `MATCH ... SET ... RETURN n` path. This is a correctness control;
+/// passing it does not establish closure of the retained crash.
+#[test]
+fn test_concurrent_auto_commit_set_return_preserves_person_labels() {
+    // graph-bench lost_update. Default stays CI-sized. SF3 is
+    // GRAFEO_LU_PEOPLE=27000 GRAFEO_LU_EDGES=540000 GRAFEO_LU_ROUNDS=10
+    let people = env_usize("GRAFEO_LU_PEOPLE", 2048);
+    let edges = env_usize("GRAFEO_LU_EDGES", 0);
+    let rounds = env_usize("GRAFEO_LU_ROUNDS", 1).max(1);
+    assert!(people > 0, "lost_update requires at least one person");
+    const BATCH: usize = 1000;
+    eprintln!("lost_update load people={people} edges={edges} rounds={rounds}");
+    let db = Arc::new(GrafeoDB::with_config(Config::in_memory()).unwrap());
+    {
+        let session = db.session();
+        for start in (0..people).step_by(BATCH) {
+            let rows = (start..(start + BATCH).min(people))
+                .map(|i| {
+                    row_map([
+                        ("id", Value::String(format!("person-{i}").into())),
+                        ("viewCount", Value::Int64(0)),
+                        ("lastUpdate", Value::String(String::new().into())),
+                        ("lastAccess", Value::String(String::new().into())),
+                    ])
+                })
+                .collect();
+            session
+                .execute_with_params(
+                    "UNWIND $rows AS r INSERT (:Person:Node {id: r.id, viewCount: r.viewCount, lastUpdate: r.lastUpdate, lastAccess: r.lastAccess})",
+                    unwind_rows(rows),
+                )
+                .unwrap();
+            session
+                .execute("CREATE INDEX IF NOT EXISTS gb_id FOR (n:Node) ON (n.id)")
+                .unwrap();
+        }
+        for start in (0..edges).step_by(BATCH) {
+            let rows = (start..(start + BATCH).min(edges))
+                .map(|edge| {
+                    row_map([
+                        (
+                            "s",
+                            Value::String(format!("person-{}", edge % people).into()),
+                        ),
+                        (
+                            "t",
+                            Value::String(format!("person-{}", (edge + 1) % people).into()),
+                        ),
+                    ])
+                })
+                .collect();
+            session
+                .execute_with_params(
+                    "UNWIND $rows AS e MATCH (s:Node {id:e.s}), (t:Node {id:e.t}) CREATE (s)-[:KNOWS]->(t)",
+                    unwind_rows(rows),
+                )
+                .unwrap();
+        }
+        let setup_updates = people.min(100);
+        for i in 0..setup_updates {
+            let reset = session
+                .execute(&format!(
+                    "MATCH (n:Node {{id: 'person-{i}'}}) SET n.viewCount = 0, n.lastUpdate = '', n.lastAccess = '' RETURN n"
+                ))
+                .expect("setup auto-commit SET RETURN must not crash");
+            assert_eq!(reset.row_count(), 1, "setup person-{i}");
+        }
+    }
+
+    for round in 0..rounds {
+        eprintln!("lost_update round {round}");
+        let session = db.session();
+        let reset = session
+            .execute("MATCH (n:Node {id: 'person-0'}) SET n.viewCount = 0 RETURN n")
+            .expect("round reset SET RETURN must not crash");
+        assert_eq!(
+            reset.row_count(),
+            1,
+            "round {round} reset should return one node"
+        );
+        let Value::Map(node) = &reset.rows()[0][0] else {
+            panic!("round {round} reset should return a node map");
+        };
+        assert_eq!(
+            node.get(&PropertyKey::new("id")),
+            Some(&Value::String("person-0".into()))
+        );
+        assert_eq!(
+            node.get(&PropertyKey::new("viewCount")),
+            Some(&Value::Int64(0))
+        );
+        let Value::List(labels) = node
+            .get(&PropertyKey::new("_labels"))
+            .expect("round reset should include typed labels")
+        else {
+            panic!("round {round} reset labels should be a list");
+        };
+        let mut label_names = Vec::with_capacity(labels.len());
+        for label in labels.iter() {
+            let Value::String(label) = label else {
+                panic!("round {round} reset labels must be strings");
+            };
+            label_names.push(label.as_str());
+        }
+        label_names.sort_unstable();
+        assert_eq!(label_names, ["Node", "Person"]);
+        drop(session);
+
+        let workers = 4;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..25 {
+                        let mut last_error = None;
+                        let mut succeeded = false;
+                        for _ in 0..64 {
+                            let mut session = db.session();
+                            session.begin_transaction().unwrap();
+                            let result = (|| {
+                                let rows = session.execute(
+                                    "MATCH (p:Person {id: 'person-0'}) RETURN p.viewCount AS viewCount",
+                                )?;
+                                assert_eq!(rows.row_count(), 1);
+                                let Value::Int64(current) = &rows.rows()[0][0] else {
+                                    panic!("viewCount must be an integer: {:?}", rows.rows()[0][0]);
+                                };
+                                let next = current + 1;
+                                session.execute(&format!(
+                                    "MATCH (p:Person {{id: 'person-0'}}) SET p.viewCount = {next}"
+                                ))?;
+                                session.commit()
+                            })();
+                            match result {
+                                Ok(_) => {
+                                    succeeded = true;
+                                    break;
+                                }
+                                Err(error) if is_classified_write_conflict(&error) => {
+                                    let _ = session.rollback();
+                                    last_error = Some(error);
+                                }
+                                Err(error) => panic!("lost_update SET must not crash: {error}"),
+                            }
+                        }
+                        assert!(
+                            succeeded,
+                            "worker increment exhausted retries: {last_error:?}"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("worker thread panicked");
+        }
+
+        let node_rows = db
+            .session()
+            .execute("MATCH (n:Node {id: 'person-0'}) RETURN n.viewCount")
+            .expect("Node post-worker read must succeed");
+        assert_eq!(
+            node_rows.rows(),
+            &[vec![Value::Int64(100)]],
+            "round {round} Node total"
+        );
+        let person_rows = db
+            .session()
+            .execute("MATCH (n:Person {id: 'person-0'}) RETURN n.viewCount")
+            .expect("Person post-worker read must succeed");
+        assert_eq!(
+            person_rows.rows(),
+            &[vec![Value::Int64(100)]],
+            "round {round} Person total"
+        );
+    }
+
+    let session = db.session();
+    let reset = session
+        .execute("MATCH (n:Node {id: 'person-0'}) SET n.viewCount = 0 RETURN n")
+        .expect("reset SET RETURN must not crash");
+    assert_eq!(reset.row_count(), 1);
+    let Value::Map(node) = &reset.rows()[0][0] else {
+        panic!("reset must return a node map");
+    };
+    assert_eq!(
+        node.get(&PropertyKey::new("id")),
+        Some(&Value::String("person-0".into()))
+    );
+    assert_eq!(
+        node.get(&PropertyKey::new("viewCount")),
+        Some(&Value::Int64(0))
+    );
+    let Value::List(labels) = node
+        .get(&PropertyKey::new("_labels"))
+        .expect("final reset should include typed labels")
+    else {
+        panic!("final reset labels should be a list");
+    };
+    let mut label_names = Vec::with_capacity(labels.len());
+    for label in labels.iter() {
+        let Value::String(label) = label else {
+            panic!("final reset labels must be strings");
+        };
+        label_names.push(label.as_str());
+    }
+    label_names.sort_unstable();
+    assert_eq!(label_names, ["Node", "Person"]);
+    assert_eq!(
+        session
+            .execute("MATCH (n:Person {id: 'person-0'}) RETURN n.viewCount")
+            .unwrap()
+            .rows(),
+        &[vec![Value::Int64(0)]]
+    );
+}
+
+/// Repeated auto-commit updates must preserve a labeled node and its identity.
+#[test]
+fn test_repeated_auto_commit_labeled_node_updates_preserve_rows_and_labels() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    let node_id = session
+        .create_node_with_props(
+            &["Node", "Person"],
+            [
+                ("id", Value::String("person".into())),
+                ("viewCount", Value::Int64(0)),
+            ],
+        )
+        .unwrap();
+    let expected_labels = ["Node", "Person"];
+    let assert_labels = |check: &Session, expected: &[&str]| {
+        let node = check
+            .get_node(node_id)
+            .expect("seeded node should remain visible");
+        let mut labels: Vec<&str> = node.labels.iter().map(|label| label.as_str()).collect();
+        labels.sort_unstable();
+        assert_eq!(labels, expected);
+        assert_eq!(
+            check.get_node_property(node_id, "id"),
+            Some(Value::String("person".into()))
+        );
+    };
+
+    for cycle in 0..32 {
+        let nonzero = i64::from(cycle + 1);
+        session
+            .set_node_property(node_id, "viewCount", Value::Int64(nonzero))
+            .unwrap();
+        assert!(!session.add_node_label(node_id, "Person"));
+        assert!(!session.remove_node_label(node_id, "Absent"));
+        assert!(session.add_node_label(node_id, "CycleLabel"));
+        assert_labels(&session, &["CycleLabel", "Node", "Person"]);
+        assert!(session.remove_node_label(node_id, "CycleLabel"));
+        assert_labels(&session, &expected_labels);
+        assert_eq!(
+            session.get_node_property(node_id, "viewCount"),
+            Some(Value::Int64(nonzero))
+        );
+
+        let result = session
+            .execute("MATCH (n:Node {id: 'person'}) SET n.viewCount = 0 RETURN n")
+            .unwrap();
+        assert_eq!(
+            result.row_count(),
+            1,
+            "cycle {cycle} should return one node"
+        );
+        let Value::Map(node) = &result.rows()[0][0] else {
+            panic!("cycle {cycle} should return a node map");
+        };
+        assert_eq!(
+            node.get(&PropertyKey::new("_id")),
+            Some(&Value::Int64(i64::try_from(node_id.as_u64()).unwrap()))
+        );
+        assert_eq!(
+            node.get(&PropertyKey::new("id")),
+            Some(&Value::String("person".into()))
+        );
+        assert_eq!(
+            node.get(&PropertyKey::new("viewCount")),
+            Some(&Value::Int64(0))
+        );
+
+        let node_rows = session
+            .execute("MATCH (n:Node) RETURN n.id, n.viewCount")
+            .unwrap();
+        assert_eq!(node_rows.row_count(), 1, "cycle {cycle} Node row count");
+        assert_eq!(
+            node_rows.rows()[0],
+            [Value::String("person".into()), Value::Int64(0)]
+        );
+        let person_rows = session
+            .execute("MATCH (n:Person) RETURN n.id, n.viewCount")
+            .unwrap();
+        assert_eq!(person_rows.row_count(), 1, "cycle {cycle} Person row count");
+        assert_eq!(
+            person_rows.rows()[0],
+            [Value::String("person".into()), Value::Int64(0)]
+        );
+        assert_labels(&session, &expected_labels);
+        assert!(
+            !session.in_transaction(),
+            "cycle {cycle} left a transaction active"
+        );
+
+        let fresh = db.session();
+        assert_labels(&fresh, &expected_labels);
+        assert_eq!(
+            fresh.get_node_property(node_id, "viewCount"),
+            Some(Value::Int64(0))
+        );
+        assert!(
+            !fresh.in_transaction(),
+            "fresh session entered a transaction"
+        );
+    }
+}
+
+/// Races the auto-commit `SET ... RETURN n` label read against every writer
+/// that mutates `node_labels` concurrently: explicit increments, label
+/// add/remove on the same node, and open transactions that inline-create
+/// labelled nodes (PENDING label logs) and then commit or roll back. Readers
+/// must never see a rolled-back node's labels. This is a regression control
+/// for concurrent label access; it does not establish general crash safety.
+#[test]
+fn test_concurrent_label_reads_race_label_writers_and_pending_creates() {
+    // GRAFEO_LABEL_RACE_ITERS scales every writer; default stays CI-sized.
+    let iterations = env_usize("GRAFEO_LABEL_RACE_ITERS", 50);
+    let db = Arc::new(GrafeoDB::with_config(Config::in_memory()).unwrap());
+    {
+        let session = db.session();
+        session
+            .execute("INSERT (:Person:Node {id: 'person-0', viewCount: 0})")
+            .unwrap();
+        session
+            .execute("CREATE INDEX IF NOT EXISTS gb_id FOR (n:Node) ON (n.id)")
+            .unwrap();
+    }
+
+    fn sorted_returned_labels(node: &Value) -> Vec<String> {
+        let Value::Map(node) = node else {
+            panic!("RETURN n must yield a node map: {node:?}");
+        };
+        let Some(Value::List(labels)) = node.get(&PropertyKey::new("_labels")) else {
+            panic!("returned node must carry a _labels list: {node:?}");
+        };
+        let mut names: Vec<String> = labels
+            .iter()
+            .map(|label| match label {
+                Value::String(label) => label.as_str().to_owned(),
+                other => panic!("label must be a string: {other:?}"),
+            })
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Runs `body` in a fresh explicit transaction, retrying classified conflicts.
+    fn with_retry(
+        db: &GrafeoDB,
+        what: &str,
+        body: impl Fn(&Session) -> grafeo_common::utils::error::Result<()>,
+    ) {
+        let mut last_error = None;
+        for attempt in 0..1024u32 {
+            let mut session = db.session();
+            session.begin_transaction().unwrap();
+            match body(&session).and_then(|()| session.commit().map(|_| ())) {
+                Ok(()) => return,
+                Err(error) if is_classified_write_conflict(&error) => {
+                    let _ = session.rollback();
+                    last_error = Some(error.to_string());
+                    // Jittered backoff, bounded at ~5ms, like the benchmark harness.
+                    let micros = (100u64 << attempt.min(5)) + u64::from(attempt * 37 % 97);
+                    thread::sleep(std::time::Duration::from_micros(micros));
+                }
+                Err(error) => panic!("{what} must not fail: {error}"),
+            }
+        }
+        panic!("{what} exhausted retries: {last_error:?}");
+    }
+
+    let writers_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let committed_pending = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(5));
+    let mut writers = Vec::new();
+
+    // Increment workers: lost_update shape.
+    for _ in 0..2 {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..iterations {
+                with_retry(&db, "increment", |session| {
+                    session.execute(
+                        "MATCH (p:Person {id: 'person-0'}) SET p.viewCount = p.viewCount + 1",
+                    )?;
+                    Ok(())
+                });
+            }
+        }));
+    }
+
+    // Label churn on the node every reader materializes.
+    {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..iterations {
+                with_retry(&db, "add Churn label", |session| {
+                    session.execute("MATCH (n:Node {id: 'person-0'}) SET n:Churn")?;
+                    Ok(())
+                });
+                with_retry(&db, "remove Churn label", |session| {
+                    session.execute("MATCH (n:Node {id: 'person-0'}) REMOVE n:Churn")?;
+                    Ok(())
+                });
+            }
+        }));
+    }
+
+    // Inline creates hold PENDING label logs open across other commits.
+    {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let committed_pending = Arc::clone(&committed_pending);
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            for k in 0..iterations {
+                let insert =
+                    format!("INSERT (:Person:Node:Pending {{id: 'pending-{k}', viewCount: 0}})");
+                if k % 2 == 0 {
+                    let mut session = db.session();
+                    session.begin_transaction().unwrap();
+                    session.execute(&insert).unwrap();
+                    for _ in 0..8 {
+                        thread::yield_now();
+                    }
+                    session.rollback().unwrap();
+                } else {
+                    // Indexed publication rejects registry contention as T001.
+                    with_retry(&db, "pending create", |session| {
+                        session.execute(&insert)?;
+                        for _ in 0..8 {
+                            thread::yield_now();
+                        }
+                        Ok(())
+                    });
+                    committed_pending.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+    }
+
+    let mut readers = Vec::new();
+
+    // Auto-commit SET ... RETURN n: the retained crash's label-read site.
+    {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let writers_done = Arc::clone(&writers_done);
+        readers.push(thread::spawn(move || {
+            barrier.wait();
+            let mut returned = 0usize;
+            while !writers_done.load(Ordering::SeqCst) || returned == 0 {
+                let session = db.session();
+                match session
+                    .execute("MATCH (n:Node {id: 'person-0'}) SET n.lastAccess = 'x' RETURN n")
+                {
+                    Ok(result) => {
+                        assert_eq!(result.row_count(), 1, "reset must return person-0");
+                        let labels = sorted_returned_labels(&result.rows()[0][0]);
+                        assert!(
+                            labels == ["Node", "Person"] || labels == ["Churn", "Node", "Person"],
+                            "person-0 labels corrupted: {labels:?}"
+                        );
+                        returned += 1;
+                    }
+                    Err(error) if is_classified_write_conflict(&error) => {}
+                    Err(error) => panic!("auto-commit SET RETURN must not fail: {error}"),
+                }
+                // Pace like the benchmark reset so explicit writers are not starved.
+                thread::sleep(std::time::Duration::from_micros(500));
+            }
+            returned
+        }));
+    }
+
+    let pending_reader = {
+        let db = Arc::clone(&db);
+        let writers_done = Arc::clone(&writers_done);
+        thread::spawn(move || {
+            while !writers_done.load(Ordering::SeqCst) {
+                let rows = db
+                    .session()
+                    .execute("MATCH (n:Pending) RETURN n.id")
+                    .expect("Pending scan must succeed");
+                for row in rows.rows() {
+                    let Value::String(id) = &row[0] else {
+                        panic!("Pending id must be a string: {:?}", row[0]);
+                    };
+                    let k: usize = id
+                        .as_str()
+                        .strip_prefix("pending-")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert!(k % 2 == 1, "rolled-back {id} became visible");
+                }
+            }
+        })
+    };
+
+    for writer in writers {
+        writer.join().expect("writer thread panicked");
+    }
+    writers_done.store(true, Ordering::SeqCst);
+    for reader in readers {
+        assert!(reader.join().expect("reader thread panicked") > 0);
+    }
+    pending_reader.join().expect("pending reader panicked");
+
+    let session = db.session();
+    let expected = i64::try_from(2 * iterations).unwrap();
+    assert_eq!(
+        session
+            .execute("MATCH (n:Person {id: 'person-0'}) RETURN n.viewCount")
+            .unwrap()
+            .rows(),
+        &[vec![Value::Int64(expected)]],
+        "every committed increment must survive"
+    );
+    let final_reset = session
+        .execute("MATCH (n:Node {id: 'person-0'}) SET n.viewCount = 0 RETURN n")
+        .unwrap();
+    assert_eq!(
+        sorted_returned_labels(&final_reset.rows()[0][0]),
+        ["Node", "Person"]
+    );
+    let committed = i64::try_from(committed_pending.load(Ordering::SeqCst)).unwrap();
+    assert_eq!(committed, i64::try_from(iterations / 2).unwrap());
+    for (label, count) in [
+        ("Pending", committed),
+        ("Person", committed + 1),
+        ("Node", committed + 1),
+    ] {
+        assert_eq!(
+            session
+                .execute(&format!("MATCH (n:{label}) RETURN count(n)"))
+                .unwrap()
+                .rows(),
+            &[vec![Value::Int64(count)]],
+            "{label} count after rollbacks"
+        );
+    }
+    assert_eq!(
+        session
+            .execute("MATCH (n:Node {id: 'pending-0'}) RETURN n")
+            .unwrap()
+            .row_count(),
+        0,
+        "rolled-back create must stay invisible"
     );
 }
 

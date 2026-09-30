@@ -4,6 +4,8 @@
 //! correctly route queries and mutations to the selected named graph,
 //! not the default store.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_engine::GrafeoDB;
 
 fn db() -> GrafeoDB {
@@ -83,6 +85,32 @@ fn session_set_schema_isolates_data() {
         result.row_count(),
         0,
         "Default graph should have no data after SESSION RESET"
+    );
+}
+
+#[test]
+fn shared_physical_cache_is_partitioned_by_effective_schema_graph() {
+    let db = db();
+    let admin = db.session();
+    admin.execute("CREATE SCHEMA alpha").unwrap();
+    admin.execute("CREATE SCHEMA beta").unwrap();
+
+    let alpha = db.session();
+    alpha.execute("SESSION SET SCHEMA alpha").unwrap();
+    alpha.execute("INSERT (:Alpha)").unwrap();
+
+    let beta = db.session();
+    beta.execute("SESSION SET SCHEMA beta").unwrap();
+    beta.execute("INSERT (:Beta)").unwrap();
+    beta.execute("INSERT (:Beta)").unwrap();
+
+    db.clear_plan_cache();
+    const QUERY: &str = "MATCH (n) RETURN n";
+    assert_eq!(alpha.execute(QUERY).unwrap().row_count(), 1);
+    assert_eq!(
+        beta.execute(QUERY).unwrap().row_count(),
+        2,
+        "a shared physical plan must never retain another schema's graph Arc"
     );
 }
 
@@ -557,7 +585,7 @@ fn drop_graph_resets_active_context() {
     db.set_current_graph(Some("ephemeral")).unwrap();
     assert_eq!(db.current_graph(), Some("ephemeral".to_string()));
 
-    db.drop_graph("ephemeral");
+    db.drop_graph("ephemeral").expect("drop graph");
     assert_eq!(
         db.current_graph(),
         None,
@@ -572,7 +600,7 @@ fn drop_graph_preserves_context_for_other_graph() {
     db.execute("CREATE GRAPH other").unwrap();
     db.set_current_graph(Some("keep")).unwrap();
 
-    db.drop_graph("other");
+    db.drop_graph("other").expect("drop graph");
     assert_eq!(
         db.current_graph(),
         Some("keep".to_string()),

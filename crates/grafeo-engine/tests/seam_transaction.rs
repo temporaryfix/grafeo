@@ -9,6 +9,8 @@
 //! cargo test -p grafeo-engine --test seam_transaction
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -170,8 +172,9 @@ mod session_state_independence {
 
         // Session state is not transactional: graph should still be set
         assert_eq!(
-            session.current_graph(),
-            Some("mydb".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path"),
             "SESSION SET GRAPH should survive ROLLBACK"
         );
     }
@@ -221,8 +224,8 @@ mod session_state_independence {
         session.execute("SESSION RESET").unwrap();
 
         assert_eq!(
-            session.current_graph(),
-            None,
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::root(),
             "RESET should clear graph in transaction"
         );
         assert_eq!(
@@ -234,7 +237,10 @@ mod session_state_independence {
         session.execute("COMMIT").unwrap();
 
         // State should remain reset after commit
-        assert_eq!(session.current_graph(), None);
+        assert_eq!(
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::root()
+        );
         assert_eq!(session.time_zone(), None);
     }
 
@@ -250,8 +256,9 @@ mod session_state_independence {
         session.execute("COMMIT").unwrap();
 
         assert_eq!(
-            session.current_graph(),
-            Some("mydb".to_string()),
+            session.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["mydb"])
+                .expect("literal graph path"),
             "Graph should persist after COMMIT"
         );
     }
@@ -598,10 +605,14 @@ mod session_isolation {
         s1.execute("USE GRAPH shared").unwrap();
 
         // s2's graph should be unaffected by s1's graph switch
-        assert_eq!(s1.current_graph(), Some("shared".to_string()));
         assert_eq!(
-            s2.current_graph(),
-            None,
+            s1.current_graph_path(),
+            grafeo_common::types::GraphPath::from_components(&["shared"])
+                .expect("literal graph path")
+        );
+        assert_eq!(
+            s2.current_graph_path(),
+            grafeo_common::types::GraphPath::root(),
             "s2 should still be on default graph"
         );
     }
