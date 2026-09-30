@@ -129,47 +129,89 @@ impl super::GrafeoDB {
         edge_type: &str,
         directed: bool,
     ) -> Result<(usize, usize)> {
-        let store = self.lpg_store();
+        use grafeo_common::types::Value;
+
+        if edges.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // A single Session transaction is both the durability chokepoint and
+        // the bulk-import atomicity boundary. No live store mutation occurs
+        // before the WAL frame can be committed.
+        let mut session = self.session();
+        session.begin_transaction()?;
 
         // Phase 1: Collect unique external IDs and create nodes.
         let mut ext_to_int: FxHashMap<u64, NodeId> = FxHashMap::default();
-
-        for &(src, dst) in edges {
-            if !ext_to_int.contains_key(&src) {
-                let id = store.create_node(&["_Imported"]);
-                ext_to_int.insert(src, id);
+        let imported = (|| -> Result<(usize, usize)> {
+            for &(src, dst) in edges {
+                if !ext_to_int.contains_key(&src) {
+                    let id = session.create_node_with_props(
+                        &["_Imported"],
+                        std::iter::empty::<(&str, Value)>(),
+                    )?;
+                    if !id.is_valid() {
+                        return Err(Error::Internal("bulk node creation failed".to_string()));
+                    }
+                    ext_to_int.insert(src, id);
+                }
+                if !ext_to_int.contains_key(&dst) {
+                    let id = session.create_node_with_props(
+                        &["_Imported"],
+                        std::iter::empty::<(&str, Value)>(),
+                    )?;
+                    if !id.is_valid() {
+                        return Err(Error::Internal("bulk node creation failed".to_string()));
+                    }
+                    ext_to_int.insert(dst, id);
+                }
             }
-            if !ext_to_int.contains_key(&dst) {
-                let id = store.create_node(&["_Imported"]);
-                ext_to_int.insert(dst, id);
+
+            // Phase 2: Create edges without leaving the transaction boundary.
+            let mut edge_count = 0usize;
+            for &(src, dst) in edges {
+                let src_id = ext_to_int[&src];
+                let dst_id = ext_to_int[&dst];
+                let id = session.create_edge_with_props(
+                    src_id,
+                    dst_id,
+                    edge_type,
+                    std::iter::empty::<(&str, Value)>(),
+                )?;
+                if !id.is_valid() {
+                    return Err(Error::Internal("bulk edge creation failed".to_string()));
+                }
+                edge_count += 1;
+                if !directed {
+                    let reverse = session.create_edge_with_props(
+                        dst_id,
+                        src_id,
+                        edge_type,
+                        std::iter::empty::<(&str, Value)>(),
+                    )?;
+                    if !reverse.is_valid() {
+                        return Err(Error::Internal("bulk edge creation failed".to_string()));
+                    }
+                    edge_count += 1;
+                }
             }
-        }
 
-        // Phase 2: Create edges in batch.
-        let mut batch: Vec<(NodeId, NodeId, &str)> = Vec::with_capacity(if directed {
-            edges.len()
-        } else {
-            edges.len() * 2
-        });
+            Ok((ext_to_int.len(), edge_count))
+        })();
 
-        for &(src, dst) in edges {
-            let src_id = ext_to_int[&src];
-            let dst_id = ext_to_int[&dst];
-            batch.push((src_id, dst_id, edge_type));
-            if !directed {
-                batch.push((dst_id, src_id, edge_type));
+        let counts = match imported {
+            Ok(counts) => counts,
+            Err(error) => {
+                let _ = session.rollback();
+                return Err(error);
             }
-        }
-
-        store.batch_create_edges(&batch);
-
-        let node_count = ext_to_int.len();
-        let edge_count = batch.len();
+        };
+        session.commit()?;
 
         // Refresh statistics so the optimizer has fresh data.
-        store.ensure_statistics_fresh();
+        self.lpg_store().ensure_statistics_fresh();
 
-        Ok((node_count, edge_count))
+        Ok(counts)
     }
 
     /// Bulk-imports a TSV edge list into the RDF store.
@@ -222,7 +264,7 @@ impl super::GrafeoDB {
             })
             .collect();
 
-        let edge_count = self.rdf_store.batch_insert(triples);
+        let edge_count = self.batch_insert_rdf(triples)?;
 
         Ok((unique_nodes.len(), edge_count))
     }
@@ -448,13 +490,36 @@ mod tests {
         assert_eq!(edge_count, 4); // 2 edges * 2 directions
     }
 
+    #[cfg(all(feature = "wal", feature = "grafeo-file"))]
+    #[test]
+    fn persistent_lpg_import_is_atomic_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("import.grafeo");
+        {
+            let db = GrafeoDB::open(&path).unwrap();
+            assert_eq!(
+                db.import_tsv_str("1 2\n2 3\n", "CONNECTS", false).unwrap(),
+                (3, 4)
+            );
+            assert_eq!(db.node_count(), 3);
+            assert_eq!(db.edge_count(), 4);
+            db.close().unwrap();
+        }
+        let reopened = GrafeoDB::open(&path).unwrap();
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.edge_count(), 4);
+    }
+
     #[cfg(feature = "triple-store")]
     #[test]
     fn test_import_tsv_rdf() {
         use grafeo_core::graph::GraphStore;
         use grafeo_core::graph::rdf::RdfGraphStoreAdapter;
 
-        let db = GrafeoDB::new_in_memory();
+        let db = GrafeoDB::with_config(
+            crate::Config::in_memory().with_graph_model(crate::GraphModel::Rdf),
+        )
+        .unwrap();
 
         // Write TSV to a temp file
         let dir = tempfile::tempdir().unwrap();
@@ -476,5 +541,36 @@ mod tests {
         let adapter = RdfGraphStoreAdapter::new(&db.rdf_store);
         assert_eq!(adapter.node_count(), 3);
         assert_eq!(adapter.edge_count(), 3);
+    }
+
+    #[cfg(all(feature = "triple-store", feature = "wal", feature = "grafeo-file"))]
+    #[test]
+    fn persistent_rdf_import_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rdf-import.grafeo");
+        let input = dir.path().join("rdf-import.tsv");
+        std::fs::write(&input, "1 2\n2 3\n").unwrap();
+
+        {
+            let db = GrafeoDB::with_config(
+                crate::Config::persistent(&path).with_graph_model(crate::GraphModel::Rdf),
+            )
+            .unwrap();
+            assert_eq!(
+                db.import_tsv_rdf(
+                    &input,
+                    "http://example.org/connects",
+                    "http://example.org/node/",
+                )
+                .unwrap(),
+                (3, 2)
+            );
+            db.close().unwrap();
+        }
+        let reopened = GrafeoDB::with_config(
+            crate::Config::persistent(&path).with_graph_model(crate::GraphModel::Rdf),
+        )
+        .unwrap();
+        assert_eq!(reopened.rdf_store().len(), 2);
     }
 }

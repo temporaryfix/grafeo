@@ -4,8 +4,67 @@
 //! node/edge iteration, validation, info/stats, to_memory, and
 //! remove_property operations.
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
+
+#[cfg(feature = "wal")]
+#[test]
+fn wal_namespace_requested_rejection_preserves_missing_tree() {
+    use grafeo_engine::{Config, config::StorageFormat};
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let path = missing.join("x.wal");
+    let result = GrafeoDB::with_config(
+        Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory),
+    );
+    assert!(result.is_err());
+    assert!(
+        !missing.exists(),
+        "rejected namespace provisioned missing ancestry"
+    );
+}
+
+#[cfg(all(feature = "wal", unix))]
+#[test]
+fn wal_namespace_resolved_rejection_preserves_tree_and_bytes() {
+    use grafeo_engine::{Config, config::StorageFormat};
+    let root = tempfile::tempdir().unwrap();
+    let reserved = root.path().join("x.wal");
+    std::fs::create_dir(&reserved).unwrap();
+    std::fs::write(reserved.join("sentinel"), b"unchanged").unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&reserved, &alias).unwrap();
+    let result = GrafeoDB::with_config(
+        Config::persistent(alias.join("missing/db"))
+            .with_storage_format(StorageFormat::WalDirectory),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(reserved.join("sentinel")).unwrap(),
+        b"unchanged"
+    );
+    assert!(
+        !reserved.join("missing").exists(),
+        "resolved rejection provisioned descendants"
+    );
+    assert_eq!(std::fs::read_dir(&reserved).unwrap().count(), 1);
+}
+
+#[cfg(feature = "wal")]
+#[test]
+fn wal_namespace_ordinary_missing_parent_opens() {
+    use grafeo_engine::{Config, config::StorageFormat};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("missing/db");
+    let db = GrafeoDB::with_config(
+        Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory),
+    )
+    .unwrap();
+    assert!(path.join("wal").is_dir());
+    db.close().unwrap();
+}
 
 // ── Edge operations ──────────────────────────────────────────────
 
@@ -47,7 +106,8 @@ fn test_set_and_remove_edge_property() {
     let b = db.create_node(&["N"]);
     let eid = db.create_edge(a, b, "R");
 
-    db.set_edge_property(eid, "weight", Value::Float64(1.5));
+    db.set_edge_property(eid, "weight", Value::Float64(1.5))
+        .expect("set edge property");
     let edge = db.get_edge(eid).unwrap();
     assert_eq!(
         edge.properties
@@ -122,7 +182,8 @@ fn test_get_node_labels_returns_none_for_invalid_id() {
 fn test_remove_node_property() {
     let db = GrafeoDB::new_in_memory();
     let n = db.create_node(&["Person"]);
-    db.set_node_property(n, "name", Value::String("Alix".into()));
+    db.set_node_property(n, "name", Value::String("Alix".into()))
+        .expect("set node property");
 
     assert!(db.remove_node_property(n, "name"));
     let node = db.get_node(n).unwrap();
@@ -146,16 +207,27 @@ fn test_property_index_lifecycle() {
     assert!(!db.has_property_index("name"));
 
     // Create index
-    db.create_property_index("name");
+    let owner = db
+        .create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: None,
+            property: "name".into(),
+            kind: grafeo_engine::IndexCreateKind::Property,
+        })
+        .expect("create property index");
     assert!(db.has_property_index("name"));
 
     // Create nodes with the property
     let n1 = db.create_node(&["Person"]);
-    db.set_node_property(n1, "name", Value::String("Alix".into()));
+    db.set_node_property(n1, "name", Value::String("Alix".into()))
+        .expect("set node property");
     let n2 = db.create_node(&["Person"]);
-    db.set_node_property(n2, "name", Value::String("Gus".into()));
+    db.set_node_property(n2, "name", Value::String("Gus".into()))
+        .expect("set node property");
     let n3 = db.create_node(&["Person"]);
-    db.set_node_property(n3, "name", Value::String("Alix".into()));
+    db.set_node_property(n3, "name", Value::String("Alix".into()))
+        .expect("set node property");
 
     // Find by property
     let results = db.find_nodes_by_property("name", &Value::String("Alix".into()));
@@ -172,9 +244,9 @@ fn test_property_index_lifecycle() {
     assert!(results.is_empty());
 
     // Drop index
-    assert!(db.drop_property_index("name"));
+    assert!(db.drop_index(owner).expect("drop property owner"));
     assert!(!db.has_property_index("name"));
-    assert!(!db.drop_property_index("name")); // second drop returns false
+    assert!(!db.drop_index(owner).expect("drop property owner")); // second drop returns false
 }
 
 // ── Iteration ────────────────────────────────────────────────────
@@ -237,7 +309,8 @@ fn test_validate_empty_database() {
 fn test_info() {
     let db = GrafeoDB::new_in_memory();
     let _n = db.create_node(&["Person"]);
-    db.set_node_property(_n, "name", Value::String("Alix".into()));
+    db.set_node_property(_n, "name", Value::String("Alix".into()))
+        .expect("set node property");
 
     let info = db.info();
     assert_eq!(info.node_count, 1);
@@ -250,9 +323,11 @@ fn test_info() {
 fn test_detailed_stats() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Person"]);
-    db.set_node_property(a, "name", Value::String("Alix".into()));
+    db.set_node_property(a, "name", Value::String("Alix".into()))
+        .expect("set node property");
     let b = db.create_node(&["Company"]);
-    db.set_node_property(b, "name", Value::String("Acme".into()));
+    db.set_node_property(b, "name", Value::String("Acme".into()))
+        .expect("set node property");
     db.create_edge(a, b, "WORKS_AT");
 
     let stats = db.detailed_stats();
@@ -283,9 +358,11 @@ fn test_graph_model_default() {
 fn test_to_memory_clones_data() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Person"]);
-    db.set_node_property(a, "name", Value::String("Alix".into()));
+    db.set_node_property(a, "name", Value::String("Alix".into()))
+        .expect("set node property");
     let b = db.create_node(&["Person"]);
-    db.set_node_property(b, "name", Value::String("Gus".into()));
+    db.set_node_property(b, "name", Value::String("Gus".into()))
+        .expect("set node property");
     db.create_edge(a, b, "KNOWS");
 
     let clone = db.to_memory().expect("to_memory should succeed");
@@ -304,10 +381,13 @@ fn test_to_memory_clones_data() {
 fn test_snapshot_export_import_roundtrip() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Person"]);
-    db.set_node_property(a, "name", Value::String("Alix".into()));
-    db.set_node_property(a, "age", Value::Int64(30));
+    db.set_node_property(a, "name", Value::String("Alix".into()))
+        .expect("set node property");
+    db.set_node_property(a, "age", Value::Int64(30))
+        .expect("set node property");
     let b = db.create_node(&["Person"]);
-    db.set_node_property(b, "name", Value::String("Gus".into()));
+    db.set_node_property(b, "name", Value::String("Gus".into()))
+        .expect("set node property");
     db.create_edge(a, b, "KNOWS");
 
     // Export
@@ -342,10 +422,13 @@ fn test_schema_returns_labels_and_edge_types() {
 
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Person"]);
-    db.set_node_property(a, "name", Value::String("Alix".into()));
-    db.set_node_property(a, "age", Value::Int64(30));
+    db.set_node_property(a, "name", Value::String("Alix".into()))
+        .expect("set node property");
+    db.set_node_property(a, "age", Value::Int64(30))
+        .expect("set node property");
     let b = db.create_node(&["Company"]);
-    db.set_node_property(b, "name", Value::String("Acme".into()));
+    db.set_node_property(b, "name", Value::String("Acme".into()))
+        .expect("set node property");
     db.create_edge(a, b, "WORKS_AT");
     db.create_edge(a, b, "LIKES");
 
@@ -395,7 +478,7 @@ fn test_is_persistent_in_memory() {
 #[test]
 fn test_wal_status_in_memory() {
     let db = GrafeoDB::new_in_memory();
-    let status = db.wal_status();
+    let status = db.wal_status().unwrap();
     // In-memory databases have no WAL
     assert!(!status.enabled);
 }
@@ -406,7 +489,8 @@ fn test_wal_status_in_memory() {
 fn test_close_in_memory_database() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["N"]);
-    db.set_node_property(a, "x", Value::Int64(1));
+    db.set_node_property(a, "x", Value::Int64(1))
+        .expect("set node property");
 
     // Close should succeed (no-op for in-memory)
     db.close().expect("close should succeed for in-memory db");
@@ -472,13 +556,16 @@ fn test_info_updates_after_operations() {
 fn test_complex_graph_with_multiple_edge_types() {
     let db = GrafeoDB::new_in_memory();
     let alix = db.create_node(&["Person"]);
-    db.set_node_property(alix, "name", Value::String("Alix".into()));
+    db.set_node_property(alix, "name", Value::String("Alix".into()))
+        .expect("set node property");
 
     let gus = db.create_node(&["Person"]);
-    db.set_node_property(gus, "name", Value::String("Gus".into()));
+    db.set_node_property(gus, "name", Value::String("Gus".into()))
+        .expect("set node property");
 
     let acme = db.create_node(&["Company"]);
-    db.set_node_property(acme, "name", Value::String("Acme".into()));
+    db.set_node_property(acme, "name", Value::String("Acme".into()))
+        .expect("set node property");
 
     db.create_edge(alix, gus, "KNOWS");
     db.create_edge(alix, acme, "WORKS_AT");

@@ -8,51 +8,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(any(
-    all(
-        feature = "lpg",
-        feature = "vector-index",
-        feature = "mmap",
-        not(feature = "temporal")
-    ),
     all(feature = "lpg", feature = "text-index"),
-    // OverlayConsumer (lpg + compact-store, no mmap requirement) and
-    // CompactStoreConsumer (lpg + compact-store + mmap) both hold a Weak
-    // back to the layered store. The broader gate covers both.
-    all(feature = "compact-store", feature = "lpg")
+    // CompactStoreConsumer holds Weak references to both the tier wrapper and
+    // layered store.
+    all(feature = "compact-store", feature = "mmap", feature = "lpg")
 ))]
 use std::sync::Weak;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "wal")]
+use std::sync::atomic::Ordering;
 
 use grafeo_common::memory::buffer::{MemoryConsumer, MemoryRegion, SpillError, priorities};
 use grafeo_common::storage::Section;
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-use grafeo_common::types::{PropertyKey, Value};
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-use grafeo_core::index::vector::VectorStorage;
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-use parking_lot::RwLock;
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-use std::collections::HashMap;
 
 /// Wraps a [`Section`] as a [`MemoryConsumer`] for the BufferManager.
 ///
@@ -64,15 +31,16 @@ use std::collections::HashMap;
 /// without a full checkpoint + mmap cycle. The [`can_spill`](MemoryConsumer::can_spill)
 /// method returns `true` for mmap-able index sections, signaling that future
 /// tiered storage support will enable actual spilling.
-pub struct SectionConsumer {
+pub struct SectionConsumer<S: Section + ?Sized> {
     name: String,
-    section: Arc<dyn Section>,
+    section: Arc<S>,
     priority: u8,
     region: MemoryRegion,
     mmap_able: bool,
     /// Directory where this consumer writes spill files. `None` disables spilling.
     spill_path: Option<PathBuf>,
     /// Counter for unique spill file names within `spill_path`.
+    #[cfg_attr(not(feature = "wal"), allow(dead_code))]
     file_counter: AtomicUsize,
     /// `true` after a successful `spill_to_dir`, cleared on reload. Drives
     /// `current_tier()` so introspection reports the actual state of
@@ -80,7 +48,7 @@ pub struct SectionConsumer {
     is_spilled: std::sync::atomic::AtomicBool,
 }
 
-impl SectionConsumer {
+impl<S: Section + ?Sized> SectionConsumer<S> {
     /// Creates a consumer for the given section without spill support.
     ///
     /// Priority and region are assigned based on the section type:
@@ -90,7 +58,7 @@ impl SectionConsumer {
     /// Calling `spill()` on a consumer constructed via `new` returns
     /// [`SpillError::NoSpillDirectory`]. Use [`with_spill`](Self::with_spill)
     /// to enable disk-backed eviction.
-    pub fn new(section: Arc<dyn Section>) -> Self {
+    pub fn new(section: Arc<S>) -> Self {
         Self::build(section, None)
     }
 
@@ -106,11 +74,11 @@ impl SectionConsumer {
     // VectorIndex, TextIndex). Allow dead_code under feature combinations
     // that don't include ring-index.
     #[cfg_attr(not(feature = "ring-index"), allow(dead_code))]
-    pub fn with_spill(section: Arc<dyn Section>, spill_path: PathBuf) -> Self {
+    pub fn with_spill(section: Arc<S>, spill_path: PathBuf) -> Self {
         Self::build(section, Some(spill_path))
     }
 
-    fn build(section: Arc<dyn Section>, spill_path: Option<PathBuf>) -> Self {
+    fn build(section: Arc<S>, spill_path: Option<PathBuf>) -> Self {
         let section_type = section.section_type();
         let is_data = section_type.is_data_section();
         let flags = section_type.default_flags();
@@ -186,7 +154,7 @@ impl SectionConsumer {
     }
 }
 
-impl MemoryConsumer for SectionConsumer {
+impl<S: Section + ?Sized> MemoryConsumer for SectionConsumer<S> {
     fn name(&self) -> &str {
         &self.name
     }
@@ -247,239 +215,10 @@ impl MemoryConsumer for SectionConsumer {
     }
 }
 
-/// Dynamic memory consumer for vector indexes.
-///
-/// Holds a `Weak<LpgStore>` and re-queries the live index map on each
-/// `memory_usage()` call. On `spill()`, vector embedding property columns
-/// are drained to `MmapStorage` files, freeing heap memory. Search uses
-/// [`SpillableVectorAccessor`](grafeo_core::index::vector::SpillableVectorAccessor)
-/// which checks the spill storage first, then falls back to property storage.
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-pub struct VectorIndexConsumer {
-    store: Weak<grafeo_core::graph::lpg::LpgStore>,
-    /// Directory for spill files. `None` disables spilling.
-    spill_path: Option<PathBuf>,
-    /// Map of "label:property" -> MmapStorage for spilled indexes.
-    /// Shared with the search path so `SpillableVectorAccessor` can read.
-    pub(crate) spilled: Arc<RwLock<HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>>>,
-}
-
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-impl VectorIndexConsumer {
-    /// Creates a consumer that dynamically queries the store for current vector indexes.
-    pub fn new(
-        store: &Arc<grafeo_core::graph::lpg::LpgStore>,
-        spill_path: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            store: Arc::downgrade(store),
-            spill_path,
-            spilled: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Returns the shared spill registry for the search path.
-    #[must_use]
-    pub fn spilled_storages(
-        &self,
-    ) -> &Arc<RwLock<HashMap<String, Arc<grafeo_core::index::vector::MmapStorage>>>> {
-        &self.spilled
-    }
-
-    /// Spills a single vector index's embeddings to disk.
-    ///
-    /// Returns bytes freed, or an error.
-    fn spill_index(
-        &self,
-        store: &grafeo_core::graph::lpg::LpgStore,
-        key: &str,
-        dimensions: usize,
-    ) -> Result<usize, SpillError> {
-        let spill_dir = self
-            .spill_path
-            .as_ref()
-            .ok_or(SpillError::NoSpillDirectory)?;
-
-        // Extract property name from key ("label:property" -> "property")
-        let property = key
-            .split(':')
-            .nth(1)
-            .ok_or_else(|| SpillError::IoError(format!("invalid index key: {key}")))?;
-        let prop_key = PropertyKey::new(property);
-
-        // Drain vector values from the property column
-        let drained = store.drain_node_property_column(&prop_key);
-        if drained.is_empty() {
-            return Ok(0);
-        }
-
-        // Create spill directory if needed
-        std::fs::create_dir_all(spill_dir).map_err(|e| SpillError::IoError(e.to_string()))?;
-
-        // Sanitize key for filename ("Label:property" -> "Label%3Aproperty")
-        // Percent-encodes ':' to preserve label case, underscores, and avoid
-        // ambiguity with any separator character.
-        let safe_key = key.replace('%', "%25").replace(':', "%3A");
-        let spill_file = spill_dir.join(format!("vectors_{safe_key}.bin"));
-
-        // Create MmapStorage and write all vectors
-        let mmap_storage = grafeo_core::index::vector::MmapStorage::create(&spill_file, dimensions)
-            .map_err(|e| SpillError::IoError(e.to_string()))?;
-
-        let mut freed_bytes = 0;
-        for (id, value) in &drained {
-            if let Value::Vector(vec_data) = value {
-                freed_bytes += vec_data.len() * 4 + std::mem::size_of::<Arc<[f32]>>();
-                mmap_storage
-                    .insert(*id, vec_data)
-                    .map_err(|e| SpillError::IoError(e.to_string()))?;
-            }
-        }
-
-        mmap_storage
-            .flush()
-            .map_err(|e| SpillError::IoError(e.to_string()))?;
-
-        // Register the spill storage
-        self.spilled
-            .write()
-            .insert(key.to_string(), Arc::new(mmap_storage));
-
-        Ok(freed_bytes)
-    }
-}
-
-#[cfg(all(
-    feature = "lpg",
-    feature = "vector-index",
-    feature = "mmap",
-    not(feature = "temporal")
-))]
-impl MemoryConsumer for VectorIndexConsumer {
-    fn name(&self) -> &str {
-        "section:VectorStore"
-    }
-
-    fn memory_usage(&self) -> usize {
-        self.store.upgrade().map_or(0, |store| {
-            store
-                .vector_index_entries()
-                .iter()
-                .map(|(_, idx)| idx.heap_memory_bytes())
-                .sum()
-        })
-    }
-
-    fn eviction_priority(&self) -> u8 {
-        priorities::INDEX_BUFFERS
-    }
-
-    fn region(&self) -> MemoryRegion {
-        MemoryRegion::IndexBuffers
-    }
-
-    fn evict(&self, _target_bytes: usize) -> usize {
-        0
-    }
-
-    fn can_spill(&self) -> bool {
-        self.spill_path.is_some()
-    }
-
-    fn current_tier(&self) -> grafeo_common::memory::StorageTier {
-        use grafeo_common::memory::StorageTier;
-        // Any spilled per-index storage means at least one index's
-        // embeddings live on disk via MmapStorage. Report OnDisk in
-        // that case; otherwise InMemory if any index has data, else
-        // Uninitialized.
-        if !self.spilled.read().is_empty() {
-            return StorageTier::OnDisk;
-        }
-        if self.memory_usage() == 0 {
-            StorageTier::Uninitialized
-        } else {
-            StorageTier::InMemory
-        }
-    }
-
-    fn spill(&self, _target_bytes: usize) -> Result<usize, SpillError> {
-        let store = self
-            .store
-            .upgrade()
-            .ok_or(SpillError::IoError("store dropped".to_string()))?;
-
-        let indexes = store.vector_index_entries();
-        let mut total_freed = 0;
-
-        for (key, index) in &indexes {
-            // Skip already-spilled indexes
-            if self.spilled.read().contains_key(key) {
-                continue;
-            }
-
-            let dimensions = index.config().dimensions;
-            match self.spill_index(&store, key, dimensions) {
-                Ok(freed) => total_freed += freed,
-                Err(e) => {
-                    // Log but continue: earlier indexes may have already been
-                    // drained and persisted. Returning Err would discard the
-                    // freed bytes from those, leaving BufferManager with
-                    // incorrect pressure tracking.
-                    eprintln!("failed to spill vector index {key}: {e}");
-                }
-            }
-        }
-
-        Ok(total_freed)
-    }
-
-    fn reload(&self) -> Result<(), SpillError> {
-        let store = self
-            .store
-            .upgrade()
-            .ok_or(SpillError::IoError("store dropped".to_string()))?;
-
-        let mut spilled = self.spilled.write();
-        for (key, mmap_storage) in spilled.drain() {
-            let property = key
-                .split(':')
-                .nth(1)
-                .ok_or_else(|| SpillError::IoError(format!("invalid index key: {key}")))?;
-            let prop_key = PropertyKey::new(property);
-
-            // Export vectors from mmap, restore to property store
-            let vectors = mmap_storage.export_all();
-            store.restore_node_property_column(
-                &prop_key,
-                vectors
-                    .into_iter()
-                    .map(|(id, vec_data)| (id, Value::Vector(vec_data))),
-            );
-
-            // Delete spill file
-            if let Ok(path) = std::fs::canonicalize(mmap_storage.path()) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-
-        Ok(())
-    }
-}
-
 /// Dynamic memory consumer for text indexes.
 ///
-/// Same rationale as [`VectorIndexConsumer`]: avoids holding stale `Arc` refs
-/// to indexes that may have been dropped, and automatically picks up new ones.
+/// Avoids holding stale `Arc` refs to indexes that may have been dropped,
+/// and automatically picks up new ones.
 #[cfg(all(feature = "lpg", feature = "text-index"))]
 pub struct TextIndexConsumer {
     store: Weak<grafeo_core::graph::lpg::LpgStore>,
@@ -555,6 +294,7 @@ impl MemoryConsumer for TextIndexConsumer {
 pub struct CompactStoreConsumer {
     tiered: Weak<super::compact_tiered::CompactStoreTiered>,
     layered: Weak<grafeo_core::graph::compact::layered::LayeredStore>,
+    transaction_manager: Weak<crate::transaction::TransactionManager>,
     spill_path: Option<PathBuf>,
 }
 
@@ -566,11 +306,13 @@ impl CompactStoreConsumer {
     pub fn new(
         tiered: &Arc<super::compact_tiered::CompactStoreTiered>,
         layered: &Arc<grafeo_core::graph::compact::layered::LayeredStore>,
+        transaction_manager: &Arc<crate::transaction::TransactionManager>,
         spill_path: Option<PathBuf>,
     ) -> Self {
         Self {
             tiered: Arc::downgrade(tiered),
             layered: Arc::downgrade(layered),
+            transaction_manager: Arc::downgrade(transaction_manager),
             spill_path,
         }
     }
@@ -640,21 +382,40 @@ impl MemoryConsumer for CompactStoreConsumer {
         }
 
         let path = self.spill_file().ok_or(SpillError::NoSpillDirectory)?;
-
+        let layered = self.layered.upgrade().ok_or_else(|| {
+            SpillError::IoError("compact-store layered owner dropped".to_string())
+        })?;
+        let transaction_manager = self.transaction_manager.upgrade().ok_or_else(|| {
+            SpillError::IoError("compact-store transaction manager dropped".to_string())
+        })?;
         let before = tiered.memory_bytes();
-        tiered
-            .persist_to_mmap(&path)
-            .map_err(|e| SpillError::IoError(e.to_string()))?;
-
-        // Publish the fresh (mmap-backed) base to the LayeredStore so readers
-        // switch over and the old allocation can drop. If the LayeredStore has
-        // been reconstructed (e.g. recompact() between registration and this
-        // call), the weak ref returns None: the new LayeredStore already owns
-        // a matching base from the new tiered wrapper, so there's nothing to
-        // swap here.
-        if let Some(layered) = self.layered.upgrade() {
-            layered.swap_base(tiered.store());
+        // The registered owner survives temporal merges. Serialize its exact
+        // current base under the existing mutation exclusion, then move tier
+        // metadata and that same base through one reader-publication cut.
+        // This is a representation transition: it never folds the hot overlay.
+        let (previous, published) = transaction_manager.with_write_authority(|| {
+            layered.transition_base_generation_with_retirement(
+                |generation| {
+                    let snapshot = tiered.snapshot_for_store(&generation).ok_or_else(|| {
+                        SpillError::IoError(
+                            "compact-store tier does not match its Layered base".to_string(),
+                        )
+                    })?;
+                    if snapshot.is_on_disk {
+                        return Ok((generation, None));
+                    }
+                    let prepared = tiered
+                        .prepare_generation_to_mmap(generation, &path)
+                        .map_err(|error| SpillError::IoError(error.to_string()))?;
+                    Ok((prepared.store(), Some(prepared)))
+                },
+                |prepared| prepared.map(|prepared| tiered.publish_prepared_reversibly(prepared)),
+            )
+        })?;
+        if let Some(published) = published {
+            published.commit();
         }
+        drop(previous);
 
         let after = tiered.memory_bytes();
         Ok(before.saturating_sub(after))
@@ -670,106 +431,36 @@ impl MemoryConsumer for CompactStoreConsumer {
             return Ok(());
         }
 
-        tiered
-            .reload_to_ram()
-            .map_err(|e| SpillError::IoError(e.to_string()))?;
-        if let Some(layered) = self.layered.upgrade() {
-            layered.swap_base(tiered.store());
+        let layered = self.layered.upgrade().ok_or_else(|| {
+            SpillError::IoError("compact-store layered owner dropped".to_string())
+        })?;
+        let transaction_manager = self.transaction_manager.upgrade().ok_or_else(|| {
+            SpillError::IoError("compact-store transaction manager dropped".to_string())
+        })?;
+        let (previous, published) = transaction_manager.with_write_authority(|| {
+            layered.transition_base_generation_with_retirement(
+                |generation| {
+                    let snapshot = tiered.snapshot_for_store(&generation).ok_or_else(|| {
+                        SpillError::IoError(
+                            "compact-store tier does not match its Layered base".to_string(),
+                        )
+                    })?;
+                    if !snapshot.is_on_disk {
+                        return Ok((generation, None));
+                    }
+                    let prepared = tiered
+                        .prepare_generation_to_ram(generation)
+                        .map_err(|error| SpillError::IoError(error.to_string()))?;
+                    Ok((prepared.store(), Some(prepared)))
+                },
+                |prepared| prepared.map(|prepared| tiered.publish_prepared_reversibly(prepared)),
+            )
+        })?;
+        if let Some(published) = published {
+            published.commit();
         }
+        drop(previous);
         Ok(())
-    }
-}
-
-// ── Phase 5c: OverlayConsumer ─────────────────────────────────────────
-//
-// Tracks the LpgStore overlay portion of a `LayeredStore`. When memory
-// pressure rises and the consumer is asked to spill, it calls
-// `LayeredStore::merge_overlay_in_place()` which rebuilds the base from
-// the combined view and clears the overlay, freeing all overlay heap.
-//
-// The new base is in-memory; if total memory pressure persists, the
-// `CompactStoreConsumer` will spill that base to mmap on its own. Two
-// independent consumers, one BufferManager — chains naturally.
-
-/// Tracks the mutable overlay (LpgStore) of a `LayeredStore`.
-///
-/// Priority is [`GRAPH_STORAGE`](priorities::GRAPH_STORAGE) (evict-last):
-/// the overlay holds unflushed mutations and merging it requires
-/// rebuilding the base, so this is the last-resort spill before query
-/// failure under sustained mutation pressure.
-#[cfg(all(feature = "compact-store", feature = "lpg"))]
-pub struct OverlayConsumer {
-    layered: Weak<grafeo_core::graph::compact::layered::LayeredStore>,
-}
-
-#[cfg(all(feature = "compact-store", feature = "lpg"))]
-impl OverlayConsumer {
-    /// Creates a consumer that monitors the overlay of `layered`.
-    pub fn new(layered: &Arc<grafeo_core::graph::compact::layered::LayeredStore>) -> Self {
-        Self {
-            layered: Arc::downgrade(layered),
-        }
-    }
-}
-
-#[cfg(all(feature = "compact-store", feature = "lpg"))]
-impl MemoryConsumer for OverlayConsumer {
-    fn name(&self) -> &str {
-        "overlay:LpgStore"
-    }
-
-    fn memory_usage(&self) -> usize {
-        self.layered
-            .upgrade()
-            .map_or(0, |layered| layered.overlay_memory_bytes())
-    }
-
-    fn eviction_priority(&self) -> u8 {
-        priorities::GRAPH_STORAGE
-    }
-
-    fn region(&self) -> MemoryRegion {
-        MemoryRegion::GraphStorage
-    }
-
-    fn evict(&self, _target_bytes: usize) -> usize {
-        // Cannot evict in place; spill via merge.
-        0
-    }
-
-    fn can_spill(&self) -> bool {
-        let Some(layered) = self.layered.upgrade() else {
-            return false;
-        };
-        // Only worth spilling if the overlay actually has mutations.
-        layered.overlay_mutation_count() > 0
-    }
-
-    fn spill(&self, _target_bytes: usize) -> Result<usize, SpillError> {
-        let Some(layered) = self.layered.upgrade() else {
-            return Err(SpillError::IoError("layered store dropped".to_string()));
-        };
-
-        if layered.overlay_mutation_count() == 0 {
-            return Ok(0);
-        }
-
-        let before = layered.overlay_memory_bytes();
-        layered
-            .merge_overlay_in_place()
-            .map_err(SpillError::IoError)?;
-        let after = layered.overlay_memory_bytes();
-        Ok(before.saturating_sub(after))
-    }
-
-    fn current_tier(&self) -> grafeo_common::memory::StorageTier {
-        // Overlay "spills" by merging into the base store; it never moves
-        // to disk on its own (the base may, separately).
-        if self.memory_usage() == 0 {
-            grafeo_common::memory::StorageTier::Uninitialized
-        } else {
-            grafeo_common::memory::StorageTier::InMemory
-        }
     }
 }
 
@@ -867,20 +558,36 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        let freed = consumer.spill(0).expect("spill should succeed");
-        assert_eq!(freed, 4096, "freed bytes equal section memory_usage");
-        assert_eq!(section.swap_count(), 1, "swap_to_mmap called once");
+        #[cfg(not(feature = "wal"))]
+        {
+            assert!(matches!(consumer.spill(0), Err(SpillError::NotSupported)));
+            assert_eq!(section.swap_count(), 0);
+            assert!(section.captured_bytes.lock().is_none());
+            assert!(
+                dir.path()
+                    .read_dir()
+                    .expect("spill directory")
+                    .next()
+                    .is_none()
+            );
+        }
+        #[cfg(feature = "wal")]
+        {
+            let freed = consumer.spill(0).expect("spill should succeed");
+            assert_eq!(freed, 4096, "freed bytes equal section memory_usage");
+            assert_eq!(section.swap_count(), 1, "swap_to_mmap called once");
 
-        let captured = section
-            .captured_bytes
-            .lock()
-            .clone()
-            .expect("bytes captured");
-        assert_eq!(
-            captured,
-            vec![0xAB; 4096],
-            "mmap bytes equal serialize output"
-        );
+            let captured = section
+                .captured_bytes
+                .lock()
+                .clone()
+                .expect("bytes captured");
+            assert_eq!(
+                captured,
+                vec![0xAB; 4096],
+                "mmap bytes equal serialize output"
+            );
+        }
     }
 
     #[test]
@@ -914,6 +621,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wal")]
     fn jules_reload_calls_section_reload_to_ram() {
         let dir = tempfile::tempdir().expect("tempdir");
         let section = Arc::new(SwappableSection::new(SectionType::PropertyIndex, 1024));

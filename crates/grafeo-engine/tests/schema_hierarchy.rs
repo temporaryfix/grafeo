@@ -197,8 +197,12 @@ fn setting_schema_does_not_reset_graph() {
     s.execute("CREATE SCHEMA s1").unwrap();
     s.execute("SESSION SET SCHEMA s1").unwrap();
 
-    // Graph field is still "standalone"
-    assert_eq!(s.current_graph(), Some("standalone".to_string()));
+    // The graph field is still "standalone", resolved within the new schema.
+    assert_eq!(
+        s.current_graph_path(),
+        grafeo_common::types::GraphPath::from_components(&["s1/standalone"])
+            .expect("literal graph path")
+    );
 }
 
 #[test]
@@ -227,7 +231,10 @@ fn reset_schema_independent_of_graph() {
 
     s.execute("SESSION RESET SCHEMA").unwrap();
     assert!(s.current_schema().is_none());
-    assert_eq!(s.current_graph(), Some("myg".to_string()));
+    assert_eq!(
+        s.current_graph_path(),
+        grafeo_common::types::GraphPath::from_components(&["myg"]).expect("literal graph path")
+    );
 }
 
 #[test]
@@ -242,7 +249,11 @@ fn reset_graph_independent_of_schema() {
 
     s.execute("SESSION RESET GRAPH").unwrap();
     assert_eq!(s.current_schema(), Some("s1".to_string()));
-    assert!(s.current_graph().is_none());
+    assert_eq!(
+        s.current_graph_path(),
+        grafeo_common::types::GraphPath::from_components(&["s1/__default__"])
+            .expect("literal graph path")
+    );
 }
 
 // ── Identifier validation ───────────────────────────────────────

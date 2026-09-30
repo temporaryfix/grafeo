@@ -1,5 +1,6 @@
 //! Admin, introspection, and diagnostic operations for GrafeoDB.
 
+#[cfg(feature = "wal")]
 use std::path::Path;
 
 use grafeo_common::utils::error::Result;
@@ -12,105 +13,41 @@ impl super::GrafeoDB {
     /// Returns the number of nodes in the database.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.lpg_store().node_count()
+        let _publication = self.transaction_manager.publication().read();
+        self.read_graph_view().node_count()
     }
 
     /// Returns the number of edges in the database.
     #[must_use]
     pub fn edge_count(&self) -> usize {
-        self.lpg_store().edge_count()
+        let _publication = self.transaction_manager.publication().read();
+        self.read_graph_view().edge_count()
     }
 
     /// Returns the number of distinct labels in the database.
     #[must_use]
     pub fn label_count(&self) -> usize {
-        self.lpg_store().label_count()
+        let _publication = self.transaction_manager.publication().read();
+        self.read_graph_view().all_labels().len()
     }
 
     /// Returns the number of distinct property keys in the database.
     #[must_use]
     pub fn property_key_count(&self) -> usize {
-        self.lpg_store().property_key_count()
+        let _publication = self.transaction_manager.publication().read();
+        self.read_graph_view().all_property_keys().len()
     }
 
     /// Returns the number of distinct edge types in the database.
     #[must_use]
     pub fn edge_type_count(&self) -> usize {
-        self.lpg_store().edge_type_count()
+        let _publication = self.transaction_manager.publication().read();
+        self.read_graph_view().all_edge_types().len()
     }
 
     // =========================================================================
     // ADMIN API: Introspection
     // =========================================================================
-
-    /// Returns true if this database is backed by a file (persistent).
-    ///
-    /// In-memory databases return false.
-    #[must_use]
-    pub fn is_persistent(&self) -> bool {
-        self.config.path.is_some()
-    }
-
-    /// Returns the database file path, if persistent.
-    ///
-    /// In-memory databases return None.
-    #[must_use]
-    pub fn path(&self) -> Option<&Path> {
-        self.config.path.as_deref()
-    }
-
-    /// Returns high-level database information.
-    ///
-    /// Includes node/edge counts, persistence status, and mode (LPG/RDF).
-    #[must_use]
-    pub fn info(&self) -> crate::admin::DatabaseInfo {
-        crate::admin::DatabaseInfo {
-            mode: crate::admin::DatabaseMode::Lpg,
-            node_count: self.lpg_store().node_count(),
-            edge_count: self.lpg_store().edge_count(),
-            is_persistent: self.is_persistent(),
-            path: self.config.path.clone(),
-            wal_enabled: self.config.wal_enabled,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            features: {
-                let mut f = vec!["gql".into()];
-                if cfg!(feature = "cypher") {
-                    f.push("cypher".into());
-                }
-                if cfg!(feature = "sparql") {
-                    f.push("sparql".into());
-                }
-                if cfg!(feature = "gremlin") {
-                    f.push("gremlin".into());
-                }
-                if cfg!(feature = "graphql") {
-                    f.push("graphql".into());
-                }
-                if cfg!(feature = "sql-pgq") {
-                    f.push("sql-pgq".into());
-                }
-                if cfg!(feature = "triple-store") {
-                    f.push("rdf".into());
-                }
-                if cfg!(feature = "algos") {
-                    f.push("algos".into());
-                }
-                if cfg!(feature = "vector-index") {
-                    f.push("vector-index".into());
-                }
-                if cfg!(feature = "text-index") {
-                    f.push("text-index".into());
-                }
-                if cfg!(feature = "hybrid-search") {
-                    f.push("hybrid-search".into());
-                }
-                if cfg!(feature = "cdc") {
-                    f.push("cdc".into());
-                }
-                f
-            },
-        }
-    }
 
     /// Returns a hierarchical memory usage breakdown.
     ///
@@ -122,6 +59,7 @@ impl super::GrafeoDB {
         use crate::memory_usage::{BufferManagerMemory, CacheMemory, MemoryUsage};
         use grafeo_common::memory::MemoryRegion;
 
+        let _publication = self.transaction_manager.publication().read();
         let (store, indexes, mvcc, string_pool) = self.lpg_store().memory_breakdown();
 
         let (parsed_bytes, optimized_bytes, cached_plan_count) =
@@ -207,11 +145,11 @@ impl super::GrafeoDB {
         let disk_bytes: Option<usize> = None;
 
         crate::admin::DatabaseStats {
-            node_count: self.lpg_store().node_count(),
-            edge_count: self.lpg_store().edge_count(),
-            label_count: self.lpg_store().label_count(),
-            edge_type_count: self.lpg_store().edge_type_count(),
-            property_key_count: self.lpg_store().property_key_count(),
+            node_count: self.node_count(),
+            edge_count: self.edge_count(),
+            label_count: self.label_count(),
+            edge_type_count: self.edge_type_count(),
+            property_key_count: self.property_key_count(),
             index_count: self.catalog.index_count(),
             memory_bytes: self.memory_usage().total_bytes,
             disk_bytes,
@@ -245,27 +183,36 @@ impl super::GrafeoDB {
     /// For RDF mode, returns predicate and named graph information.
     #[must_use]
     pub fn schema(&self) -> crate::admin::SchemaInfo {
-        let labels = self
-            .lpg_store()
+        let _publication = self.transaction_manager.publication().read();
+        let view = self.read_graph_view();
+        let labels = view
             .all_labels()
             .into_iter()
             .map(|name| crate::admin::LabelInfo {
-                name: name.clone(),
-                count: self.lpg_store().nodes_with_label(&name).count(),
+                count: view.nodes_by_label(&name).len(),
+                name,
             })
             .collect();
 
-        let edge_types = self
-            .lpg_store()
+        // Per-edge-type counts, tier-merged: tally the merged edge set once
+        // (the raw overlay is empty after compact()).
+        let mut edge_type_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for edge in self.read_all_edges() {
+            *edge_type_counts
+                .entry(edge.edge_type.to_string())
+                .or_default() += 1;
+        }
+        let edge_types = view
             .all_edge_types()
             .into_iter()
             .map(|name| crate::admin::EdgeTypeInfo {
-                name: name.clone(),
-                count: self.lpg_store().edges_with_type(&name).count(),
+                count: edge_type_counts.get(&name).copied().unwrap_or(0),
+                name,
             })
             .collect();
 
-        let property_keys = self.lpg_store().all_property_keys();
+        let property_keys = view.all_property_keys();
 
         crate::admin::SchemaInfo::Lpg(crate::admin::LpgSchemaInfo {
             labels,
@@ -274,23 +221,24 @@ impl super::GrafeoDB {
         })
     }
 
-    /// Returns detailed information about all indexes.
+    /// Returns detailed information about all indexes, using their canonical
+    /// explicit or catalog-allocated owner names.
     #[must_use]
     pub fn list_indexes(&self) -> Vec<crate::admin::IndexInfo> {
-        self.catalog
+        let _publication = self.transaction_manager.publication().read();
+        let catalog = self.catalog.read();
+        catalog
             .all_indexes()
             .into_iter()
             .map(|def| {
-                let label_name = self
-                    .catalog
+                let label_name = catalog
                     .get_label_name(def.label)
                     .unwrap_or_else(|| "?".into());
-                let prop_name = self
-                    .catalog
+                let prop_name = catalog
                     .get_property_key_name(def.property_key)
                     .unwrap_or_else(|| "?".into());
                 crate::admin::IndexInfo {
-                    name: format!("idx_{}_{}", label_name, prop_name),
+                    name: def.name,
                     index_type: format!("{:?}", def.index_type),
                     target: format!("{}:{}", label_name, prop_name),
                     unique: false,
@@ -310,11 +258,13 @@ impl super::GrafeoDB {
     /// Returns a list of errors and warnings. Empty errors = valid.
     #[must_use]
     pub fn validate(&self) -> crate::admin::ValidationResult {
+        let _publication = self.transaction_manager.publication().read();
         let mut result = crate::admin::ValidationResult::default();
 
-        // Check for dangling edge references
-        for edge in self.lpg_store().all_edges() {
-            if self.lpg_store().get_node(edge.src).is_none() {
+        // Check for dangling edge references (tier-merged).
+        let view = self.read_graph_view();
+        for edge in self.read_all_edges() {
+            if view.get_node(edge.src).is_none() {
                 result.errors.push(crate::admin::ValidationError {
                     code: "DANGLING_SRC".to_string(),
                     message: format!(
@@ -324,7 +274,7 @@ impl super::GrafeoDB {
                     context: Some(format!("edge:{}", edge.id.0)),
                 });
             }
-            if self.lpg_store().get_node(edge.dst).is_none() {
+            if view.get_node(edge.dst).is_none() {
                 result.errors.push(crate::admin::ValidationError {
                     code: "DANGLING_DST".to_string(),
                     message: format!(
@@ -337,7 +287,7 @@ impl super::GrafeoDB {
         }
 
         // Add warnings for potential issues
-        if self.lpg_store().node_count() > 0 && self.lpg_store().edge_count() == 0 {
+        if view.node_count() > 0 && view.edge_count() == 0 {
             result.warnings.push(crate::admin::ValidationWarning {
                 code: "NO_EDGES".to_string(),
                 message: "Database has nodes but no edges".to_string(),
@@ -350,127 +300,111 @@ impl super::GrafeoDB {
 
     /// Returns WAL (Write-Ahead Log) status.
     ///
-    /// Returns None if WAL is not enabled.
-    #[must_use]
-    pub fn wal_status(&self) -> crate::admin::WalStatus {
+    /// Returns a disabled status if WAL is not enabled.
+    ///
+    /// # Errors
+    /// Returns the underlying WAL telemetry error.
+    pub fn wal_status(&self) -> Result<crate::admin::WalStatus> {
         #[cfg(feature = "wal")]
         if let Some(ref wal) = self.wal {
-            return crate::admin::WalStatus {
+            return Ok(crate::admin::WalStatus {
                 enabled: true,
                 path: self.config.path.as_ref().map(|p| p.join("wal")),
-                size_bytes: wal.size_bytes(),
+                size_bytes: wal.size_bytes()?,
                 // reason: WAL record count fits usize on 64-bit targets
                 #[allow(clippy::cast_possible_truncation)]
                 record_count: wal.record_count() as usize,
-                last_checkpoint: wal.last_checkpoint_timestamp(),
+                last_checkpoint: wal.last_checkpoint_timestamp()?,
                 current_epoch: self.lpg_store().current_epoch().as_u64(),
-            };
+            });
         }
 
-        crate::admin::WalStatus {
+        Ok(crate::admin::WalStatus {
             enabled: false,
             path: None,
             size_bytes: 0,
             record_count: 0,
             last_checkpoint: None,
             current_epoch: self.lpg_store().current_epoch().as_u64(),
-        }
+        })
     }
+}
 
-    /// Forces a WAL checkpoint.
-    ///
-    /// Flushes all pending WAL records to the main storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the checkpoint fails.
-    pub fn wal_checkpoint(&self) -> Result<()> {
-        // Read-only databases have no WAL and the on-disk file is already a
-        // valid snapshot: nothing to checkpoint.
-        if self.read_only {
-            return Ok(());
-        }
+#[cfg(all(test, feature = "lpg"))]
+mod index_info {
+    use super::super::GrafeoDB;
+    use crate::{CreateIndexRequest, IndexCreateKind};
+    use grafeo_common::types::GraphPath;
 
-        #[cfg(feature = "wal")]
-        if let Some(ref wal) = self.wal {
-            let epoch = self.lpg_store().current_epoch();
-            let transaction_id = self
-                .transaction_manager
-                .last_assigned_transaction_id()
-                .unwrap_or_else(|| self.transaction_manager.begin());
-            wal.checkpoint(transaction_id, epoch)?;
-            wal.sync()?;
-        }
-
-        // Flush all sections to .grafeo file (explicit checkpoint)
-        #[cfg(feature = "grafeo-file")]
-        if let Some(ref fm) = self.file_manager {
-            let _ = self.checkpoint_to_file(fm, super::flush::FlushReason::Explicit)?;
-        }
-
+    #[test]
+    fn list_indexes_reports_actual_explicit_and_anonymous_owners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let db = GrafeoDB::new_in_memory();
+        let anonymous = db.create_index(CreateIndexRequest {
+            graph: GraphPath::root(),
+            name: None,
+            label: None,
+            property: "body".into(),
+            kind: IndexCreateKind::Property,
+        })?;
+        let explicit = db.create_index(CreateIndexRequest {
+            graph: GraphPath::root(),
+            name: Some("declared-owner".into()),
+            label: None,
+            property: "title".into(),
+            kind: IndexCreateKind::BTree,
+        })?;
+        let anonymous_name = format!("@grafeo-index:{}", anonymous.as_u32());
+        let mut names: Vec<_> = db
+            .list_indexes()
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, [anonymous_name.clone(), "declared-owner".into()]);
+        assert!(db.drop_index(explicit)?);
+        let remaining = db.list_indexes();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, anonymous_name);
+        assert!(db.drop_index(anonymous)?);
+        assert!(db.list_indexes().is_empty());
         Ok(())
     }
+}
 
-    // =========================================================================
-    // ADMIN API: Change Data Capture
-    // =========================================================================
+#[cfg(test)]
+mod publication_checkpoint {
+    use super::super::GrafeoDB;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    /// Returns whether CDC is enabled by default for new sessions.
-    #[cfg(feature = "cdc")]
-    #[must_use]
-    pub fn is_cdc_enabled(&self) -> bool {
-        self.cdc_active()
-    }
-
-    /// Sets whether CDC is enabled by default for new sessions.
-    ///
-    /// Does not affect sessions that were already created.
-    #[cfg(feature = "cdc")]
-    pub fn set_cdc_enabled(&self, enabled: bool) {
-        self.cdc_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Returns the full change history for an entity (node or edge).
-    ///
-    /// Events are ordered chronologically by epoch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the CDC feature is not enabled.
-    #[cfg(feature = "cdc")]
-    pub fn history(
-        &self,
-        entity_id: impl Into<crate::cdc::EntityId>,
-    ) -> Result<Vec<crate::cdc::ChangeEvent>> {
-        Ok(self.cdc_log.history(entity_id.into()))
-    }
-
-    /// Returns change events for an entity since the given epoch.
-    ///
-    /// # Errors
-    ///
-    /// Currently infallible, but returns `Result` for forward compatibility.
-    #[cfg(feature = "cdc")]
-    pub fn history_since(
-        &self,
-        entity_id: impl Into<crate::cdc::EntityId>,
-        since_epoch: grafeo_common::types::EpochId,
-    ) -> Result<Vec<crate::cdc::ChangeEvent>> {
-        Ok(self.cdc_log.history_since(entity_id.into(), since_epoch))
-    }
-
-    /// Returns all change events across all entities in an epoch range.
-    ///
-    /// # Errors
-    ///
-    /// Currently infallible, but returns `Result` for forward compatibility.
-    #[cfg(feature = "cdc")]
-    pub fn changes_between(
-        &self,
-        start_epoch: grafeo_common::types::EpochId,
-        end_epoch: grafeo_common::types::EpochId,
-    ) -> Result<Vec<crate::cdc::ChangeEvent>> {
-        Ok(self.cdc_log.changes_between(start_epoch, end_epoch))
+    /// `wal_checkpoint` takes the publication write lock, so it cannot retire
+    /// WAL while a commit (or another checkpoint) holds that lock.
+    #[test]
+    fn wal_checkpoint_waits_for_publication_write() {
+        let db = Arc::new(GrafeoDB::new_in_memory());
+        let held = db.transaction_manager.publication().write();
+        let db_ckpt = Arc::clone(&db);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).ok();
+            let _ = db_ckpt.wal_checkpoint();
+            done_tx.send(()).ok();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("checkpoint thread started");
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "wal_checkpoint must block while publication write is held"
+        );
+        drop(held);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wal_checkpoint completes after publication write is released");
+        handle.join().expect("checkpoint thread");
     }
 }

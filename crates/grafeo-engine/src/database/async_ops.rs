@@ -78,12 +78,19 @@ impl GrafeoDB {
             if db.read_only {
                 return Ok(());
             }
+            #[cfg(feature = "triple-store")]
+            let _rdf_gate = db.rdf_store.lock_commit();
+            let _publication = db.transaction_manager.publication().write();
+            db.require_quiescent("async_write_snapshot")?;
             let Some(ref fm) = db.file_manager else {
                 return Err(Error::Internal(
                     "no file manager configured for snapshot write".to_string(),
                 ));
             };
-            db.checkpoint_to_file(fm, super::flush::FlushReason::Checkpoint)
+            // build_sections() creates ephemeral Section wrappers whose local
+            // dirty flags start clean. A user-requested snapshot is therefore
+            // an explicit full-container cut, not a dirty-section poll.
+            db.checkpoint_to_file(fm, super::flush::FlushReason::Explicit)
                 .map(|_| ())
         })
         .await
@@ -102,6 +109,7 @@ mod tests {
         db.async_wal_checkpoint().await.unwrap();
     }
 
+    #[cfg(feature = "grafeo-file")]
     #[tokio::test]
     async fn async_wal_checkpoint_with_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -157,6 +165,7 @@ mod tests {
     async fn async_write_snapshot_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.grafeo");
+        let snapshot_copy = dir.path().join("snapshot-copy.grafeo");
         let db = Arc::new(GrafeoDB::open(&path).unwrap());
 
         // Insert data
@@ -167,9 +176,11 @@ mod tests {
         // Write snapshot
         db.async_write_snapshot().await.unwrap();
 
-        // Verify data survives by opening a fresh instance
-        drop(db);
-        let db2 = GrafeoDB::open(&path).unwrap();
+        // Copy and open the container while the source DB is still live. This
+        // deliberately excludes both Drop::close and the sidecar WAL, proving
+        // async_write_snapshot itself wrote the committed cut.
+        std::fs::copy(&path, &snapshot_copy).unwrap();
+        let db2 = GrafeoDB::open(&snapshot_copy).unwrap();
         let session2 = db2.session();
         let result = session2.execute("MATCH (p:Person) RETURN p.name").unwrap();
         assert_eq!(result.rows.len(), 1);

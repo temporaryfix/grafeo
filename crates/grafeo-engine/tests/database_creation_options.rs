@@ -40,17 +40,63 @@ fn rdf_database_executes_sparql() {
     assert!(result.is_ok(), "SPARQL on RDF db should work: {result:?}");
 }
 
+#[cfg(feature = "triple-store")]
+#[test]
+fn database_info_reports_the_configured_native_model() {
+    use grafeo_engine::admin::DatabaseMode;
+
+    let rdf = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf)).unwrap();
+    let triple = grafeo_core::graph::rdf::Triple::new(
+        grafeo_core::graph::rdf::Term::iri("http://ex.org/s"),
+        grafeo_core::graph::rdf::Term::iri("http://ex.org/p"),
+        grafeo_core::graph::rdf::Term::literal("v"),
+    );
+    rdf.batch_insert_rdf([triple]).unwrap();
+    let info = rdf.info();
+    assert_eq!(info.mode, DatabaseMode::Rdf);
+    assert_eq!(info.node_count, 1, "RDF node_count is distinct subjects");
+    assert_eq!(info.edge_count, 1, "RDF edge_count is triples");
+    assert_eq!(
+        info.features.iter().any(|feature| feature == "gql"),
+        cfg!(feature = "gql"),
+        "inspection must report compiled features rather than assumed defaults"
+    );
+
+    #[cfg(feature = "lpg")]
+    {
+        let both =
+            GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Both)).unwrap();
+        assert_eq!(both.info().mode, DatabaseMode::Both);
+    }
+}
+
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 #[test]
-fn lpg_database_allows_explicit_sparql() {
-    // Explicit execute_sparql() works on any database (both stores are always initialized).
-    // Only the generic execute() enforces graph model routing.
+fn lpg_database_rejects_explicit_sparql_at_every_entry_point() {
     let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Lpg)).unwrap();
     let session = db.session();
-    let result = session.execute_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1");
+    let result = session
+        .execute_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1")
+        .unwrap_err();
     assert!(
-        result.is_ok(),
-        "Explicit SPARQL should work on LPG db: {result:?}"
+        result.to_string().contains("LPG database"),
+        "explicit Session SPARQL must honor GraphModel: {result}"
+    );
+
+    let with_params = session
+        .execute_sparql_with_params(
+            "SELECT ?s WHERE { ?s ?p ?o }",
+            std::collections::HashMap::new(),
+        )
+        .unwrap_err();
+    assert!(with_params.to_string().contains("LPG database"));
+
+    let explain = db
+        .execute_sparql("EXPLAIN SELECT ?s WHERE { ?s ?p ?o }")
+        .unwrap_err();
+    assert!(
+        explain.to_string().contains("LPG database"),
+        "GrafeoDB EXPLAIN must not bypass the Session boundary: {explain}"
     );
 }
 
@@ -66,16 +112,38 @@ fn lpg_database_executes_cypher() {
 
 #[cfg(all(feature = "cypher", feature = "triple-store"))]
 #[test]
-fn rdf_database_allows_explicit_cypher() {
-    // Explicit execute_cypher() works on any database (both stores are always initialized).
-    // Only the generic execute() enforces graph model routing.
+fn rdf_database_rejects_explicit_cypher() {
     let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf)).unwrap();
     let session = db.session();
-    let result = session.execute_cypher("MATCH (p:Person) RETURN p.name");
+    let result = session
+        .execute_cypher("MATCH (p:Person) RETURN p.name")
+        .unwrap_err();
     assert!(
-        result.is_ok(),
-        "Explicit Cypher should work on RDF db: {result:?}"
+        result.to_string().contains("RDF database"),
+        "explicit Cypher must honor GraphModel: {result}"
     );
+}
+
+#[cfg(all(feature = "graphql", feature = "triple-store"))]
+#[test]
+fn explicit_graphql_entry_points_honor_graph_model() {
+    let lpg = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Lpg)).unwrap();
+    let lpg_session = lpg.session();
+    let rdf_query = lpg_session
+        .execute_graphql_rdf("query { anything }")
+        .unwrap_err();
+    assert!(rdf_query.to_string().contains("LPG database"));
+    let rdf_params = lpg_session
+        .execute_graphql_rdf_with_params("query { anything }", std::collections::HashMap::new())
+        .unwrap_err();
+    assert!(rdf_params.to_string().contains("LPG database"));
+
+    let rdf = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf)).unwrap();
+    let lpg_query = rdf
+        .session()
+        .execute_graphql("query { anything }")
+        .unwrap_err();
+    assert!(lpg_query.to_string().contains("RDF database"));
 }
 
 // --- Config::validate() tests ---
@@ -146,9 +214,10 @@ fn memory_limit_accessor_returns_configured_value() {
 // --- DurabilityMode tests ---
 
 #[test]
-fn default_durability_is_batch() {
+fn default_durability_is_strict_sync() {
     let config = Config::default();
-    assert_eq!(config.wal_durability, DurabilityMode::default());
+    assert_eq!(config.wal_durability, DurabilityMode::Sync);
+    assert_eq!(DurabilityMode::default(), DurabilityMode::Sync);
 }
 
 #[test]

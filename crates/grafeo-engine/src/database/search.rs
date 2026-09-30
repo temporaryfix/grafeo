@@ -18,38 +18,7 @@ use grafeo_common::utils::error::Error;
 use grafeo_common::utils::error::Result;
 
 impl super::GrafeoDB {
-    /// Creates a vector accessor for the given label/property, using spilled
-    /// MmapStorage if the index has been spilled to disk.
-    #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-    fn make_vector_accessor<'a>(
-        &'a self,
-        label: &str,
-        property: &str,
-    ) -> grafeo_core::index::vector::VectorAccessorKind<'a> {
-        let key = format!("{label}:{property}");
-        if let Some(ref spill_map) = self.vector_spill_storages {
-            let map = spill_map.read();
-            if let Some(storage) = map.get(&key) {
-                return grafeo_core::index::vector::VectorAccessorKind::Spilled(
-                    grafeo_core::index::vector::SpillableVectorAccessor::new(
-                        self.graph_store_ref(),
-                        property,
-                        std::sync::Arc::clone(storage)
-                            as std::sync::Arc<dyn grafeo_core::index::vector::VectorStorage>,
-                    ),
-                );
-            }
-        }
-        grafeo_core::index::vector::VectorAccessorKind::Property(
-            grafeo_core::index::vector::PropertyVectorAccessor::new(
-                self.graph_store_ref(),
-                property,
-            ),
-        )
-    }
-
-    /// Creates a vector accessor (no spill support when mmap or temporal unavailable).
-    #[cfg(not(all(feature = "vector-index", feature = "mmap", not(feature = "temporal"))))]
+    /// Creates a vector accessor for the given label/property.
     #[cfg(feature = "vector-index")]
     fn make_vector_accessor<'a>(
         &'a self,
@@ -120,7 +89,7 @@ impl super::GrafeoDB {
 
     /// Searches for the k nearest neighbors of a query vector.
     ///
-    /// Uses the HNSW index created by [`create_vector_index`](Self::create_vector_index).
+    /// Uses the existing HNSW index for the requested label and property.
     ///
     /// # Arguments
     ///
@@ -140,6 +109,19 @@ impl super::GrafeoDB {
     /// \[0, inf), dot product (negated, so lower = higher similarity),
     /// manhattan \[0, inf).
     ///
+    /// # Isolation
+    ///
+    /// This is an **auto-commit** convenience API: it reads the committed-latest
+    /// index and does NOT apply transaction snapshot visibility, read-your-writes,
+    /// or Serializable SSI read-recording. Called from inside an open transaction
+    /// it returns committed-latest results (not your snapshot), and a concurrent
+    /// write it would otherwise conflict with under Serializable is not recorded.
+    /// For snapshot/serializable-correct vector search inside a transaction, run a
+    /// GQL `MATCH` query (the `VectorScanOperator` path applies visibility and
+    /// records the read). The same caveat applies to
+    /// [`batch_vector_search`](Self::batch_vector_search) and
+    /// [`mmr_search`](Self::mmr_search).
+    ///
     /// # Errors
     ///
     /// Returns an error if no vector index exists for the given label and property.
@@ -153,9 +135,10 @@ impl super::GrafeoDB {
         ef: Option<usize>,
         filters: Option<&std::collections::HashMap<String, Value>>,
     ) -> Result<Vec<(grafeo_common::types::NodeId, f32)>> {
+        let _publication = self.transaction_manager.publication().read();
         let index = self.lpg_store().get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
-                "No vector index found for :{label}({property}). Call create_vector_index() first."
+                "No vector index found for :{label}({property}). Call create_index() with IndexCreateKind::Vector first."
             ))
         })?;
 
@@ -203,9 +186,10 @@ impl super::GrafeoDB {
         ef: Option<usize>,
         filters: Option<&std::collections::HashMap<String, Value>>,
     ) -> Result<Vec<Vec<(grafeo_common::types::NodeId, f32)>>> {
+        let _publication = self.transaction_manager.publication().read();
         let index = self.lpg_store().get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
-                "No vector index found for :{label}({property}). Call create_vector_index() first."
+                "No vector index found for :{label}({property}). Call create_index() with IndexCreateKind::Vector first."
             ))
         })?;
 
@@ -268,9 +252,10 @@ impl super::GrafeoDB {
     ) -> Result<Vec<(grafeo_common::types::NodeId, f32)>> {
         use grafeo_core::index::vector::mmr_select;
 
+        let _publication = self.transaction_manager.publication().read();
         let index = self.lpg_store().get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
-                "No vector index found for :{label}({property}). Call create_vector_index() first."
+                "No vector index found for :{label}({property}). Call create_index() with IndexCreateKind::Vector first."
             ))
         })?;
 
@@ -334,6 +319,7 @@ impl super::GrafeoDB {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeId, f64)>> {
+        let _publication = self.transaction_manager.publication().read();
         let index = self
             .lpg_store()
             .get_text_index(label, property)
@@ -394,6 +380,7 @@ impl super::GrafeoDB {
     ) -> Result<Vec<(NodeId, f64)>> {
         use grafeo_core::index::text::fuse_results;
 
+        let _publication = self.transaction_manager.publication().read();
         let fusion_method = fusion.unwrap_or_default();
         let mut sources: Vec<Vec<(NodeId, f64)>> = Vec::new();
 
