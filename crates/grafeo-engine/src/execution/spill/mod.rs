@@ -12,4 +12,4 @@ pub mod async_manager;
 #[cfg(feature = "async-storage")]
 pub use async_file::{AsyncSpillFile, AsyncSpillFileReader};
 #[cfg(feature = "async-storage")]
-pub use async_manager::AsyncSpillManager;
+pub use async_manager::{AsyncSpillError, AsyncSpillManager};
