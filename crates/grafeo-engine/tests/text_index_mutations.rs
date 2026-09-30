@@ -3,7 +3,7 @@
 //! These verify that text indexes are automatically kept in sync
 //! when nodes are created, updated, or deleted.
 
-#![cfg(feature = "text-index")]
+#![cfg(all(feature = "lpg", feature = "text-index"))]
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
@@ -11,7 +11,16 @@ use grafeo_engine::GrafeoDB;
 /// Helper: create a DB with a text index on :Doc(content).
 fn setup_db_with_text_index() -> GrafeoDB {
     let db = GrafeoDB::new_in_memory();
-    db.create_text_index("Doc", "content").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "content".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
     db
 }
 
@@ -57,7 +66,8 @@ fn test_text_index_auto_update_via_set_property() {
         id,
         "content",
         Value::String("updated text about graph theory".into()),
-    );
+    )
+    .expect("set node property");
 
     // Old text should no longer match
     let results = db.text_search("Doc", "content", "databases", 10).unwrap();
@@ -72,6 +82,14 @@ fn test_text_index_auto_update_via_set_property() {
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, id);
+
+    assert!(db.remove_node_property(id, "content"));
+    assert!(
+        db.text_search("Doc", "content", "graph theory", 10)
+            .unwrap()
+            .is_empty(),
+        "removed text properties must be removed by the central index hook"
+    );
 }
 
 #[test]
@@ -105,7 +123,16 @@ fn test_text_index_auto_delete() {
 #[test]
 fn test_text_index_add_label() {
     let db = GrafeoDB::new_in_memory();
-    db.create_text_index("Article", "content").unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "content".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
 
     // Create a node WITHOUT the Article label
     let id = db.create_node_with_props(
@@ -133,6 +160,76 @@ fn test_text_index_add_label() {
 }
 
 #[test]
+#[cfg(feature = "gql")]
+fn session_transaction_label_and_delete_maintain_text_index() {
+    let db = GrafeoDB::new_in_memory();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "content".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .unwrap();
+    let id = db.create_node_with_props(
+        &["Other"],
+        [
+            ("name", Value::from("tx-text-target")),
+            ("content", Value::from("transactional text indexing")),
+        ],
+    );
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin label add");
+    session
+        .execute("MATCH (n:Other {name: 'tx-text-target'}) SET n:Article")
+        .expect("transactional text-index label add");
+    session.commit().expect("commit label add");
+    assert_eq!(
+        db.text_search("Article", "content", "transactional", 10)
+            .unwrap()
+            .iter()
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>(),
+        vec![id]
+    );
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin label remove");
+    session
+        .execute("MATCH (n:Article {name: 'tx-text-target'}) REMOVE n:Article")
+        .expect("transactional text-index label remove");
+    session.commit().expect("commit label remove");
+    assert!(
+        db.text_search("Article", "content", "transactional", 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin label re-add");
+    session
+        .execute("MATCH (n:Other {name: 'tx-text-target'}) SET n:Article")
+        .expect("transactional text-index label re-add");
+    session.commit().expect("commit label re-add");
+
+    let mut session = db.session();
+    session.begin_transaction().expect("begin delete");
+    session
+        .execute("MATCH (n:Article {name: 'tx-text-target'}) DELETE n")
+        .expect("transactional text-index delete");
+    session.commit().expect("commit delete");
+    assert!(
+        db.text_search("Article", "content", "transactional", 10)
+            .unwrap()
+            .is_empty(),
+        "Session/GQL DELETE commit must remove text-index membership"
+    );
+}
+
+#[test]
 fn test_text_index_non_string_property_ignored() {
     let db = setup_db_with_text_index();
 
@@ -150,7 +247,8 @@ fn test_text_index_non_string_property_ignored() {
         id,
         "content",
         Value::String("now it is a string value".into()),
-    );
+    )
+    .expect("set node property");
     let results = db
         .text_search("Doc", "content", "string value", 10)
         .unwrap();
