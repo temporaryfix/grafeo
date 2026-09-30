@@ -1,6 +1,6 @@
 {
   "name": "@grafeo-db/js-darwin-x64",
-  "version": "0.5.42",
+  "version": "0.0.1",
   "os": [
     "darwin"
   ],
@@ -9,12 +9,13 @@
   ],
   "main": "grafeo.darwin-x64.node",
   "files": [
-    "grafeo.darwin-x64.node"
+    "grafeo.darwin-x64.node",
+    "LICENSE"
   ],
   "description": "Grafeo native binding for macOS x64",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3.0"
   },
   "repository": {
     "type": "git",

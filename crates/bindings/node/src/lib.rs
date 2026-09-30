@@ -14,13 +14,21 @@
 // napi FFI requires unsafe casts between JS value types
 #![allow(unsafe_code)]
 
+#[cfg(all(
+    feature = "full",
+    not(all(feature = "rdf", feature = "shacl", feature = "analytics"))
+))]
+compile_error!("Node `full` must retain RDF, SHACL, and analytics support");
+
 #[macro_use]
 extern crate napi_derive;
 
+mod control;
 mod database;
 mod error;
 mod graph;
 mod query;
+#[cfg(feature = "gql")]
 mod stream;
 mod transaction;
 mod types;

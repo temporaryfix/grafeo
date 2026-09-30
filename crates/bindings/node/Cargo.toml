@@ -13,11 +13,11 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
-grafeo-engine = { path = "../../grafeo-engine" }
-grafeo-core = { path = "../../grafeo-core" }
-grafeo-common = { path = "../../grafeo-common" }
-grafeo-adapters = { path = "../../grafeo-adapters" }
-grafeo-bindings-common = { path = "../common" }
+grafeo-engine = { workspace = true }
+grafeo-core = { workspace = true }
+grafeo-common = { workspace = true }
+grafeo-adapters = { workspace = true }
+grafeo-bindings-common = { workspace = true }
 
 napi = { version = "3", default-features = false, features = ["napi9", "async", "serde-json", "error_anyhow"] }
 napi-derive = "3.5.5"
@@ -25,6 +25,11 @@ parking_lot.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 serde_json = "1.0"
+
+[dev-dependencies]
+# Standalone Rust tests have no Node process providing the Node-API symbols.
+# Keep dynamic lookup confined to test builds; shipping addons use normal linkage.
+napi = { version = "3", default-features = false, features = ["dyn-symbols"] }
 
 [build-dependencies]
 napi-build = "2"
@@ -40,12 +45,14 @@ sql-pgq = ["grafeo-engine/sql-pgq"]
 vector-index = ["grafeo-engine/vector-index"]
 text-index = ["grafeo-engine/text-index"]
 hybrid-search = ["grafeo-engine/hybrid-search"]
-cdc = ["grafeo-engine/cdc"]
+cdc = ["grafeo-engine/cdc", "grafeo-bindings-common/cdc"]
 embed = ["grafeo-engine/embed"]
 algos = ["grafeo-engine/algos"]
 triple-store = ["grafeo-engine/triple-store"]
 shacl = ["grafeo-engine/shacl"]
-compact-store = ["grafeo-engine/compact-store"]
+ring-index = ["grafeo-engine/ring-index", "triple-store"]
+# Compact maintenance needs LPG storage even in a parser-free build.
+compact-store = ["grafeo-engine/compact-store", "grafeo-engine/lpg"]
 arrow-export = ["grafeo-engine/arrow-export"]
 jsonl-import = ["grafeo-engine/jsonl-import"]
 parquet-import = ["grafeo-engine/parquet-import"]
@@ -55,12 +62,26 @@ ai = ["vector-index", "text-index", "hybrid-search", "cdc"]
 storage = ["grafeo-engine/storage"]
 # Persona-based profiles
 lpg = ["grafeo-engine/lpg", "gql", "cypher", "gremlin", "sql-pgq", "storage", "grafeo-engine/regex"]
-rdf = ["triple-store", "gql", "sparql", "graphql", "storage", "grafeo-engine/regex", "shacl"]
+rdf = ["triple-store", "sparql", "graphql", "ring-index", "storage", "grafeo-engine/regex", "shacl"]
+native = ["grafeo-engine/native", "triple-store"]
 analytics = ["algos", "vector-index", "text-index", "hybrid-search", "jsonl-import", "parquet-import"]
-edge = ["grafeo-engine/lpg", "gql", "grafeo-engine/regex-lite"]
+edge = ["grafeo-engine/lpg", "gql", "compact-store", "grafeo-engine/regex-lite"]
 # Deployment-based profiles (deprecated)
-embedded = ["gql", "ai", "algos", "compact-store", "arrow-export", "grafeo-engine/parallel", "grafeo-engine/regex", "grafeo-engine/grafeo-file"]
-full = ["languages", "ai", "algos", "triple-store"]
+embedded = [
+    "grafeo-engine/lpg",
+    "gql",
+    "ai",
+    "algos",
+    "compact-store",
+    "arrow-export",
+    "grafeo-engine/parallel",
+    "grafeo-engine/regex",
+    "grafeo-engine/grafeo-file",
+    "grafeo-engine/wal",
+    "grafeo-engine/spill",
+    "grafeo-engine/mmap",
+]
+full = ["embedded", "languages", "rdf", "analytics", "ai"]
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 {
   "name": "@grafeo-db/js",
-  "version": "0.5.42",
+  "version": "0.0.1",
   "description": "Node.js/TypeScript bindings for Grafeo - a high-performance embeddable graph database",
   "main": "index.js",
   "types": "index.d.ts",
@@ -13,19 +13,21 @@
       "aarch64-apple-darwin",
       "aarch64-unknown-linux-gnu",
       "aarch64-unknown-linux-musl"
-    ]
+    ],
+    "dtsHeaderFile": "types-header.d.ts"
   },
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "LICENSE"
   ],
   "optionalDependencies": {
-    "@grafeo-db/js-darwin-x64": "0.5.42",
-    "@grafeo-db/js-win32-x64-msvc": "0.5.42",
-    "@grafeo-db/js-linux-x64-gnu": "0.5.42",
-    "@grafeo-db/js-darwin-arm64": "0.5.42",
-    "@grafeo-db/js-linux-arm64-gnu": "0.5.42",
-    "@grafeo-db/js-linux-arm64-musl": "0.5.42"
+    "@grafeo-db/js-darwin-x64": "0.0.1",
+    "@grafeo-db/js-win32-x64-msvc": "0.0.1",
+    "@grafeo-db/js-linux-x64-gnu": "0.0.1",
+    "@grafeo-db/js-darwin-arm64": "0.0.1",
+    "@grafeo-db/js-linux-arm64-gnu": "0.0.1",
+    "@grafeo-db/js-linux-arm64-musl": "0.0.1"
   },
   "keywords": [
     "graph",
@@ -50,17 +52,19 @@
     "url": "https://github.com/GrafeoDB/grafeo/issues"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3.0"
   },
   "scripts": {
-    "artifacts": "napi artifacts",
-    "build": "napi build --platform --release --features full",
-    "build:debug": "napi build --platform",
-    "test": "vitest run",
-    "version": "napi version"
+    "artifacts": "npx --prefix tools --no-install napi artifacts",
+    "build": "npx --prefix tools --no-install napi build --platform --release --features full -- --locked && node -e \"require('fs').appendFileSync('index.js', require('fs').readFileSync('loader-footer.js'))\"",
+    "build:debug": "npx --prefix tools --no-install napi build --platform -- --locked && node -e \"require('fs').appendFileSync('index.js', require('fs').readFileSync('loader-footer.js'))\"",
+    "test": "npx --prefix tools --no-install vitest run",
+    "version": "npx --prefix tools --no-install napi version"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.0.0",
-    "vitest": "^4.0.18"
+    "@napi-rs/cli": "3.10.5",
+    "@types/node": "20.19.43",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11"
   }
 }

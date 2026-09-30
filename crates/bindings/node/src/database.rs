@@ -5,22 +5,354 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 use napi::JsString;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use parking_lot::RwLock;
 
-use grafeo_common::types::{EdgeId, NodeId, Value};
-use grafeo_engine::config::Config;
+use grafeo_common::types::Value;
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+use grafeo_common::types::{EdgeId, NodeId};
+#[cfg(feature = "compact-store")]
+use grafeo_core::graph::Direction;
+use grafeo_engine::config::{Config, GraphModel};
 use grafeo_engine::database::{GrafeoDB, QueryResult as EngineQueryResult};
 
 use crate::error::NodeGrafeoError;
 use crate::graph::{JsEdge, JsNode};
 use crate::query::QueryResult;
 use crate::transaction::Transaction;
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 use crate::types;
 
+/// A checked graph-qualified index creation request.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+#[napi(object, object_from_js = false)]
+pub struct CreateIndexRequest {
+    /// Property to index.
+    pub property: String,
+    /// "property" (default), "btree", "text", or "vector".
+    #[napi(ts_type = "'property' | 'btree' | 'text' | 'vector'")]
+    pub kind: Option<String>,
+    /// Graph path components; [] is root and [""] is an empty child.
+    pub graph: Option<Vec<String>>,
+    /// Optional owner name; generated names use the reserved engine namespace.
+    pub name: Option<String>,
+    /// Required for text/vector; omitted for property/btree.
+    pub label: Option<String>,
+    /// Text-only minimum token length; omitted defaults to 2, and 0 is valid.
+    pub min_token_length: Option<f64>,
+    /// Vector dimensions; omitted to infer from data.
+    pub dimensions: Option<f64>,
+    /// Vector distance metric.
+    pub metric: Option<String>,
+    /// Vector HNSW links per node.
+    pub m: Option<f64>,
+    /// Vector HNSW construction beam width.
+    pub ef_construction: Option<f64>,
+    /// Vector quantization mode.
+    pub quantization: Option<String>,
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+impl CreateIndexRequest {
+    /// Capture JavaScript values on its own thread before any lossy UTF-8
+    /// conversion or asynchronous engine work. Read only the validated keys.
+    fn from_js(request: Unknown<'_>) -> Result<Self> {
+        if request.get_type()? != napi::ValueType::Object {
+            return Err(napi::Error::from_reason("index request must be an object"));
+        }
+        let object = request.coerce_to_object()?;
+        if object.is_array()? {
+            return Err(napi::Error::from_reason(
+                "index request must not be an array",
+            ));
+        }
+        let keys = object.get_all_property_names(
+            KeyCollectionMode::OwnOnly,
+            KeyFilter::AllProperties,
+            KeyConversion::NumbersToStrings,
+        )?;
+        let mut names = Vec::new();
+        for position in 0..keys.get_array_length()? {
+            let key: JsString = keys.get_element(position)?;
+            let name = checked_index_string(key, "request key")?;
+            if !matches!(
+                name.as_str(),
+                "property"
+                    | "kind"
+                    | "graph"
+                    | "name"
+                    | "label"
+                    | "minTokenLength"
+                    | "dimensions"
+                    | "metric"
+                    | "m"
+                    | "efConstruction"
+                    | "quantization"
+            ) {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown index request field '{name}'"
+                )));
+            }
+            names.push(name);
+        }
+        // Inherited enumerable options must not silently select a different
+        // graph or configuration than the caller's request suggests.
+        let inherited = object.get_all_property_names(
+            KeyCollectionMode::IncludePrototypes,
+            KeyFilter::Enumerable,
+            KeyConversion::NumbersToStrings,
+        )?;
+        for position in 0..inherited.get_array_length()? {
+            let key: JsString = inherited.get_element(position)?;
+            if !object.has_own_property_js(key)? {
+                return Err(napi::Error::from_reason(
+                    "index request fields must be own properties",
+                ));
+            }
+        }
+        let mut decoded = Self {
+            property: String::new(),
+            kind: None,
+            graph: None,
+            name: None,
+            label: None,
+            min_token_length: None,
+            dimensions: None,
+            metric: None,
+            m: None,
+            ef_construction: None,
+            quantization: None,
+        };
+        let mut has_property = false;
+        for name in names {
+            match name.as_str() {
+                "property" => {
+                    decoded.property =
+                        checked_index_string(object.get_named_property("property")?, "property")?;
+                    has_property = true;
+                }
+                "kind" => decoded.kind = optional_index_string(&object, "kind")?,
+                "name" => decoded.name = optional_index_string(&object, "name")?,
+                "label" => decoded.label = optional_index_string(&object, "label")?,
+                "minTokenLength" => {
+                    let value: Unknown<'_> = object.get_named_property("minTokenLength")?;
+                    if value.get_type()? != napi::ValueType::Undefined {
+                        if value.get_type()? != napi::ValueType::Number {
+                            return Err(napi::Error::from_reason(
+                                "minTokenLength must be a number",
+                            ));
+                        }
+                        decoded.min_token_length = Some(value.coerce_to_number()?.get_double()?);
+                    }
+                }
+                "metric" => decoded.metric = optional_index_string(&object, "metric")?,
+                "quantization" => {
+                    decoded.quantization = optional_index_string(&object, "quantization")?;
+                }
+                "dimensions" => decoded.dimensions = object.get_named_property("dimensions")?,
+                "m" => decoded.m = object.get_named_property("m")?,
+                "efConstruction" => {
+                    decoded.ef_construction = object.get_named_property("efConstruction")?;
+                }
+                "graph" => {
+                    let graph: Option<Object<'_>> = object.get_named_property("graph")?;
+                    if let Some(graph) = graph {
+                        if !graph.is_array()? {
+                            return Err(napi::Error::from_reason(
+                                "index graph must be an array of string components",
+                            ));
+                        }
+                        let mut components = Vec::new();
+                        for position in 0..graph.get_array_length()? {
+                            let component: JsString = graph.get_element(position)?;
+                            components.push(checked_index_string(component, "graph component")?);
+                        }
+                        decoded.graph = Some(components);
+                    }
+                }
+                _ => return Err(napi::Error::from_reason("unvalidated index request field")),
+            }
+        }
+        if !has_property {
+            return Err(napi::Error::from_reason("index request requires property"));
+        }
+        Ok(decoded)
+    }
+
+    fn into_engine(self) -> Result<grafeo_engine::CreateIndexRequest> {
+        use grafeo_common::types::GraphPath;
+        use grafeo_engine::IndexCreateKind;
+
+        let kind = self.kind.as_deref().map_or("property", |kind| kind);
+        if kind != "text" && self.min_token_length.is_some() {
+            return Err(NodeGrafeoError::InvalidArgument(
+                "minTokenLength requires kind='text'".into(),
+            )
+            .into());
+        }
+        if kind != "vector"
+            && (self.dimensions.is_some()
+                || self.metric.is_some()
+                || self.m.is_some()
+                || self.ef_construction.is_some()
+                || self.quantization.is_some())
+        {
+            return Err(NodeGrafeoError::InvalidArgument(
+                "vector options require kind='vector'".into(),
+            )
+            .into());
+        }
+        let kind = match kind {
+            "property" => IndexCreateKind::Property,
+            "btree" => IndexCreateKind::BTree,
+            "text" => IndexCreateKind::Text {
+                min_token_length: checked_index_size(self.min_token_length, "minTokenLength")?,
+            },
+            "vector" => IndexCreateKind::Vector {
+                dimensions: checked_index_size(self.dimensions, "dimensions")?,
+                metric: self.metric,
+                m: checked_index_size(self.m, "m")?,
+                ef_construction: checked_index_size(self.ef_construction, "efConstruction")?,
+                ef: None,
+                quantization: self.quantization,
+            },
+            other => {
+                return Err(NodeGrafeoError::InvalidArgument(format!(
+                    "unknown index kind '{other}'"
+                ))
+                .into());
+            }
+        };
+        let components: Vec<&str> = self
+            .graph
+            .as_deref()
+            .map_or(&[][..], |path| path)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let graph = GraphPath::from_components(&components)
+            .map_err(|error| NodeGrafeoError::InvalidArgument(error.to_string()))?;
+        Ok(grafeo_engine::CreateIndexRequest {
+            graph,
+            name: self.name,
+            label: self.label,
+            property: self.property,
+            kind,
+        })
+    }
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+fn checked_index_string(value: JsString<'_>, field: &str) -> Result<String> {
+    // N-API's buffer includes one terminator; as_str excludes that terminator
+    // while still validating UTF-16 and retaining caller-owned NUL characters.
+    value
+        .into_utf16()?
+        .as_str()
+        .map_err(|_| napi::Error::from_reason(format!("{field} contains invalid UTF-16")))
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+fn optional_index_string(object: &Object<'_>, field: &str) -> Result<Option<String>> {
+    let value: Option<JsString<'_>> = object.get_named_property(field)?;
+    value
+        .map(|value| checked_index_string(value, field))
+        .transpose()
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+fn checked_index_size(value: Option<f64>, field: &str) -> Result<Option<usize>> {
+    value
+        .map(|value| {
+            if !(0.0..=9_007_199_254_740_991.0).contains(&value) || value.fract() != 0.0 {
+                return Err(NodeGrafeoError::InvalidArgument(format!(
+                    "{field} must be a non-negative safe integer"
+                ))
+                .into());
+            }
+            value.to_string().parse::<usize>().map_err(|_| {
+                NodeGrafeoError::InvalidArgument(format!(
+                    "{field} is outside the supported integer range"
+                ))
+                .into()
+            })
+        })
+        .transpose()
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+fn checked_index_owner(owner: f64) -> Result<grafeo_common::types::IndexId> {
+    owner
+        .to_string()
+        .parse::<u32>()
+        .map(grafeo_common::types::IndexId::new)
+        .map_err(|_| {
+            NodeGrafeoError::InvalidArgument(
+                "index owner must be an unsigned 32-bit integer".into(),
+            )
+            .into()
+        })
+}
+
 /// Converts a serde_json filter map to a Grafeo filter map.
+#[cfg(any(feature = "vector-index", feature = "hybrid-search"))]
 fn convert_json_filters(
     filters: Option<HashMap<String, serde_json::Value>>,
 ) -> Result<Option<HashMap<String, Value>>> {
@@ -39,6 +371,13 @@ fn convert_json_filters(
 ///
 /// JavaScript numbers are f64, but entity IDs are u64. This rejects
 /// negative values, NaN, Infinity, and values beyond `Number.MAX_SAFE_INTEGER`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn validate_node_id(id: f64) -> Result<NodeId> {
     if !(0.0..=9_007_199_254_740_991.0).contains(&id) {
         return Err(NodeGrafeoError::InvalidArgument(format!("Invalid node ID: {id}")).into());
@@ -49,6 +388,13 @@ fn validate_node_id(id: f64) -> Result<NodeId> {
 }
 
 /// Validate a JavaScript number as a safe edge ID.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn validate_edge_id(id: f64) -> Result<EdgeId> {
     if !(0.0..=9_007_199_254_740_991.0).contains(&id) {
         return Err(NodeGrafeoError::InvalidArgument(format!("Invalid edge ID: {id}")).into());
@@ -62,6 +408,12 @@ fn validate_edge_id(id: f64) -> Result<EdgeId> {
 ///
 /// Rejects negative values, NaN, Infinity, and values beyond
 /// `Number.MAX_SAFE_INTEGER`. Epochs are unsigned 64-bit integers internally.
+#[cfg(any(
+    feature = "compact-store",
+    feature = "storage",
+    feature = "native",
+    feature = "embedded"
+))]
 fn validate_epoch(epoch: f64) -> Result<grafeo_common::types::EpochId> {
     if !(0.0..=9_007_199_254_740_991.0).contains(&epoch) {
         return Err(NodeGrafeoError::InvalidArgument(format!("Invalid epoch: {epoch}")).into());
@@ -69,6 +421,170 @@ fn validate_epoch(epoch: f64) -> Result<grafeo_common::types::EpochId> {
     // reason: Range check above guarantees the value is in [0, 2^53-1], safe for u64
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Ok(grafeo_common::types::EpochId::new(epoch as u64))
+}
+
+#[cfg(feature = "triple-store")]
+pub(crate) fn parse_node_rdf_term(s: &str) -> Result<grafeo_engine::Term> {
+    let s = s.trim();
+    grafeo_engine::Term::from_ntriples(s)
+        .or_else(|| {
+            if s.starts_with('"') || s.starts_with("_:") || s.starts_with('<') || s.is_empty() {
+                None
+            } else {
+                Some(grafeo_engine::Term::iri(s))
+            }
+        })
+        .ok_or_else(|| {
+            NodeGrafeoError::InvalidArgument(format!(
+                "invalid RDF term '{s}': expected N-Triples or a bare IRI"
+            ))
+            .into()
+        })
+}
+
+#[cfg(feature = "triple-store")]
+pub(crate) fn parse_node_rdf_quad(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    graph: Option<&str>,
+) -> Result<grafeo_engine::Quad> {
+    let subject_term = parse_node_rdf_term(subject)?;
+    if !subject_term.is_iri() && !subject_term.is_blank_node() {
+        return Err(NodeGrafeoError::InvalidArgument(
+            "RDF subject must be an IRI or blank node".into(),
+        )
+        .into());
+    }
+    let predicate_term = parse_node_rdf_term(predicate)?;
+    if !predicate_term.is_iri() {
+        return Err(NodeGrafeoError::InvalidArgument("RDF predicate must be an IRI".into()).into());
+    }
+    let triple =
+        grafeo_engine::Triple::new(subject_term, predicate_term, parse_node_rdf_term(object)?);
+    match graph {
+        Some(g) if !g.is_empty() => {
+            let iri = g
+                .strip_prefix('<')
+                .and_then(|inner| inner.strip_suffix('>'))
+                .unwrap_or(g);
+            Ok(grafeo_engine::Quad::named(triple, iri))
+        }
+        _ => Ok(grafeo_engine::Quad::new(triple)),
+    }
+}
+
+#[cfg(feature = "triple-store")]
+pub(crate) fn parse_node_quad_list(quads: &[Vec<String>]) -> Result<Vec<grafeo_engine::Quad>> {
+    validate_rdf_input_count(quads.len())?;
+    quads
+        .iter()
+        .map(|parts| {
+            if parts.len() < 3 {
+                return Err(NodeGrafeoError::InvalidArgument(
+                    "RDF quad must be [subject, predicate, object] or [subject, predicate, object, graph]"
+                        .into(),
+                )
+                .into());
+            }
+            parse_node_rdf_quad(
+                &parts[0],
+                &parts[1],
+                &parts[2],
+                parts.get(3).map(String::as_str),
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "triple-store")]
+fn validate_rdf_input_count(count: usize) -> Result<()> {
+    u32::try_from(count).map(|_| ()).map_err(|_| {
+        NodeGrafeoError::InvalidArgument("RDF input exceeds the unsigned 32-bit count limit".into())
+            .into()
+    })
+}
+
+#[cfg(feature = "triple-store")]
+pub(crate) fn rdf_insert_count(count: usize) -> Result<u32> {
+    u32::try_from(count).map_err(|_| {
+        NodeGrafeoError::Native(grafeo_common::utils::error::Error::Internal(
+            "RDF inserted count exceeds the admitted input range".into(),
+        ))
+        .into()
+    })
+}
+
+#[cfg(feature = "triple-store")]
+fn rdf_insert_receipt(
+    inserted: usize,
+    epoch: grafeo_common::types::EpochId,
+) -> Result<Vec<Either<u32, String>>> {
+    Ok(vec![
+        Either::A(rdf_insert_count(inserted)?),
+        Either::B(epoch.as_u64().to_string()),
+    ])
+}
+
+#[cfg(all(test, feature = "triple-store"))]
+mod rdf_insert_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_preserves_unsigned_epochs_beyond_javascript_and_signed_ranges() {
+        for (epoch, expected) in [
+            (0, "0"),
+            (9_007_199_254_740_991, "9007199254740991"),
+            (9_007_199_254_740_993, "9007199254740993"),
+            (9_223_372_036_854_775_808, "9223372036854775808"),
+            (u64::MAX, "18446744073709551615"),
+        ] {
+            let receipt = rdf_insert_receipt(1, grafeo_common::types::EpochId::new(epoch))
+                .expect("admitted count");
+            assert!(
+                matches!(receipt.as_slice(), [Either::A(1), Either::B(value)] if value == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn counts_preserve_the_full_unsigned_32_bit_range() {
+        for count in [0, 1, u32::MAX] {
+            let native =
+                usize::try_from(count).expect("supported target has at least 32-bit usize");
+            validate_rdf_input_count(native).expect("representable input");
+            assert_eq!(
+                rdf_insert_count(native).expect("representable result"),
+                count
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_input_and_impossible_results_fail_instead_of_truncating() {
+        let too_large = usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit target");
+        assert_eq!(
+            validate_rdf_input_count(too_large).unwrap_err().status,
+            Status::InvalidArg
+        );
+        let error = rdf_insert_count(too_large).unwrap_err();
+        assert_eq!(error.status, Status::GenericFailure);
+        assert!(error.reason.contains("admitted input range"));
+    }
+}
+
+#[cfg(feature = "compact-store")]
+fn parse_asof_direction(direction: Option<&str>) -> Result<Direction> {
+    match direction {
+        None | Some("outgoing") | Some("out") => Ok(Direction::Outgoing),
+        Some("incoming") | Some("in") => Ok(Direction::Incoming),
+        Some("both") => Ok(Direction::Both),
+        Some(other) => Err(NodeGrafeoError::InvalidArgument(format!(
+            "unknown direction '{other}': expected 'outgoing', 'incoming', or 'both'"
+        ))
+        .into()),
+    }
 }
 
 /// Your connection to a Grafeo database.
@@ -80,16 +596,34 @@ pub struct JsGrafeoDB {
 #[napi]
 impl JsGrafeoDB {
     /// Create a database. Pass a path for persistence, or omit for in-memory.
-    #[napi(factory)]
-    pub fn create(path: Option<String>) -> Result<Self> {
-        let config = match path {
+    /// `graphModel` is `"lpg"`, `"rdf"`, or `"both"`.
+    #[napi(
+        factory,
+        ts_args_type = "path?: string | undefined | null, graphModel?: 'lpg' | 'rdf' | 'both'"
+    )]
+    pub fn create(path: Option<String>, graph_model: Option<String>) -> Result<Self> {
+        let mut config = match path {
             Some(p) => Config::persistent(p),
             None => Config::in_memory(),
         };
+        if let Some(model) = graph_model {
+            let parsed = GraphModel::from_name(&model).ok_or_else(|| {
+                NodeGrafeoError::InvalidArgument(format!(
+                    "unknown graphModel '{model}': expected 'lpg', 'rdf', or 'both'"
+                ))
+            })?;
+            config = config.with_graph_model(parsed);
+        }
         let db = GrafeoDB::with_config(config).map_err(NodeGrafeoError::from)?;
         Ok(Self {
             inner: Arc::new(RwLock::new(db)),
         })
+    }
+
+    /// Graph model this database was created with: `"lpg"`, `"rdf"`, or `"both"`.
+    #[napi(js_name = "graphModel", ts_return_type = "'lpg' | 'rdf' | 'both'")]
+    pub fn graph_model(&self) -> String {
+        self.inner.read().graph_model().as_name().to_string()
     }
 
     /// Open an existing database at the given path.
@@ -115,84 +649,261 @@ impl JsGrafeoDB {
         })
     }
 
-    /// Shared implementation for all language-specific execute methods.
-    async fn execute_language_impl(
+    /// Admit JavaScript arguments before scheduling owned native work.
+    fn execute_language_impl<'env>(
         &self,
-        language: &'static str,
+        env: &'env Env,
+        language: &str,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        let db = self.inner.clone();
-        let mut result = tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            execute_language_query(&db, &query, language, params.as_ref())
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        let (params, prepared) = prepare_node_query(language, params, options)?;
+        let db = Arc::clone(&self.inner);
+        crate::error::spawn_execution(env, async move {
+            tokio::task::spawn_blocking(move || {
+                let result = db
+                    .read()
+                    .execute_with_options(&query, params, prepared.native)
+                    .map_err(NodeGrafeoError::from)?;
+                finish_node_result(result, prepared.max_bytes)
+            })
+            .await
+            .map_err(|error| NodeGrafeoError::Database(error.to_string()))?
         })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))??;
-
-        let db = self.inner.read();
-        let (nodes, edges) = extract_entities(&result, &db);
-        let columns = std::mem::take(&mut result.columns);
-        let exec_time = result.execution_time_ms;
-        let scanned = result.rows_scanned;
-
-        Ok(QueryResult::with_metrics(
-            columns,
-            result.into_rows(),
-            nodes,
-            edges,
-            exec_time,
-            scanned,
-        ))
     }
 
-    /// Execute a GQL query. Returns a Promise<QueryResult>.
+    /// Execute a GQL query with optional cancellation and output limits.
+    #[napi(
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute<'env>(
+        &self,
+        env: &'env Env,
+        query: String,
+        params: Option<serde_json::Value>,
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, "gql", query, params, options)
+    }
+
+    /// Begin a transaction with an optional isolation level.
+    ///
+    /// Isolation levels: "read_committed", "snapshot" (default), "serializable".
+    #[napi(js_name = "beginTransaction")]
+    pub fn begin_transaction(
+        &self,
+        env: Env,
+        isolation_level: Option<String>,
+    ) -> Result<Transaction> {
+        Transaction::new(self.inner.clone(), isolation_level.as_deref()).map_err(
+            |error| match error {
+                NodeGrafeoError::Native(native) => crate::error::native_to_js_error(&env, native),
+                other => other.into(),
+            },
+        )
+    }
+
+    /// Returns the Grafeo engine version string.
     #[napi]
-    pub async fn execute(
-        &self,
-        query: String,
-        params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        self.execute_language_impl("gql", query, params).await
+    pub fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
     }
 
-    /// Runs a read-only GQL query and returns an async cursor.
+    /// Clear all cached query plans.
     ///
-    /// The returned `ResultStream` yields one row at a time via `await
-    /// stream.next()`. Memory stays bounded regardless of result-set size.
+    /// Forces re-parsing and re-optimization on next execution.
+    /// Called automatically after DDL operations, but can be invoked manually.
+    #[napi(js_name = "clearPlanCache")]
+    pub fn clear_plan_cache(&self) {
+        self.inner.read().clear_plan_cache();
+    }
+
+    /// Forces a WAL checkpoint.
     ///
-    /// Rejects mutations (INSERT / DELETE / SET), EXPLAIN / PROFILE,
-    /// SESSION / SCHEMA commands, and queries that require push-based
-    /// operators (ORDER BY, aggregate, DISTINCT). Use `execute()` for those.
+    /// Flushes all pending WAL records to the main storage.
+    #[napi(js_name = "walCheckpoint")]
+    pub fn wal_checkpoint(&self) -> Result<()> {
+        let db = self.inner.read();
+        db.wal_checkpoint()
+            .map_err(NodeGrafeoError::from)
+            .map_err(napi::Error::from)
+    }
+
+    /// Close the database.
+    #[napi]
+    pub fn close(&self, env: Env) -> Result<()> {
+        self.inner
+            .read()
+            .try_close()
+            .map_err(|error| crate::error::native_to_js_error(&env, error))
+    }
+
+    // ── Schema context ───────────────────────────────────────────────────
+
+    /// Sets the current schema for subsequent `execute()` calls.
     ///
-    /// **Stability:** experimental. Parameterized streaming queries are not
-    /// yet supported.
-    #[napi(js_name = "executeStream")]
-    pub async fn execute_stream(&self, query: String) -> Result<crate::stream::JsResultStream> {
-        let db_arc = Arc::clone(&self.inner);
-        let keepalive = Arc::clone(&self.inner);
-        let stream = tokio::task::spawn_blocking(move || {
-            let db = db_arc.read();
-            db.execute_streaming(&query).map_err(NodeGrafeoError::from)
+    /// Equivalent to running `SESSION SET SCHEMA <name>` but persists across
+    /// calls. Use `resetSchema()` to clear it.
+    #[napi(js_name = "setSchema")]
+    pub fn set_schema(&self, name: String) -> napi::Result<()> {
+        self.inner
+            .read()
+            .set_current_schema(Some(&name))
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Clears the current schema context.
+    ///
+    /// Subsequent `execute()` calls will use the default (no-schema) namespace.
+    #[napi(js_name = "resetSchema")]
+    pub fn reset_schema(&self) {
+        let _ = self.inner.read().set_current_schema(None);
+    }
+
+    /// Returns the current schema name, or `null` if no schema is set.
+    #[napi(js_name = "currentSchema")]
+    pub fn current_schema(&self) -> Option<String> {
+        self.inner.read().current_schema()
+    }
+
+    // ── Graph projections ───────────────────────────────────────────────
+
+    /// Creates a named graph projection. Returns `true` if created, `false`
+    /// if a projection with that name already exists.
+    ///
+    /// A projection is a read-only, filtered view of the default graph.
+    /// Only nodes with matching labels and edges with matching types are visible.
+    #[napi(js_name = "createProjection")]
+    pub fn create_projection(
+        &self,
+        name: String,
+        node_labels: Option<Vec<String>>,
+        edge_types: Option<Vec<String>>,
+    ) -> bool {
+        use grafeo_core::graph::ProjectionSpec;
+
+        let mut spec = ProjectionSpec::new();
+        if let Some(labels) = node_labels.filter(|l| !l.is_empty()) {
+            spec = spec.with_node_labels(labels);
+        }
+        if let Some(types) = edge_types.filter(|t| !t.is_empty()) {
+            spec = spec.with_edge_types(types);
+        }
+        self.inner.read().create_projection(name, spec)
+    }
+
+    /// Drops a named graph projection. Returns `true` if it existed.
+    #[napi(js_name = "dropProjection")]
+    pub fn drop_projection(&self, name: String) -> bool {
+        self.inner.read().drop_projection(&name)
+    }
+
+    /// Returns the names of all graph projections.
+    #[napi(js_name = "listProjections")]
+    pub fn list_projections(&self) -> Vec<String> {
+        self.inner.read().list_projections()
+    }
+}
+
+// Canonical index owners are available in every profile enabling engine LPG.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+#[napi]
+impl JsGrafeoDB {
+    /// Create an index and return its committed owner ID.
+    /// Graph paths are component arrays, never slash-delimited strings.
+    #[napi(
+        js_name = "createIndex",
+        ts_args_type = "request: CreateIndexRequest",
+        ts_return_type = "Promise<number>"
+    )]
+    pub fn create_index<'env>(
+        &self,
+        env: &'env Env,
+        request: Unknown<'_>,
+    ) -> Result<PromiseRaw<'env, u32>> {
+        let request =
+            CreateIndexRequest::from_js(request).and_then(CreateIndexRequest::into_engine);
+        let db = Arc::clone(&self.inner);
+        env.spawn_future(async move {
+            let request = request?;
+            tokio::task::spawn_blocking(move || {
+                db.read()
+                    .create_index(request)
+                    .map(|owner| owner.as_u32())
+                    .map_err(NodeGrafeoError::from)
+                    .map_err(napi::Error::from)
+            })
+            .await
+            .map_err(|error| napi::Error::from_reason(error.to_string()))?
+        })
+    }
+
+    /// Drop an owner; false means only that the owner was absent.
+    #[napi(js_name = "dropIndex")]
+    pub async fn drop_index(&self, owner: f64) -> Result<bool> {
+        let owner = checked_index_owner(owner)?;
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            db.read()
+                .drop_index(owner)
+                .map_err(NodeGrafeoError::from)
+                .map_err(napi::Error::from)
         })
         .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))??;
-        Ok(crate::stream::JsResultStream::new(keepalive, stream))
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?
     }
 
+    /// Atomically rebuild an existing owner, preserving its ID and configuration.
+    #[napi(js_name = "rebuildIndex")]
+    pub async fn rebuild_index(&self, owner: f64) -> Result<()> {
+        let owner = checked_index_owner(owner)?;
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            db.read()
+                .rebuild_index(owner)
+                .map_err(NodeGrafeoError::from)
+                .map_err(napi::Error::from)
+        })
+        .await
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?
+    }
+}
+
+// LPG node/edge CRUD, admin, and backup. Separate impl because napi-rs
+// generates callback registrations for every method inside a `#[napi]` impl,
+// so a per-method `#[cfg]` does not work.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+#[napi]
+impl JsGrafeoDB {
     /// Create a node with labels and optional properties.
     #[napi(js_name = "createNode")]
     pub fn create_node(
         &self,
         env: Env,
-        labels: Vec<String>,
+        mut labels: Vec<String>,
         properties: Option<Object<'_>>,
     ) -> Result<JsNode> {
         let db = self.inner.read();
+        let session = db.session();
+        labels.sort_unstable();
+        labels.dedup();
         let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
 
-        let id = if let Some(props_obj) = properties {
-            let mut props = Vec::new();
+        let mut props = Vec::new();
+        if let Some(props_obj) = properties {
             let keys = props_obj.get_property_names()?;
             let len = keys.get_array_length()?;
             for i in 0..len {
@@ -202,12 +913,18 @@ impl JsGrafeoDB {
                 let val = types::js_to_value(&env, value)?;
                 props.push((grafeo_common::types::PropertyKey::new(key_str), val));
             }
-            db.create_node_with_props(&label_refs, props)
-        } else {
-            db.create_node(&label_refs)
-        };
-
-        fetch_node(&db, id)
+        }
+        let id = session
+            .create_node_with_props(
+                &label_refs,
+                props
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.clone())),
+            )
+            .map_err(NodeGrafeoError::from)?;
+        // Null removes a property in storage; response keys must match that image.
+        props.retain(|(_, value)| !matches!(value, Value::Null));
+        Ok(JsNode::new(id, labels, props.into_iter().collect()))
     }
 
     /// Create an edge between two nodes.
@@ -221,11 +938,12 @@ impl JsGrafeoDB {
         properties: Option<Object<'_>>,
     ) -> Result<JsEdge> {
         let db = self.inner.read();
+        let session = db.session();
         let src = validate_node_id(source_id)?;
         let dst = validate_node_id(target_id)?;
 
-        let id = if let Some(props_obj) = properties {
-            let mut props = Vec::new();
+        let mut props = Vec::new();
+        if let Some(props_obj) = properties {
             let keys = props_obj.get_property_names()?;
             let len = keys.get_array_length()?;
             for i in 0..len {
@@ -235,12 +953,25 @@ impl JsGrafeoDB {
                 let val = types::js_to_value(&env, value)?;
                 props.push((grafeo_common::types::PropertyKey::new(key_str), val));
             }
-            db.create_edge_with_props(src, dst, &edge_type, props)
-        } else {
-            db.create_edge(src, dst, &edge_type)
-        };
-
-        fetch_edge(&db, id)
+        }
+        let id = session
+            .create_edge_with_props(
+                src,
+                dst,
+                &edge_type,
+                props
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.clone())),
+            )
+            .map_err(NodeGrafeoError::from)?;
+        props.retain(|(_, value)| !matches!(value, Value::Null));
+        Ok(JsEdge::new(
+            id,
+            edge_type,
+            src,
+            dst,
+            props.into_iter().collect(),
+        ))
     }
 
     /// Get a node by ID.
@@ -289,6 +1020,7 @@ impl JsGrafeoDB {
     }
 
     /// Set a property on a node.
+    /// Throws if the node is missing or the write is rejected.
     #[napi(js_name = "setNodeProperty")]
     pub fn set_node_property(
         &self,
@@ -300,11 +1032,13 @@ impl JsGrafeoDB {
         let node_id = validate_node_id(id)?;
         let db = self.inner.read();
         let val = types::js_to_value(&env, value)?;
-        db.set_node_property(node_id, &key, val);
+        db.set_node_property(node_id, &key, val)
+            .map_err(NodeGrafeoError::from)?;
         Ok(())
     }
 
     /// Set a property on an edge.
+    /// Throws if the edge is missing or the write is rejected.
     #[napi(js_name = "setEdgeProperty")]
     pub fn set_edge_property(
         &self,
@@ -316,7 +1050,8 @@ impl JsGrafeoDB {
         let edge_id = validate_edge_id(id)?;
         let db = self.inner.read();
         let val = types::js_to_value(&env, value)?;
-        db.set_edge_property(edge_id, &key, val);
+        db.set_edge_property(edge_id, &key, val)
+            .map_err(NodeGrafeoError::from)?;
         Ok(())
     }
 
@@ -336,89 +1071,6 @@ impl JsGrafeoDB {
         #[allow(clippy::cast_possible_truncation)]
         let count = self.inner.read().edge_count() as u32;
         count
-    }
-
-    /// Begin a transaction with an optional isolation level.
-    ///
-    /// Isolation levels: "read_committed", "snapshot" (default), "serializable".
-    #[napi(js_name = "beginTransaction")]
-    pub fn begin_transaction(&self, isolation_level: Option<String>) -> Result<Transaction> {
-        Transaction::new(self.inner.clone(), isolation_level.as_deref())
-    }
-
-    /// Create a vector similarity index on a node property.
-    #[napi(js_name = "createVectorIndex")]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_vector_index(
-        &self,
-        label: String,
-        property: String,
-        dimensions: Option<u32>,
-        metric: Option<String>,
-        m: Option<u32>,
-        ef_construction: Option<u32>,
-        quantization: Option<String>,
-    ) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            db.create_vector_index(
-                &label,
-                &property,
-                dimensions.map(|d| d as usize),
-                metric.as_deref(),
-                m.map(|v| v as usize),
-                ef_construction.map(|v| v as usize),
-                quantization.as_deref(),
-            )
-            .map_err(NodeGrafeoError::from)
-            .map_err(napi::Error::from)
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
-    /// Search for the k nearest neighbors of a query vector.
-    ///
-    /// Returns an array of [nodeId, distance] pairs sorted by distance
-    /// ascending (lower = more similar). The distance scale depends on
-    /// the metric configured at index creation.
-    #[napi(js_name = "vectorSearch")]
-    // reason: f64->f32 is intentional: HNSW index uses f32 vectors
-    #[allow(clippy::cast_possible_truncation)]
-    pub async fn vector_search(
-        &self,
-        label: String,
-        property: String,
-        query: Vec<f64>,
-        k: u32,
-        ef: Option<u32>,
-        filters: Option<HashMap<String, serde_json::Value>>,
-    ) -> Result<Vec<Vec<f64>>> {
-        let filter_map = convert_json_filters(filters)?;
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
-            let results = db
-                .vector_search(
-                    &label,
-                    &property,
-                    &query_f32,
-                    k as usize,
-                    ef.map(|v| v as usize),
-                    filter_map.as_ref(),
-                )
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)?;
-            // Return as [[nodeId, distance], ...] since napi doesn't have tuples
-            Ok(results
-                .into_iter()
-                .map(|(id, dist)| vec![id.as_u64() as f64, dist as f64])
-                .collect::<Vec<Vec<f64>>>())
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
     }
 
     /// Bulk-insert nodes with vector properties.
@@ -503,33 +1155,12 @@ impl JsGrafeoDB {
         let schema = db.schema();
         serde_json::to_value(&schema).map_err(|e| NodeGrafeoError::Database(e.to_string()).into())
     }
+}
 
-    /// Returns the Grafeo engine version string.
-    #[napi]
-    pub fn version(&self) -> String {
-        env!("CARGO_PKG_VERSION").to_string()
-    }
-
-    /// Clear all cached query plans.
-    ///
-    /// Forces re-parsing and re-optimization on next execution.
-    /// Called automatically after DDL operations, but can be invoked manually.
-    #[napi(js_name = "clearPlanCache")]
-    pub fn clear_plan_cache(&self) {
-        self.inner.read().clear_plan_cache();
-    }
-
-    /// Forces a WAL checkpoint.
-    ///
-    /// Flushes all pending WAL records to the main storage.
-    #[napi(js_name = "walCheckpoint")]
-    pub fn wal_checkpoint(&self) -> Result<()> {
-        let db = self.inner.read();
-        db.wal_checkpoint()
-            .map_err(NodeGrafeoError::from)
-            .map_err(napi::Error::from)
-    }
-
+// Saving is shared by LPG and RDF whenever this binding supplies WAL storage.
+#[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
+#[napi]
+impl JsGrafeoDB {
     /// Saves the database to a file path.
     ///
     /// If in-memory, creates a new persistent database at the given path.
@@ -542,7 +1173,21 @@ impl JsGrafeoDB {
             .map_err(NodeGrafeoError::from)
             .map_err(napi::Error::from)
     }
+}
 
+// Backup additionally requires the compiled LPG plane.
+#[cfg(all(
+    any(
+        feature = "lpg",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "compact-store"
+    ),
+    any(feature = "storage", feature = "embedded", feature = "native")
+))]
+#[napi]
+impl JsGrafeoDB {
     /// Create a full backup of the database.
     #[napi]
     pub fn backup_full(&self, backup_dir: String) -> Result<()> {
@@ -562,95 +1207,6 @@ impl JsGrafeoDB {
             .map_err(NodeGrafeoError::from)
             .map_err(napi::Error::from)
     }
-
-    /// Restore a database to a specific epoch from a backup chain.
-    #[napi]
-    pub fn restore_to_epoch(backup_dir: String, epoch: f64, output_path: String) -> Result<()> {
-        let epoch_id = validate_epoch(epoch)?;
-        grafeo_engine::GrafeoDB::restore_to_epoch(
-            std::path::Path::new(&backup_dir),
-            epoch_id,
-            std::path::Path::new(&output_path),
-        )
-        .map_err(NodeGrafeoError::from)
-        .map_err(napi::Error::from)
-    }
-
-    /// Close the database.
-    #[napi]
-    pub fn close(&self) -> Result<()> {
-        self.inner
-            .read()
-            .close()
-            .map_err(NodeGrafeoError::from)
-            .map_err(napi::Error::from)
-    }
-
-    // ── Schema context ───────────────────────────────────────────────────
-
-    /// Sets the current schema for subsequent `execute()` calls.
-    ///
-    /// Equivalent to running `SESSION SET SCHEMA <name>` but persists across
-    /// calls. Use `resetSchema()` to clear it.
-    #[napi(js_name = "setSchema")]
-    pub fn set_schema(&self, name: String) -> napi::Result<()> {
-        self.inner
-            .read()
-            .set_current_schema(Some(&name))
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
-    }
-
-    /// Clears the current schema context.
-    ///
-    /// Subsequent `execute()` calls will use the default (no-schema) namespace.
-    #[napi(js_name = "resetSchema")]
-    pub fn reset_schema(&self) {
-        let _ = self.inner.read().set_current_schema(None);
-    }
-
-    /// Returns the current schema name, or `null` if no schema is set.
-    #[napi(js_name = "currentSchema")]
-    pub fn current_schema(&self) -> Option<String> {
-        self.inner.read().current_schema()
-    }
-
-    // ── Graph projections ───────────────────────────────────────────────
-
-    /// Creates a named graph projection. Returns `true` if created, `false`
-    /// if a projection with that name already exists.
-    ///
-    /// A projection is a read-only, filtered view of the default graph.
-    /// Only nodes with matching labels and edges with matching types are visible.
-    #[napi(js_name = "createProjection")]
-    pub fn create_projection(
-        &self,
-        name: String,
-        node_labels: Option<Vec<String>>,
-        edge_types: Option<Vec<String>>,
-    ) -> bool {
-        use grafeo_core::graph::ProjectionSpec;
-
-        let mut spec = ProjectionSpec::new();
-        if let Some(labels) = node_labels.filter(|l| !l.is_empty()) {
-            spec = spec.with_node_labels(labels);
-        }
-        if let Some(types) = edge_types.filter(|t| !t.is_empty()) {
-            spec = spec.with_edge_types(types);
-        }
-        self.inner.read().create_projection(name, spec)
-    }
-
-    /// Drops a named graph projection. Returns `true` if it existed.
-    #[napi(js_name = "dropProjection")]
-    pub fn drop_projection(&self, name: String) -> bool {
-        self.inner.read().drop_projection(&name)
-    }
-
-    /// Returns the names of all graph projections.
-    #[napi(js_name = "listProjections")]
-    pub fn list_projections(&self) -> Vec<String> {
-        self.inner.read().list_projections()
-    }
 }
 
 // Vector-index methods live in a separate impl block so the entire block can
@@ -659,34 +1215,43 @@ impl JsGrafeoDB {
 #[cfg(feature = "vector-index")]
 #[napi]
 impl JsGrafeoDB {
-    /// Drop a vector index for the given label and property.
-    /// Returns true if the index existed and was removed.
-    #[napi(js_name = "dropVectorIndex")]
-    pub async fn drop_vector_index(&self, label: String, property: String) -> Result<bool> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            Ok(db.drop_vector_index(&label, &property))
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
-    /// Rebuild a vector index by rescanning all matching nodes.
-    /// Preserves the original index configuration.
+    /// Search for the k nearest neighbors of a query vector.
     ///
-    /// Note: Vector indexes auto-sync when you call setNodeProperty(),
-    /// batchCreateNodes(), or batchCreateNodesWithProps() with vector data.
-    /// You only need this after non-standard data imports or to compact
-    /// the index after many deletions.
-    #[napi(js_name = "rebuildVectorIndex")]
-    pub async fn rebuild_vector_index(&self, label: String, property: String) -> Result<()> {
+    /// Returns an array of [nodeId, distance] pairs sorted by distance
+    /// ascending (lower = more similar). The distance scale depends on
+    /// the metric configured at index creation.
+    #[napi(js_name = "vectorSearch")]
+    // reason: f64->f32 is intentional: HNSW index uses f32 vectors
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn vector_search(
+        &self,
+        label: String,
+        property: String,
+        query: Vec<f64>,
+        k: u32,
+        ef: Option<u32>,
+        filters: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<Vec<Vec<f64>>> {
+        let filter_map = convert_json_filters(filters)?;
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let db = db.read();
-            db.rebuild_vector_index(&label, &property)
+            let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+            let results = db
+                .vector_search(
+                    &label,
+                    &property,
+                    &query_f32,
+                    k as usize,
+                    ef.map(|v| v as usize),
+                    filter_map.as_ref(),
+                )
                 .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)
+                .map_err(napi::Error::from)?;
+            Ok(results
+                .into_iter()
+                .map(|(id, dist)| vec![id.as_u64() as f64, dist as f64])
+                .collect::<Vec<Vec<f64>>>())
         })
         .await
         .map_err(|e| napi::Error::from_reason(e.to_string()))?
@@ -791,53 +1356,6 @@ impl JsGrafeoDB {
 #[cfg(feature = "text-index")]
 #[napi]
 impl JsGrafeoDB {
-    /// Create a BM25 text index on a node property for full-text search.
-    ///
-    /// The index is automatically kept in sync as nodes are created,
-    /// updated, or deleted. You do not need to call rebuildTextIndex()
-    /// after normal write operations.
-    #[napi(js_name = "createTextIndex")]
-    pub async fn create_text_index(&self, label: String, property: String) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            db.create_text_index(&label, &property)
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
-    /// Drop a text index for the given label and property.
-    #[napi(js_name = "dropTextIndex")]
-    pub async fn drop_text_index(&self, label: String, property: String) -> Result<bool> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            Ok(db.drop_text_index(&label, &property))
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
-    /// Rebuild a text index by rescanning all matching nodes.
-    ///
-    /// Note: Text indexes auto-sync on normal writes. You only need this
-    /// after importing data through non-standard paths.
-    #[napi(js_name = "rebuildTextIndex")]
-    pub async fn rebuild_text_index(&self, label: String, property: String) -> Result<()> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            db.rebuild_text_index(&label, &property)
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
     /// Search a text index using BM25 scoring.
     ///
     /// Returns an array of [nodeId, score] pairs sorted by descending
@@ -874,8 +1392,8 @@ impl JsGrafeoDB {
 impl JsGrafeoDB {
     /// Perform hybrid search combining text (BM25) and vector similarity.
     ///
-    /// Requires both a text index (createTextIndex) and a vector index
-    /// (createVectorIndex). If either is missing, that source is silently
+    /// Requires both a text index and a vector index
+    /// (both created with createIndex). If either is missing, that source is silently
     /// omitted from fusion.
     ///
     /// Returns an array of [nodeId, score] pairs sorted by fused score
@@ -936,17 +1454,192 @@ impl JsGrafeoDB {
 #[cfg(feature = "compact-store")]
 #[napi]
 impl JsGrafeoDB {
-    /// Converts the database to a read-only CompactStore for faster queries.
+    /// Folds retained committed LPG history into a columnar base with a writable overlay.
     ///
-    /// Takes a snapshot of all nodes and edges, builds a columnar store with
-    /// CSR adjacency, and switches to read-only mode. After this call, write
-    /// operations will fail.
+    /// Call again to fold later overlay writes. Finish asynchronous operations
+    /// and drop live Sessions before maintenance; active transactions, closed
+    /// or durability-poisoned databases are rejected. Throws on failure.
+    /// This is not a durability checkpoint or a history-retention lease.
     #[napi]
     pub fn compact(&self) -> Result<()> {
         let mut db = self.inner.write();
         db.compact()
             .map_err(NodeGrafeoError::from)
             .map_err(napi::Error::from)
+    }
+
+    /// Whole-state as-of scrub: node frames plus edge frames at `epoch`.
+    ///
+    /// Returns `{ nodes: [...], edges: [...] }`.
+    ///
+    /// Each node frame is
+    /// `{ label, nodeIds, columns }` and each edge frame is
+    /// `{ edgeType, edgeIds, srcIds, dstIds, columns }`. Columns align to
+    /// the id list (`null` = property absent at `epoch`).
+    ///
+    /// `PENDING` cannot be passed as a JS number; omit `epoch` on
+    /// `neighborsAtEpoch` / `edgesAtEpoch` for the current snapshot, or
+    /// pass `currentEpoch()`. Requires `compact()`; empty frames when
+    /// nothing has been compacted yet.
+    #[napi(js_name = "scrubAtEpoch")]
+    pub fn scrub_at_epoch(&self, epoch: f64) -> Result<serde_json::Value> {
+        let epoch_id = validate_epoch(epoch)?;
+        let db = self.inner.read();
+        let scrub = db.scrub_at_epoch(epoch_id);
+
+        let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(scrub.nodes.len());
+        for frame in &scrub.nodes {
+            let node_ids: Vec<serde_json::Value> = frame
+                .node_ids
+                .iter()
+                .map(|n| serde_json::Value::from(n.as_u64()))
+                .collect();
+            let mut columns = serde_json::Map::new();
+            for (key, values) in &frame.columns {
+                let col: Vec<serde_json::Value> = values
+                    .iter()
+                    .map(|v| {
+                        v.as_ref()
+                            .map_or(serde_json::Value::Null, grafeo_value_to_json)
+                    })
+                    .collect();
+                columns.insert(key.to_string(), serde_json::Value::Array(col));
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "label".to_string(),
+                serde_json::Value::String(frame.label.to_string()),
+            );
+            obj.insert("nodeIds".to_string(), serde_json::Value::Array(node_ids));
+            obj.insert("columns".to_string(), serde_json::Value::Object(columns));
+            nodes.push(serde_json::Value::Object(obj));
+        }
+
+        let mut edges: Vec<serde_json::Value> = Vec::with_capacity(scrub.edges.len());
+        for frame in &scrub.edges {
+            let edge_ids: Vec<serde_json::Value> = frame
+                .edge_ids
+                .iter()
+                .map(|e| serde_json::Value::from(e.as_u64()))
+                .collect();
+            let src_ids: Vec<serde_json::Value> = frame
+                .src_ids
+                .iter()
+                .map(|n| serde_json::Value::from(n.as_u64()))
+                .collect();
+            let dst_ids: Vec<serde_json::Value> = frame
+                .dst_ids
+                .iter()
+                .map(|n| serde_json::Value::from(n.as_u64()))
+                .collect();
+            let mut columns = serde_json::Map::new();
+            for (key, values) in &frame.columns {
+                let col: Vec<serde_json::Value> = values
+                    .iter()
+                    .map(|v| {
+                        v.as_ref()
+                            .map_or(serde_json::Value::Null, grafeo_value_to_json)
+                    })
+                    .collect();
+                columns.insert(key.to_string(), serde_json::Value::Array(col));
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "edgeType".to_string(),
+                serde_json::Value::String(frame.edge_type.to_string()),
+            );
+            obj.insert("edgeIds".to_string(), serde_json::Value::Array(edge_ids));
+            obj.insert("srcIds".to_string(), serde_json::Value::Array(src_ids));
+            obj.insert("dstIds".to_string(), serde_json::Value::Array(dst_ids));
+            obj.insert("columns".to_string(), serde_json::Value::Object(columns));
+            edges.push(serde_json::Value::Object(obj));
+        }
+
+        let mut out = serde_json::Map::new();
+        out.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+        out.insert("edges".to_string(), serde_json::Value::Array(edges));
+        Ok(serde_json::Value::Object(out))
+    }
+
+    /// Neighbors of `nodeId` visible at `epoch`.
+    ///
+    /// Omit `epoch` (or pass `null`) for `PENDING` — current 1-hop,
+    /// the derived open CSR. `direction` is `"outgoing"` (default),
+    /// `"incoming"`, or `"both"`.
+    #[napi(js_name = "neighborsAtEpoch")]
+    pub fn neighbors_at_epoch(
+        &self,
+        node_id: f64,
+        epoch: Option<f64>,
+        direction: Option<String>,
+    ) -> Result<Vec<f64>> {
+        let node = validate_node_id(node_id)?;
+        let epoch_id = match epoch {
+            None => grafeo_common::types::EpochId::PENDING,
+            Some(e) => validate_epoch(e)?,
+        };
+        let dir = parse_asof_direction(direction.as_deref())?;
+        let db = self.inner.read();
+        Ok(db
+            .neighbors_at_epoch(node, dir, epoch_id)
+            .into_iter()
+            .map(|n| {
+                // reason: node ids returned to JS are already in the safe integer range
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    n.as_u64() as f64
+                }
+            })
+            .collect())
+    }
+
+    /// Every edge visible at `epoch`. Omit `epoch` for current (`PENDING`).
+    #[napi(js_name = "edgesAtEpoch")]
+    pub fn edges_at_epoch(&self, epoch: Option<f64>) -> Result<Vec<JsEdge>> {
+        let epoch_id = match epoch {
+            None => grafeo_common::types::EpochId::PENDING,
+            Some(e) => validate_epoch(e)?,
+        };
+        let db = self.inner.read();
+        Ok(db
+            .edges_at_epoch(epoch_id)
+            .into_iter()
+            .map(|edge| {
+                let properties: HashMap<
+                    grafeo_common::types::PropertyKey,
+                    grafeo_common::types::Value,
+                > = edge.properties.into_iter().collect();
+                JsEdge::new(
+                    edge.id,
+                    edge.edge_type.to_string(),
+                    edge.src,
+                    edge.dst,
+                    properties,
+                )
+            })
+            .collect())
+    }
+
+    /// Every node visible at `epoch`. Omit `epoch` for current (`PENDING`).
+    #[napi(js_name = "nodesAtEpoch")]
+    pub fn nodes_at_epoch(&self, epoch: Option<f64>) -> Result<Vec<JsNode>> {
+        let epoch_id = match epoch {
+            None => grafeo_common::types::EpochId::PENDING,
+            Some(e) => validate_epoch(e)?,
+        };
+        let db = self.inner.read();
+        Ok(db
+            .nodes_at_epoch(epoch_id)
+            .into_iter()
+            .map(|node| {
+                let labels: Vec<String> = node.labels.iter().map(|s| s.to_string()).collect();
+                let properties: HashMap<
+                    grafeo_common::types::PropertyKey,
+                    grafeo_common::types::Value,
+                > = node.properties.into_iter().collect();
+                JsNode::new(node.id, labels, properties)
+            })
+            .collect())
     }
 }
 
@@ -972,82 +1665,122 @@ impl JsGrafeoDB {
         self.inner.read().is_cdc_enabled()
     }
 
-    /// Returns the full change history for a node.
-    #[napi(js_name = "nodeHistory")]
-    pub async fn node_history(&self, node_id: f64) -> Result<Vec<serde_json::Value>> {
-        let id = validate_node_id(node_id)?;
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            let events = db
-                .history(id)
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)?;
-            Ok(events.iter().map(change_event_to_json).collect())
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
-    /// Returns the full change history for an edge.
-    #[napi(js_name = "edgeHistory")]
-    pub async fn edge_history(&self, edge_id: f64) -> Result<Vec<serde_json::Value>> {
-        let id = validate_edge_id(edge_id)?;
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            let events = db
-                .history(id)
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)?;
-            Ok(events.iter().map(change_event_to_json).collect())
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
-    }
-
-    /// Returns change events for a node since a given epoch.
-    #[napi(js_name = "nodeHistorySince")]
-    pub async fn node_history_since(
+    /// Reads bounded node history with exact decimal ID/epoch coordinates.
+    // Keep the explicit foreign-function bounds and optional selector together.
+    #[allow(clippy::too_many_arguments)]
+    #[napi(js_name = "nodeHistoryAfter")]
+    pub fn node_history_after<'env>(
         &self,
-        node_id: f64,
-        since_epoch: f64,
-    ) -> Result<Vec<serde_json::Value>> {
-        let id = validate_node_id(node_id)?;
-        let epoch = validate_epoch(since_epoch)?;
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            let events = db
-                .history_since(id, epoch)
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)?;
-            Ok(events.iter().map(change_event_to_json).collect())
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
+        env: &'env Env,
+        node_id: String,
+        cursor: Option<Buffer>,
+        max_events: f64,
+        max_bytes: f64,
+        since_epoch: Option<String>,
+    ) -> Result<PromiseRaw<'env, JsChangePage>> {
+        self.cdc_page_impl(
+            env,
+            Some(entity_history_query(true, &node_id, since_epoch.as_deref())),
+            cursor,
+            max_events,
+            max_bytes,
+        )
     }
 
-    /// Returns all change events across entities in an epoch range.
-    #[napi(js_name = "changesBetween")]
-    pub async fn changes_between(
+    /// Reads bounded edge history with exact decimal ID/epoch coordinates.
+    // Keep the explicit foreign-function bounds and optional selector together.
+    #[allow(clippy::too_many_arguments)]
+    #[napi(js_name = "edgeHistoryAfter")]
+    pub fn edge_history_after<'env>(
         &self,
-        start_epoch: f64,
-        end_epoch: f64,
-    ) -> Result<Vec<serde_json::Value>> {
-        let start = validate_epoch(start_epoch)?;
-        let end = validate_epoch(end_epoch)?;
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            let events = db
-                .changes_between(start, end)
-                .map_err(NodeGrafeoError::from)
-                .map_err(napi::Error::from)?;
-            Ok(events.iter().map(change_event_to_json).collect())
+        env: &'env Env,
+        edge_id: String,
+        cursor: Option<Buffer>,
+        max_events: f64,
+        max_bytes: f64,
+        since_epoch: Option<String>,
+    ) -> Result<PromiseRaw<'env, JsChangePage>> {
+        self.cdc_page_impl(
+            env,
+            Some(entity_history_query(
+                false,
+                &edge_id,
+                since_epoch.as_deref(),
+            )),
+            cursor,
+            max_events,
+            max_bytes,
+        )
+    }
+
+    /// Reads an owned bounded feed page. An unchanged cursor marks the end.
+    #[napi(js_name = "changesAfter")]
+    pub fn changes_after<'env>(
+        &self,
+        env: &'env Env,
+        cursor: Option<Buffer>,
+        max_events: f64,
+        max_bytes: f64,
+    ) -> Result<PromiseRaw<'env, JsChangePage>> {
+        self.cdc_page_impl(env, None, cursor, max_events, max_bytes)
+    }
+
+    fn cdc_page_impl<'env>(
+        &self,
+        env: &'env Env,
+        query: Option<crate::error::NodeResult<grafeo_engine::cdc::EntityHistoryQuery>>,
+        cursor: Option<Buffer>,
+        max_events: f64,
+        max_bytes: f64,
+    ) -> Result<PromiseRaw<'env, JsChangePage>> {
+        // Decode before scheduling: JavaScript can mutate its Buffer while
+        // native work is running. Only a fixed-size owned cursor crosses here.
+        let cursor = cursor
+            .map(|bytes| grafeo_common::types::DurableCursor::from_bytes(&bytes))
+            .transpose();
+        let db = Arc::clone(&self.inner);
+        crate::error::spawn_execution(env, async move {
+            tokio::task::spawn_blocking(move || {
+                let limit = |value: f64| {
+                    if !value.is_finite()
+                        || value < 1.0
+                        || value.fract() != 0.0
+                        || value > 9_007_199_254_740_991.0
+                        || value >= usize::MAX as f64
+                    {
+                        return Err(NodeGrafeoError::from(
+                            grafeo_common::utils::error::Error::InvalidValue(
+                                "change page limits must be positive safe integers fitting usize"
+                                    .into(),
+                            ),
+                        ));
+                    }
+                    // The finite, integral, positive platform bound above proves this cast.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let value = value as usize;
+                    Ok(value)
+                };
+                let max_events = limit(max_events)?;
+                let max_bytes = limit(max_bytes)?;
+                let cursor = cursor.map_err(NodeGrafeoError::from)?;
+                let query = query.transpose()?;
+                let db = db.read();
+                let session = db.session();
+                let page = match query {
+                    Some(query) => {
+                        session.history_after(&query, cursor.as_ref(), max_events, max_bytes)
+                    }
+                    None => session.changes_after(cursor.as_ref(), max_events, max_bytes),
+                }
+                .map_err(NodeGrafeoError::from)?;
+                Ok(JsChangePage {
+                    events: page.events.iter().map(change_page_event_to_json).collect(),
+                    next: page.next.to_bytes().to_vec().into(),
+                })
+            })
+            .await
+            .map_err(|error| NodeGrafeoError::Database(error.to_string()))?
         })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?
     }
 }
 
@@ -1157,6 +1890,120 @@ impl JsGrafeoDB {
     }
 }
 
+#[cfg(any(feature = "storage", feature = "native", feature = "embedded"))]
+#[napi]
+impl JsGrafeoDB {
+    /// Restore a database to a specific epoch from a backup chain.
+    #[napi]
+    pub fn restore_to_epoch(backup_dir: String, epoch: f64, output_path: String) -> Result<()> {
+        let epoch_id = validate_epoch(epoch)?;
+        grafeo_engine::GrafeoDB::restore_to_epoch(
+            std::path::Path::new(&backup_dir),
+            epoch_id,
+            std::path::Path::new(&output_path),
+        )
+        .map_err(NodeGrafeoError::from)
+        .map_err(napi::Error::from)
+    }
+}
+
+#[cfg(feature = "gql")]
+#[napi]
+impl JsGrafeoDB {
+    /// Runs a read-only GQL query and returns an async cursor.
+    #[napi(
+        js_name = "executeStream",
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_stream<'env>(
+        &self,
+        env: &'env Env,
+        query: String,
+        params: Option<serde_json::Value>,
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, crate::stream::JsResultStream>> {
+        let (params, mut prepared) = prepare_node_query("gql", params, options)?;
+        prepared.native.result_admission = None;
+        let cancellation = prepared.native.control.cancellation_handle();
+        let db = Arc::clone(&self.inner);
+        crate::error::spawn_execution(env, async move {
+            tokio::task::spawn_blocking(move || {
+                let stream = db
+                    .read()
+                    .stream_with_options(&query, params, prepared.native)
+                    .map_err(NodeGrafeoError::from)?;
+                crate::stream::JsResultStream::new(
+                    db,
+                    stream,
+                    prepared.max_bytes,
+                    prepared.max_rows,
+                    cancellation,
+                )
+            })
+            .await
+            .map_err(|error| NodeGrafeoError::Database(error.to_string()))?
+        })
+    }
+}
+
+#[cfg(feature = "triple-store")]
+#[napi]
+impl JsGrafeoDB {
+    /// Insert one RDF quad. Terms are N-Triples or bare IRIs.
+    /// Returns the number of newly inserted quads (0 or 1).
+    #[napi(js_name = "insertRdfQuad")]
+    pub fn insert_rdf_quad(
+        &self,
+        subject: String,
+        predicate: String,
+        object: String,
+        graph: Option<String>,
+    ) -> Result<u32> {
+        let quad = parse_node_rdf_quad(&subject, &predicate, &object, graph.as_deref())?;
+        let (n, _) = self
+            .inner
+            .read()
+            .insert_rdf_quads([quad])
+            .map_err(NodeGrafeoError::from)?;
+        rdf_insert_count(n)
+    }
+
+    /// Bulk-insert RDF quads. Each item is `[subject, predicate, object]` or
+    /// `[subject, predicate, object, graph]`.
+    /// Returns `[inserted, epoch]`, with the exact epoch as a decimal string.
+    #[napi(
+        js_name = "insertRdfQuads",
+        ts_return_type = "[number, string]",
+        ts_args_type = "quads: Array<[string, string, string] | [string, string, string, string]>"
+    )]
+    pub fn insert_rdf_quads(&self, quads: Vec<Vec<String>>) -> Result<Vec<Either<u32, String>>> {
+        let parsed = parse_node_quad_list(&quads)?;
+        let (n, epoch) = self
+            .inner
+            .read()
+            .insert_rdf_quads(parsed)
+            .map_err(NodeGrafeoError::from)?;
+        rdf_insert_receipt(n, epoch)
+    }
+
+    /// Exact typed-quad membership.
+    #[napi(js_name = "containsRdfQuad")]
+    pub fn contains_rdf_quad(
+        &self,
+        subject: String,
+        predicate: String,
+        object: String,
+        graph: Option<String>,
+    ) -> Result<bool> {
+        let quad = parse_node_rdf_quad(&subject, &predicate, &object, graph.as_deref())?;
+        Ok(self
+            .inner
+            .read()
+            .try_contains_rdf_quad(&quad)
+            .map_err(NodeGrafeoError::from)?)
+    }
+}
+
 // Language-specific execute methods live in separate impl blocks so the
 // `#[napi]` macro only generates C callback symbols when the feature is active.
 
@@ -1164,13 +2011,18 @@ impl JsGrafeoDB {
 #[napi]
 impl JsGrafeoDB {
     /// Execute a Cypher query.
-    #[napi(js_name = "executeCypher")]
-    pub async fn execute_cypher(
+    #[napi(
+        js_name = "executeCypher",
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_cypher<'env>(
         &self,
+        env: &'env Env,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        self.execute_language_impl("cypher", query, params).await
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, "cypher", query, params, options)
     }
 }
 
@@ -1178,13 +2030,18 @@ impl JsGrafeoDB {
 #[napi]
 impl JsGrafeoDB {
     /// Execute a SQL/PGQ query (SQL:2023 GRAPH_TABLE).
-    #[napi(js_name = "executeSql")]
-    pub async fn execute_sql(
+    #[napi(
+        js_name = "executeSql",
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_sql<'env>(
         &self,
+        env: &'env Env,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        self.execute_language_impl("sql", query, params).await
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, "sql", query, params, options)
     }
 }
 
@@ -1192,13 +2049,18 @@ impl JsGrafeoDB {
 #[napi]
 impl JsGrafeoDB {
     /// Execute a Gremlin query.
-    #[napi(js_name = "executeGremlin")]
-    pub async fn execute_gremlin(
+    #[napi(
+        js_name = "executeGremlin",
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_gremlin<'env>(
         &self,
+        env: &'env Env,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        self.execute_language_impl("gremlin", query, params).await
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, "gremlin", query, params, options)
     }
 }
 
@@ -1206,13 +2068,18 @@ impl JsGrafeoDB {
 #[napi]
 impl JsGrafeoDB {
     /// Execute a GraphQL query.
-    #[napi(js_name = "executeGraphql")]
-    pub async fn execute_graphql(
+    #[napi(
+        js_name = "executeGraphql",
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_graphql<'env>(
         &self,
+        env: &'env Env,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        self.execute_language_impl("graphql", query, params).await
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, "graphql", query, params, options)
     }
 }
 
@@ -1220,45 +2087,37 @@ impl JsGrafeoDB {
 #[napi]
 impl JsGrafeoDB {
     /// Execute a SPARQL query against the RDF triple store.
-    #[napi(js_name = "executeSparql")]
-    pub async fn execute_sparql(
+    #[napi(
+        js_name = "executeSparql",
+        ts_args_type = "query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_sparql<'env>(
         &self,
+        env: &'env Env,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        self.execute_language_impl("sparql", query, params).await
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, "sparql", query, params, options)
     }
+}
 
-    /// Execute a query in a named language (e.g. `"graphql-rdf"`).
-    #[napi(js_name = "executeLanguage")]
-    pub async fn execute_language(
+#[napi]
+impl JsGrafeoDB {
+    /// Execute a query in a named language with the same execution owner.
+    #[napi(
+        js_name = "executeLanguage",
+        ts_args_type = "language: string, query: string, params?: any | undefined | null, options?: ExecutionOptions | undefined | null"
+    )]
+    pub fn execute_language<'env>(
         &self,
+        env: &'env Env,
         language: String,
         query: String,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
-        let db = self.inner.clone();
-        let mut result = tokio::task::spawn_blocking(move || {
-            let db = db.read();
-            execute_language_query(&db, &query, &language, params.as_ref())
-        })
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))??;
-
-        let db = self.inner.read();
-        let (nodes, edges) = extract_entities(&result, &db);
-        let columns = std::mem::take(&mut result.columns);
-        let exec_time = result.execution_time_ms;
-        let scanned = result.rows_scanned;
-
-        Ok(QueryResult::with_metrics(
-            columns,
-            result.into_rows(),
-            nodes,
-            edges,
-            exec_time,
-            scanned,
-        ))
+        options: Option<Object<'env>>,
+    ) -> Result<PromiseRaw<'env, QueryResult>> {
+        self.execute_language_impl(env, &language, query, params, options)
     }
 }
 
@@ -1477,121 +2336,112 @@ fn read_jsonl_keys(path: &std::path::Path) -> std::result::Result<Vec<String>, S
     Ok(Vec::new())
 }
 
-/// Execute a query in a given language with optional JSON params.
-fn execute_language_query(
-    db: &GrafeoDB,
-    query: &str,
+/// Validate parameters and consume the invocation's native control on JS entry.
+pub(crate) fn prepare_node_query(
     language: &str,
-    params: Option<&serde_json::Value>,
-) -> std::result::Result<EngineQueryResult, napi::Error> {
-    let param_map = convert_json_params(params)?;
-    db.execute_language(query, language, param_map)
-        .map_err(NodeGrafeoError::from)
-        .map_err(napi::Error::from)
+    params: Option<serde_json::Value>,
+    options: Option<Object<'_>>,
+) -> Result<(HashMap<String, Value>, crate::control::PreparedOptions)> {
+    let params = grafeo_bindings_common::json::json_params_to_map(params.as_ref())
+        .map_err(|message| napi::Error::from(NodeGrafeoError::InvalidArgument(message)))?
+        .unwrap_or_default();
+    // Parameter validation precedes consumption of the single native owner.
+    let mut prepared = crate::control::prepare_execution_options(options)?;
+    prepared.native.language = Some(language.to_owned());
+    Ok((params, prepared))
 }
 
-/// Convert JSON params to a HashMap<String, Value>.
-fn convert_json_params(
-    params: Option<&serde_json::Value>,
-) -> std::result::Result<Option<HashMap<String, Value>>, napi::Error> {
-    grafeo_bindings_common::json::json_params_to_map(params)
-        .map_err(|msg| NodeGrafeoError::InvalidArgument(msg).into())
+pub(crate) fn finish_node_result(
+    mut result: EngineQueryResult,
+    max_bytes: usize,
+) -> crate::error::NodeResult<QueryResult> {
+    // Dense columns have no entities; rows() would force an infallible cache.
+    let (nodes, edges) = if result.is_int64_columnar() {
+        (Vec::new(), Vec::new())
+    } else {
+        grafeo_bindings_common::entity::extract_and_map(
+            &result,
+            |node| JsNode::new(node.id, node.labels, node.properties),
+            |edge| {
+                JsEdge::new(
+                    edge.id,
+                    edge.edge_type,
+                    edge.source_id,
+                    edge.target_id,
+                    edge.properties,
+                )
+            },
+        )
+    };
+    let columns = std::mem::take(&mut result.columns);
+    let time = result.execution_time_ms;
+    let scanned = result.rows_scanned;
+    Ok(QueryResult::with_metrics(
+        columns,
+        result.into_rows().map_err(NodeGrafeoError::from)?,
+        nodes,
+        edges,
+        time,
+        scanned,
+    )
+    .with_conversion_limit(max_bytes))
 }
 
 /// Convert a serde_json::Value to a Grafeo Value.
+#[cfg(any(feature = "vector-index", feature = "hybrid-search"))]
 pub(crate) fn json_to_value(v: &serde_json::Value) -> std::result::Result<Value, napi::Error> {
     Ok(grafeo_bindings_common::json::json_to_value(v))
 }
 
-/// Fetch a node from the database and wrap it as JsNode.
-fn fetch_node(db: &GrafeoDB, id: NodeId) -> Result<JsNode> {
-    db.get_node(id)
-        .map(|node| {
-            let labels: Vec<String> = node.labels.iter().map(|s| s.to_string()).collect();
-            let properties = node.properties.into_iter().collect();
-            JsNode::new(id, labels, properties)
-        })
-        .ok_or_else(|| NodeGrafeoError::Database("Failed to fetch created node".into()).into())
-}
-
-/// Fetch an edge from the database and wrap it as JsEdge.
-fn fetch_edge(db: &GrafeoDB, id: EdgeId) -> Result<JsEdge> {
-    db.get_edge(id)
-        .map(|edge| {
-            let properties = edge.properties.into_iter().collect();
-            JsEdge::new(
-                id,
-                edge.edge_type.to_string(),
-                edge.src,
-                edge.dst,
-                properties,
-            )
-        })
-        .ok_or_else(|| NodeGrafeoError::Database("Failed to fetch created edge".into()).into())
-}
-
-/// Extract nodes and edges from query results based on column types.
-pub(crate) fn extract_entities(
-    result: &EngineQueryResult,
-    _db: &GrafeoDB,
-) -> (Vec<JsNode>, Vec<JsEdge>) {
-    grafeo_bindings_common::entity::extract_and_map(
-        result,
-        |n| JsNode::new(n.id, n.labels, n.properties),
-        |e| JsEdge::new(e.id, e.edge_type, e.source_id, e.target_id, e.properties),
-    )
-}
-
 /// Convert a Grafeo Value to serde_json::Value.
-#[cfg(feature = "cdc")]
+// Used by compact-store scrub readback; CDC uses the shared page converter.
+#[cfg(feature = "compact-store")]
 fn grafeo_value_to_json(v: &Value) -> serde_json::Value {
     grafeo_bindings_common::json::value_to_json(v)
 }
 
-/// Convert a CDC ChangeEvent to a JSON object.
+/// Owned CDC page; its cursor is an opaque canonical byte string.
 #[cfg(feature = "cdc")]
-fn change_event_to_json(event: &grafeo_engine::cdc::ChangeEvent) -> serde_json::Value {
-    let entity_type = if event.entity_id.is_node() {
-        "node"
+#[napi(object)]
+pub struct JsChangePage {
+    #[napi(ts_type = "Array<JsChangeEvent>")]
+    pub events: Vec<serde_json::Value>,
+    pub next: Buffer,
+}
+
+/// The bounded page transport preserves every bit of native coordinates.
+#[cfg(feature = "cdc")]
+fn change_page_event_to_json(event: &grafeo_engine::cdc::ChangeEvent) -> serde_json::Value {
+    grafeo_bindings_common::cdc::change_event_to_json(event)
+}
+
+#[cfg(feature = "cdc")]
+fn entity_history_query(
+    node: bool,
+    id: &str,
+    since_epoch: Option<&str>,
+) -> crate::error::NodeResult<grafeo_engine::cdc::EntityHistoryQuery> {
+    let integer = |text: &str| {
+        if text.is_empty() || text.len() > 20 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(NodeGrafeoError::from(
+                grafeo_common::utils::error::Error::InvalidValue(
+                    "history coordinates must be unsigned decimal u64 strings".into(),
+                ),
+            ));
+        }
+        text.parse::<u64>().map_err(|_| {
+            NodeGrafeoError::from(grafeo_common::utils::error::Error::InvalidValue(
+                "history coordinate exceeds u64".into(),
+            ))
+        })
+    };
+    let id = integer(id)?;
+    let entity = if node {
+        grafeo_engine::cdc::EntityId::Node(grafeo_common::types::NodeId::new(id))
     } else {
-        "edge"
+        grafeo_engine::cdc::EntityId::Edge(grafeo_common::types::EdgeId::new(id))
     };
-    let kind = match event.kind {
-        grafeo_engine::cdc::ChangeKind::Create => "create",
-        grafeo_engine::cdc::ChangeKind::Update => "update",
-        grafeo_engine::cdc::ChangeKind::Delete => "delete",
-        _ => "unknown",
-    };
-
-    let before = match &event.before {
-        Some(props) => {
-            let obj: serde_json::Map<String, serde_json::Value> = props
-                .iter()
-                .map(|(k, v)| (k.clone(), grafeo_value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        None => serde_json::Value::Null,
-    };
-
-    let after = match &event.after {
-        Some(props) => {
-            let obj: serde_json::Map<String, serde_json::Value> = props
-                .iter()
-                .map(|(k, v)| (k.clone(), grafeo_value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        None => serde_json::Value::Null,
-    };
-
-    serde_json::json!({
-        "entity_id": event.entity_id.as_u64(),
-        "entity_type": entity_type,
-        "kind": kind,
-        "epoch": event.epoch.0,
-        "timestamp": event.timestamp,
-        "before": before,
-        "after": after,
-    })
+    let mut query = grafeo_engine::cdc::EntityHistoryQuery::new(entity);
+    query.since_epoch = grafeo_common::types::EpochId::new(integer(since_epoch.unwrap_or("0"))?);
+    Ok(query)
 }

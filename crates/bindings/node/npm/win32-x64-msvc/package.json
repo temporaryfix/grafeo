@@ -1,6 +1,6 @@
 {
   "name": "@grafeo-db/js-win32-x64-msvc",
-  "version": "0.5.42",
+  "version": "0.0.1",
   "os": [
     "win32"
   ],
@@ -9,12 +9,13 @@
   ],
   "main": "grafeo.win32-x64-msvc.node",
   "files": [
-    "grafeo.win32-x64-msvc.node"
+    "grafeo.win32-x64-msvc.node",
+    "LICENSE"
   ],
   "description": "Grafeo native binding for Windows x64",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3.0"
   },
   "repository": {
     "type": "git",

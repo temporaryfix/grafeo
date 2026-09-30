@@ -19,6 +19,21 @@ function seedDb() {
   return { db, alix, gus, vincent, acme, knows1, knows2, worksAt }
 }
 
+// Finite fixture collector: all production reads require explicit bounded pages.
+async function collectHistory(db, id, edge = false, since = '0') {
+  let cursor = null
+  const events = []
+  for (;;) {
+    const page = await (edge
+      ? db.edgeHistoryAfter(String(id), cursor, 1, 1024 * 1024, since)
+      : db.nodeHistoryAfter(String(id), cursor, 1, 1024 * 1024, since))
+    expect(page.events.length).toBeLessThanOrEqual(1)
+    if (cursor?.equals(page.next)) return events
+    cursor = page.next
+    events.push(...page.events)
+  }
+}
+
 // ── Module-level exports ─────────────────────────────────────────────
 
 describe('module exports', () => {
@@ -30,6 +45,83 @@ describe('module exports', () => {
     const simd = simdSupport()
     expect(typeof simd).toBe('string')
     expect(simd.length).toBeGreaterThan(0)
+  })
+})
+
+describe('index owner contract', () => {
+  let db
+  beforeEach(() => { db = GrafeoDB.create() })
+  afterEach(() => { db.close() })
+
+  it('preserves owner identity across rebuild and rejects implicit recreation', async () => {
+    const owner = await db.createIndex({ property: 'owner_contract' })
+    expect(Number.isInteger(owner)).toBe(true)
+    await expect(db.createIndex({ property: 'owner_contract' })).rejects.toThrow(/index|owner/i)
+    await db.rebuildIndex(owner)
+    expect(await db.dropIndex(owner)).toBe(true)
+    expect(await db.dropIndex(owner)).toBe(false)
+    await expect(db.rebuildIndex(owner)).rejects.toThrow(/index|owner/i)
+    const replacement = await db.createIndex({ property: 'owner_contract' })
+    expect(replacement).toBeGreaterThan(owner)
+    expect(await db.dropIndex(replacement)).toBe(true)
+  })
+
+  it('rejects invalid owner IDs and request options', async () => {
+    for (const owner of [-1, 1.5, 2 ** 32, NaN, Infinity]) {
+      await expect(db.dropIndex(owner)).rejects.toThrow(/owner/i)
+    }
+    await expect(db.createIndex({ property: 'p', kind: 'mystery' })).rejects.toThrow(/kind/i)
+    await expect(db.createIndex({ property: 'p', dimensions: 3 })).rejects.toThrow(/vector/i)
+    await expect(db.createIndex({ property: 'p', kind: 'vector', label: 'Doc', dimensions: 1.5 })).rejects.toThrow(/integer/i)
+  })
+
+  it('rejects unknown request keys without creating a root index or consuming an owner', async () => {
+    const hidden = { property: 'unknown_options' }
+    Object.defineProperty(hidden, 'graphPath', { value: ['child'] })
+    const inherited = Object.assign(Object.create({ graphPath: ['child'] }), { property: 'unknown_options' })
+    for (const request of [
+      { property: 'unknown_options', graphPath: ['child'] },
+      { property: 'unknown_options', ef_construction: 32 },
+      { property: 'unknown_options', [Symbol('graph')]: ['child'] },
+      { property: 'unknown_options', ['\ud800']: true },
+      hidden,
+      inherited,
+    ]) {
+      const pending = db.createIndex(request)
+      expect(pending).toBeInstanceOf(Promise)
+      await expect(pending).rejects.toThrow()
+    }
+    expect(await db.createIndex({ property: 'unknown_options' })).toBe(0)
+  })
+
+  it('rejects lone UTF-16 surrogates in every string field before conversion', async () => {
+    for (const invalid of ['\ud800', '\udfff', 'before\ud800after']) {
+      for (const field of ['property', 'name', 'label', 'kind', 'metric', 'quantization']) {
+        const pending = db.createIndex({ property: 'unicode_options', [field]: invalid })
+        expect(pending).toBeInstanceOf(Promise)
+        await expect(pending).rejects.toThrow(/UTF-16/i)
+      }
+      await expect(db.createIndex({ property: 'unicode_options', graph: [invalid] }))
+        .rejects.toThrow(/UTF-16/i)
+    }
+    // A real replacement character and a valid surrogate pair are identities,
+    // not aliases for malformed strings; failed attempts consumed no owner.
+    expect(await db.createIndex({ property: '\ufffd', name: 'owner-\ud83d\ude80' })).toBe(0)
+    expect(await db.createIndex({ property: '\ud83d\ude80' })).toBe(1)
+  })
+
+  it('keeps malformed raw request rejections asynchronous and mutation-free', async () => {
+    for (const request of [null, undefined, 'property', [], { graph: [] },
+      { property: 'raw_options', graph: 'child' },
+      { property: 'raw_options', graph: [null] },
+      { property: 'raw_options', graph: new Array(1) },
+      { property: 'raw_options', dimensions: '3' },
+    ]) {
+      const pending = db.createIndex(request)
+      expect(pending).toBeInstanceOf(Promise)
+      await expect(pending).rejects.toThrow()
+    }
+    expect(await db.createIndex({ property: 'raw_options', graph: [] })).toBe(0)
   })
 })
 
@@ -229,6 +321,36 @@ describe('properties', () => {
     expect(updated.get('weight')).toBeCloseTo(3.14)
   })
 
+  it('should reject a missing node property target without changing data', () => {
+    const node = db.createNode(['N'], { score: 1 })
+
+    expect(() => db.setNodeProperty(99999, 'score', 42)).toThrow(
+      'GRAFEO-V002: Node not found: 99999'
+    )
+    expect(db.nodeCount()).toBe(1)
+    expect(db.edgeCount()).toBe(0)
+    expect(db.getNode(node.id).get('score')).toBe(1)
+
+    db.setNodeProperty(node.id, 'score', 3)
+    expect(db.getNode(node.id).get('score')).toBe(3)
+  })
+
+  it('should reject a missing edge property target without changing data', () => {
+    const node = db.createNode(['N'])
+    const other = db.createNode(['N'])
+    const edge = db.createEdge(node.id, other.id, 'R', { score: 2 })
+
+    expect(() => db.setEdgeProperty(99999, 'score', 42)).toThrow(
+      'GRAFEO-V003: Edge not found: 99999'
+    )
+    expect(db.nodeCount()).toBe(2)
+    expect(db.edgeCount()).toBe(1)
+    expect(db.getEdge(edge.id).get('score')).toBe(2)
+
+    db.setEdgeProperty(edge.id, 'score', 4)
+    expect(db.getEdge(edge.id).get('score')).toBe(4)
+  })
+
   it('should handle multiple property types', () => {
     const node = db.createNode(['Test'], {
       str: 'hello',
@@ -241,7 +363,7 @@ describe('properties', () => {
     expect(node.get('int')).toBe(42)
     expect(node.get('float')).toBeCloseTo(3.14)
     expect(node.get('bool')).toBe(true)
-    expect(node.get('nil')).toBeNull()
+    expect(node.get('nil')).toBeUndefined()
   })
 
   it('should return undefined for missing property', () => {
@@ -647,7 +769,7 @@ describe('Gremlin queries', () => {
 
 describe('SPARQL queries', () => {
   it('should execute basic SPARQL SELECT', async () => {
-    const db = GrafeoDB.create()
+    const db = GrafeoDB.create(undefined, 'rdf')
     // SPARQL works against the RDF triple store
     const result = await db.executeSparql('SELECT ?x WHERE { ?x ?y ?z }')
     // Empty triple store returns 0 rows
@@ -664,9 +786,7 @@ describe('transaction edge cases', () => {
     const tx = db.beginTransaction()
     await tx.execute("INSERT (:Person {name: 'Alix'})")
     tx.commit()
-    await expect(
-      tx.execute("INSERT (:Person {name: 'Gus'})")
-    ).rejects.toThrow(/no longer active/)
+    expect(() => tx.execute("INSERT (:Person {name: 'Gus'})")).toThrow(/Already committed/)
     db.close()
   })
 
@@ -674,9 +794,7 @@ describe('transaction edge cases', () => {
     const db = GrafeoDB.create()
     const tx = db.beginTransaction()
     tx.rollback()
-    await expect(
-      tx.execute("INSERT (:Person {name: 'Alix'})")
-    ).rejects.toThrow(/no longer active/)
+    expect(() => tx.execute("INSERT (:Person {name: 'Alix'})")).toThrow(/Already rolled back/)
     db.close()
   })
 
@@ -921,9 +1039,7 @@ describe('error handling', () => {
   it('should throw on invalid params type', async () => {
     const db = GrafeoDB.create()
     // Passing a non-object as params
-    await expect(
-      db.execute('MATCH (n) RETURN n', 'not-an-object')
-    ).rejects.toThrow()
+    expect(() => db.execute('MATCH (n) RETURN n', 'not-an-object')).toThrow()
     db.close()
   })
 })
@@ -950,7 +1066,7 @@ describe('vector operations', () => {
       [0, 0, 1],
     ])
 
-    await db.createVectorIndex('Doc', 'embedding', 3, 'cosine')
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'cosine' })
     const results = await db.vectorSearch('Doc', 'embedding', [1, 0, 0], 3)
 
     expect(results.length).toBe(3)
@@ -968,7 +1084,7 @@ describe('vector operations', () => {
       [0, 1, 0],
     ])
 
-    await db.createVectorIndex('Doc', 'embedding', 3, 'cosine')
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'cosine' })
     const results = await db.vectorSearch('Doc', 'embedding', [1, 0, 0], 2, 200)
 
     expect(results.length).toBe(2)
@@ -980,7 +1096,7 @@ describe('vector operations', () => {
     await db.batchCreateNodes('Doc', 'embedding', [[1, 0, 0]])
 
     // Pass m and ef_construction
-    await db.createVectorIndex('Doc', 'embedding', 3, 'cosine', 32, 200)
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'cosine', m: 32, efConstruction: 200 })
     const results = await db.vectorSearch('Doc', 'embedding', [1, 0, 0], 1)
     expect(results.length).toBe(1)
     db.close()
@@ -993,7 +1109,7 @@ describe('vector operations', () => {
       [0, 1, 0],
     ])
 
-    await db.createVectorIndex('Doc', 'embedding', 3, 'euclidean')
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'euclidean' })
     const results = await db.vectorSearch('Doc', 'embedding', [1, 0, 0], 2)
     expect(results.length).toBe(2)
     // Identical vector should have distance ~0
@@ -1031,7 +1147,7 @@ describe('vector operations', () => {
       [0, 0, 1],
     ]
     await db.batchCreateNodes('Doc', 'embedding', vectors)
-    await db.createVectorIndex('Doc', 'embedding', 3, 'cosine')
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'cosine' })
 
     const queries = [
       [1, 0, 0],
@@ -1054,7 +1170,7 @@ describe('vector operations', () => {
       [0, 1, 0],
       [0, 0, 1],
     ])
-    await db.createVectorIndex('Doc', 'embedding', 3, 'cosine')
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'cosine' })
 
     const queries = [
       [1, 0, 0],
@@ -1077,7 +1193,7 @@ describe('vector operations', () => {
       [1, 0, 0],
       [0, 1, 0],
     ])
-    await db.createVectorIndex('Doc', 'embedding', 3, 'cosine')
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'embedding', dimensions: 3, metric: 'cosine' })
 
     const results = await db.batchVectorSearch(
       'Doc',
@@ -1123,7 +1239,7 @@ describe('text search', () => {
     db.createNode(['Article'], { title: 'Python machine learning' })
     db.createNode(['Article'], { title: 'Rust systems programming' })
 
-    await db.createTextIndex('Article', 'title')
+    await db.createIndex({ kind: 'text', label: 'Article', property: 'title' })
     const results = await db.textSearch('Article', 'title', 'Rust', 10)
     expect(results.length).toBeGreaterThanOrEqual(2)
     db.close()
@@ -1132,7 +1248,7 @@ describe('text search', () => {
   it('should return empty for no matches', async () => {
     const db = GrafeoDB.create()
     db.createNode(['Article'], { title: 'Rust graph database' })
-    await db.createTextIndex('Article', 'title')
+    await db.createIndex({ kind: 'text', label: 'Article', property: 'title' })
 
     const results = await db.textSearch('Article', 'title', 'nonexistentxyz', 10)
     expect(results.length).toBe(0)
@@ -1151,7 +1267,7 @@ describe('text search', () => {
   it('should find new nodes after mutation', async () => {
     const db = GrafeoDB.create()
     db.createNode(['Article'], { title: 'Rust graph' })
-    await db.createTextIndex('Article', 'title')
+    await db.createIndex({ kind: 'text', label: 'Article', property: 'title' })
 
     db.createNode(['Article'], { title: 'Rust web framework' })
 
@@ -1179,8 +1295,8 @@ describe('hybrid search', () => {
       emb: new Float32Array([0.9, 0.1, 0]),
     })
 
-    await db.createTextIndex('Doc', 'content')
-    await db.createVectorIndex('Doc', 'emb', 3, 'cosine')
+    await db.createIndex({ kind: 'text', label: 'Doc', property: 'content' })
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'emb', dimensions: 3, metric: 'cosine' })
 
     const results = await db.hybridSearch(
       'Doc', 'content', 'emb', 'Rust graph', 4, [1, 0, 0]
@@ -1200,8 +1316,8 @@ describe('hybrid search', () => {
       emb: new Float32Array([0, 1, 0]),
     })
 
-    await db.createTextIndex('Doc', 'content')
-    await db.createVectorIndex('Doc', 'emb', 3, 'cosine')
+    await db.createIndex({ kind: 'text', label: 'Doc', property: 'content' })
+    await db.createIndex({ kind: 'vector', label: 'Doc', property: 'emb', dimensions: 3, metric: 'cosine' })
 
     const results = await db.hybridSearch(
       'Doc', 'content', 'emb', 'Rust', 4
@@ -1214,12 +1330,29 @@ describe('hybrid search', () => {
 // ── CDC operations ───────────────────────────────────────────────────
 
 describe('CDC operations', () => {
+  it('should return the stored absence of null properties after creation', () => {
+    const db = GrafeoDB.create()
+    try {
+      const node = db.createNode(['N'], { absent: null, present: 1 })
+      const target = db.createNode(['N'])
+      const edge = db.createEdge(node.id, target.id, 'R', { absent: null, present: 2 })
+      expect(node.get('absent')).toBeUndefined()
+      expect(edge.get('absent')).toBeUndefined()
+      expect(db.getNode(node.id).get('absent')).toBeUndefined()
+      expect(db.getEdge(edge.id).get('absent')).toBeUndefined()
+      expect(node.get('present')).toBe(1)
+      expect(edge.get('present')).toBe(2)
+    } finally {
+      db.close()
+    }
+  })
+
   it('should track node creation history', async () => {
     const db = GrafeoDB.create()
     db.enableCdc()
     const node = db.createNode(['Person'], { name: 'Alix' })
 
-    const history = await db.nodeHistory(node.id)
+    const history = await collectHistory(db, node.id)
     expect(history.length).toBeGreaterThanOrEqual(1)
     db.close()
   })
@@ -1230,9 +1363,27 @@ describe('CDC operations', () => {
     const node = db.createNode(['Person'], { name: 'Alix' })
     db.setNodeProperty(node.id, 'age', 30)
 
-    const history = await db.nodeHistory(node.id)
+    const history = await collectHistory(db, node.id)
     expect(history.length).toBeGreaterThanOrEqual(2)
+    expect(history.every(event => Array.isArray(event.lpg_graph) && event.lpg_graph.length === 0)).toBe(true)
+    expect(history.every(event => event.triple_graph === null)).toBe(true)
     db.close()
+  })
+
+  it('should retain named LPG CDC coordinates as component arrays', async () => {
+    const db = GrafeoDB.create()
+    try {
+      db.enableCdc()
+      await db.execute('CREATE GRAPH scoped')
+      await db.execute('USE GRAPH scoped')
+      const node = db.createNode(['Person'], { name: 'Scoped' })
+      const history = await collectHistory(db, node.id)
+      expect(history.length).toBeGreaterThanOrEqual(1)
+      expect(history.every(event => JSON.stringify(event.lpg_graph) === '["scoped"]')).toBe(true)
+      expect(history.every(event => event.triple_graph === null)).toBe(true)
+    } finally {
+      db.close()
+    }
   })
 
   it('should track edge creation history', async () => {
@@ -1242,25 +1393,67 @@ describe('CDC operations', () => {
     const b = db.createNode(['N'])
     const edge = db.createEdge(a.id, b.id, 'R')
 
-    const history = await db.edgeHistory(edge.id)
+    const history = await collectHistory(db, edge.id, true)
     expect(history.length).toBeGreaterThanOrEqual(1)
     db.close()
   })
 
-  it('should return changes between epochs', async () => {
+  it('should read created named entities from their captured graph despite colliding root IDs', async () => {
+    const db = GrafeoDB.create()
+    try {
+      db.enableCdc()
+      const root = db.createNode(['Root'], { name: 'Root' })
+      const rootTarget = db.createNode(['RootTarget'])
+      const rootEdge = db.createEdge(root.id, rootTarget.id, 'ROOT_EDGE', { weight: 1 })
+      await db.execute('CREATE GRAPH scoped')
+      await db.execute('USE GRAPH scoped')
+      const named = db.createNode(['Named', 'Named'], { name: 'Scoped' })
+      const namedTarget = db.createNode(['NamedTarget'])
+      const namedEdge = db.createEdge(named.id, namedTarget.id, 'NAMED_EDGE', { weight: 2 })
+      const emptyEdge = db.createEdge(named.id, namedTarget.id, 'NO_PROPERTIES')
+      expect(named.id).toBe(root.id)
+      expect(namedTarget.id).toBe(rootTarget.id)
+      expect(namedEdge.id).toBe(rootEdge.id)
+      expect(named.labels).toEqual(['Named'])
+      expect(named.get('name')).toBe('Scoped')
+      expect(namedTarget.labels).toEqual(['NamedTarget'])
+      expect(namedEdge.edgeType).toBe('NAMED_EDGE')
+      expect(namedEdge.get('weight')).toBe(2)
+      expect(emptyEdge.edgeType).toBe('NO_PROPERTIES')
+      const nodeHistory = await collectHistory(db, named.id)
+      const edgeHistory = await collectHistory(db, namedEdge.id, true)
+      expect(new Set(nodeHistory.map(event => JSON.stringify(event.lpg_graph)))).toEqual(new Set(['[]', '["scoped"]']))
+      expect(new Set(edgeHistory.map(event => JSON.stringify(event.lpg_graph)))).toEqual(new Set(['[]', '["scoped"]']))
+      await db.execute('USE GRAPH default')
+      expect(db.getNode(root.id).get('name')).toBe('Root')
+      expect(db.getEdge(rootEdge.id).get('weight')).toBe(1)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('should resume bounded change pages', async () => {
     const db = GrafeoDB.create()
     db.enableCdc()
     db.createNode(['Person'], { name: 'Alix' })
     db.createNode(['Person'], { name: 'Gus' })
 
-    const changes = await db.changesBetween(0, 1000)
+    let cursor = null
+    const changes = []
+    for (;;) {
+      const page = await db.changesAfter(cursor, 1, 4096)
+      expect(page.events.length).toBeLessThanOrEqual(1)
+      if (cursor?.equals(page.next)) break
+      cursor = page.next
+      changes.push(...page.events)
+    }
     expect(changes.length).toBeGreaterThanOrEqual(2)
     db.close()
   })
 
   it('should return empty history for nonexistent node', async () => {
     const db = GrafeoDB.create()
-    const history = await db.nodeHistory(9999)
+    const history = await collectHistory(db, 9999)
     expect(history.length).toBe(0)
     db.close()
   })
@@ -1359,7 +1552,7 @@ describe('property removal', () => {
 
 describe('SPARQL with parameters', () => {
   it('should execute SPARQL with params argument', async () => {
-    const db = GrafeoDB.create()
+    const db = GrafeoDB.create(undefined, 'rdf')
     // Even if params aren't used in this query, the API should accept them
     const result = await db.executeSparql(
       'SELECT ?x WHERE { ?x ?y ?z }',
@@ -1369,8 +1562,8 @@ describe('SPARQL with parameters', () => {
     db.close()
   })
 
-  it('should execute SPARQL without params (backward compat)', async () => {
-    const db = GrafeoDB.create()
+  it('should execute SPARQL without params', async () => {
+    const db = GrafeoDB.create(undefined, 'rdf')
     const result = await db.executeSparql('SELECT ?x WHERE { ?x ?y ?z }')
     expect(result.length).toBe(0)
     db.close()

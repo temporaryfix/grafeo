@@ -13,16 +13,56 @@
 //! | `BigInt`         | `Int64`       |                                |
 //! | `Float32Array`   | `Vector`      |                                |
 
+#[cfg(any(
+    test,
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 use std::collections::BTreeMap;
 use std::ffi::CString;
+#[cfg(any(
+    test,
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
-use napi::{JsDate, JsString, JsValue, ValueType, sys};
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+use napi::{JsDate, JsString, ValueType};
+use napi::{JsValue, sys};
 
-use grafeo_common::types::{PropertyKey, Timestamp, Value};
+use grafeo_common::types::Value;
+#[cfg(any(
+    test,
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
+use grafeo_common::types::{PropertyKey, Timestamp};
 
 /// Converts a JavaScript value to a Grafeo Value.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 pub fn js_to_value(env: &Env, val: Unknown<'_>) -> Result<Value> {
     #![allow(clippy::trivially_copy_pass_by_ref)] // Env refs are conventional in napi
     let value_type = val.get_type()?;
@@ -92,6 +132,13 @@ pub fn js_to_value(env: &Env, val: Unknown<'_>) -> Result<Value> {
 }
 
 /// Converts a JavaScript object (Array, Buffer, Date, or plain object) to a Grafeo Value.
+#[cfg(any(
+    feature = "lpg",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native",
+    feature = "compact-store"
+))]
 fn js_object_to_value(env: &Env, obj: &Object<'_>) -> Result<Value> {
     if obj.is_array()? {
         let len = obj.get_array_length()?;
@@ -159,11 +206,8 @@ pub(crate) fn check_napi(status: sys::napi_status) -> Result<()> {
     }
 }
 
-/// Converts a Grafeo Value to a raw napi value (no lifetime constraints).
-///
-/// This uses the raw napi C API to avoid lifetime issues when returning
-/// JS values from `#[napi]` methods where `env` is taken by value.
-pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_value> {
+/// The complete copied row/result must be admitted before entering this converter.
+pub(crate) fn value_to_napi_admitted(env: sys::napi_env, value: &Value) -> Result<sys::napi_value> {
     match value {
         // SAFETY: env is a valid napi_env passed by the caller
         Value::Null => unsafe { <Null as ToNapiValue>::to_napi_value(env, Null) },
@@ -198,7 +242,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
                 sys::napi_create_array_with_length(env, items.len(), &raw mut arr)
             })?;
             for (i, item) in items.iter().enumerate() {
-                let val = value_to_napi(env, item)?;
+                let val = value_to_napi_admitted(env, item)?;
                 // SAFETY: env, arr, and val are valid napi values
                 // reason: JS arrays are limited to 2^32-1 elements, so index fits u32
                 #[allow(clippy::cast_possible_truncation)]
@@ -213,7 +257,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
             for (key, val) in map.as_ref() {
                 let key_cstr = CString::new(key.as_str())
                     .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-                let napi_val = value_to_napi(env, val)?;
+                let napi_val = value_to_napi_admitted(env, val)?;
                 // SAFETY: env, obj, key_cstr, and napi_val are all valid
                 check_napi(unsafe {
                     sys::napi_set_named_property(env, obj, key_cstr.as_ptr(), napi_val)
@@ -266,7 +310,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
                 sys::napi_create_array_with_length(env, nodes.len(), &raw mut nodes_arr)
             })?;
             for (i, node) in nodes.iter().enumerate() {
-                let val = value_to_napi(env, node)?;
+                let val = value_to_napi_admitted(env, node)?;
                 // SAFETY: env, nodes_arr, and val are valid napi values
                 // reason: JS arrays are limited to 2^32-1 elements
                 #[allow(clippy::cast_possible_truncation)]
@@ -280,15 +324,15 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
                 sys::napi_create_array_with_length(env, edges.len(), &raw mut edges_arr)
             })?;
             for (i, edge) in edges.iter().enumerate() {
-                let val = value_to_napi(env, edge)?;
+                let val = value_to_napi_admitted(env, edge)?;
                 // SAFETY: env, edges_arr, and val are valid napi values
                 // reason: JS arrays are limited to 2^32-1 elements
                 #[allow(clippy::cast_possible_truncation)]
                 check_napi(unsafe { sys::napi_set_element(env, edges_arr, i as u32, val) })?;
             }
 
-            let nodes_key = CString::new("nodes").expect("static string has no null bytes");
-            let edges_key = CString::new("edges").expect("static string has no null bytes");
+            let nodes_key = c"nodes";
+            let edges_key = c"edges";
             // SAFETY: env, obj, and the key/value pointers are all valid
             check_napi(unsafe {
                 sys::napi_set_named_property(env, obj, nodes_key.as_ptr(), nodes_arr)
@@ -306,9 +350,11 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
             check_napi(unsafe { sys::napi_create_object(env, &raw mut obj) })?;
             let mut replicas = std::ptr::null_mut();
             check_napi(unsafe { sys::napi_create_object(env, &raw mut replicas) })?;
-            let mut total: u64 = 0;
+            // At most usize::MAX replicas each contribute u64::MAX; their
+            // exact sum fits u128 before the single JavaScript Number conversion.
+            let mut total: u128 = 0;
             for (replica, count) in counts.iter() {
-                total += count;
+                total += u128::from(*count);
                 let mut val = std::ptr::null_mut();
                 let count_f64 = *count as f64;
                 // SAFETY: env is valid; napi_create_double writes to our out-pointer
@@ -320,7 +366,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
                     sys::napi_set_named_property(env, replicas, key.as_ptr(), val)
                 })?;
             }
-            let gcounter_key = CString::new("$gcounter").expect("static string has no null bytes");
+            let gcounter_key = c"$gcounter";
             // SAFETY: env, obj, and replicas are valid
             check_napi(unsafe {
                 sys::napi_set_named_property(env, obj, gcounter_key.as_ptr(), replicas)
@@ -328,7 +374,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
             let mut total_val = std::ptr::null_mut();
             // SAFETY: env is valid; napi_create_double writes to our out-pointer
             check_napi(unsafe { sys::napi_create_double(env, total as f64, &raw mut total_val) })?;
-            let value_key = CString::new("$value").expect("static string has no null bytes");
+            let value_key = c"$value";
             // SAFETY: env, obj, and total_val are valid
             check_napi(unsafe {
                 sys::napi_set_named_property(env, obj, value_key.as_ptr(), total_val)
@@ -346,8 +392,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
             } else {
                 -((neg_sum - pos_sum) as f64)
             };
-            let pncounter_key =
-                CString::new("$pncounter").expect("static string has no null bytes");
+            let pncounter_key = c"$pncounter";
             let mut true_val = std::ptr::null_mut();
             // SAFETY: env is valid; napi_get_boolean writes to our out-pointer
             check_napi(unsafe { sys::napi_get_boolean(env, true, &raw mut true_val) })?;
@@ -358,7 +403,7 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
             let mut net_val = std::ptr::null_mut();
             // SAFETY: env is valid; napi_create_double writes to our out-pointer
             check_napi(unsafe { sys::napi_create_double(env, net, &raw mut net_val) })?;
-            let value_key = CString::new("$value").expect("static string has no null bytes");
+            let value_key = c"$value";
             // SAFETY: env, obj, and net_val are valid
             check_napi(unsafe {
                 sys::napi_set_named_property(env, obj, value_key.as_ptr(), net_val)
@@ -373,13 +418,348 @@ pub fn value_to_napi(env: sys::napi_env, value: &Value) -> Result<sys::napi_valu
     }
 }
 
-/// Converts a Grafeo Value to a JavaScript Unknown value.
-///
-/// Uses `value_to_napi` internally and wraps the result as `Unknown`.
-/// The lifetime is unconstrained (from `from_raw_unchecked`), so this is
-/// safe to call from `#[napi]` methods where `env` is taken by value.
-pub fn value_to_js(env: sys::napi_env, value: &Value) -> Result<Unknown<'_>> {
-    let raw = value_to_napi(env, value)?;
-    // SAFETY: env and raw are valid napi values produced by value_to_napi
-    Ok(unsafe { Unknown::from_raw_unchecked(env, raw) })
+/// The native default bounds standalone JavaScript value conversions too.
+pub(crate) fn default_conversion_limit() -> usize {
+    grafeo_engine::query::ResultLimits::default().max_bytes
+}
+
+type CopyResult<T> = grafeo_common::utils::error::Result<T>;
+
+pub(crate) fn copy_limit_error() -> grafeo_common::utils::error::Error {
+    use grafeo_common::utils::error::{Error, StorageError};
+    Error::Storage(StorageError::Full).with_context("Node result conversion exceeds max_bytes")
+}
+
+/// Allocation-free admission for native Values, copied serde_json storage and
+/// V8 values. The bound covers both direct JS and existing tagged JSON routes.
+/// Strings charge UTF-8, CString temporaries and two-byte V8 storage; arrays
+/// charge JSON slots, napi handles and V8 backing including resize overlap.
+/// Native retained-size accounting separately covers B-tree and hash capacity.
+/// External libraries and V8 heap/GC policy are outside these binding-owned
+/// copies; whole-process allocator qualification remains a separate gate.
+pub(crate) struct CopyBudget {
+    remaining: usize,
+}
+
+impl CopyBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining: max_bytes,
+        }
+    }
+    pub(crate) fn charge(&mut self, bytes: usize) -> CopyResult<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or_else(copy_limit_error)?;
+        Ok(())
+    }
+    pub(crate) fn repeated(&mut self, count: usize, bytes: usize) -> CopyResult<()> {
+        self.charge(count.checked_mul(bytes).ok_or_else(copy_limit_error)?)
+    }
+    pub(crate) fn string(&mut self, value: &str) -> CopyResult<()> {
+        self.charge(128)?;
+        self.repeated(value.len(), 8)
+    }
+    pub(crate) fn list(&mut self, length: usize) -> CopyResult<()> {
+        u32::try_from(length).map_err(|_| copy_limit_error())?;
+        self.charge(128)?;
+        self.repeated(length, 64)
+    }
+    pub(crate) fn dict(&mut self, length: usize) -> CopyResult<()> {
+        u32::try_from(length).map_err(|_| copy_limit_error())?;
+        // serde_json's B-tree root (11 slots), V8 property storage, and
+        // property-name/entry temporaries while both representations coexist.
+        self.charge(1024)?;
+        self.repeated(length, 384)
+    }
+    pub(crate) fn columns(&mut self, columns: &[String]) -> CopyResult<()> {
+        self.list(columns.len())?;
+        for column in columns {
+            self.string(column)?;
+        }
+        Ok(())
+    }
+    /// Charge native nested schema storage retained alongside a copied result.
+    pub(crate) fn logical_type(
+        &mut self,
+        logical_type: &grafeo_common::LogicalType,
+        depth: usize,
+    ) -> CopyResult<()> {
+        use grafeo_common::LogicalType;
+        if depth >= 256 {
+            return Err(copy_limit_error());
+        }
+        match logical_type {
+            LogicalType::List(item) => {
+                self.charge(std::mem::size_of::<LogicalType>())?;
+                self.logical_type(item, depth + 1)
+            }
+            LogicalType::Map { key, value } => {
+                self.repeated(2, std::mem::size_of::<LogicalType>())?;
+                self.logical_type(key, depth + 1)?;
+                self.logical_type(value, depth + 1)
+            }
+            LogicalType::Struct(fields) => {
+                self.repeated(
+                    fields.capacity(),
+                    std::mem::size_of::<(String, LogicalType)>(),
+                )?;
+                for (name, logical_type) in fields {
+                    self.charge(name.capacity())?;
+                    self.logical_type(logical_type, depth + 1)?;
+                }
+                Ok(())
+            }
+            LogicalType::Any
+            | LogicalType::Null
+            | LogicalType::Bool
+            | LogicalType::Int8
+            | LogicalType::Int16
+            | LogicalType::Int32
+            | LogicalType::Int64
+            | LogicalType::Float32
+            | LogicalType::Float64
+            | LogicalType::String
+            | LogicalType::Bytes
+            | LogicalType::Date
+            | LogicalType::Time
+            | LogicalType::Timestamp
+            | LogicalType::Duration
+            | LogicalType::ZonedTime
+            | LogicalType::ZonedDatetime
+            | LogicalType::Node
+            | LogicalType::Edge
+            | LogicalType::Path
+            | LogicalType::Vector(_) => Ok(()),
+            _ => Err(copy_limit_error()),
+        }
+    }
+    pub(crate) fn row(&mut self, columns: &[String], values: &[Value]) -> CopyResult<()> {
+        self.dict(columns.len())?;
+        for column in columns {
+            self.string(column)?;
+        }
+        for value in values {
+            self.value(value)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn value(&mut self, value: &Value) -> CopyResult<()> {
+        let before = self.remaining;
+        self.nested_value(value, 0)?;
+        // Tagged json! wrappers can copy their already converted descendants.
+        // Admit both full representations without recursively revisiting them.
+        self.charge(before - self.remaining)?;
+        self.charge(value.retained_size_bytes().ok_or_else(copy_limit_error)?)
+    }
+    fn nested_value(&mut self, value: &Value, depth: usize) -> CopyResult<()> {
+        // Bound the conversion call stack as well as copied heap memory. This is
+        // a resource failure, before recursion or JavaScript allocation can overflow.
+        if depth >= 256 {
+            return Err(copy_limit_error());
+        }
+        self.charge(128)?;
+        match value {
+            Value::String(text) => self.string(text.as_str()),
+            Value::Bytes(bytes) => {
+                // Tagged JSON uses one Number value per byte; direct JS uses
+                // Buffer. Admit the larger JSON array together with V8 elements.
+                self.list(bytes.len())?;
+                self.repeated(bytes.len(), 128)
+            }
+            Value::List(values) => {
+                self.list(values.len())?;
+                for value in values.iter() {
+                    self.nested_value(value, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Map(values) => {
+                self.dict(values.len())?;
+                for (key, value) in values.iter() {
+                    self.string(key.as_str())?;
+                    self.nested_value(value, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Vector(values) => {
+                self.list(values.len())?;
+                self.repeated(values.len(), 64)
+            }
+            Value::Path { nodes, edges } => {
+                self.dict(1)?;
+                self.string("$path")?;
+                self.dict(2)?;
+                self.string("nodes")?;
+                self.string("edges")?;
+                for values in [nodes, edges] {
+                    self.list(values.len())?;
+                    for value in values.iter() {
+                        // The existing tagged codec serializes temporary JSON
+                        // arrays into the wrapper. Their copies coexist here.
+                        self.nested_value(value, depth + 1)?;
+                    }
+                }
+                Ok(())
+            }
+            Value::GCounter(values) => {
+                self.dict(2)?;
+                self.charge(4096)?;
+                self.dict(values.len())?;
+                for key in values.keys() {
+                    self.string(key.as_str())?;
+                    self.charge(128)?;
+                }
+                Ok(())
+            }
+            Value::OnCounter { pos, neg } => {
+                self.dict(2)?;
+                self.charge(4096)?;
+                for values in [pos, neg] {
+                    self.dict(values.len())?;
+                    for key in values.keys() {
+                        self.string(key.as_str())?;
+                        self.charge(128)?;
+                    }
+                }
+                Ok(())
+            }
+            Value::Timestamp(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::Duration(_)
+            | Value::ZonedDatetime(_) => self.charge(4096),
+            Value::Null | Value::Bool(_) | Value::Int64(_) | Value::Float64(_) => Ok(()),
+            Value::RdfLiteral {
+                lexical,
+                language,
+                datatype,
+            } => {
+                self.string(lexical.as_str())?;
+                if let Some(language) = language {
+                    self.string(language.as_str())?;
+                }
+                if let Some(datatype) = datatype {
+                    self.string(datatype.as_str())?;
+                }
+                self.charge(128)
+            }
+            _ => Err(copy_limit_error()),
+        }
+    }
+}
+
+pub(crate) fn display_bytes(value: &impl std::fmt::Display, limit: usize) -> CopyResult<usize> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.bytes = self.bytes.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            if self.bytes > self.limit {
+                return Err(std::fmt::Error);
+            }
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    std::fmt::write(&mut counter, format_args!("{value}")).map_err(|_| copy_limit_error())?;
+    Ok(counter.bytes)
+}
+
+/// Preserve the shared JSON tag contract after admitting the complete copy.
+#[cfg(any(test, feature = "gql"))]
+pub(crate) fn bounded_row_to_json(
+    columns: &[String],
+    values: &[Value],
+    max_bytes: usize,
+) -> CopyResult<serde_json::Value> {
+    let mut budget = CopyBudget::new(max_bytes);
+    budget.row(columns, values)?;
+    let mut object = serde_json::Map::new();
+    for (column, value) in columns.iter().zip(values) {
+        object.insert(
+            column.clone(),
+            grafeo_bindings_common::json::value_to_json(value),
+        );
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+pub(crate) fn bounded_columns(columns: &[String], max_bytes: usize) -> CopyResult<Vec<String>> {
+    CopyBudget::new(max_bytes).columns(columns)?;
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(columns.len())
+        .map_err(|_| copy_limit_error())?;
+    for column in columns {
+        let mut name = String::new();
+        name.try_reserve_exact(column.len())
+            .map_err(|_| copy_limit_error())?;
+        name.push_str(column);
+        copied.push(name);
+    }
+    Ok(copied)
+}
+
+#[cfg(test)]
+mod copy_admission_tests {
+    use super::*;
+
+    #[test]
+    fn tagged_json_row_keeps_recursive_types_and_admits_byte_expansion() {
+        let value = Value::Map(Arc::new(BTreeMap::from([
+            (
+                PropertyKey::new("bytes"),
+                Value::Bytes(vec![255; 128].into()),
+            ),
+            (PropertyKey::new("text"), Value::from("雪😀")),
+            (
+                PropertyKey::new("timestamp"),
+                Value::Timestamp(Timestamp::from_micros(42)),
+            ),
+            (
+                PropertyKey::new("nested"),
+                Value::List(vec![Value::Null, Value::List(Vec::new().into())].into()),
+            ),
+        ])));
+        let columns = vec!["value".to_owned()];
+        let values = [value];
+        let error = bounded_row_to_json(&columns, &values, 8192).unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            grafeo_common::utils::error::ErrorCode::StorageFull
+        );
+        let copied = bounded_row_to_json(&columns, &values, 131072).unwrap();
+        assert_eq!(copied["value"]["bytes"], serde_json::json!(vec![255; 128]));
+        assert_eq!(copied["value"]["text"], "雪😀");
+        assert_eq!(
+            copied["value"]["timestamp"],
+            serde_json::json!({"$timestamp_us": 42})
+        );
+        assert_eq!(copied["value"]["nested"], serde_json::json!([null, []]));
+    }
+
+    #[test]
+    fn repeated_keys_and_json_path_wrapper_are_included_before_copy() {
+        let columns = vec!["column".repeat(128)];
+        let values = [Value::Int64(1)];
+        let mut budget = CopyBudget::new(16384);
+        assert!(budget.row(&columns, &values).is_ok());
+        assert!(budget.row(&columns, &values).is_ok());
+        assert!(budget.row(&columns, &values).is_err());
+        let path = Value::Path {
+            nodes: vec![Value::from("first"), Value::from("second")].into(),
+            edges: vec![Value::from("edge")].into(),
+        };
+        let copied = bounded_row_to_json(&["path".to_owned()], &[path], 65536).unwrap();
+        assert_eq!(
+            copied,
+            serde_json::json!({"path": {"$path": {
+                "nodes": ["first", "second"], "edges": ["edge"],
+            }}})
+        );
+    }
 }

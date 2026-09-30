@@ -4,6 +4,8 @@ Node.js/TypeScript bindings for [Grafeo](https://grafeo.dev), a high-performance
 
 ## Installation
 
+Requires Node.js 20.3.0 or newer (Node-API 9).
+
 ```bash
 npm install @grafeo-db/js
 ```
@@ -50,16 +52,47 @@ db.edgeCount();   // number of edges
 
 ### Query Languages
 
-All query methods return `Promise<QueryResult>` and accept optional parameters:
+All query methods return `Promise<QueryResult>` and accept optional parameters and execution options:
 
 ```typescript
-await db.execute(gql, params?);         // GQL (ISO standard)
-await db.executeCypher(query, params?);  // Cypher
-await db.executeGremlin(query, params?); // Gremlin
-await db.executeGraphql(query, params?); // GraphQL
-await db.executeSparql(query, params?);  // SPARQL
-await db.executeSql(query, params?);     // SQL/PGQ (SQL:2023)
+import { QueryControl } from '@grafeo-db/js';
+
+const control = new QueryControl(10_000); // deadline starts at construction
+await db.execute(gql, params, { control, maxRows: 1_000_000, maxBytes: 64 * 1024 * 1024 });
+await db.executeCypher(query, params, options);  // Cypher
+await db.executeGremlin(query, params, options); // Gremlin
+await db.executeGraphql(query, params, options); // GraphQL
+await db.executeSparql(query, params, options);  // SPARQL
+await db.executeSql(query, params, options);     // SQL/PGQ (SQL:2023)
+// Call control.cancel() while the query is pending to request cancellation.
 ```
+
+Native eager results default to 1,000,000 rows and 64 MiB of retained result
+storage. `maxRows` and `maxBytes` override those limits; copied binding output
+uses the same byte cap with conservative conversion accounting. A deadline reports `GRAFEO-Q003` and a result limit
+reports `GRAFEO-S001`; native failures expose the identifier as `error.code`.
+A control is consumed synchronously and cannot be reused. Limits must be
+nonnegative JavaScript safe integers; zero admits no rows or bytes.
+
+### Streaming
+
+```typescript
+const stream = await db.executeStream(gql, params, options);
+for await (const row of stream) {
+  console.log(row);
+  break; // awaits native close() through the async iterator return() hook
+}
+await stream.close(); // idempotent; next() then resolves to null
+```
+
+Streams retain bounded native state and charge each copied row against
+`maxBytes`. An explicit `maxRows` also bounds the total emitted rows; without
+it, the stream has no total row cap. `close()` releases the cursor asynchronously
+and interrupts an active pull. Native cancellation or cleanup errors remain
+observable from close; repeated calls preserve that outcome. `next()` remains
+available and resolves to `null` at EOF or after close. Database `close()`
+reports `GRAFEO-T004` promptly while a query, stream or transaction is active;
+finish or close those owners before retrying.
 
 ### Node & Edge CRUD
 
@@ -134,7 +167,7 @@ GrafeoDB.restoreToEpoch('/backups/full', 100, './restored');
 
 ```typescript
 // Create an HNSW index
-await db.createVectorIndex('Document', 'embedding', 384);
+await db.createIndex({ kind: 'vector', label: 'Document', property: 'embedding', dimensions: 384 });
 
 // Bulk insert
 const ids = await db.batchCreateNodes('Document', 'embedding', vectors);
@@ -165,3 +198,49 @@ const results = await db.vectorSearch('Document', 'embedding', queryVector, 10);
 ## License
 
 Apache-2.0
+
+## Index owners
+
+`createIndex(request)` resolves to an unsigned 32-bit owner ID.
+The request includes `property`, optional `kind` (property/btree/text/vector),
+`graph`, `name`, and `label` (text/vector only). Graphs are component arrays:
+`[]` is root; `[""]` is an empty child; `["a/b"]` differs from `["a", "b"]`.
+Vector-only fields are dimensions, metric, m, efConstruction, and quantization.
+Text-only `minTokenLength` counts UTF-8 bytes and defaults to 2 when omitted
+(or `undefined`); explicit 0 is valid. Supply a nonnegative safe integer fitting
+the platform size range.
+Null, coercible/non-numeric values, and use with another kind reject without
+allocating an owner. Rebuild and persistence retain the resolved tokenizer.
+Unknown keys (including non-enumerable or symbol keys), inherited enumerable
+options, and malformed UTF-16 strings reject the Promise before mutation.
+Valid Unicode is preserved exactly, including graph path components.
+
+```typescript
+const owner = await db.createIndex({ property: 'email' });
+await db.rebuildIndex(owner); // Atomic; preserves owner and resolved configuration.
+await db.dropIndex(owner);    // Resolves to false only when the owner is absent.
+```
+
+The standalone tokenizer controls need no npm dependencies. From the repository
+root, point them at the newly built local addon with GQL, Text and storage enabled:
+
+```sh
+GRAFEO_NODE_LIBRARY=/absolute/path/to/libgrafeo_node.dylib node --test crates/bindings/node/__test__/index-tokenizer.node.mjs
+```
+
+Against a local LPG addon built without Text support, set
+`GRAFEO_EXPECT_TEXT_DISABLED=1` for the same command. That mode checks structured
+feature errors and owner-allocation safety instead of skipping unavailable behavior.
+
+Duplicate creation and missing-owner rebuild reject; explicit recreation
+returns a new owner. Invalid paths/options and unavailable features report errors.
+
+### Building the Node package
+
+Release tools are pinned separately from the optional native packages. From
+`crates/bindings/node`, install them with `npm ci --prefix tools --ignore-scripts`.
+The Linux GNU producer uses Node.js 24.21.0, Rust 1.97.1 and
+`bash scripts/build-node-linux.sh x86_64-unknown-linux-gnu` from the repository
+root (use `aarch64-unknown-linux-gnu` on ARM64). It writes the addon and generated
+loader/declarations under `target/node-release/package/generated`. Package these
+outputs together; include the root Apache license in the main and native packages.

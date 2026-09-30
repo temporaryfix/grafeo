@@ -51,6 +51,7 @@ describe('executeStream', () => {
         'MATCH (p:Person) RETURN p.name AS name, p.age AS age',
       )
       expect(stream.columns).toEqual(['name', 'age'])
+      await stream.close()
     } finally {
       db.close()
     }
