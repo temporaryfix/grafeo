@@ -11,6 +11,9 @@ npx @grafeo-db/cli --help
 ```
 
 The correct platform-specific binary is installed automatically via optional dependencies.
+If that dependency is missing or incomplete, the launcher reports an error.
+Reinstall with optional dependencies enabled; the launcher requires its matching
+native package even when another `grafeo` executable is installed.
 
 ## Supported Platforms
 

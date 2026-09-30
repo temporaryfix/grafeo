@@ -42,20 +42,20 @@ try {
         Write-Host "PASSED" -ForegroundColor Green
 
         Write-Host "`n[2/4] Clippy..." -ForegroundColor Yellow
-        cargo clippy --all-targets --all-features -- -D warnings
+        cargo clippy --locked --all-targets --all-features -- -D warnings
         if ($LASTEXITCODE -ne 0) { throw "Clippy failed" }
         Write-Host "PASSED" -ForegroundColor Green
 
         Write-Host "`n[3/4] Docs..." -ForegroundColor Yellow
         Remove-Item -Recurse -Force target\doc -ErrorAction SilentlyContinue
         $env:RUSTDOCFLAGS = "-D warnings"
-        cargo doc --no-deps --all-features
+        cargo doc --locked --no-deps --all-features
         if ($LASTEXITCODE -ne 0) { throw "Doc check failed" }
         Remove-Item Env:\RUSTDOCFLAGS -ErrorAction SilentlyContinue
         Write-Host "PASSED" -ForegroundColor Green
 
         Write-Host "`n[4/4] Rust tests..." -ForegroundColor Yellow
-        cargo test --all-features --workspace
+        cargo test --locked --all-features --workspace
         if ($LASTEXITCODE -ne 0) { throw "Rust tests failed" }
         Write-Host "PASSED" -ForegroundColor Green
     } else {
@@ -94,7 +94,7 @@ try {
 
             # Build wheel for this Python version
             Write-Host "  Building wheel..." -ForegroundColor Yellow
-            maturin build --release --out $pyDistDir -m crates/bindings/python/Cargo.toml --interpreter $pyInterp
+            maturin build --locked --release --out $pyDistDir -m crates/bindings/python/Cargo.toml --interpreter $pyInterp
             if ($LASTEXITCODE -ne 0) { throw "Wheel build failed" }
 
             # Create venv and install

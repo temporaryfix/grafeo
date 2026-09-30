@@ -64,16 +64,16 @@ if [[ "$SKIP_RUST" == false ]]; then
     echo -e "${GREEN}PASSED${NC}"
 
     echo -e "\n${YELLOW}[2/4] Clippy...${NC}"
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --locked --all-targets --all-features -- -D warnings
     echo -e "${GREEN}PASSED${NC}"
 
     echo -e "\n${YELLOW}[3/4] Docs...${NC}"
     rm -rf target/doc
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
     echo -e "${GREEN}PASSED${NC}"
 
     echo -e "\n${YELLOW}[4/4] Rust tests...${NC}"
-    cargo test --all-features --workspace
+    cargo test --locked --all-features --workspace
     echo -e "${GREEN}PASSED${NC}"
 else
     echo -e "${YELLOW}Skipping Rust checks (--skip-rust)${NC}"
@@ -102,7 +102,7 @@ for PY_VER in "${PYTHON_VERSIONS[@]}"; do
 
     # Build wheel for this Python version
     echo -e "\n${YELLOW}  Building wheel...${NC}"
-    if ! maturin build --release --out "$PY_DIST_DIR" -m crates/bindings/python/Cargo.toml --interpreter "$PY_INTERP"; then
+    if ! maturin build --locked --release --out "$PY_DIST_DIR" -m crates/bindings/python/Cargo.toml --interpreter "$PY_INTERP"; then
         echo -e "${RED}  Python $PY_VER FAILED: Wheel build failed${NC}"
         FAILED+=("Python $PY_VER")
         continue
@@ -119,7 +119,13 @@ for PY_VER in "${PYTHON_VERSIONS[@]}"; do
     PYTHON_CMD="$PY_VENV_DIR/bin/python"
 
     echo -e "${GRAY}  Installing wheel...${NC}"
-    WHEEL=$(ls "$PY_DIST_DIR"/*.whl | head -1)
+    WHEELS=("$PY_DIST_DIR"/*.whl)
+    if [[ ! -e "${WHEELS[0]}" ]]; then
+        echo -e "${RED}  Python $PY_VER FAILED: No wheel was produced${NC}"
+        FAILED+=("Python $PY_VER")
+        continue
+    fi
+    WHEEL=${WHEELS[0]}
     if ! uv pip install "$WHEEL" --python "$PYTHON_CMD"; then
         echo -e "${RED}  Python $PY_VER FAILED: Wheel install failed${NC}"
         FAILED+=("Python $PY_VER")

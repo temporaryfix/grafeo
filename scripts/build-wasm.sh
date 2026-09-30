@@ -16,21 +16,26 @@ CRATE_DIR="crates/bindings/wasm"
 OUT_DIR=""
 PROFILE="minimal-size"
 TARGET="web"
-SCOPE=""
+PACKAGE_SCOPE=""
 FEATURES=""
 PKG_NAME="@grafeo-db/wasm"
+PKG_NAME_SET=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --target)   TARGET="$2"; shift 2 ;;
-        --scope)    SCOPE="--scope $2"; shift 2 ;;
+        --scope)    PACKAGE_SCOPE="${2#@}"; shift 2 ;;
         --features) FEATURES="--features $2"; shift 2 ;;
         --out-dir)  OUT_DIR="$2"; shift 2 ;;
-        --name)     PKG_NAME="$2"; shift 2 ;;
+        --name)     PKG_NAME="$2"; PKG_NAME_SET=true; shift 2 ;;
         --release)  PROFILE="release"; shift ;;
         *)          echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [[ -n "$PACKAGE_SCOPE" && "$PKG_NAME_SET" == false ]]; then
+    PKG_NAME="@${PACKAGE_SCOPE}/wasm"
+fi
 
 # Default output directory
 if [[ -z "$OUT_DIR" ]]; then
@@ -40,7 +45,7 @@ fi
 echo "Building WASM (profile: ${PROFILE}, target: ${TARGET})"
 
 # Step 1: Cargo build
-CARGO_CMD="cargo build --target wasm32-unknown-unknown --profile ${PROFILE} -p grafeo-wasm"
+CARGO_CMD="cargo build --locked --target wasm32-unknown-unknown --profile ${PROFILE} -p grafeo-wasm"
 if [[ -n "$FEATURES" ]]; then
     CARGO_CMD="${CARGO_CMD} ${FEATURES}"
 fi
@@ -74,6 +79,18 @@ if [[ ! -f "$WASM_FILE" ]]; then
 fi
 
 # Step 2: wasm-bindgen
+# The wasm-bindgen CLI must be schema-compatible with the wasm-bindgen *crate*
+# pinned in Cargo.lock, or the CLI fails with a cryptic "schema version mismatch".
+# Compatibility tracks major.minor (patch drift is fine), so check that up front
+# and print the exact install command instead of leaving a confusing failure.
+CRATE_WB_VERSION=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[" ]/,"",$3); print $3; exit}' Cargo.lock)
+CLI_WB_VERSION=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')
+if [[ -n "$CRATE_WB_VERSION" && -n "$CLI_WB_VERSION" \
+      && "$(echo "$CRATE_WB_VERSION" | cut -d. -f1,2)" != "$(echo "$CLI_WB_VERSION" | cut -d. -f1,2)" ]]; then
+    echo "Error: wasm-bindgen CLI ${CLI_WB_VERSION} is incompatible with the crate ${CRATE_WB_VERSION} (Cargo.lock)." >&2
+    echo "  Install a matching CLI:  cargo install -f wasm-bindgen-cli --version ${CRATE_WB_VERSION}" >&2
+    exit 1
+fi
 echo "  wasm-bindgen..."
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -136,16 +153,18 @@ echo "  Raw:    $(( RAW_SIZE / 1024 )) KB"
 echo "  Gzip:   $(( GZ_SIZE / 1024 )) KB"
 
 # Size thresholds (gzipped bytes) depend on feature set.
-# Default (browser profile, GQL + regex-lite): competitive with sql.js (~600 KB).
+# Default (edge profile: lpg + gql + compact-store + regex-lite): the
+# cold-tier columnar store (compact-store) is part of this profile, so the budget
+# is the documented 826 KiB gzip ceiling (see crates/bindings/wasm/Cargo.toml).
 # Full profile (all languages + AI): larger binary, ~1.2 MB gzipped.
 if [[ "$FEATURES" == *"full"* ]]; then
     WARN_THRESHOLD=1258291   # 1.2 MB
     FAIL_THRESHOLD=1468006   # 1.4 MB
     LABEL="full profile"
 else
-    WARN_THRESHOLD=696320    # 680 KB
-    FAIL_THRESHOLD=737280    # 720 KB
-    LABEL="browser profile"
+    WARN_THRESHOLD=819200    # 800 KB
+    FAIL_THRESHOLD=845824    # 826 KiB (documented gzip budget; includes compact-store)
+    LABEL="edge profile"
 fi
 
 if [[ "$GZ_SIZE" -gt "$FAIL_THRESHOLD" ]]; then

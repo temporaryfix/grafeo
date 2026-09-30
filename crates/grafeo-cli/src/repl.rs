@@ -120,7 +120,7 @@ pub fn run(
         }
         if upper == "COMMIT" {
             match session.commit() {
-                Ok(()) => {
+                Ok(_) => {
                     settings.state = ReplState::Idle;
                     if !settings.quiet {
                         println!("Transaction committed.");
@@ -379,7 +379,7 @@ fn handle_meta_command(
         }
         ":commit" => {
             match session.commit() {
-                Ok(()) => {
+                Ok(_) => {
                     *state = ReplState::Idle;
                     if !quiet {
                         println!("Transaction committed.");

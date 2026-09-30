@@ -99,8 +99,10 @@ mod tests {
         let db = grafeo_engine::GrafeoDB::open(dir).expect("create db");
         let n1 = db.create_node(&["Person"]);
         let n2 = db.create_node(&["Company"]);
-        db.set_node_property(n1, "name", grafeo_common::types::Value::from("Alix"));
-        db.set_node_property(n2, "name", grafeo_common::types::Value::from("Acme"));
+        db.set_node_property(n1, "name", grafeo_common::types::Value::from("Alix"))
+            .expect("set node property");
+        db.set_node_property(n2, "name", grafeo_common::types::Value::from("Acme"))
+            .expect("set node property");
         db.create_edge(n1, n2, "WORKS_AT");
         db.close().expect("close db");
     }

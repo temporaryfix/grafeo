@@ -43,26 +43,39 @@ if (-not (Run-Check "Format" "cargo fmt --all -- --check")) {
 }
 
 # 2. Clippy
-if (-not (Run-Check "Clippy" "cargo clippy --all-targets --all-features -- -D warnings")) {
+if (-not (Run-Check "Clippy" "cargo clippy --locked --all-targets --all-features -- -D warnings")) {
     $failures += "Clippy"
 }
 
 # 3. Documentation
 Remove-Item -Recurse -Force target\doc -ErrorAction SilentlyContinue
 $env:RUSTDOCFLAGS = "-D warnings"
-if (-not (Run-Check "Docs" "cargo doc --no-deps --all-features")) {
+if (-not (Run-Check "Docs" "cargo doc --locked --no-deps --all-features")) {
     $failures += "Docs"
 }
 Remove-Item Env:\RUSTDOCFLAGS -ErrorAction SilentlyContinue
 
 # 4. Rust tests
-if (-not (Run-Check "Rust Tests" "cargo test --all-features --workspace")) {
+if (-not (Run-Check "Rust Tests" "cargo test --locked --all-features --workspace")) {
     $failures += "Rust Tests"
+}
+
+# Exact RDF resource/semantic gate (Rust 1.97.1, matching CI qualification).
+$rdfExactSpillChecks = @(
+    @("RDF Exact Spill (minimal resident)", "cargo +1.97.1 test --locked -p grafeo-engine --no-default-features --features triple-store,sparql --test rdf_exact_spill -- --test-threads=1"),
+    @("RDF Exact Spill (spill)", "cargo +1.97.1 test --locked -p grafeo-engine --no-default-features --features triple-store,sparql,spill --test rdf_exact_spill -- --test-threads=1"),
+    @("RDF Exact Spill (encrypted)", "cargo +1.97.1 test --locked -p grafeo-engine --no-default-features --features triple-store,sparql,spill,encryption,wal,grafeo-file --test rdf_exact_spill -- --test-threads=1"),
+    @("RDF Exact Spill (all features)", "cargo +1.97.1 test --locked -p grafeo-engine --all-features --test rdf_exact_spill -- --test-threads=1")
+)
+foreach ($check in $rdfExactSpillChecks) {
+    if (-not (Run-Check $check[0] $check[1])) {
+        $failures += $check[0]
+    }
 }
 
 # 5. Rust tests (release) - skip in quick mode
 if (-not $Quick) {
-    if (-not (Run-Check "Rust Tests (Release)" "cargo test --all-features --workspace --release")) {
+    if (-not (Run-Check "Rust Tests (Release)" "cargo test --locked --all-features --workspace --release")) {
         $failures += "Rust Tests (Release)"
     }
 }
@@ -74,7 +87,7 @@ if (Test-Path ".venv") {
     # Rebuild Python package
     Write-Host "`n[Python Build] Rebuilding..." -ForegroundColor Yellow
     Push-Location "crates\bindings\python"
-    & maturin develop --features pyo3/extension-module,full 2>$null
+    & maturin develop --locked --features pyo3/extension-module,full 2>$null
     Pop-Location
 
     # Install test deps if needed

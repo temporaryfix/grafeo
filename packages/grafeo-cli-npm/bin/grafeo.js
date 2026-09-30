@@ -36,7 +36,7 @@ function findBinary() {
     process.exit(1);
   }
 
-  // 1. Try platform-specific optional dependency
+  // Only the matching package owns this launcher's native executable.
   try {
     const pkgDir = require.resolve(`${entry.pkg}/package.json`);
     const binPath = join(pkgDir, "..", entry.bin);
@@ -47,20 +47,17 @@ function findBinary() {
     // Package not installed (optional dependency)
   }
 
-  // 2. Try binary adjacent to this package (development installs)
-  const adjacent = join(__dirname, "..", entry.bin);
-  if (existsSync(adjacent)) {
-    return adjacent;
-  }
-
-  // 3. Fall back to system PATH
-  return entry.bin;
+  console.error(
+    `error: native package ${entry.pkg} is missing or incomplete.\n` +
+      "Reinstall @grafeo-db/cli with optional dependencies enabled."
+  );
+  process.exit(1);
 }
 
 const binary = findBinary();
 
 try {
-  const result = execFileSync(binary, process.argv.slice(2), {
+  execFileSync(binary, process.argv.slice(2), {
     stdio: "inherit",
     windowsHide: true,
   });

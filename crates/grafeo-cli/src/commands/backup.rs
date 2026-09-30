@@ -1,7 +1,5 @@
 //! Backup management commands.
 
-use std::fs;
-
 use anyhow::{Context, Result};
 use grafeo_engine::GrafeoDB;
 
@@ -20,25 +18,12 @@ pub fn run(cmd: BackupCommands, _format: OutputFormat, quiet: bool) -> Result<()
 
             output::success(&format!("Backup created at {}", out.display()), quiet);
         }
-        BackupCommands::Restore {
-            backup,
-            path,
-            force,
-        } => {
-            if path.exists() && !force {
+        BackupCommands::Restore { backup, path } => {
+            if path.exists() {
                 anyhow::bail!(
-                    "Target path {} already exists. Use --force to overwrite.",
+                    "Target path {} already exists. Choose a new destination for native restore.",
                     path.display()
                 );
-            }
-
-            if path.exists() && force {
-                output::status(
-                    &format!("Removing existing database at {}...", path.display()),
-                    quiet,
-                );
-                fs::remove_dir_all(&path)
-                    .with_context(|| format!("Failed to remove {}", path.display()))?;
             }
 
             output::status(&format!("Restoring from {}...", backup.display()), quiet);

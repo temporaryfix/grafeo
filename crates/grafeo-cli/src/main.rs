@@ -235,10 +235,6 @@ enum BackupCommands {
 
         /// Target database path
         path: PathBuf,
-
-        /// Overwrite if exists
-        #[arg(long)]
-        force: bool,
     },
 
     /// Create a full backup of the database

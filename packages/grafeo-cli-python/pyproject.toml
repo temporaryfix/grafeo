@@ -1,13 +1,14 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "grafeo-cli"
-version = "0.5.42"
+version = "0.0.1"
 description = "Command-line interface for Grafeo graph database"
 readme = "README.md"
-license = { text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [
     { name = "S.T. Grond" }
@@ -17,7 +18,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Rust",
     "Topic :: Database",
@@ -39,3 +39,13 @@ artifacts = ["grafeo_cli/grafeo", "grafeo_cli/grafeo.exe"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["grafeo_cli"]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["grafeo_cli/*.py", "hatch_build.py", "pyproject.toml", "README.md", "LICENSE"]
+exclude = ["grafeo_cli/grafeo", "grafeo_cli/grafeo.exe"]
+
+[tool.hatch.build.targets.sdist.force-include]
+rust = "rust"

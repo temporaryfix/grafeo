@@ -621,6 +621,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jsonl-import")]
     fn import_jsonl_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let jsonl_path = dir.path().join("people.jsonl");
@@ -640,6 +641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jsonl-import")]
     fn import_jsonl_empty_file_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let jsonl_path = dir.path().join("empty.jsonl");

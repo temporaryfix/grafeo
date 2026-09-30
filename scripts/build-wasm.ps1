@@ -23,11 +23,14 @@ $ErrorActionPreference = "Stop"
 $CrateDir = "crates\bindings\wasm"
 if (-not $OutDir) { $OutDir = "$CrateDir\pkg" }
 $Profile = if ($Release) { "release" } else { "minimal-size" }
+if ($Scope -and $Name -eq "@grafeo-db/wasm") {
+    $Name = "@$($Scope.TrimStart('@'))/wasm"
+}
 
 Write-Host "Building WASM (profile: $Profile, target: $Target)"
 
 # Step 1: Cargo build
-$cargoArgs = @("build", "--target", "wasm32-unknown-unknown", "--profile", $Profile, "-p", "grafeo-wasm")
+$cargoArgs = @("build", "--locked", "--target", "wasm32-unknown-unknown", "--profile", $Profile, "-p", "grafeo-wasm")
 if ($Features) {
     $cargoArgs += "--features"
     $cargoArgs += $Features
@@ -109,7 +112,7 @@ Write-Host "  Raw:    $([math]::Round($rawSize / 1024)) KB"
 Write-Host "  Gzip:   $([math]::Round($gzSize / 1024)) KB"
 
 # Size thresholds (gzipped bytes)
-# 660 KB = 675840 bytes: warning threshold for browser profile
+# 660 KB = 675840 bytes: warning threshold for edge profile
 # Binary is ~95% essential application code (parser, planner, executor),
 # competitive with sql.js (~600 KB). Profiled with twiggy in 0.5.39.
 $warnThreshold = 675840

@@ -11,12 +11,17 @@ uv add grafeo-cli
 # or: pip install grafeo-cli
 ```
 
-The package looks for the `grafeo` binary in this order:
-1. Bundled with the wheel (platform-specific wheels)
-2. In the virtualenv `bin/` or `Scripts/` directory
-3. On your system `PATH`
+The launcher requires the `grafeo` executable bundled with its platform-specific
+wheel. If it is missing, reinstall the wheel for your platform.
 
-If no binary is found, install it separately:
+The source distribution includes the Rust workspace and compiles the executable
+during installation. Building from source requires Rust 1.91.1 or newer, Cargo,
+a native C/C++ toolchain and enough temporary disk space for a release build.
+Cargo uses the included lockfile; dependencies must be available locally or
+downloadable. The resulting wheel bundles the executable, and temporary native
+build outputs are removed afterward.
+
+You can also install and run the native CLI directly:
 
 ```bash
 # Via cargo

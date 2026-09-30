@@ -46,7 +46,7 @@ function Build-NativeLib {
     if ($script:builtNative) { return $true }
     Write-Header "Building grafeo-c (release, full features)"
     Push-Location $root
-    cargo build --release -p grafeo-c --features full
+    cargo build --locked --release -p grafeo-c --features full
     $ok = $LASTEXITCODE -eq 0
     Pop-Location
     if ($ok) { $script:builtNative = $true }
@@ -57,7 +57,7 @@ function Build-NativeLib {
 if (Should-Run "rust") {
     Write-Header "Rust Spec Tests"
     Push-Location $root
-    cargo test -p grafeo-spec-tests --all-features 2>&1 | Tee-Object -Variable rustOut
+    cargo test --locked -p grafeo-spec-tests --all-features 2>&1 | Tee-Object -Variable rustOut
     if ($LASTEXITCODE -eq 0) { $passed += "rust" } else { $failures += "rust" }
     Pop-Location
 }
@@ -66,7 +66,7 @@ if (Should-Run "rust") {
 if (Should-Run "python") {
     Write-Header "Python Spec Tests"
     Push-Location "$root\crates\bindings\python"
-    maturin develop --release --features pyo3/extension-module 2>&1 | Out-Null
+    maturin develop --locked --release --features pyo3/extension-module 2>&1 | Out-Null
     Pop-Location
     if ($LASTEXITCODE -eq 0) {
         Push-Location $root

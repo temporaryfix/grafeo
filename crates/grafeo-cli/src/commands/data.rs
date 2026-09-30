@@ -72,7 +72,12 @@ pub fn run(cmd: DataCommands, _format: OutputFormat, quiet: bool) -> Result<()> 
                             for (key, val) in props {
                                 let value: Value =
                                     serde_json::from_value(val.clone()).unwrap_or(Value::Null);
-                                db.set_node_property(id, key, value);
+                                db.set_node_property(id, key, value).with_context(|| {
+                                    format!(
+                                        "Failed to set node property '{key}' on line {}",
+                                        line_num + 1
+                                    )
+                                })?;
                             }
                         }
                         node_count += 1;
@@ -105,7 +110,12 @@ pub fn run(cmd: DataCommands, _format: OutputFormat, quiet: bool) -> Result<()> 
                             for (key, val) in props {
                                 let value: Value =
                                     serde_json::from_value(val.clone()).unwrap_or(Value::Null);
-                                db.set_edge_property(id, key, value);
+                                db.set_edge_property(id, key, value).with_context(|| {
+                                    format!(
+                                        "Failed to set edge property '{key}' on line {}",
+                                        line_num + 1
+                                    )
+                                })?;
                             }
                         }
                         edge_count += 1;
@@ -393,11 +403,15 @@ mod tests {
         let db = grafeo_engine::GrafeoDB::open(dir).expect("create db");
         let n1 = db.create_node(&["Person"]);
         let n2 = db.create_node(&["Company"]);
-        db.set_node_property(n1, "name", Value::from("Alix"));
-        db.set_node_property(n1, "age", Value::Int64(30));
-        db.set_node_property(n2, "name", Value::from("Acme"));
+        db.set_node_property(n1, "name", Value::from("Alix"))
+            .expect("set node property");
+        db.set_node_property(n1, "age", Value::Int64(30))
+            .expect("set node property");
+        db.set_node_property(n2, "name", Value::from("Acme"))
+            .expect("set node property");
         let e = db.create_edge(n1, n2, "WORKS_AT");
-        db.set_edge_property(e, "since", Value::Int64(2020));
+        db.set_edge_property(e, "since", Value::Int64(2020))
+            .expect("set edge property");
         db
     }
 
@@ -948,6 +962,41 @@ mod tests {
     }
 
     #[test]
+    fn test_load_rejected_edge_property_reports_error() {
+        let temp = TempDir::new().unwrap();
+        let input_path = temp.path().join("missing_edge.jsonl");
+        let db_path = temp.path().join("target.grafeo");
+        std::fs::write(
+            &input_path,
+            r#"{"type":"edge","source":0,"target":1,"edge_type":"KNOWS","properties":{"since":1994}}"#,
+        )
+        .unwrap();
+
+        let error = run(
+            DataCommands::Load {
+                input: input_path,
+                path: db_path.clone(),
+            },
+            OutputFormat::Json,
+            true,
+        )
+        .expect_err("a rejected property write must not report a successful load");
+        assert!(
+            error
+                .to_string()
+                .contains("edge property 'since' on line 1")
+        );
+        assert!(matches!(
+            error.downcast_ref::<grafeo_common::utils::error::Error>(),
+            Some(grafeo_common::utils::error::Error::EdgeNotFound(_))
+        ));
+
+        let db = grafeo_engine::GrafeoDB::open(&db_path).unwrap();
+        assert_eq!(db.node_count(), 0);
+        assert_eq!(db.edge_count(), 0);
+    }
+
+    #[test]
     fn test_load_node_with_null_property_value() {
         let temp = TempDir::new().unwrap();
         let input_path = temp.path().join("null_prop.jsonl");
@@ -1172,11 +1221,15 @@ this is not json\n";
             let db = grafeo_engine::GrafeoDB::open(&db_path).expect("create db");
             let n1 = db.create_node(&["Person"]);
             let n2 = db.create_node(&["Person"]);
-            db.set_node_property(n1, "name", Value::from("Django"));
-            db.set_node_property(n2, "name", Value::from("Shosanna"));
+            db.set_node_property(n1, "name", Value::from("Django"))
+                .expect("set node property");
+            db.set_node_property(n2, "name", Value::from("Shosanna"))
+                .expect("set node property");
             let edge = db.create_edge(n1, n2, "FRIENDS_WITH");
-            db.set_edge_property(edge, "year", Value::Int64(2012));
-            db.set_edge_property(edge, "strong", Value::Bool(true));
+            db.set_edge_property(edge, "year", Value::Int64(2012))
+                .expect("set edge property");
+            db.set_edge_property(edge, "strong", Value::Bool(true))
+                .expect("set edge property");
         }
 
         run(
@@ -1216,9 +1269,12 @@ this is not json\n";
         {
             let db = grafeo_engine::GrafeoDB::open(&db_path).expect("create db");
             let node = db.create_node(&["City"]);
-            db.set_node_property(node, "name", Value::from("Amsterdam"));
-            db.set_node_property(node, "population", Value::Int64(905_234));
-            db.set_node_property(node, "capital", Value::Bool(true));
+            db.set_node_property(node, "name", Value::from("Amsterdam"))
+                .expect("set node property");
+            db.set_node_property(node, "population", Value::Int64(905_234))
+                .expect("set node property");
+            db.set_node_property(node, "capital", Value::Bool(true))
+                .expect("set node property");
         }
 
         run(
@@ -1255,15 +1311,21 @@ this is not json\n";
             let hans = db.create_node(&["Person"]);
             let beatrix = db.create_node(&["Person"]);
             let paris = db.create_node(&["City"]);
-            db.set_node_property(hans, "name", Value::from("Hans"));
-            db.set_node_property(beatrix, "name", Value::from("Beatrix"));
-            db.set_node_property(paris, "name", Value::from("Paris"));
-            db.set_node_property(paris, "country", Value::from("France"));
+            db.set_node_property(hans, "name", Value::from("Hans"))
+                .expect("set node property");
+            db.set_node_property(beatrix, "name", Value::from("Beatrix"))
+                .expect("set node property");
+            db.set_node_property(paris, "name", Value::from("Paris"))
+                .expect("set node property");
+            db.set_node_property(paris, "country", Value::from("France"))
+                .expect("set node property");
 
             let edge1 = db.create_edge(hans, paris, "LIVES_IN");
-            db.set_edge_property(edge1, "since", Value::Int64(2015));
+            db.set_edge_property(edge1, "since", Value::Int64(2015))
+                .expect("set edge property");
             let edge2 = db.create_edge(beatrix, paris, "VISITED");
-            db.set_edge_property(edge2, "year", Value::Int64(2023));
+            db.set_edge_property(edge2, "year", Value::Int64(2023))
+                .expect("set edge property");
         }
 
         // Dump

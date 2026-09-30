@@ -51,7 +51,6 @@ gremlin = ["grafeo-engine/gremlin"]
 graphql = ["grafeo-engine/graphql"]
 sql-pgq = ["grafeo-engine/sql-pgq"]
 triple-store = ["grafeo-engine/triple-store"]
-rdf = ["triple-store"]  # Deprecated: use triple-store
 algos = ["grafeo-engine/algos"]
 vector-index = ["grafeo-engine/vector-index"]
 text-index = ["grafeo-engine/text-index"]

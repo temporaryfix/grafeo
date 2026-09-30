@@ -23,7 +23,7 @@ pub fn run(cmd: WalCommands, format: OutputFormat, quiet: bool) -> Result<()> {
     match cmd {
         WalCommands::Status { path } => {
             let db = super::open_existing(&path)?;
-            let status = db.wal_status();
+            let status = db.wal_status()?;
 
             let output = WalStatusOutput {
                 enabled: status.enabled,
