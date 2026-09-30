@@ -46,7 +46,14 @@
 //!     // Trigger spilling for spillable operators
 //! }
 //! ```
+//!
+//! The former tiered-store trait is unavailable:
+//!
+//! ```compile_fail,E0432
+//! use grafeo_common::memory::buffer::TieredStore;
+//! ```
 
+mod accounted_error;
 mod consumer;
 mod grant;
 mod manager;
@@ -54,11 +61,22 @@ mod region;
 mod stats;
 mod tiered;
 
+#[cfg(test)]
+mod accounted_error_tests;
+
+pub use accounted_error::{
+    AccountedError, AccountedErrorPublisher, AccountedErrorPublisherBuildError,
+    AccountedErrorPublisherBuildFailure,
+};
 pub use consumer::{ConsumerStats, MemoryConsumer, SpillError, priorities};
-pub use grant::{CompositeGrant, GrantReleaser, MemoryGrant};
-pub use manager::{BufferManager, BufferManagerConfig};
+pub use grant::{
+    CompositeGrant, DetachedCompositeGrant, DetachedMemoryGrant, MemoryGrant, MemoryGrantError,
+    MemoryLimitScope,
+};
+pub use manager::{
+    BufferManager, BufferManagerConfig, ConsumerRegistration, ConsumerRegistrationCloseError,
+    ConsumerRegistrationError, ConsumerRegistrationId, QueryMemoryPool,
+};
 pub use region::MemoryRegion;
 pub use stats::{BufferStats, PressureLevel};
 pub use tiered::StorageTier;
-#[allow(deprecated)]
-pub use tiered::TieredStore;

@@ -79,6 +79,18 @@ impl FactorizationLevel {
         }
     }
 
+    /// Multiplicity spine only — used when `project` drops a level's columns
+    /// but a deeper level is still selected (path count must stay correct).
+    #[must_use]
+    pub fn structure_only(src: &Self) -> Self {
+        Self {
+            columns: Vec::new(),
+            column_names: Vec::new(),
+            group_count: src.group_count,
+            multiplicities: src.multiplicities.clone(),
+        }
+    }
+
     /// Creates a new unflat level with the given multiplicities.
     ///
     /// Note: `multiplicities[i]` is the number of values for parent i.
@@ -118,6 +130,20 @@ impl FactorizationLevel {
             .iter()
             .map(FactorizedVector::physical_len)
             .sum()
+    }
+
+    /// Physical `[start, end)` of children of `parent_idx`.
+    ///
+    /// Uses the first column's offsets when present; structure-only levels
+    /// reconstruct the range from multiplicities.
+    #[must_use]
+    pub fn range_for_parent(&self, parent_idx: usize) -> (usize, usize) {
+        if let Some(col) = self.columns.first() {
+            return col.range_for_parent(parent_idx);
+        }
+        let start: usize = self.multiplicities.iter().take(parent_idx).sum();
+        let len = self.multiplicities.get(parent_idx).copied().unwrap_or(0);
+        (start, start + len)
     }
 
     /// Returns the multiplicities for this level.
@@ -399,6 +425,13 @@ impl FactorizedChunk {
 
         // Iterate through all logical rows
         for indices in row_iter {
+            if let Some(sel) = self.state.selection() {
+                let deepest = self.levels.len() - 1;
+                let phys = indices.get(deepest).copied().unwrap_or(0);
+                if !sel.is_selected(deepest, phys) {
+                    continue;
+                }
+            }
             let mut col_offset = 0;
             for (level_idx, level) in self.levels.iter().enumerate() {
                 let level_idx_value = indices.get(level_idx).copied().unwrap_or(0);
@@ -934,15 +967,20 @@ impl FactorizedChunk {
             }
         }
 
-        // Build new levels with projected columns
+        // Build new levels with projected columns. Keep ancestor levels with
+        // no selected columns so flatten still emits one row per path.
+        let max_selected = level_specs.iter().rposition(|s| !s.is_empty());
         let mut new_levels = Vec::new();
 
         for (level_idx, specs) in level_specs.iter().enumerate() {
+            if max_selected.is_none_or(|max| level_idx > max) {
+                break;
+            }
+            let src_level = &self.levels[level_idx];
             if specs.is_empty() {
+                new_levels.push(FactorizationLevel::structure_only(src_level));
                 continue;
             }
-
-            let src_level = &self.levels[level_idx];
 
             let columns: Vec<FactorizedVector> = specs
                 .iter()
@@ -1042,12 +1080,7 @@ impl<'a> FactorizedRowIterator<'a> {
             let (_start, end) = if level_idx == 0 {
                 (0, level.group_count)
             } else {
-                // For unflat levels, get range from parent
-                if let Some(col) = level.columns.first() {
-                    col.range_for_parent(parent_idx)
-                } else {
-                    (0, 0)
-                }
+                level.range_for_parent(parent_idx)
             };
 
             let current = self.indices[level_idx];
@@ -1056,11 +1089,9 @@ impl<'a> FactorizedRowIterator<'a> {
                 self.indices[level_idx] = current + 1;
                 // Reset all deeper levels to their start positions
                 for deeper_idx in (level_idx + 1)..self.chunk.levels.len() {
-                    if let Some(deeper_col) = self.chunk.levels[deeper_idx].columns.first() {
-                        let (deeper_start, _) =
-                            deeper_col.range_for_parent(self.indices[deeper_idx - 1]);
-                        self.indices[deeper_idx] = deeper_start;
-                    }
+                    let (deeper_start, _) = self.chunk.levels[deeper_idx]
+                        .range_for_parent(self.indices[deeper_idx - 1]);
+                    self.indices[deeper_idx] = deeper_start;
                 }
 
                 // Check if the deepest level has valid range - if any parent has 0 children,
@@ -1093,12 +1124,8 @@ impl<'a> FactorizedRowIterator<'a> {
         // Check every unflat level (1..len) has a non-empty range for its parent
         for level_idx in 1..self.chunk.levels.len() {
             let parent_idx = self.indices[level_idx - 1];
-            if let Some(col) = self.chunk.levels[level_idx].columns.first() {
-                let (start, end) = col.range_for_parent(parent_idx);
-                if start >= end {
-                    return false;
-                }
-            } else {
+            let (start, end) = self.chunk.levels[level_idx].range_for_parent(parent_idx);
+            if start >= end {
                 return false;
             }
         }
@@ -1884,5 +1911,15 @@ mod tests {
 
         let level1 = chunk.level(1).unwrap();
         assert_eq!(level1.column_names(), &["nbr"]);
+    }
+
+    #[test]
+    fn project_deepest_keeps_logical_row_count() {
+        let chunk = create_multi_level_chunk();
+        assert_eq!(chunk.logical_row_count(), 4);
+        let projected = chunk.project(&[(1, 0, "nbr".into())]);
+        assert_eq!(projected.logical_row_count(), 4);
+        assert_eq!(projected.flatten().row_count(), 4);
+        assert_eq!(projected.flatten().column_count(), 1);
     }
 }

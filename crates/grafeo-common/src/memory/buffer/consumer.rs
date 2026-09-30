@@ -1,8 +1,41 @@
 //! Memory consumer trait for subsystems that use managed memory.
 
+use std::cell::Cell;
 use thiserror::Error;
 
 use super::region::MemoryRegion;
+
+thread_local! {
+    static IN_MEMORY_CONSUMER_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Non-allocating, nesting-safe marker around calls into user consumer code.
+pub(super) struct MemoryConsumerCallbackContext {
+    previous: Option<bool>,
+}
+
+impl MemoryConsumerCallbackContext {
+    pub(super) fn enter() -> Self {
+        let previous = IN_MEMORY_CONSUMER_CALLBACK
+            .try_with(|active| active.replace(true))
+            .ok();
+        Self { previous }
+    }
+}
+
+impl Drop for MemoryConsumerCallbackContext {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            let _ = IN_MEMORY_CONSUMER_CALLBACK.try_with(|active| active.set(previous));
+        }
+    }
+}
+
+pub(super) fn in_memory_consumer_callback() -> bool {
+    IN_MEMORY_CONSUMER_CALLBACK
+        .try_with(Cell::get)
+        .unwrap_or(true)
+}
 
 /// Error type for spilling operations.
 #[derive(Error, Debug, Clone)]
@@ -28,7 +61,10 @@ pub enum SpillError {
 /// in eviction when memory pressure is detected. Lower priority consumers
 /// are evicted first.
 pub trait MemoryConsumer: Send + Sync {
-    /// Returns a unique name for this consumer (for debugging/logging).
+    /// Returns a stable diagnostic name for this consumer.
+    ///
+    /// Multiple registrations may deliberately share a name. Scoped
+    /// registration identity, rather than this label, determines ownership.
     fn name(&self) -> &str;
 
     /// Returns current memory usage in bytes.
@@ -133,6 +169,7 @@ pub struct ConsumerStats {
 impl ConsumerStats {
     /// Creates stats from a consumer.
     pub fn from_consumer(consumer: &dyn MemoryConsumer) -> Self {
+        let _callback_context = MemoryConsumerCallbackContext::enter();
         Self {
             name: consumer.name().to_string(),
             region: consumer.region(),

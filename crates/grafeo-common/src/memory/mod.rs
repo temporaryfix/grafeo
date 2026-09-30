@@ -9,6 +9,12 @@
 //! | [`bump`] | Temporary data within a query | Must reset to free anything |
 //! | [`pool`] | Frequently reused objects | Fixed-size objects only |
 //! | [`buffer`] | Large data, memory pressure | More complex API |
+//!
+//! The former tiered-store trait is unavailable:
+//!
+//! ```compile_fail,E0432
+//! use grafeo_common::memory::TieredStore;
+//! ```
 
 pub mod arena;
 pub mod buffer;
@@ -18,11 +24,10 @@ pub mod reporter;
 pub mod usage;
 
 pub use arena::{AllocError, Arena, ArenaAllocator};
-#[allow(deprecated)]
-pub use buffer::TieredStore;
 pub use buffer::{
-    BufferManager, BufferManagerConfig, BufferStats, MemoryConsumer, MemoryGrant, MemoryRegion,
-    PressureLevel, StorageTier,
+    AccountedError, AccountedErrorPublisher, AccountedErrorPublisherBuildError,
+    AccountedErrorPublisherBuildFailure, BufferManager, BufferManagerConfig, BufferStats,
+    MemoryConsumer, MemoryGrant, MemoryRegion, PressureLevel, StorageTier,
 };
 pub use bump::BumpAllocator;
 pub use pool::ObjectPool;

@@ -4,7 +4,7 @@
 //! batches (typically 1024-2048 rows) lets the CPU stay busy and enables SIMD.
 
 use super::selection::SelectionVector;
-use super::vector::ValueVector;
+use super::vector::{ResidentCapacityError, ValueVector};
 use crate::index::ZoneMapEntry;
 use grafeo_common::types::LogicalType;
 use grafeo_common::utils::hash::FxHashMap;
@@ -157,6 +157,72 @@ impl DataChunk {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Returns the checked direct backing capacity of the columnar payload.
+    ///
+    /// The result includes the outer `Vec<ValueVector>`, each column's data
+    /// backing, and each column's optional validity bitmap. Selection vectors,
+    /// zone-map hints, and payloads shared through `Arc` are intentionally
+    /// outside this column-storage measurement. Sort output chunks have no
+    /// selection or zone hints, so this is the complete direct allocation
+    /// created by their row-to-column conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResidentCapacityError::ArithmeticOverflow`] if an observed
+    /// capacity cannot be represented as bytes.
+    pub fn observed_column_capacity_bytes(&self) -> Result<usize, ResidentCapacityError> {
+        let mut bytes = self
+            .columns
+            .capacity()
+            .checked_mul(std::mem::size_of::<ValueVector>())
+            .ok_or(ResidentCapacityError::ArithmeticOverflow {
+                container: "data chunk columns",
+            })?;
+        for column in &self.columns {
+            bytes = bytes.checked_add(column.observed_capacity_bytes()?).ok_or(
+                ResidentCapacityError::ArithmeticOverflow {
+                    container: "data chunk column storage",
+                },
+            )?;
+        }
+        Ok(bytes)
+    }
+
+    /// Bounds all retained storage carried across the public output boundary.
+    ///
+    /// Counts complete column capacity, physical pointees, schema and selection
+    /// capacity. Shared payloads may be charged multiple times conservatively.
+    /// Zone hints are execution metadata and must be cleared before admission.
+    /// This is a retained-output measurement, not sealed operator provenance or
+    /// proof that upstream construction was admitted before allocation.
+    ///
+    /// # Errors
+    /// Returns an arithmetic error when a complete bound cannot be represented,
+    /// including excessive schema/value nesting or retained zone hints.
+    pub fn output_retained_bytes(&self) -> Result<usize, ResidentCapacityError> {
+        if self.zone_hints.is_some() {
+            return Err(ResidentCapacityError::ArithmeticOverflow {
+                container: "output zone hints must be cleared before admission",
+            });
+        }
+        let measure = || {
+            let mut bytes = self
+                .columns
+                .capacity()
+                .checked_mul(std::mem::size_of::<ValueVector>())?;
+            for column in &self.columns {
+                bytes = bytes.checked_add(column.output_retained_bytes().ok()?)?;
+            }
+            if let Some(selection) = &self.selection {
+                bytes = bytes.checked_add(selection.output_retained_bytes()?)?;
+            }
+            Some(bytes)
+        };
+        measure().ok_or(ResidentCapacityError::ArithmeticOverflow {
+            container: "complete output chunk storage",
+        })
     }
 
     /// Returns true if the chunk is full.
@@ -363,7 +429,19 @@ impl DataChunk {
         let mut result_columns = Vec::with_capacity(num_columns);
 
         for col_idx in 0..num_columns {
-            let mut concat_vector = ValueVector::new();
+            // A single chunk can retain only a uniform column type. Intermediate
+            // pipelines keep heterogeneous schema runs separate instead.
+            let first_type = chunks[0].columns[col_idx].data_type();
+            let data_type = if chunks.iter().all(|chunk| {
+                chunk
+                    .column(col_idx)
+                    .is_some_and(|col| col.data_type() == first_type)
+            }) {
+                first_type.clone()
+            } else {
+                LogicalType::Any
+            };
+            let mut concat_vector = ValueVector::with_capacity(data_type, total_rows);
 
             for chunk in chunks {
                 if let Some(col) = chunk.column(col_idx) {
@@ -399,7 +477,7 @@ impl DataChunk {
         let mut result_columns = Vec::with_capacity(self.columns.len());
 
         for col in &self.columns {
-            let mut new_col = ValueVector::new();
+            let mut new_col = ValueVector::with_capacity(col.data_type().clone(), selected.len());
             for &idx in &selected {
                 if let Some(val) = col.get(idx) {
                     new_col.push(val);
@@ -430,7 +508,7 @@ impl DataChunk {
         let mut result_columns = Vec::with_capacity(self.columns.len());
 
         for col in &self.columns {
-            let mut new_col = ValueVector::new();
+            let mut new_col = ValueVector::with_capacity(col.data_type().clone(), actual_count);
             for i in offset..(offset + actual_count) {
                 let actual_idx = if let Some(sel) = &self.selection {
                     sel.get(i).unwrap_or(i)
@@ -540,6 +618,52 @@ mod tests {
     use grafeo_common::types::Value;
 
     #[test]
+    fn output_storage_counts_unselected_payloads_and_spare_selection_capacity() {
+        let mut columns = Vec::with_capacity(8);
+        let mut values = ValueVector::with_capacity(LogicalType::String, 16);
+        values.push_value(Value::from("retained".repeat(1024)));
+        columns.push(values);
+        let mut chunk = DataChunk::new(columns);
+        let before = chunk.output_retained_bytes().unwrap();
+        assert!(before >= 8 * std::mem::size_of::<ValueVector>() + 8192);
+        let selection = SelectionVector::with_capacity(4096);
+        let selection_bytes = selection.output_retained_bytes().unwrap();
+        chunk.set_selection(selection);
+        assert_eq!(chunk.row_count(), 0);
+        assert_eq!(
+            chunk.output_retained_bytes().unwrap(),
+            before + selection_bytes
+        );
+        chunk.set_zone_hints(ChunkZoneHints::default());
+        assert!(chunk.output_retained_bytes().is_err());
+        chunk.clear_zone_hints();
+        assert_eq!(
+            chunk.output_retained_bytes().unwrap(),
+            before + selection_bytes
+        );
+    }
+
+    #[test]
+    fn observed_column_capacity_counts_outer_and_vector_backings() {
+        let mut columns = Vec::new();
+        columns.try_reserve_exact(2).unwrap();
+        columns.push(ValueVector::try_with_capacity(LogicalType::Any, 3).unwrap());
+        columns.push(ValueVector::try_with_capacity(LogicalType::Int64, 3).unwrap());
+        let expected = columns
+            .capacity()
+            .checked_mul(std::mem::size_of::<ValueVector>())
+            .unwrap()
+            .checked_add(columns[0].observed_capacity_bytes().unwrap())
+            .unwrap()
+            .checked_add(columns[1].observed_capacity_bytes().unwrap())
+            .unwrap();
+
+        let chunk = DataChunk::new(columns);
+
+        assert_eq!(chunk.observed_column_capacity_bytes().unwrap(), expected);
+    }
+
+    #[test]
     fn test_chunk_creation() {
         let schema = [LogicalType::Int64, LogicalType::String];
         let chunk = DataChunk::with_schema(&schema);
@@ -590,6 +714,70 @@ mod tests {
 
         assert_eq!(chunk.row_count(), 5); // 0, 2, 4, 6, 8
         assert_eq!(chunk.total_row_count(), 10);
+    }
+
+    #[test]
+    fn selected_filter_and_slice_preserve_edge_list_provenance() {
+        let edge_list = LogicalType::List(Box::new(LogicalType::Edge));
+        let mut builder = DataChunkBuilder::new(&[edge_list.clone(), LogicalType::Int64]);
+        for id in 0..5 {
+            builder
+                .column_mut(0)
+                .unwrap()
+                .push_value(Value::List(vec![Value::Int64(id)].into()));
+            builder.column_mut(1).unwrap().push_int64(id);
+            builder.advance_row();
+        }
+        let mut input = builder.finish();
+        input.set_selection(SelectionVector::from_predicate(5, |i| i == 1 || i == 3));
+        for (output, expected) in [
+            (input.slice(1, 1), vec![3]),
+            (
+                input.filter(&SelectionVector::from_predicate(5, |i| i >= 2)),
+                vec![3],
+            ),
+        ] {
+            assert_eq!(output.column(0).unwrap().data_type(), &edge_list);
+            assert_eq!(output.column(1).unwrap().data_type(), &LogicalType::Int64);
+            let actual: Vec<i64> = output
+                .selected_indices()
+                .map(|row| output.column(1).unwrap().get_int64(row).unwrap())
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                output.column(0).unwrap().get_value(0),
+                Some(Value::List(vec![Value::Int64(3)].into()))
+            );
+        }
+    }
+
+    #[test]
+    fn concat_preserves_homogeneous_edge_list_provenance_and_selected_rows() {
+        let edge_list = LogicalType::List(Box::new(LogicalType::Edge));
+        let make_chunk = |offset| {
+            let mut builder = DataChunkBuilder::new(std::slice::from_ref(&edge_list));
+            for id in offset..offset + 4 {
+                builder
+                    .column_mut(0)
+                    .unwrap()
+                    .push_value(Value::List(vec![Value::Int64(id)].into()));
+                builder.advance_row();
+            }
+            let mut chunk = builder.finish();
+            chunk.set_selection(SelectionVector::from_predicate(4, |i| i == 1 || i == 3));
+            chunk
+        };
+        let output = DataChunk::concat(&[make_chunk(0), make_chunk(4)]);
+        assert_eq!(output.column(0).unwrap().data_type(), &edge_list);
+        assert_eq!(output.len(), 4);
+        let values: Vec<_> = output
+            .selected_indices()
+            .map(|i| output.column(0).unwrap().get_value(i).unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            [1, 3, 5, 7].map(|id| Value::List(vec![Value::Int64(id)].into()))
+        );
     }
 
     #[test]

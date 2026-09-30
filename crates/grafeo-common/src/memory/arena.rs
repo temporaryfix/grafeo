@@ -290,12 +290,8 @@ impl Arena {
     ///
     /// # Errors
     ///
-    /// Returns `AllocError::InsufficientSpace` if the primary chunk does not
-    /// have enough room. Increase the chunk size for your use case.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the arena has no chunks (should never happen in normal use).
+    /// Returns `AllocError::InsufficientSpace` if the primary chunk is missing
+    /// or does not have enough room. Increase the chunk size for your use case.
     #[cfg(feature = "tiered-storage")]
     pub fn alloc_value_with_offset<T>(&self, value: T) -> Result<(u32, &mut T), AllocError> {
         let size = std::mem::size_of::<T>();
@@ -303,9 +299,7 @@ impl Arena {
 
         // Try to allocate in the first chunk to get a stable offset
         let chunks = self.chunks.read();
-        let chunk = chunks
-            .first()
-            .expect("Arena should have at least one chunk");
+        let chunk = chunks.first().ok_or(AllocError::InsufficientSpace)?;
 
         let (offset, ptr) = chunk
             .try_alloc_with_offset(size, align)
@@ -474,7 +468,72 @@ pub struct ArenaAllocator {
     chunk_size: usize,
 }
 
+/// A complete hot-arena image paired with an unused destination allocator.
+///
+/// Callers publishing version offsets must retain their structural writers
+/// until this guard drains. The source owns every displaced allocation.
+#[doc(hidden)]
+pub struct PreparedArenaRestore<'target, 'source> {
+    target: &'target ArenaAllocator,
+    arenas: parking_lot::RwLockWriteGuard<'target, hashbrown::HashMap<EpochId, Arena>>,
+    source: &'source mut ArenaAllocator,
+}
+
+impl PreparedArenaRestore<'_, '_> {
+    /// Moves the already-qualified backing without allocation or retirement.
+    pub fn install(&mut self) {
+        std::mem::swap(&mut *self.arenas, self.source.arenas.get_mut());
+        let epoch = self.source.current_epoch.load(Ordering::Relaxed);
+        let old_epoch = self.target.current_epoch.swap(epoch, Ordering::AcqRel);
+        self.source
+            .current_epoch
+            .store(old_epoch, Ordering::Relaxed);
+    }
+}
+
 impl ArenaAllocator {
+    /// Pins an unused destination and one exclusively owned prepared image.
+    /// Returns `None` on contention, prior allocation, or incompatible sizing.
+    #[doc(hidden)]
+    pub fn prepare_pristine_restore<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedArenaRestore<'target, 'source>> {
+        let prepared = self.prepare_replacement(source)?;
+        if self.current_epoch.load(Ordering::Acquire) != 0 || prepared.arenas.len() != 1 {
+            return None;
+        }
+        {
+            let initial = prepared.arenas.get(&EpochId::INITIAL)?;
+            let chunks = initial.chunks.try_read()?;
+            if chunks
+                .iter()
+                .any(|chunk| chunk.offset.load(Ordering::Acquire) != 0)
+            {
+                return None;
+            }
+        }
+        Some(prepared)
+    }
+
+    /// Pins a populated allocator for an allocation-free complete image swap.
+    /// Structural version writers must remain held until this guard drains.
+    #[doc(hidden)]
+    pub fn prepare_replacement<'target, 'source>(
+        &'target self,
+        source: &'source mut Self,
+    ) -> Option<PreparedArenaRestore<'target, 'source>> {
+        let arenas = self.arenas.try_write()?;
+        if self.chunk_size != source.chunk_size {
+            return None;
+        }
+        Some(PreparedArenaRestore {
+            target: self,
+            arenas,
+            source,
+        })
+    }
+
     /// Creates a new arena allocator.
     ///
     /// # Errors
@@ -961,6 +1020,63 @@ mod tiered_storage_tests {
         for handle in handles {
             handle.join().expect("Thread panicked");
         }
+    }
+
+    #[test]
+    fn test_alloc_value_with_offset_missing_primary_rejects_and_recovers() {
+        struct DropCounted<'a>(&'a AtomicUsize);
+
+        impl Drop for DropCounted<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let arena = Arena::with_chunk_size(EpochId::INITIAL, 4096).unwrap();
+        let (prefix_offset, _) = arena.alloc_value_with_offset(0x5au8).unwrap();
+        assert_eq!(prefix_offset, 0);
+        assert_eq!(arena.total_used(), 1);
+        let chunk = arena.chunks.write().pop().unwrap();
+        let original_pointer = chunk.ptr;
+        let original_used = chunk.used();
+        let allocated_before = arena.total_allocated();
+        let used_before = arena.total_used();
+        let capacity_before = arena.chunks.read().capacity();
+        let drops = AtomicUsize::new(0);
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arena.alloc_value_with_offset(DropCounted(&drops))
+        }));
+        let Ok(result) = outcome else {
+            panic!("missing primary chunk must return an allocation error without panicking");
+        };
+        assert!(matches!(result, Err(AllocError::InsufficientSpace)));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(arena.total_allocated(), allocated_before);
+        assert_eq!(arena.total_used(), used_before);
+        assert_eq!(arena.chunks.read().capacity(), capacity_before);
+        assert!(arena.chunks.read().is_empty());
+        assert_eq!(chunk.used(), original_used);
+        assert_eq!(chunk.ptr, original_pointer);
+
+        arena.chunks.write().push(chunk);
+        let expected = 0x1020_3040_5060_7080u64;
+        let (offset, stored) = arena.alloc_value_with_offset(expected).unwrap();
+        assert_eq!(offset, 8);
+        assert_eq!(*stored, expected);
+        // SAFETY: both offsets came from successful allocations of these exact
+        // types in the original primary chunk, which has been restored intact.
+        unsafe {
+            assert_eq!(*arena.read_at::<u8>(prefix_offset), 0x5a);
+            assert_eq!(*arena.read_at::<u64>(offset), expected);
+        }
+        assert_eq!(arena.total_allocated(), allocated_before);
+        assert_eq!(arena.total_used(), 16);
+        let chunks = arena.chunks.read();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.capacity(), capacity_before);
+        assert_eq!(chunks[0].ptr, original_pointer);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
