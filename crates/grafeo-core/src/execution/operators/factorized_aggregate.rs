@@ -260,6 +260,29 @@ impl FactorizedAggregateOperator {
 
     /// Executes the aggregation on factorized input.
     fn execute(&mut self) -> OperatorResult {
+        let count_only = self.aggregates.iter().all(|a| {
+            matches!(
+                a,
+                FactorizedAggregate::Count | FactorizedAggregate::CountColumn { .. }
+            )
+        });
+        if count_only {
+            let n = self.input.count_paths()?;
+            let n_val = Value::Int64(i64::try_from(n).unwrap_or(i64::MAX));
+            let output_cols: Vec<ValueVector> = self
+                .aggregates
+                .iter()
+                .map(|_| {
+                    let mut col = ValueVector::with_type(LogicalType::Int64);
+                    col.push_value(n_val.clone());
+                    col
+                })
+                .collect();
+            let mut chunk = DataChunk::new(output_cols);
+            chunk.set_count(1);
+            return Ok(Some(chunk));
+        }
+
         // Get the factorized result WITHOUT flattening
         let mut factorized = match self.input.next_factorized() {
             Ok(Some(chunk)) => chunk,
@@ -345,7 +368,10 @@ impl Operator for FactorizedAggregateOperator {
 ///
 /// This trait allows the planner to check if an operator can provide
 /// factorized data for factorized aggregation.
-pub trait FactorizedOperator {
+/// With an explicit cooperative execution checkpoint, a successful call may
+/// be followed immediately by cancellation. Externally visible effects must
+/// remain rollbackable until the execution owner fences success.
+pub trait FactorizedOperator: Send + Sync {
     /// Returns the next chunk as factorized data.
     ///
     /// # Errors
