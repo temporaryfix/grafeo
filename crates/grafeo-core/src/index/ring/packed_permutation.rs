@@ -1,12 +1,10 @@
-//! Packed succinct permutation for the v2 Ring on-disk format (Phase 6d).
+//! Packed succinct permutation for the canonical Ring on-disk format.
 //!
 //! [`SuccinctPermutation`] stores both the forward and inverse mappings on
-//! the heap (O(2n) space). The bincode'd v1 format serializes both, even
-//! though the inverse is O(n)-rebuildable from the forward mapping alone.
-//!
-//! v2 stores only the forward mapping as a packed `u32` LE array.
-//! Deserialization rebuilds the inverse in a single linear pass. This
-//! halves the on-disk size compared to v1.
+//! the heap (O(2n) space). The wire format stores only the forward mapping
+//! as a packed `u32` LE array.
+//! Deserialization rebuilds the inverse in a single linear pass, halving
+//! the persisted mapping footprint.
 //!
 //! ## Layout
 //!
@@ -37,6 +35,8 @@ pub enum PackedPermutationError {
     BadMagic,
     /// Version byte not recognized.
     UnsupportedVersion(u8),
+    /// Reserved header bytes must be zero in the canonical encoding.
+    NonZeroReserved,
     /// Forward array is shorter than `n` declares.
     TruncatedForward {
         /// Bytes the forward array should contain.
@@ -46,6 +46,15 @@ pub enum PackedPermutationError {
     },
     /// `n` field overflows the platform-native usize.
     SizeOverflow,
+    /// The input contains bytes beyond its declared forward array.
+    TrailingBytes {
+        /// Exact canonical size implied by the header.
+        expected: usize,
+        /// Actual buffer size.
+        actual: usize,
+    },
+    /// An in-memory permutation omitted an in-range forward target.
+    MissingTarget(usize),
     /// A `forward\[i\]` entry references an index >= n (not a valid
     /// permutation).
     InvalidPermutation {
@@ -72,11 +81,21 @@ impl std::fmt::Display for PackedPermutationError {
             Self::UnsupportedVersion(v) => {
                 write!(f, "packed permutation unsupported version {v}")
             }
+            Self::NonZeroReserved => {
+                write!(f, "packed permutation reserved bytes must be zero")
+            }
             Self::TruncatedForward { expected, actual } => write!(
                 f,
                 "packed permutation forward truncated: expected {expected} bytes, got {actual}"
             ),
             Self::SizeOverflow => write!(f, "packed permutation size field overflows usize"),
+            Self::TrailingBytes { expected, actual } => write!(
+                f,
+                "packed permutation has trailing bytes: expected {expected}, got {actual}"
+            ),
+            Self::MissingTarget(index) => {
+                write!(f, "permutation is missing in-range target at index {index}")
+            }
             Self::InvalidPermutation { index, value } => write!(
                 f,
                 "packed permutation forward[{index}] = {value} is out of range"
@@ -91,31 +110,52 @@ impl std::fmt::Display for PackedPermutationError {
 
 impl std::error::Error for PackedPermutationError {}
 
-/// Serializes a [`SuccinctPermutation`] to the v2 packed format.
+/// Serializes a [`SuccinctPermutation`] to the canonical packed format.
 ///
-/// # Panics
+/// # Errors
 ///
-/// The internal `apply(i)` `expect` describes an invariant the
-/// `0..n` loop bounds already guarantee — `apply(i)` returns `None` only
-/// when `i >= n`. Does not panic in normal operation.
-#[must_use]
-pub fn serialize_permutation(perm: &SuccinctPermutation) -> Vec<u8> {
+/// Returns an error if the permutation cannot be represented by the wire
+/// grammar or its in-memory forward map is incomplete.
+pub fn serialize_permutation(
+    perm: &SuccinctPermutation,
+) -> Result<Vec<u8>, PackedPermutationError> {
     let n = perm.len();
-    let total = HEADER_SIZE + n * 4;
+    let n_u64 = u64::try_from(n).map_err(|_| PackedPermutationError::SizeOverflow)?;
+    let n_u32 = u32::try_from(n).map_err(|_| PackedPermutationError::SizeOverflow)?;
+    let total = n
+        .checked_mul(4)
+        .and_then(|value| HEADER_SIZE.checked_add(value))
+        .ok_or(PackedPermutationError::SizeOverflow)?;
     let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(MAGIC); // 0..4
     buf.push(VERSION); // 4
     buf.extend_from_slice(&[0u8; 3]); // 5..8 reserved
-    buf.extend_from_slice(&(n as u64).to_le_bytes()); // 8..16
+    buf.extend_from_slice(&n_u64.to_le_bytes()); // 8..16
+    let mut seen = vec![false; n];
     for i in 0..n {
-        // `apply` is O(1) on the heap representation; safe because i < n.
-        let target = perm.apply(i).expect("i < n");
-        buf.extend_from_slice(&u32::try_from(target).unwrap_or(u32::MAX).to_le_bytes());
+        let target = perm
+            .apply(i)
+            .ok_or(PackedPermutationError::MissingTarget(i))?;
+        let target = u32::try_from(target).map_err(|_| PackedPermutationError::SizeOverflow)?;
+        if target >= n_u32 {
+            return Err(PackedPermutationError::InvalidPermutation {
+                index: i,
+                value: target,
+            });
+        }
+        if seen[target as usize] {
+            return Err(PackedPermutationError::DuplicateTarget {
+                index: i,
+                value: target,
+            });
+        }
+        seen[target as usize] = true;
+        buf.extend_from_slice(&target.to_le_bytes());
     }
-    buf
+    Ok(buf)
 }
 
-/// Parses a [`SuccinctPermutation`] from the v2 packed format. Rebuilds
+/// Parses a [`SuccinctPermutation`] from the canonical packed format. Rebuilds
 /// the inverse mapping in a single linear pass.
 ///
 /// # Errors
@@ -124,11 +164,6 @@ pub fn serialize_permutation(perm: &SuccinctPermutation) -> Vec<u8> {
 /// mismatch, out-of-range entries, or duplicate targets (the input is
 /// not a valid permutation).
 ///
-/// # Panics
-///
-/// Internal `expect` calls describe invariants the bounds checks above
-/// already guarantee — every indexed read is preceded by a length
-/// check. Does not panic in normal operation.
 pub fn deserialize_permutation(data: Bytes) -> Result<SuccinctPermutation, PackedPermutationError> {
     if data.len() < HEADER_SIZE {
         return Err(PackedPermutationError::TruncatedHeader);
@@ -140,7 +175,10 @@ pub fn deserialize_permutation(data: Bytes) -> Result<SuccinctPermutation, Packe
     if version != VERSION {
         return Err(PackedPermutationError::UnsupportedVersion(version));
     }
-    let n_raw = u64::from_le_bytes(data[8..16].try_into().expect("8-byte slice"));
+    if data[5..8] != [0; 3] {
+        return Err(PackedPermutationError::NonZeroReserved);
+    }
+    let n_raw = read_u64(&data, 8).ok_or(PackedPermutationError::TruncatedHeader)?;
     let n = usize::try_from(n_raw).map_err(|_| PackedPermutationError::SizeOverflow)?;
 
     let forward_bytes = n
@@ -155,15 +193,26 @@ pub fn deserialize_permutation(data: Bytes) -> Result<SuccinctPermutation, Packe
             actual: data.len() - HEADER_SIZE,
         });
     }
+    if total != data.len() {
+        return Err(PackedPermutationError::TrailingBytes {
+            expected: total,
+            actual: data.len(),
+        });
+    }
 
     // Validate + collect forward array as usize for SuccinctPermutation::new.
     let n_u32 = u32::try_from(n).map_err(|_| PackedPermutationError::SizeOverflow)?;
     let mut forward: Vec<usize> = Vec::with_capacity(n);
     let mut seen: Vec<bool> = vec![false; n];
     for i in 0..n {
-        let off = HEADER_SIZE + i * 4;
-        let chunk: [u8; 4] = data[off..off + 4].try_into().expect("4-byte slice");
-        let value = u32::from_le_bytes(chunk);
+        let off = i
+            .checked_mul(4)
+            .and_then(|value| HEADER_SIZE.checked_add(value))
+            .ok_or(PackedPermutationError::SizeOverflow)?;
+        let value = read_u32(&data, off).ok_or(PackedPermutationError::TruncatedForward {
+            expected: forward_bytes,
+            actual: data.len() - HEADER_SIZE,
+        })?;
         if value >= n_u32 {
             return Err(PackedPermutationError::InvalidPermutation { index: i, value });
         }
@@ -177,6 +226,18 @@ pub fn deserialize_permutation(data: Bytes) -> Result<SuccinctPermutation, Packe
     Ok(SuccinctPermutation::new(&forward))
 }
 
+fn read_u64(bytes: &[u8], start: usize) -> Option<u64> {
+    let end = start.checked_add(8)?;
+    let chunk: [u8; 8] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(chunk))
+}
+
+fn read_u32(bytes: &[u8], start: usize) -> Option<u32> {
+    let end = start.checked_add(4)?;
+    let chunk: [u8; 4] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(chunk))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,11 +246,15 @@ mod tests {
         SuccinctPermutation::new(forward)
     }
 
+    fn encode(perm: &SuccinctPermutation) -> Vec<u8> {
+        serialize_permutation(perm).expect("serialize permutation")
+    }
+
     #[test]
     fn alix_packed_perm_roundtrip_small() {
         let forward = vec![3usize, 0, 4, 1, 2];
         let perm = build_perm(&forward);
-        let bytes = serialize_permutation(&perm);
+        let bytes = encode(&perm);
         let restored = deserialize_permutation(Bytes::from(bytes)).expect("deserialize");
         assert_eq!(restored.len(), perm.len());
         for i in 0..perm.len() {
@@ -202,7 +267,7 @@ mod tests {
     fn gus_packed_perm_roundtrip_identity() {
         let forward: Vec<usize> = (0..256).collect();
         let perm = build_perm(&forward);
-        let bytes = serialize_permutation(&perm);
+        let bytes = encode(&perm);
         let restored = deserialize_permutation(Bytes::from(bytes)).expect("deserialize");
         for i in 0..256 {
             assert_eq!(restored.apply(i), Some(i));
@@ -213,7 +278,7 @@ mod tests {
     fn vincent_packed_perm_roundtrip_reverse() {
         let forward: Vec<usize> = (0..128).rev().collect();
         let perm = build_perm(&forward);
-        let bytes = serialize_permutation(&perm);
+        let bytes = encode(&perm);
         let restored = deserialize_permutation(Bytes::from(bytes)).expect("deserialize");
         for i in 0..128 {
             assert_eq!(restored.apply(i), Some(127 - i));
@@ -225,7 +290,7 @@ mod tests {
     #[test]
     fn jules_packed_perm_empty() {
         let perm = build_perm(&[]);
-        let bytes = serialize_permutation(&perm);
+        let bytes = encode(&perm);
         assert_eq!(bytes.len(), HEADER_SIZE);
         let restored = deserialize_permutation(Bytes::from(bytes)).expect("empty");
         assert_eq!(restored.len(), 0);
@@ -297,31 +362,34 @@ mod tests {
     }
 
     #[test]
-    fn tarantino_packed_perm_size_competitive_with_bincode() {
-        // Bincode varint encoding is surprisingly compact for small
-        // permutations: indices < 16384 take only 2-3 bytes per
-        // element, vs v2's fixed 4-byte u32. v2 stores only the forward
-        // mapping (half the elements), so the total comparison ends
-        // up close-to-even at small n. v2's win materialises at
-        // n > ~16k where varint widens to 3-4 bytes per element.
-        //
-        // This test pins the small-n behaviour to "v2 not larger than
-        // v1" so format regressions still get caught.
+    fn tarantino_packed_perm_has_fixed_width_size() {
         let forward: Vec<usize> = (0..512).map(|i| (i * 17) % 512).collect();
         let perm = build_perm(&forward);
-        let v2_bytes = serialize_permutation(&perm);
-        let v1_bytes = bincode::serde::encode_to_vec(&perm, bincode::config::standard())
-            .expect("bincode encode");
-        eprintln!(
-            "v1 bincode: {} bytes, v2 packed: {} bytes",
-            v1_bytes.len(),
-            v2_bytes.len()
+        let bytes = encode(&perm);
+        assert_eq!(bytes.len(), HEADER_SIZE + forward.len() * 4);
+    }
+
+    #[test]
+    fn non_zero_reserved_bytes_are_rejected() {
+        let mut bytes = encode(&build_perm(&[0]));
+        bytes[5] = 1;
+        assert_eq!(
+            deserialize_permutation(Bytes::from(bytes)).unwrap_err(),
+            PackedPermutationError::NonZeroReserved
         );
-        assert!(
-            v2_bytes.len() <= v1_bytes.len(),
-            "v2 packed must not be larger than v1 bincode (v1={}, v2={})",
-            v1_bytes.len(),
-            v2_bytes.len()
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = encode(&build_perm(&[0]));
+        let expected = bytes.len();
+        bytes.push(0);
+        assert_eq!(
+            deserialize_permutation(Bytes::from(bytes)).unwrap_err(),
+            PackedPermutationError::TrailingBytes {
+                expected,
+                actual: expected + 1,
+            }
         );
     }
 }

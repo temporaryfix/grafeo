@@ -36,7 +36,9 @@
 
 mod dictionary;
 mod graph_store_adapter;
+pub mod history;
 pub mod nquads;
+mod projection;
 pub mod section;
 pub mod sink;
 mod store;
@@ -48,9 +50,26 @@ pub mod turtle;
 pub mod shacl;
 
 pub use dictionary::TermDictionary;
+pub use grafeo_common::types::{InvalidValidTimeInterval, TaiNanoseconds, ValidTimeInterval};
 pub use graph_store_adapter::RdfGraphStoreAdapter;
+pub use history::{
+    RdfCdcPage, RdfDatasetHistory, RdfGraphIdentity, RdfGraphLife, RdfHistoricalQuad,
+    RdfHistoryCursor, RdfHistoryCursorError, RdfHistoryCut, RdfHistoryDiff, RdfHistoryError,
+    RdfHistoryTransition, RdfHistoryTransitionKind, RdfQuadVersion, statement_handle,
+};
+pub use projection::{
+    InstalledRdfLpgProjectionRegistryRestore, PreparedRdfLpgProjectionReceipt,
+    PreparedRdfLpgProjectionRegistryRestore, RDF_LPG_PROJECTION_IRI_PROPERTY,
+    RDF_LPG_PROJECTION_MAPPING_VERSION, RDF_LPG_PROJECTION_OWNER_PROPERTY,
+    RDF_LPG_PROJECTION_RECEIPT_VERSION, RdfLpgProjectionDefinition, RdfLpgProjectionReceipt,
+    RdfLpgProjectionRegistry, ReadyRdfLpgProjectionRegistryRestore,
+};
 pub use section::RdfStoreSection;
 pub use sink::{BatchInsertSink, CountSink, TripleSink, VecSink};
-pub use store::{BulkLoadResult, NTriplesError, RdfStore, RdfStoreConfig};
+pub use store::{
+    BulkLoadResult, InstalledRdfDatasetReplacement, NTriplesError, PreparedRdfDatasetReplacement,
+    QuadLife, RdfCommitGuard, RdfStore, RdfStoreConfig, RdfTransactionSavepoint,
+    ReadyRdfDatasetReplacement,
+};
 pub use term::{BlankNode, Iri, Literal, Term};
-pub use triple::{Triple, TriplePattern};
+pub use triple::{Quad, Triple, TriplePattern};

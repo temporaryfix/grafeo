@@ -106,7 +106,7 @@ mod tests {
             Term::literal("default"),
         ));
 
-        let graph = store.graph_or_create("http://example.org/g1");
+        let graph = store.graph_or_create("http://example.org/g1").unwrap();
         graph.insert(Triple::new(
             Term::iri("http://example.org/s"),
             Term::iri("http://example.org/p"),

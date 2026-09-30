@@ -1,15 +1,9 @@
-//! Packed wavelet tree for the v2 Ring on-disk format (Phase 6c).
+//! Packed wavelet tree for the canonical Ring on-disk format.
 //!
 //! The in-memory [`WaveletTree`] stores `height` `SuccinctBitVector`
-//! levels alongside rank/select sampling caches. The bincode'd v1 format
-//! serializes both the bit data AND the caches, even though the caches
-//! are O(n) rebuildable from the bits alone (per
-//! [`SuccinctBitVector::from_bitvec`]).
-//!
-//! v2 keeps only the bit data, packed as little-endian `u64` words, and
-//! rebuilds caches on `to_wavelet_tree`. This shrinks the on-disk size
-//! ~30-40% and removes schema overhead, while the reload cost is
-//! unchanged (cache rebuild is the dominant term either way).
+//! levels alongside rank/select sampling caches. Those caches are O(n)
+//! rebuildable from the bits alone, so the wire image keeps only the bit
+//! data as little-endian `u64` words and reconstructs the caches on load.
 //!
 //! ## Layout
 //!
@@ -49,6 +43,8 @@ pub enum PackedWaveletError {
     BadMagic,
     /// Version byte not recognized.
     UnsupportedVersion(u8),
+    /// Reserved or padding header bytes are non-zero.
+    NonZeroReserved,
     /// Recorded sizes overflow the input buffer.
     Truncated {
         /// Region we were trying to read.
@@ -56,6 +52,10 @@ pub enum PackedWaveletError {
     },
     /// A field overflows the platform-native usize.
     SizeOverflow,
+    /// Header fields cannot describe a canonical wavelet tree.
+    InconsistentMetadata,
+    /// The in-memory source violates its structural invariants.
+    InvalidSource(String),
     /// Per-level bit count doesn't match the declared `len` field.
     BitCountMismatch {
         /// Level index where the mismatch was observed.
@@ -64,6 +64,32 @@ pub enum PackedWaveletError {
         expected: u64,
         /// Bit count observed in the level.
         actual: u64,
+    },
+    /// Word count is not exactly `ceil(bit_count / 64)`.
+    WordCountMismatch {
+        /// Level index where the mismatch was observed.
+        level: usize,
+        /// Exact word count required by the bit count.
+        expected: u64,
+        /// Word count carried in the level header.
+        actual: u64,
+    },
+    /// Padding bits above the declared bit count must be zero.
+    NonZeroPaddingBits {
+        /// Level index containing non-canonical padding bits.
+        level: usize,
+    },
+    /// Level bits encode a code outside the declared alphabet.
+    InvalidCode {
+        /// Encoded code carrying at least one occurrence.
+        code: usize,
+    },
+    /// Bytes remain after the declared levels.
+    TrailingBytes {
+        /// Exact canonical length implied by the metadata.
+        expected: usize,
+        /// Actual buffer length.
+        actual: usize,
     },
     /// Reconstructed parts violated a structural [`WaveletTree`]
     /// invariant — caught here rather than letting the tree return
@@ -77,8 +103,13 @@ impl std::fmt::Display for PackedWaveletError {
             Self::TruncatedHeader => write!(f, "packed wavelet header truncated"),
             Self::BadMagic => write!(f, "packed wavelet bad magic (expected 'WTRE')"),
             Self::UnsupportedVersion(v) => write!(f, "packed wavelet unsupported version {v}"),
+            Self::NonZeroReserved => write!(f, "packed wavelet reserved bytes must be zero"),
             Self::Truncated { region } => write!(f, "packed wavelet truncated in {region}"),
             Self::SizeOverflow => write!(f, "packed wavelet size field overflows usize"),
+            Self::InconsistentMetadata => {
+                write!(f, "packed wavelet metadata is not canonical")
+            }
+            Self::InvalidSource(error) => write!(f, "wavelet source is invalid: {error}"),
             Self::BitCountMismatch {
                 level,
                 expected,
@@ -87,6 +118,25 @@ impl std::fmt::Display for PackedWaveletError {
                 f,
                 "packed wavelet bit count mismatch at level {level}: expected {expected}, got {actual}"
             ),
+            Self::WordCountMismatch {
+                level,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "packed wavelet word count mismatch at level {level}: expected {expected}, got {actual}"
+            ),
+            Self::NonZeroPaddingBits { level } => {
+                write!(f, "packed wavelet level {level} has non-zero padding bits")
+            }
+            Self::InvalidCode { code } => write!(
+                f,
+                "packed wavelet code {code} lies outside the declared alphabet"
+            ),
+            Self::TrailingBytes { expected, actual } => write!(
+                f,
+                "packed wavelet has trailing bytes: expected {expected}, got {actual}"
+            ),
             Self::InvariantViolation(e) => write!(f, "packed wavelet invariant violation: {e}"),
         }
     }
@@ -94,33 +144,49 @@ impl std::fmt::Display for PackedWaveletError {
 
 impl std::error::Error for PackedWaveletError {}
 
-/// Serializes a [`WaveletTree`] to the v2 packed format.
-#[must_use]
-pub fn serialize_wavelet_tree(tree: &WaveletTree) -> Vec<u8> {
+/// Serializes a [`WaveletTree`] to the canonical packed format.
+///
+/// # Errors
+///
+/// Returns an error if any size cannot be represented by the wire grammar.
+pub fn serialize_wavelet_tree(tree: &WaveletTree) -> Result<Vec<u8>, PackedWaveletError> {
+    validate_source(tree)?;
     let symbols = tree.symbols_slice();
     let height = tree.height();
     let levels = tree.levels_slice();
     let sigma = tree.sigma();
-    let len = tree.len() as u64;
+    let len = u64::try_from(tree.len()).map_err(|_| PackedWaveletError::SizeOverflow)?;
+    let height = u32::try_from(height).map_err(|_| PackedWaveletError::SizeOverflow)?;
+    let symbol_count =
+        u64::try_from(symbols.len()).map_err(|_| PackedWaveletError::SizeOverflow)?;
+    validate_padding_bits(levels, tree.len())?;
 
     // Estimate total size to pre-allocate.
-    let symbols_bytes = symbols.len() * 8;
-    let level_bytes: usize = levels
-        .iter()
-        .map(|sbv| 16 /* bit_count + word_count */ + sbv.inner().data_bytes().len())
-        .sum();
-    let total = HEADER_SIZE + symbols_bytes + level_bytes;
+    let symbols_bytes = symbols
+        .len()
+        .checked_mul(8)
+        .ok_or(PackedWaveletError::SizeOverflow)?;
+    let level_bytes = levels.iter().try_fold(0usize, |total, sbv| {
+        total
+            .checked_add(16)
+            .and_then(|value| value.checked_add(sbv.inner().data_bytes().len()))
+            .ok_or(PackedWaveletError::SizeOverflow)
+    })?;
+    let total = HEADER_SIZE
+        .checked_add(symbols_bytes)
+        .and_then(|value| value.checked_add(level_bytes))
+        .ok_or(PackedWaveletError::SizeOverflow)?;
 
     let mut buf = Vec::with_capacity(total);
     // Header (40 bytes total — see module-top layout doc):
     buf.extend_from_slice(MAGIC); // 0..4
     buf.push(VERSION); // 4
     buf.extend_from_slice(&[0u8; 3]); // 5..8 reserved
-    buf.extend_from_slice(&u32::try_from(height).unwrap_or(u32::MAX).to_le_bytes()); // 8..12
+    buf.extend_from_slice(&height.to_le_bytes()); // 8..12
     buf.extend_from_slice(&[0u8; 4]); // 12..16 padding to align sigma
     buf.extend_from_slice(&sigma.to_le_bytes()); // 16..24
     buf.extend_from_slice(&len.to_le_bytes()); // 24..32
-    buf.extend_from_slice(&(symbols.len() as u64).to_le_bytes()); // 32..40 symbol_count
+    buf.extend_from_slice(&symbol_count.to_le_bytes()); // 32..40 symbol_count
 
     // Symbols.
     for &sym in symbols {
@@ -130,34 +196,30 @@ pub fn serialize_wavelet_tree(tree: &WaveletTree) -> Vec<u8> {
     // Levels.
     for sbv in levels {
         let bv = sbv.inner();
-        let bit_count = bv.len() as u64;
+        let bit_count = u64::try_from(bv.len()).map_err(|_| PackedWaveletError::SizeOverflow)?;
         let word_data = bv.data_bytes();
-        let word_count = (word_data.len() / 8) as u64;
+        let word_count =
+            u64::try_from(word_data.len() / 8).map_err(|_| PackedWaveletError::SizeOverflow)?;
         buf.extend_from_slice(&bit_count.to_le_bytes());
         buf.extend_from_slice(&word_count.to_le_bytes());
         buf.extend_from_slice(word_data);
     }
 
-    buf
+    Ok(buf)
 }
 
-/// Parses a [`WaveletTree`] from the v2 packed format. Rebuilds rank/select
+/// Parses a [`WaveletTree`] from the canonical packed format. Rebuilds rank/select
 /// caches per level via [`SuccinctBitVector::from_bitvec`].
 ///
 /// `data` is consumed via `Bytes::slice` so the underlying allocation is
 /// shared with the caller. Per-level `BitVector`s adopt their slices via
-/// [`BitVector::from_mmap`], so a mmap-backed buffer never copies.
+/// [`BitVector::from_bytes_storage`], so a mmap-backed buffer never copies.
 ///
 /// # Errors
 ///
 /// Returns a [`PackedWaveletError`] on truncation, magic/version
 /// mismatch, or per-level bit-count inconsistency.
 ///
-/// # Panics
-///
-/// Internal `expect` calls describe invariants that the bounds checks
-/// above already guarantee — every indexed read is preceded by an
-/// explicit length check. Does not panic in normal operation.
 pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWaveletError> {
     if data.len() < HEADER_SIZE {
         return Err(PackedWaveletError::TruncatedHeader);
@@ -169,17 +231,34 @@ pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWavele
     if version != VERSION {
         return Err(PackedWaveletError::UnsupportedVersion(version));
     }
+    if data[5..8] != [0; 3] || data[12..16] != [0; 4] {
+        return Err(PackedWaveletError::NonZeroReserved);
+    }
     // Header offsets (per module-top layout doc):
-    let height_raw = u32::from_le_bytes(data[8..12].try_into().expect("4-byte slice"));
-    // 12..16 is padding.
-    let sigma = u64::from_le_bytes(data[16..24].try_into().expect("8-byte slice"));
-    let len_raw = u64::from_le_bytes(data[24..32].try_into().expect("8-byte slice"));
-    let symbol_count_raw = u64::from_le_bytes(data[32..40].try_into().expect("8-byte slice"));
+    let height_raw = read_u32(&data, 8).ok_or(PackedWaveletError::TruncatedHeader)?;
+    let sigma = read_u64(&data, 16).ok_or(PackedWaveletError::TruncatedHeader)?;
+    let len_raw = read_u64(&data, 24).ok_or(PackedWaveletError::TruncatedHeader)?;
+    let symbol_count_raw = read_u64(&data, 32).ok_or(PackedWaveletError::TruncatedHeader)?;
 
     let height = usize::try_from(height_raw).map_err(|_| PackedWaveletError::SizeOverflow)?;
     let len_usize = usize::try_from(len_raw).map_err(|_| PackedWaveletError::SizeOverflow)?;
     let symbol_count =
         usize::try_from(symbol_count_raw).map_err(|_| PackedWaveletError::SizeOverflow)?;
+
+    let expected_height = if sigma == 0 {
+        0
+    } else if sigma == 1 {
+        1
+    } else {
+        usize::try_from(64 - (sigma - 1).leading_zeros())
+            .map_err(|_| PackedWaveletError::SizeOverflow)?
+    };
+    if (len_usize == 0 && (height != 0 || sigma != 0 || symbol_count != 0))
+        || (len_usize > 0
+            && (symbol_count == 0 || symbol_count_raw != sigma || height != expected_height))
+    {
+        return Err(PackedWaveletError::InconsistentMetadata);
+    }
 
     let mut cursor = HEADER_SIZE;
 
@@ -195,16 +274,25 @@ pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWavele
     }
     let mut symbols: Vec<u64> = Vec::with_capacity(symbol_count);
     for i in 0..symbol_count {
-        // Inner offsets are safe: `symbols_end = cursor + symbols_bytes`
-        // is bounds-checked above, and i < symbol_count implies
-        // `cursor + i*8 + 8 <= symbols_end`.
-        let off = cursor + i * 8;
-        let chunk: [u8; 8] = data[off..off + 8].try_into().expect("8-byte slice");
-        symbols.push(u64::from_le_bytes(chunk));
+        let off = i
+            .checked_mul(8)
+            .and_then(|value| cursor.checked_add(value))
+            .ok_or(PackedWaveletError::SizeOverflow)?;
+        symbols
+            .push(read_u64(&data, off).ok_or(PackedWaveletError::Truncated { region: "symbols" })?);
     }
     cursor = symbols_end;
 
     // Levels region.
+    let minimum_levels_end = height
+        .checked_mul(16)
+        .and_then(|value| cursor.checked_add(value))
+        .ok_or(PackedWaveletError::SizeOverflow)?;
+    if minimum_levels_end > data.len() {
+        return Err(PackedWaveletError::Truncated {
+            region: "level headers",
+        });
+    }
     let mut levels: Vec<SuccinctBitVector> = Vec::with_capacity(height);
     for level_idx in 0..height {
         let level_header_end = cursor
@@ -215,15 +303,12 @@ pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWavele
                 region: "level header",
             });
         }
-        // Header bounds verified above: `level_header_end = cursor + 16`
-        // doesn't overflow and is in range.
-        let bit_count =
-            u64::from_le_bytes(data[cursor..cursor + 8].try_into().expect("8-byte slice"));
-        let word_count = u64::from_le_bytes(
-            data[cursor + 8..cursor + 16]
-                .try_into()
-                .expect("8-byte slice"),
-        );
+        let bit_count = read_u64(&data, cursor).ok_or(PackedWaveletError::Truncated {
+            region: "level header",
+        })?;
+        let word_count = read_u64(&data, cursor + 8).ok_or(PackedWaveletError::Truncated {
+            region: "level header",
+        })?;
         cursor = level_header_end;
 
         if bit_count != len_raw {
@@ -231,6 +316,15 @@ pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWavele
                 level: level_idx,
                 expected: len_raw,
                 actual: bit_count,
+            });
+        }
+
+        let expected_word_count = len_raw.div_ceil(64);
+        if word_count != expected_word_count {
+            return Err(PackedWaveletError::WordCountMismatch {
+                level: level_idx,
+                expected: expected_word_count,
+                actual: word_count,
             });
         }
 
@@ -251,7 +345,26 @@ pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWavele
         let level_slice = data.slice(cursor..level_data_end);
         cursor = level_data_end;
 
-        let bv = BitVector::from_mmap(level_slice, len_usize).map_err(|_| {
+        let remainder = len_usize % 64;
+        if remainder != 0 {
+            let last_word_offset =
+                level_slice
+                    .len()
+                    .checked_sub(8)
+                    .ok_or(PackedWaveletError::Truncated {
+                        region: "level bits",
+                    })?;
+            let last_word =
+                read_u64(&level_slice, last_word_offset).ok_or(PackedWaveletError::Truncated {
+                    region: "level bits",
+                })?;
+            let padding_mask = !((1u64 << remainder) - 1);
+            if last_word & padding_mask != 0 {
+                return Err(PackedWaveletError::NonZeroPaddingBits { level: level_idx });
+            }
+        }
+
+        let bv = BitVector::from_bytes_storage(level_slice, len_usize).map_err(|_| {
             PackedWaveletError::Truncated {
                 region: "level bits",
             }
@@ -259,8 +372,125 @@ pub fn deserialize_wavelet_tree(data: Bytes) -> Result<WaveletTree, PackedWavele
         levels.push(SuccinctBitVector::from_bitvec(bv));
     }
 
+    if cursor != data.len() {
+        return Err(PackedWaveletError::TrailingBytes {
+            expected: cursor,
+            actual: data.len(),
+        });
+    }
+
+    validate_codes(&levels, height, len_usize, symbols.len())?;
     WaveletTree::from_packed_parts(levels, height, sigma, len_usize, symbols)
         .map_err(PackedWaveletError::InvariantViolation)
+}
+
+fn validate_source(tree: &WaveletTree) -> Result<(), PackedWaveletError> {
+    let height = tree.height();
+    let sigma = tree.sigma();
+    let len = tree.len();
+    let levels = tree.levels_slice();
+    let symbols = tree.symbols_slice();
+    if len == 0 {
+        if height != 0 || sigma != 0 || !levels.is_empty() || !symbols.is_empty() {
+            return Err(PackedWaveletError::InvalidSource(
+                "empty tree carries non-empty metadata".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let symbol_count = u64::try_from(symbols.len())
+        .map_err(|_| PackedWaveletError::InvalidSource("symbol count overflows u64".to_owned()))?;
+    let expected_height = if sigma <= 1 {
+        1
+    } else {
+        usize::try_from(64 - (sigma - 1).leading_zeros())
+            .map_err(|_| PackedWaveletError::InvalidSource("height overflows usize".to_owned()))?
+    };
+    if levels.len() != height
+        || symbol_count != sigma
+        || height != expected_height
+        || levels.iter().any(|level| level.len() != len)
+        || symbols.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(PackedWaveletError::InvalidSource(
+            "tree metadata is inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_codes(
+    levels: &[SuccinctBitVector],
+    height: usize,
+    len: usize,
+    symbol_count: usize,
+) -> Result<(), PackedWaveletError> {
+    let height = u32::try_from(height).map_err(|_| PackedWaveletError::SizeOverflow)?;
+    let code_space = 1usize
+        .checked_shl(height)
+        .ok_or(PackedWaveletError::SizeOverflow)?;
+    for code in symbol_count..code_space {
+        let mut lower = 0usize;
+        let mut upper = len;
+        for (level, bit_vector) in levels.iter().enumerate() {
+            let level = u32::try_from(level).map_err(|_| PackedWaveletError::SizeOverflow)?;
+            let bit_position = height
+                .checked_sub(level + 1)
+                .ok_or(PackedWaveletError::InconsistentMetadata)?;
+            if (code >> bit_position) & 1 == 0 {
+                lower = bit_vector.rank0(lower);
+                upper = bit_vector.rank0(upper);
+            } else {
+                let zero_count = bit_vector.count_zeros();
+                lower = zero_count
+                    .checked_add(bit_vector.rank1(lower))
+                    .ok_or(PackedWaveletError::SizeOverflow)?;
+                upper = zero_count
+                    .checked_add(bit_vector.rank1(upper))
+                    .ok_or(PackedWaveletError::SizeOverflow)?;
+            }
+        }
+        if upper > lower {
+            return Err(PackedWaveletError::InvalidCode { code });
+        }
+    }
+    Ok(())
+}
+
+fn validate_padding_bits(
+    levels: &[SuccinctBitVector],
+    len: usize,
+) -> Result<(), PackedWaveletError> {
+    let remainder = len % 64;
+    if remainder == 0 {
+        return Ok(());
+    }
+    for (level, bit_vector) in levels.iter().enumerate() {
+        let bytes = bit_vector.inner().data_bytes();
+        let last_word_offset = bytes
+            .len()
+            .checked_sub(8)
+            .ok_or_else(|| PackedWaveletError::InvalidSource("missing final word".to_owned()))?;
+        let last_word = read_u64(bytes, last_word_offset)
+            .ok_or_else(|| PackedWaveletError::InvalidSource("truncated final word".to_owned()))?;
+        let padding_mask = !((1u64 << remainder) - 1);
+        if last_word & padding_mask != 0 {
+            return Err(PackedWaveletError::NonZeroPaddingBits { level });
+        }
+    }
+    Ok(())
+}
+
+fn read_u64(bytes: &[u8], start: usize) -> Option<u64> {
+    let end = start.checked_add(8)?;
+    let chunk: [u8; 8] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(chunk))
+}
+
+fn read_u32(bytes: &[u8], start: usize) -> Option<u32> {
+    let end = start.checked_add(4)?;
+    let chunk: [u8; 4] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(chunk))
 }
 
 #[cfg(test)]
@@ -269,6 +499,10 @@ mod tests {
 
     fn build_tree(seq: &[u64]) -> WaveletTree {
         WaveletTree::new(seq)
+    }
+
+    fn encode(tree: &WaveletTree) -> Vec<u8> {
+        serialize_wavelet_tree(tree).expect("serialize wavelet tree")
     }
 
     fn assert_trees_equal(orig: &WaveletTree, restored: &WaveletTree) {
@@ -287,7 +521,7 @@ mod tests {
     fn alix_packed_wavelet_roundtrip_small() {
         let seq = vec![1u64, 3, 2, 1, 2, 3, 1, 2];
         let tree = build_tree(&seq);
-        let bytes = serialize_wavelet_tree(&tree);
+        let bytes = encode(&tree);
         let restored = deserialize_wavelet_tree(Bytes::from(bytes)).expect("deserialize");
         assert_trees_equal(&tree, &restored);
     }
@@ -298,7 +532,7 @@ mod tests {
         // wavelet structure at non-trivial size.
         let seq: Vec<u64> = (0..1024u64).map(|i| (i * 7) % 16).collect();
         let tree = build_tree(&seq);
-        let bytes = serialize_wavelet_tree(&tree);
+        let bytes = encode(&tree);
         let restored = deserialize_wavelet_tree(Bytes::from(bytes)).expect("deserialize");
         assert_trees_equal(&tree, &restored);
     }
@@ -306,7 +540,7 @@ mod tests {
     #[test]
     fn vincent_packed_wavelet_empty() {
         let tree = WaveletTree::new(&[]);
-        let bytes = serialize_wavelet_tree(&tree);
+        let bytes = encode(&tree);
         let restored = deserialize_wavelet_tree(Bytes::from(bytes)).expect("deserialize");
         assert_eq!(restored.len(), 0);
         assert!(restored.is_empty());
@@ -317,7 +551,7 @@ mod tests {
         // sigma = 1; height ends up = 1 per `WaveletTree::new`.
         let seq = vec![42u64; 16];
         let tree = build_tree(&seq);
-        let bytes = serialize_wavelet_tree(&tree);
+        let bytes = encode(&tree);
         let restored = deserialize_wavelet_tree(Bytes::from(bytes)).expect("deserialize");
         assert_trees_equal(&tree, &restored);
     }
@@ -352,25 +586,18 @@ mod tests {
     }
 
     #[test]
-    fn hans_packed_wavelet_size_smaller_than_bincode() {
-        // The whole point of v2: smaller than bincode by removing
-        // redundant rank/select caches and schema overhead.
+    fn hans_packed_wavelet_size_matches_grammar() {
         let seq: Vec<u64> = (0..2048u64).map(|i| (i * 11) % 64).collect();
         let tree = build_tree(&seq);
-        let v2_bytes = serialize_wavelet_tree(&tree);
-        let v1_bytes = bincode::serde::encode_to_vec(&tree, bincode::config::standard())
-            .expect("bincode encode");
-        eprintln!(
-            "v1 bincode: {} bytes, v2 packed: {} bytes",
-            v1_bytes.len(),
-            v2_bytes.len()
-        );
-        assert!(
-            v2_bytes.len() < v1_bytes.len(),
-            "v2 packed must be smaller than v1 bincode (v1={}, v2={})",
-            v1_bytes.len(),
-            v2_bytes.len()
-        );
+        let bytes = encode(&tree);
+        let expected = HEADER_SIZE
+            + tree.symbols_slice().len() * 8
+            + tree
+                .levels_slice()
+                .iter()
+                .map(|level| 16 + level.inner().data_bytes().len())
+                .sum::<usize>();
+        assert_eq!(bytes.len(), expected);
     }
 
     #[test]
@@ -379,7 +606,7 @@ mod tests {
         // shares the underlying source allocation (zero-copy mmap path).
         let seq = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
         let tree = build_tree(&seq);
-        let bytes = serialize_wavelet_tree(&tree);
+        let bytes = encode(&tree);
         let source = Bytes::from(bytes);
         let source_ptr = source.as_ptr();
         let source_len = source.len();
@@ -393,5 +620,54 @@ mod tests {
                 "level {idx}: inner BitVector should be inside source allocation; offset={offset}"
             );
         }
+    }
+
+    #[test]
+    fn reserved_bytes_are_rejected() {
+        let mut bytes = encode(&build_tree(&[1]));
+        bytes[12] = 1;
+        assert_eq!(
+            deserialize_wavelet_tree(Bytes::from(bytes)).unwrap_err(),
+            PackedWaveletError::NonZeroReserved
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = encode(&build_tree(&[1]));
+        let expected = bytes.len();
+        bytes.push(0);
+        assert_eq!(
+            deserialize_wavelet_tree(Bytes::from(bytes)).unwrap_err(),
+            PackedWaveletError::TrailingBytes {
+                expected,
+                actual: expected + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn non_zero_padding_bits_are_rejected() {
+        let mut bytes = encode(&build_tree(&[1]));
+        let first_level_word = HEADER_SIZE + 8 + 16;
+        bytes[first_level_word + 7] = 0x80;
+        assert_eq!(
+            deserialize_wavelet_tree(Bytes::from(bytes)).unwrap_err(),
+            PackedWaveletError::NonZeroPaddingBits { level: 0 }
+        );
+    }
+
+    #[test]
+    fn bit_pattern_outside_alphabet_is_rejected() {
+        let mut bytes = encode(&build_tree(&[10, 20, 30]));
+        let symbols_end = HEADER_SIZE + 3 * 8;
+        let first_word = symbols_end + 16;
+        let second_word = first_word + 8 + 16;
+        bytes[first_word] = 0b111;
+        bytes[second_word] = 0b111;
+        assert!(matches!(
+            deserialize_wavelet_tree(Bytes::from(bytes)).unwrap_err(),
+            PackedWaveletError::InvalidCode { .. }
+        ));
     }
 }

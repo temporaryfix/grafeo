@@ -1,15 +1,16 @@
-//! Packed term dictionary for the v2 Ring on-disk format (Phase 6b).
+//! Packed term dictionary for the canonical Ring on-disk format.
 //!
 //! Stores RDF terms as concatenated UTF-8 N-Triples strings in a refcounted
 //! [`Bytes`] buffer, with an offset index for O(1) `id -> term` lookups and
 //! a sorted-id permutation for O(log n) `term -> id` lookups via binary
-//! search.
+//! search. The retained storage is zero-copy on load; validation may
+//! transiently allocate parsed terms before the slices are accepted.
 //!
 //! The packed format is designed to mmap directly: the entire structure
 //! is three contiguous byte slices (`string_table`, `offsets`, `sorted_ids`)
-//! all stored as little-endian primitives. No allocation on load — the
+//! all stored as little-endian primitives. The
 //! [`from_bytes`](PackedTermDictionary::from_bytes) entry point adopts
-//! pre-mapped memory via `Bytes::slice`.
+//! pre-mapped storage via `Bytes::slice` rather than copying those regions.
 //!
 //! ## Layout
 //!
@@ -30,8 +31,8 @@
 //!
 //! The wavelet trees and permutations elsewhere in the Ring index reference
 //! terms by their original insertion-order IDs. Sorting the dictionary
-//! would require rebuilding those structures — expensive at migration
-//! time. Instead, we keep IDs stable and store an auxiliary `sorted_ids`
+//! would require rebuilding those structures. Instead, we keep IDs stable
+//! and store an auxiliary `sorted_ids`
 //! array so query-time `get_id` lookups remain O(log n).
 
 use bytes::Bytes;
@@ -43,7 +44,7 @@ const MAGIC: &[u8; 4] = b"PDCT";
 const VERSION: u8 = 1;
 const HEADER_SIZE: usize = 16;
 
-/// Packed dictionary in the v2 Ring on-disk format (Phase 6b).
+/// Packed dictionary in the canonical Ring on-disk format.
 #[derive(Debug, Clone)]
 pub struct PackedTermDictionary {
     /// Concatenated UTF-8 N-Triples encodings in insertion order.
@@ -67,6 +68,10 @@ pub enum PackedDictError {
     BadMagic,
     /// Version byte not recognized.
     UnsupportedVersion(u8),
+    /// Reserved header bytes must be zero in the canonical encoding.
+    NonZeroReserved,
+    /// A size or offset cannot be represented safely.
+    SizeOverflow,
     /// Recorded sizes overflow the input buffer.
     InconsistentSizes {
         /// Total bytes the header claims the dictionary occupies.
@@ -79,6 +84,12 @@ pub enum PackedDictError {
     InvalidOffsets,
     /// Sorted-id entry references an id outside `[0, count)`.
     InvalidSortedId(u32),
+    /// The sorted-id array is not a bijection in strict term-byte order.
+    InvalidSortedOrder,
+    /// A string-table record is not a canonical N-Triples term.
+    InvalidTermEncoding(u32),
+    /// A source dictionary did not return a term for an in-range id.
+    MissingSourceTerm(u32),
 }
 
 impl std::fmt::Display for PackedDictError {
@@ -87,6 +98,8 @@ impl std::fmt::Display for PackedDictError {
             Self::TruncatedHeader => write!(f, "packed dict header truncated"),
             Self::BadMagic => write!(f, "packed dict bad magic (expected 'PDCT')"),
             Self::UnsupportedVersion(v) => write!(f, "packed dict unsupported version {v}"),
+            Self::NonZeroReserved => write!(f, "packed dict reserved bytes must be zero"),
+            Self::SizeOverflow => write!(f, "packed dict size overflows the platform"),
             Self::InconsistentSizes {
                 expected_total,
                 actual_total,
@@ -99,6 +112,15 @@ impl std::fmt::Display for PackedDictError {
                 "packed dict offsets invalid (non-monotonic or sentinel mismatch)"
             ),
             Self::InvalidSortedId(id) => write!(f, "packed dict sorted-id {id} out of range"),
+            Self::InvalidSortedOrder => {
+                write!(f, "packed dict sorted ids are not a canonical permutation")
+            }
+            Self::InvalidTermEncoding(id) => {
+                write!(f, "packed dict term {id} is not canonical N-Triples")
+            }
+            Self::MissingSourceTerm(id) => {
+                write!(f, "source dictionary is missing in-range term id {id}")
+            }
         }
     }
 }
@@ -179,95 +201,108 @@ impl PackedTermDictionary {
     }
 
     /// Builds a [`PackedTermDictionary`] from an in-memory
-    /// [`TermDictionary`] (Phase 6e ring serialization).
+    /// [`TermDictionary`] for Ring serialization.
     ///
     /// Walks the dictionary in insertion order, accumulating the string
     /// table and offsets, then computes the lex-sorted permutation
     /// once at the end.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the source dictionary contains more than `u32::MAX`
-    /// terms. This matches the rest of the Ring index, which uses `u32`
-    /// term ids throughout.
-    #[must_use]
-    pub fn from_term_dict(dict: &TermDictionary) -> Self {
+    /// Returns an error if the dictionary exceeds the Ring id space, is
+    /// internally incomplete, or its encoded size overflows the platform.
+    pub fn from_term_dict(dict: &TermDictionary) -> Result<Self, PackedDictError> {
         let count = dict.len();
-        assert!(
-            u32::try_from(count).is_ok(),
-            "PackedTermDictionary supports up to u32::MAX terms; got {count}"
-        );
+        let count_u32 = u32::try_from(count).map_err(|_| PackedDictError::SizeOverflow)?;
         // Insertion-order string table.
         let mut strings: Vec<String> = Vec::with_capacity(count);
         let mut total_bytes = 0usize;
-        for id in 0..count {
+        for id in 0..count_u32 {
             let term = dict
-                .get_term(u32::try_from(id).expect("count <= u32::MAX checked above"))
-                .expect("id < len");
+                .get_term(id)
+                .ok_or(PackedDictError::MissingSourceTerm(id))?;
             let s = term.to_string();
-            total_bytes += s.len();
+            total_bytes = total_bytes
+                .checked_add(s.len())
+                .ok_or(PackedDictError::SizeOverflow)?;
             strings.push(s);
         }
 
         let mut string_table_buf = Vec::with_capacity(total_bytes);
-        let mut offsets_buf = Vec::with_capacity((count + 1) * 8);
+        let offsets_capacity = count
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(8))
+            .ok_or(PackedDictError::SizeOverflow)?;
+        let mut offsets_buf = Vec::with_capacity(offsets_capacity);
         let mut current = 0u64;
         for s in &strings {
             offsets_buf.extend_from_slice(&current.to_le_bytes());
             string_table_buf.extend_from_slice(s.as_bytes());
-            current = current.saturating_add(s.len() as u64);
+            let len = u64::try_from(s.len()).map_err(|_| PackedDictError::SizeOverflow)?;
+            current = current
+                .checked_add(len)
+                .ok_or(PackedDictError::SizeOverflow)?;
         }
         // Sentinel.
         offsets_buf.extend_from_slice(&current.to_le_bytes());
 
         // Lex-sorted permutation.
-        let mut sorted: Vec<u32> = (0..u32::try_from(count).expect("count fits u32")).collect();
+        let mut sorted: Vec<u32> = (0..count_u32).collect();
         sorted.sort_unstable_by(|&a, &b| {
             strings[a as usize]
                 .as_bytes()
                 .cmp(strings[b as usize].as_bytes())
         });
-        let mut sorted_buf = Vec::with_capacity(count * 4);
+        let sorted_capacity = count.checked_mul(4).ok_or(PackedDictError::SizeOverflow)?;
+        let mut sorted_buf = Vec::with_capacity(sorted_capacity);
         for id in &sorted {
             sorted_buf.extend_from_slice(&id.to_le_bytes());
         }
 
-        Self {
+        Ok(Self {
             string_table: Bytes::from(string_table_buf),
             offsets: Bytes::from(offsets_buf),
             sorted_ids: Bytes::from(sorted_buf),
             count,
-        }
+        })
     }
 
     /// Serializes this dictionary to a flat byte buffer per the layout
     /// documented at the module top.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let total =
-            HEADER_SIZE + 8 + self.string_table.len() + self.offsets.len() + self.sorted_ids.len();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a length or the complete image cannot be
+    /// represented safely.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PackedDictError> {
+        let total = HEADER_SIZE
+            .checked_add(8)
+            .and_then(|value| value.checked_add(self.string_table.len()))
+            .and_then(|value| value.checked_add(self.offsets.len()))
+            .and_then(|value| value.checked_add(self.sorted_ids.len()))
+            .ok_or(PackedDictError::SizeOverflow)?;
+        let count = u64::try_from(self.count).map_err(|_| PackedDictError::SizeOverflow)?;
+        let string_table_len =
+            u64::try_from(self.string_table.len()).map_err(|_| PackedDictError::SizeOverflow)?;
         let mut buf = Vec::with_capacity(total);
         // Header.
         buf.extend_from_slice(MAGIC);
         buf.push(VERSION);
         buf.extend_from_slice(&[0u8; 3]); // reserved
-        buf.extend_from_slice(&(self.count as u64).to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
         // String table size + table.
-        buf.extend_from_slice(&(self.string_table.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&string_table_len.to_le_bytes());
         buf.extend_from_slice(&self.string_table);
         // Offsets (count + 1 u64 LE).
         buf.extend_from_slice(&self.offsets);
         // Sorted ids (count u32 LE).
         buf.extend_from_slice(&self.sorted_ids);
-        buf
+        Ok(buf)
     }
 
     fn read_count_from_header(data: &[u8]) -> Result<usize, PackedDictError> {
-        let raw = u64::from_le_bytes(data[8..16].try_into().expect("16-byte slice"));
-        usize::try_from(raw).map_err(|_| PackedDictError::InconsistentSizes {
-            expected_total: usize::MAX,
-            actual_total: data.len(),
-        })
+        let raw = read_u64(data, 8).ok_or(PackedDictError::TruncatedHeader)?;
+        usize::try_from(raw).map_err(|_| PackedDictError::SizeOverflow)
     }
 
     /// Parses a packed dictionary from a refcounted [`Bytes`] buffer.
@@ -280,12 +315,19 @@ impl PackedTermDictionary {
     /// Returns a [`PackedDictError`] on truncation, magic/version
     /// mismatch, inconsistent sizes, or invalid offsets/sorted-ids.
     ///
-    /// # Panics
-    ///
-    /// Does not panic in normal operation: header-size checks happen
-    /// before any indexed read. Internal `expect`s describe invariants
-    /// that the bounds checks above already guarantee.
     pub fn from_bytes(data: Bytes) -> Result<Self, PackedDictError> {
+        let dict = Self::from_bytes_structural(data)?;
+        dict.validate_terms()?;
+        Ok(dict)
+    }
+
+    /// Parses layout and lookup invariants while deferring term parsing to the
+    /// consuming Ring reconstruction, where each term is materialized once.
+    pub(super) fn from_ring_bytes(data: Bytes) -> Result<Self, PackedDictError> {
+        Self::from_bytes_structural(data)
+    }
+
+    fn from_bytes_structural(data: Bytes) -> Result<Self, PackedDictError> {
         if data.len() < HEADER_SIZE {
             return Err(PackedDictError::TruncatedHeader);
         }
@@ -296,29 +338,25 @@ impl PackedTermDictionary {
         if version != VERSION {
             return Err(PackedDictError::UnsupportedVersion(version));
         }
+        if data[5..8] != [0; 3] {
+            return Err(PackedDictError::NonZeroReserved);
+        }
         let count = Self::read_count_from_header(&data)?;
 
         // String table size header.
         let mut cursor = HEADER_SIZE;
-        if cursor + 8 > data.len() {
+        let size_header_end = cursor.checked_add(8).ok_or(PackedDictError::SizeOverflow)?;
+        if size_header_end > data.len() {
             return Err(PackedDictError::TruncatedHeader);
         }
-        let st_size_raw =
-            u64::from_le_bytes(data[cursor..cursor + 8].try_into().expect("8-byte slice"));
-        let st_size =
-            usize::try_from(st_size_raw).map_err(|_| PackedDictError::InconsistentSizes {
-                expected_total: usize::MAX,
-                actual_total: data.len(),
-            })?;
-        cursor += 8;
+        let st_size_raw = read_u64(&data, cursor).ok_or(PackedDictError::TruncatedHeader)?;
+        let st_size = usize::try_from(st_size_raw).map_err(|_| PackedDictError::SizeOverflow)?;
+        cursor = size_header_end;
 
         // String table region.
         let st_end = cursor
             .checked_add(st_size)
-            .ok_or(PackedDictError::InconsistentSizes {
-                expected_total: 0,
-                actual_total: data.len(),
-            })?;
+            .ok_or(PackedDictError::SizeOverflow)?;
         if st_end > data.len() {
             return Err(PackedDictError::InconsistentSizes {
                 expected_total: st_end,
@@ -329,14 +367,13 @@ impl PackedTermDictionary {
         cursor = st_end;
 
         // Offsets region: (count + 1) * 8 bytes.
-        let offsets_size = (count + 1) * 8;
-        let offsets_end =
-            cursor
-                .checked_add(offsets_size)
-                .ok_or(PackedDictError::InconsistentSizes {
-                    expected_total: 0,
-                    actual_total: data.len(),
-                })?;
+        let offsets_size = count
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(8))
+            .ok_or(PackedDictError::SizeOverflow)?;
+        let offsets_end = cursor
+            .checked_add(offsets_size)
+            .ok_or(PackedDictError::SizeOverflow)?;
         if offsets_end > data.len() {
             return Err(PackedDictError::InconsistentSizes {
                 expected_total: offsets_end,
@@ -347,15 +384,11 @@ impl PackedTermDictionary {
         cursor = offsets_end;
 
         // Sorted ids region: count * 4 bytes.
-        let sorted_size = count * 4;
-        let sorted_end =
-            cursor
-                .checked_add(sorted_size)
-                .ok_or(PackedDictError::InconsistentSizes {
-                    expected_total: 0,
-                    actual_total: data.len(),
-                })?;
-        if sorted_end > data.len() {
+        let sorted_size = count.checked_mul(4).ok_or(PackedDictError::SizeOverflow)?;
+        let sorted_end = cursor
+            .checked_add(sorted_size)
+            .ok_or(PackedDictError::SizeOverflow)?;
+        if sorted_end != data.len() {
             return Err(PackedDictError::InconsistentSizes {
                 expected_total: sorted_end,
                 actual_total: data.len(),
@@ -391,7 +424,7 @@ impl PackedTermDictionary {
         let mut prev: u64 = 0;
         for i in 0..=self.count {
             let v = read_u64_at(&self.offsets, i).ok_or(PackedDictError::InvalidOffsets)?;
-            if v < prev {
+            if (i == 0 && v != 0) || v < prev {
                 return Err(PackedDictError::InvalidOffsets);
             }
             prev = v;
@@ -403,12 +436,33 @@ impl PackedTermDictionary {
         Ok(())
     }
 
+    fn validate_terms(&self) -> Result<(), PackedDictError> {
+        for index in 0..self.count {
+            let id = u32::try_from(index).map_err(|_| PackedDictError::SizeOverflow)?;
+            let bytes = self
+                .term_bytes_for(id)
+                .ok_or(PackedDictError::InvalidTermEncoding(id))?;
+            let text =
+                std::str::from_utf8(bytes).map_err(|_| PackedDictError::InvalidTermEncoding(id))?;
+            Term::from_canonical_ntriples(text).ok_or(PackedDictError::InvalidTermEncoding(id))?;
+        }
+        Ok(())
+    }
+
     fn validate_sorted_ids(&self) -> Result<(), PackedDictError> {
+        let mut previous: Option<&[u8]> = None;
         for i in 0..self.count {
             let id = read_u32_at(&self.sorted_ids, i).ok_or(PackedDictError::InvalidOffsets)?;
             if id as usize >= self.count {
                 return Err(PackedDictError::InvalidSortedId(id));
             }
+            let current = self
+                .term_bytes_for(id)
+                .ok_or(PackedDictError::InvalidSortedId(id))?;
+            if previous.is_some_and(|value| value >= current) {
+                return Err(PackedDictError::InvalidSortedOrder);
+            }
+            previous = Some(current);
         }
         Ok(())
     }
@@ -419,6 +473,12 @@ impl PackedTermDictionary {
     pub fn approximate_bytes(&self) -> usize {
         self.string_table.len() + self.offsets.len() + self.sorted_ids.len()
     }
+}
+
+fn read_u64(bytes: &[u8], start: usize) -> Option<u64> {
+    let end = start.checked_add(8)?;
+    let chunk: [u8; 8] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(chunk))
 }
 
 fn read_u64_at(bytes: &Bytes, idx: usize) -> Option<u64> {
@@ -457,8 +517,8 @@ mod tests {
             Term::literal("Gus"),
         ];
         let dict = build_dict_with(&terms);
-        let packed = PackedTermDictionary::from_term_dict(&dict);
-        let bytes = packed.to_bytes();
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
+        let bytes = packed.to_bytes().expect("serialize dictionary");
         let restored = PackedTermDictionary::from_bytes(Bytes::from(bytes)).expect("from_bytes");
 
         assert_eq!(restored.len(), terms.len());
@@ -476,7 +536,7 @@ mod tests {
             .map(|i| Term::iri(format!("http://ex.org/term-{i:03}")))
             .collect();
         let dict = build_dict_with(&terms);
-        let packed = PackedTermDictionary::from_term_dict(&dict);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
 
         for (i, term) in terms.iter().enumerate() {
             let id = packed
@@ -490,7 +550,7 @@ mod tests {
     #[test]
     fn vincent_get_id_returns_none_for_absent_term() {
         let dict = build_dict_with(&[Term::iri("http://a"), Term::iri("http://b")]);
-        let packed = PackedTermDictionary::from_term_dict(&dict);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
         assert!(packed.get_id(&Term::iri("http://c")).is_none());
         assert!(packed.get_id(&Term::literal("missing")).is_none());
     }
@@ -498,9 +558,9 @@ mod tests {
     #[test]
     fn jules_empty_dict_round_trip() {
         let dict = TermDictionary::new();
-        let packed = PackedTermDictionary::from_term_dict(&dict);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
         assert!(packed.is_empty());
-        let bytes = packed.to_bytes();
+        let bytes = packed.to_bytes().expect("serialize dictionary");
         let restored = PackedTermDictionary::from_bytes(Bytes::from(bytes)).expect("empty");
         assert!(restored.is_empty());
         assert!(restored.get_term(0).is_none());
@@ -510,7 +570,7 @@ mod tests {
     #[test]
     fn mia_get_term_str_out_of_range_returns_none() {
         let dict = build_dict_with(&[Term::iri("http://a")]);
-        let packed = PackedTermDictionary::from_term_dict(&dict);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
         assert!(packed.get_term_str(0).is_some());
         assert!(packed.get_term_str(1).is_none());
         assert!(packed.get_term_str(u32::MAX).is_none());
@@ -566,8 +626,8 @@ mod tests {
             Term::iri("http://example.org/alix"),
             Term::iri("http://example.org/gus"),
         ]);
-        let packed = PackedTermDictionary::from_term_dict(&dict);
-        let serialized = packed.to_bytes();
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
+        let serialized = packed.to_bytes().expect("serialize dictionary");
         let source = Bytes::from(serialized);
         let source_ptr = source.as_ptr();
 
@@ -581,6 +641,65 @@ mod tests {
         assert!(
             offset < (HEADER_SIZE + 8 + restored.string_table.len() + 256),
             "string_table should be inside source allocation; offset={offset}"
+        );
+    }
+
+    #[test]
+    fn reserved_bytes_are_rejected() {
+        let dict = build_dict_with(&[Term::iri("http://example.org/a")]);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
+        let mut bytes = packed.to_bytes().expect("serialize dictionary");
+        bytes[5] = 1;
+        assert_eq!(
+            PackedTermDictionary::from_bytes(Bytes::from(bytes)).unwrap_err(),
+            PackedDictError::NonZeroReserved
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let dict = build_dict_with(&[Term::iri("http://example.org/a")]);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
+        let mut bytes = packed.to_bytes().expect("serialize dictionary");
+        let expected = bytes.len();
+        bytes.push(0);
+        assert_eq!(
+            PackedTermDictionary::from_bytes(Bytes::from(bytes)).unwrap_err(),
+            PackedDictError::InconsistentSizes {
+                expected_total: expected,
+                actual_total: expected + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_term_encoding_is_rejected() {
+        let dict = build_dict_with(&[Term::iri("http://example.org/a")]);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
+        let mut bytes = packed.to_bytes().expect("serialize dictionary");
+        bytes[HEADER_SIZE + 8] = b'x';
+        assert_eq!(
+            PackedTermDictionary::from_bytes(Bytes::from(bytes)).unwrap_err(),
+            PackedDictError::InvalidTermEncoding(0)
+        );
+    }
+
+    #[test]
+    fn duplicate_sorted_id_is_rejected() {
+        let dict = build_dict_with(&[
+            Term::iri("http://example.org/a"),
+            Term::iri("http://example.org/b"),
+        ]);
+        let packed = PackedTermDictionary::from_term_dict(&dict).expect("pack dictionary");
+        let mut bytes = packed.to_bytes().expect("serialize dictionary");
+        let string_bytes = usize::try_from(read_u64(&bytes, 16).expect("string-table size"))
+            .expect("fixture size fits usize");
+        let sorted_start = HEADER_SIZE + 8 + string_bytes + 3 * 8;
+        let first = bytes[sorted_start..sorted_start + 4].to_vec();
+        bytes[sorted_start + 4..sorted_start + 8].copy_from_slice(&first);
+        assert_eq!(
+            PackedTermDictionary::from_bytes(Bytes::from(bytes)).unwrap_err(),
+            PackedDictError::InvalidSortedOrder
         );
     }
 }

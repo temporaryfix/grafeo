@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn target_with_named_graph() {
         let store = RdfStore::new();
-        let graph = store.graph_or_create("http://ex.org/g1");
+        let graph = store.graph_or_create("http://ex.org/g1").unwrap();
         let rdf_type = Term::iri(RDF::TYPE);
         let person = Term::iri("http://ex.org/Person");
         graph.insert(Triple::new(

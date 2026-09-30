@@ -1,13 +1,12 @@
-//! Ring index v2 packed on-disk format (Phase 6e).
+//! Canonical packed on-disk format for the Ring index.
 //!
-//! Composes the four packed sub-formats from Phase 6a-d into a single
-//! mmap-friendly byte buffer:
+//! Composes the packed sub-formats into a single mmap-friendly byte buffer:
 //!
-//! - [`PackedTermDictionary`] (Phase 6b)
+//! - [`PackedTermDictionary`]
 //! - `PackedWaveletTree` (see [`super::packed_wavelet`]) for subjects,
-//!   predicates, objects (Phase 6c)
+//!   predicates and objects
 //! - `PackedPermutation` (see [`super::packed_permutation`]) for spo→pos
-//!   and spo→osp (Phase 6d)
+//!   and spo→osp
 //!
 //! ## Layout
 //!
@@ -52,9 +51,10 @@ use crate::index::ring::{
 const MAGIC: &[u8; 4] = b"GRFR";
 const VERSION: u8 = 2;
 const HEADER_SIZE: usize = 64;
+const HEADER_SIZE_U64: u64 = 64;
 const TRAILER_SIZE: usize = 4;
 
-/// Errors returned when parsing a Ring v2 packed file.
+/// Errors returned when encoding or parsing a packed Ring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackedRingError {
     /// Buffer is too small to even read the header.
@@ -63,6 +63,15 @@ pub enum PackedRingError {
     BadMagic,
     /// Version byte not recognized (only `2` is accepted).
     UnsupportedVersion(u8),
+    /// Reserved header bytes must be zero in the canonical encoding.
+    NonZeroReserved,
+    /// A size cannot be represented safely by the wire grammar.
+    SizeOverflow {
+        /// Component whose size overflowed.
+        section: &'static str,
+    },
+    /// The first sub-section must begin immediately after the header.
+    NonCanonicalLayout,
     /// A declared sub-section offset points outside the buffer.
     OffsetOutOfBounds {
         /// Sub-section that had the bad offset.
@@ -100,26 +109,33 @@ pub enum PackedRingError {
 impl std::fmt::Display for PackedRingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TruncatedHeader => write!(f, "ring v2 header truncated"),
-            Self::BadMagic => write!(f, "ring v2 bad magic (expected 'GRFR')"),
-            Self::UnsupportedVersion(v) => write!(f, "ring v2 unsupported version {v}"),
+            Self::TruncatedHeader => write!(f, "packed ring header truncated"),
+            Self::BadMagic => write!(f, "packed ring bad magic (expected 'GRFR')"),
+            Self::UnsupportedVersion(v) => write!(f, "packed ring unsupported version {v}"),
+            Self::NonZeroReserved => write!(f, "packed ring reserved bytes must be zero"),
+            Self::SizeOverflow { section } => {
+                write!(f, "packed ring {section} size overflows the wire grammar")
+            }
+            Self::NonCanonicalLayout => {
+                write!(f, "packed ring sub-sections are not canonically contiguous")
+            }
             Self::OffsetOutOfBounds { section, offset } => write!(
                 f,
-                "ring v2 offset out of bounds: section '{section}' at {offset}"
+                "packed ring offset out of bounds: section '{section}' at {offset}"
             ),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
-                "ring v2 CRC mismatch: expected {expected:#010X}, got {actual:#010X}"
+                "packed ring CRC mismatch: expected {expected:#010X}, got {actual:#010X}"
             ),
-            Self::Dict(e) => write!(f, "ring v2 dictionary parse error: {e}"),
-            Self::Wavelet(e) => write!(f, "ring v2 wavelet parse error: {e}"),
-            Self::Permutation(e) => write!(f, "ring v2 permutation parse error: {e}"),
+            Self::Dict(e) => write!(f, "packed ring dictionary error: {e}"),
+            Self::Wavelet(e) => write!(f, "packed ring wavelet error: {e}"),
+            Self::Permutation(e) => write!(f, "packed ring permutation error: {e}"),
             Self::NumTriplesMismatch { declared, observed } => write!(
                 f,
-                "ring v2 num_triples mismatch: declared {declared}, observed {observed}"
+                "packed ring num_triples mismatch: declared {declared}, observed {observed}"
             ),
             Self::RingInvariantViolation(e) => {
-                write!(f, "ring v2 ring invariant violation: {e}")
+                write!(f, "packed ring invariant violation: {e}")
             }
         }
     }
@@ -151,38 +167,81 @@ impl From<super::triple_ring::TripleRingInvariantError> for PackedRingError {
     }
 }
 
-/// Serializes a [`TripleRing`] to the v2 packed format.
+/// Serializes a [`TripleRing`] to the canonical packed format.
 ///
 /// The output buffer is laid out per the module-top documentation: a
 /// 64-byte header with explicit sub-section offsets, the six packed
 /// sub-sections in order, then a 4-byte CRC32 trailer.
-#[must_use]
-pub fn serialize_triple_ring(ring: &TripleRing) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns an error if a component or aggregate size cannot be represented,
+/// or if an in-memory component is structurally incomplete.
+pub fn serialize_triple_ring(ring: &TripleRing) -> Result<Vec<u8>, PackedRingError> {
     // Serialize each sub-section first so we know their sizes for the
     // offset table.
-    let dict_bytes = PackedTermDictionary::from_term_dict(ring.dictionary()).to_bytes();
-    let subj_bytes = serialize_wavelet_tree(ring.subjects_wt());
-    let pred_bytes = serialize_wavelet_tree(ring.predicates_wt());
-    let obj_bytes = serialize_wavelet_tree(ring.objects_wt());
-    let pos_bytes = serialize_permutation(ring.spo_to_pos_perm());
-    let osp_bytes = serialize_permutation(ring.spo_to_osp_perm());
+    let dict_bytes = PackedTermDictionary::from_term_dict(ring.dictionary())?.to_bytes()?;
+    let subj_bytes = serialize_wavelet_tree(ring.subjects_wt())?;
+    let pred_bytes = serialize_wavelet_tree(ring.predicates_wt())?;
+    let obj_bytes = serialize_wavelet_tree(ring.objects_wt())?;
+    let pos_bytes = serialize_permutation(ring.spo_to_pos_perm())?;
+    let osp_bytes = serialize_permutation(ring.spo_to_osp_perm())?;
 
-    let dict_offset = HEADER_SIZE as u64;
-    let subj_offset = dict_offset + dict_bytes.len() as u64;
-    let pred_offset = subj_offset + subj_bytes.len() as u64;
-    let obj_offset = pred_offset + pred_bytes.len() as u64;
-    let pos_offset = obj_offset + obj_bytes.len() as u64;
-    let osp_offset = pos_offset + pos_bytes.len() as u64;
-    let body_end = osp_offset + osp_bytes.len() as u64;
-
-    let total = usize::try_from(body_end).unwrap_or(usize::MAX) + TRAILER_SIZE;
+    let dict_offset = HEADER_SIZE;
+    let subj_offset =
+        dict_offset
+            .checked_add(dict_bytes.len())
+            .ok_or(PackedRingError::SizeOverflow {
+                section: "dictionary",
+            })?;
+    let pred_offset =
+        subj_offset
+            .checked_add(subj_bytes.len())
+            .ok_or(PackedRingError::SizeOverflow {
+                section: "subjects",
+            })?;
+    let obj_offset =
+        pred_offset
+            .checked_add(pred_bytes.len())
+            .ok_or(PackedRingError::SizeOverflow {
+                section: "predicates",
+            })?;
+    let pos_offset = obj_offset
+        .checked_add(obj_bytes.len())
+        .ok_or(PackedRingError::SizeOverflow { section: "objects" })?;
+    let osp_offset =
+        pos_offset
+            .checked_add(pos_bytes.len())
+            .ok_or(PackedRingError::SizeOverflow {
+                section: "spo_to_pos",
+            })?;
+    let body_end =
+        osp_offset
+            .checked_add(osp_bytes.len())
+            .ok_or(PackedRingError::SizeOverflow {
+                section: "spo_to_osp",
+            })?;
+    let total = body_end
+        .checked_add(TRAILER_SIZE)
+        .ok_or(PackedRingError::SizeOverflow { section: "image" })?;
+    let to_wire_offset = |offset: usize| {
+        u64::try_from(offset).map_err(|_| PackedRingError::SizeOverflow { section: "offset" })
+    };
+    let dict_offset = to_wire_offset(dict_offset)?;
+    let subj_offset = to_wire_offset(subj_offset)?;
+    let pred_offset = to_wire_offset(pred_offset)?;
+    let obj_offset = to_wire_offset(obj_offset)?;
+    let pos_offset = to_wire_offset(pos_offset)?;
+    let osp_offset = to_wire_offset(osp_offset)?;
+    let num_triples = u64::try_from(ring.len())
+        .map_err(|_| PackedRingError::SizeOverflow { section: "triples" })?;
     let mut buf = Vec::with_capacity(total);
 
     // Header.
     buf.extend_from_slice(MAGIC); // 0..4
     buf.push(VERSION); // 4
     buf.extend_from_slice(&[0u8; 3]); // 5..8 reserved
-    buf.extend_from_slice(&(ring.len() as u64).to_le_bytes()); // 8..16 num_triples
+    buf.extend_from_slice(&num_triples.to_le_bytes()); // 8..16 num_triples
     buf.extend_from_slice(&dict_offset.to_le_bytes()); // 16..24
     buf.extend_from_slice(&subj_offset.to_le_bytes()); // 24..32
     buf.extend_from_slice(&pred_offset.to_le_bytes()); // 32..40
@@ -202,10 +261,10 @@ pub fn serialize_triple_ring(ring: &TripleRing) -> Vec<u8> {
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
 
-    buf
+    Ok(buf)
 }
 
-/// Parses a [`TripleRing`] from the v2 packed format.
+/// Parses a [`TripleRing`] from the canonical packed format.
 ///
 /// `data` is consumed via [`Bytes::slice`] so each sub-section's
 /// allocation is shared with the caller. Mmap-backed buffers stay
@@ -217,11 +276,6 @@ pub fn serialize_triple_ring(ring: &TripleRing) -> Vec<u8> {
 /// mismatch, out-of-bounds sub-section offsets, CRC trailer mismatch,
 /// or any of the embedded sub-format errors propagating up.
 ///
-/// # Panics
-///
-/// Internal `expect` calls describe invariants the bounds checks above
-/// already guarantee — every indexed read is preceded by a length
-/// check. Does not panic in normal operation.
 pub fn deserialize_triple_ring(data: Bytes) -> Result<TripleRing, PackedRingError> {
     if data.len() < HEADER_SIZE + TRAILER_SIZE {
         return Err(PackedRingError::TruncatedHeader);
@@ -233,11 +287,13 @@ pub fn deserialize_triple_ring(data: Bytes) -> Result<TripleRing, PackedRingErro
     if version != VERSION {
         return Err(PackedRingError::UnsupportedVersion(version));
     }
+    if data[5..8] != [0; 3] {
+        return Err(PackedRingError::NonZeroReserved);
+    }
 
     // CRC trailer first — fail fast on corruption.
     let body_end = data.len() - TRAILER_SIZE;
-    let trailer: [u8; 4] = data[body_end..].try_into().expect("4-byte trailer slice");
-    let expected_crc = u32::from_le_bytes(trailer);
+    let expected_crc = read_u32(&data, body_end).ok_or(PackedRingError::TruncatedHeader)?;
     let actual_crc = crc32fast::hash(&data[..body_end]);
     if actual_crc != expected_crc {
         return Err(PackedRingError::ChecksumMismatch {
@@ -246,20 +302,21 @@ pub fn deserialize_triple_ring(data: Bytes) -> Result<TripleRing, PackedRingErro
         });
     }
 
-    let num_triples_raw = u64::from_le_bytes(data[8..16].try_into().expect("8-byte slice"));
+    let num_triples_raw = read_u64(&data, 8).ok_or(PackedRingError::TruncatedHeader)?;
     let num_triples =
         usize::try_from(num_triples_raw).map_err(|_| PackedRingError::OffsetOutOfBounds {
             section: "num_triples",
             offset: num_triples_raw,
         })?;
-    let dict_offset = u64::from_le_bytes(data[16..24].try_into().expect("8-byte slice"));
-    let subj_offset = u64::from_le_bytes(data[24..32].try_into().expect("8-byte slice"));
-    let pred_offset = u64::from_le_bytes(data[32..40].try_into().expect("8-byte slice"));
-    let obj_offset = u64::from_le_bytes(data[40..48].try_into().expect("8-byte slice"));
-    let pos_offset = u64::from_le_bytes(data[48..56].try_into().expect("8-byte slice"));
-    let osp_offset = u64::from_le_bytes(data[56..64].try_into().expect("8-byte slice"));
+    let dict_offset = read_u64(&data, 16).ok_or(PackedRingError::TruncatedHeader)?;
+    let subj_offset = read_u64(&data, 24).ok_or(PackedRingError::TruncatedHeader)?;
+    let pred_offset = read_u64(&data, 32).ok_or(PackedRingError::TruncatedHeader)?;
+    let obj_offset = read_u64(&data, 40).ok_or(PackedRingError::TruncatedHeader)?;
+    let pos_offset = read_u64(&data, 48).ok_or(PackedRingError::TruncatedHeader)?;
+    let osp_offset = read_u64(&data, 56).ok_or(PackedRingError::TruncatedHeader)?;
 
-    let body_end_u64 = body_end as u64;
+    let body_end_u64 =
+        u64::try_from(body_end).map_err(|_| PackedRingError::SizeOverflow { section: "body" })?;
     for (section, offset) in [
         ("dict", dict_offset),
         ("subjects", subj_offset),
@@ -281,6 +338,9 @@ pub fn deserialize_triple_ring(data: Bytes) -> Result<TripleRing, PackedRingErro
         pos_offset,
         osp_offset,
     ];
+    if dict_offset != HEADER_SIZE_U64 {
+        return Err(PackedRingError::NonCanonicalLayout);
+    }
     for window in offsets.windows(2) {
         if window[0] >= window[1] {
             return Err(PackedRingError::OffsetOutOfBounds {
@@ -305,7 +365,7 @@ pub fn deserialize_triple_ring(data: Bytes) -> Result<TripleRing, PackedRingErro
     let pos_slice = data.slice(to_usize(pos_offset)?..to_usize(osp_offset)?);
     let osp_slice = data.slice(to_usize(osp_offset)?..body_end);
 
-    let dict = PackedTermDictionary::from_bytes(dict_slice)?;
+    let dict = PackedTermDictionary::from_ring_bytes(dict_slice)?;
     let subjects = deserialize_wavelet_tree(subj_slice)?;
     let predicates = deserialize_wavelet_tree(pred_slice)?;
     let objects = deserialize_wavelet_tree(obj_slice)?;
@@ -329,6 +389,18 @@ pub fn deserialize_triple_ring(data: Bytes) -> Result<TripleRing, PackedRingErro
         spo_to_osp,
     )
     .map_err(PackedRingError::RingInvariantViolation)
+}
+
+fn read_u64(bytes: &[u8], start: usize) -> Option<u64> {
+    let end = start.checked_add(8)?;
+    let chunk: [u8; 8] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(chunk))
+}
+
+fn read_u32(bytes: &[u8], start: usize) -> Option<u32> {
+    let end = start.checked_add(4)?;
+    let chunk: [u8; 4] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(chunk))
 }
 
 #[cfg(test)]
@@ -357,10 +429,20 @@ mod tests {
         TripleRing::from_triples(triples.into_iter())
     }
 
+    fn encode(ring: &TripleRing) -> Vec<u8> {
+        serialize_triple_ring(ring).expect("serialize packed ring")
+    }
+
+    fn rewrite_crc(bytes: &mut [u8]) {
+        let body_end = bytes.len() - TRAILER_SIZE;
+        let crc = crc32fast::hash(&bytes[..body_end]);
+        bytes[body_end..].copy_from_slice(&crc.to_le_bytes());
+    }
+
     #[test]
     fn alix_packed_ring_roundtrip() {
         let ring = build_test_ring();
-        let bytes = serialize_triple_ring(&ring);
+        let bytes = encode(&ring);
         let restored = deserialize_triple_ring(Bytes::from(bytes)).expect("deserialize");
 
         assert_eq!(restored.len(), ring.len());
@@ -379,7 +461,7 @@ mod tests {
     #[test]
     fn gus_packed_ring_empty() {
         let ring = TripleRing::from_triples(std::iter::empty());
-        let bytes = serialize_triple_ring(&ring);
+        let bytes = encode(&ring);
         let restored = deserialize_triple_ring(Bytes::from(bytes)).expect("deserialize empty");
         assert_eq!(restored.len(), 0);
         assert!(restored.is_empty());
@@ -411,9 +493,7 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + TRAILER_SIZE];
         buf[..4].copy_from_slice(MAGIC);
         buf[4] = 99;
-        let crc = crc32fast::hash(&buf[..buf.len() - TRAILER_SIZE]);
-        let len = buf.len();
-        buf[len - 4..].copy_from_slice(&crc.to_le_bytes());
+        rewrite_crc(&mut buf);
         assert_eq!(
             deserialize_triple_ring(Bytes::from(buf)).unwrap_err(),
             PackedRingError::UnsupportedVersion(99)
@@ -423,7 +503,7 @@ mod tests {
     #[test]
     fn shosanna_packed_ring_corrupted_byte_caught_by_crc() {
         let ring = build_test_ring();
-        let mut bytes = serialize_triple_ring(&ring);
+        let mut bytes = encode(&ring);
         // Flip a byte deep inside the body.
         let len = bytes.len();
         bytes[len / 2] ^= 0x01;
@@ -461,7 +541,7 @@ mod tests {
             ),
         ];
         let ring = TripleRing::from_triples(triples.into_iter());
-        let bytes = serialize_triple_ring(&ring);
+        let bytes = encode(&ring);
         let restored = deserialize_triple_ring(Bytes::from(bytes)).expect("deserialize");
 
         // All-? pattern: count every triple.
@@ -499,8 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn hans_packed_ring_size_smaller_than_bincode() {
-        // Build a ring big enough for v2 to clearly win.
+    fn hans_packed_ring_stays_within_size_budget() {
         let triples: Vec<Triple> = (0..100u32)
             .flat_map(|i| {
                 let s = format!("http://ex.org/s-{i}");
@@ -514,18 +593,51 @@ mod tests {
             })
             .collect();
         let ring = TripleRing::from_triples(triples.into_iter());
-        let v2_bytes = serialize_triple_ring(&ring);
-        let v1_bytes = ring.save_to_bytes().expect("v1 save");
-        eprintln!(
-            "v1 bincode: {} bytes, v2 packed: {} bytes",
-            v1_bytes.len(),
-            v2_bytes.len()
-        );
+        let bytes = encode(&ring);
         assert!(
-            v2_bytes.len() < v1_bytes.len(),
-            "v2 packed must be smaller than v1 bincode (v1={}, v2={})",
-            v1_bytes.len(),
-            v2_bytes.len()
+            bytes.len() < 50_000,
+            "500-triple packed Ring exceeded its 50 KiB budget: {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn reserved_header_bytes_are_rejected_with_valid_crc() {
+        let mut bytes = encode(&build_test_ring());
+        bytes[5] = 1;
+        rewrite_crc(&mut bytes);
+        assert_eq!(
+            deserialize_triple_ring(Bytes::from(bytes)).unwrap_err(),
+            PackedRingError::NonZeroReserved
+        );
+    }
+
+    #[test]
+    fn non_canonical_first_offset_is_rejected_with_valid_crc() {
+        let mut bytes = encode(&build_test_ring());
+        bytes[16..24].copy_from_slice(&65u64.to_le_bytes());
+        rewrite_crc(&mut bytes);
+        assert_eq!(
+            deserialize_triple_ring(Bytes::from(bytes)).unwrap_err(),
+            PackedRingError::NonCanonicalLayout
+        );
+    }
+
+    #[test]
+    fn crc_valid_noncanonical_term_is_rejected_before_reconstruction() {
+        let term = Term::iri("http://example.org/only");
+        let ring =
+            TripleRing::from_triples([Triple::new(term.clone(), term.clone(), term)].into_iter());
+        let mut bytes = encode(&ring);
+        bytes[HEADER_SIZE + 24] = b'x';
+        rewrite_crc(&mut bytes);
+        assert_eq!(
+            deserialize_triple_ring(Bytes::from(bytes)).unwrap_err(),
+            PackedRingError::RingInvariantViolation(
+                super::super::triple_ring::TripleRingInvariantError::DictionaryNonCanonicalTerm {
+                    id: 0,
+                }
+            )
         );
     }
 }

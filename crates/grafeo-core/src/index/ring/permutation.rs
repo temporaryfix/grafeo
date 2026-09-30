@@ -12,7 +12,7 @@
 ///
 /// Stores both forward and inverse mappings for O(1) access.
 /// Uses 2n * 32 bits = 8n bytes for n elements.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct SuccinctPermutation {
     /// The number of elements in the permutation.
     n: usize,
@@ -22,96 +22,6 @@ pub struct SuccinctPermutation {
 
     /// Inverse mapping: inverse[j] = π⁻¹(j)
     inverse: Vec<u32>,
-}
-
-impl<'de> serde::Deserialize<'de> for SuccinctPermutation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        #[derive(serde::Deserialize)]
-        struct Raw {
-            n: usize,
-            forward: Vec<u32>,
-            inverse: Vec<u32>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-
-        // Validate that n matches both array lengths
-        if raw.forward.len() != raw.n {
-            return Err(D::Error::custom(format!(
-                "forward length {} does not match n {}",
-                raw.forward.len(),
-                raw.n
-            )));
-        }
-        if raw.inverse.len() != raw.n {
-            return Err(D::Error::custom(format!(
-                "inverse length {} does not match n {}",
-                raw.inverse.len(),
-                raw.n
-            )));
-        }
-
-        // Validate that all values in forward are valid indices (< n)
-        // and that each value appears exactly once (valid permutation)
-        if raw.n > 0 {
-            let n = raw.n;
-            // reason: permutation size fits u32 for practical data sizes
-            #[allow(clippy::cast_possible_truncation)]
-            let n32 = n as u32;
-
-            let mut forward_seen = vec![false; n];
-            for (i, &val) in raw.forward.iter().enumerate() {
-                if val >= n32 {
-                    return Err(D::Error::custom(format!(
-                        "forward[{i}] = {val} is out of range for n = {n}"
-                    )));
-                }
-                if forward_seen[val as usize] {
-                    return Err(D::Error::custom(format!(
-                        "duplicate value {val} in forward array"
-                    )));
-                }
-                forward_seen[val as usize] = true;
-            }
-
-            let mut inverse_seen = vec![false; n];
-            for (i, &val) in raw.inverse.iter().enumerate() {
-                if val >= n32 {
-                    return Err(D::Error::custom(format!(
-                        "inverse[{i}] = {val} is out of range for n = {n}"
-                    )));
-                }
-                if inverse_seen[val as usize] {
-                    return Err(D::Error::custom(format!(
-                        "duplicate value {val} in inverse array"
-                    )));
-                }
-                inverse_seen[val as usize] = true;
-            }
-
-            // Validate that forward and inverse are actually inverses of each other
-            for (i, &fwd) in raw.forward.iter().enumerate() {
-                // reason: permutation index fits u32
-                #[allow(clippy::cast_possible_truncation)]
-                if raw.inverse[fwd as usize] != i as u32 {
-                    return Err(D::Error::custom(format!(
-                        "inverse[forward[{i}]] != {i}: forward and inverse are inconsistent"
-                    )));
-                }
-            }
-        }
-
-        Ok(SuccinctPermutation {
-            n: raw.n,
-            forward: raw.forward,
-            inverse: raw.inverse,
-        })
-    }
 }
 
 impl SuccinctPermutation {
@@ -350,92 +260,5 @@ mod tests {
         let size = perm.size_bytes();
         // Should be reasonable (not huge)
         assert!(size < 1000);
-    }
-
-    #[test]
-    fn test_deserialize_valid_roundtrip() {
-        let original = SuccinctPermutation::new(&[2, 0, 3, 1]);
-        let serialized = serde_json::to_string(&original).unwrap();
-        let deserialized: SuccinctPermutation = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.len(), original.len());
-        for i in 0..original.len() {
-            assert_eq!(deserialized.apply(i), original.apply(i));
-            assert_eq!(deserialized.apply_inverse(i), original.apply_inverse(i));
-        }
-    }
-
-    #[test]
-    fn test_deserialize_empty_roundtrip() {
-        let original = SuccinctPermutation::new(&[]);
-        let serialized = serde_json::to_string(&original).unwrap();
-        let deserialized: SuccinctPermutation = serde_json::from_str(&serialized).unwrap();
-        assert!(deserialized.is_empty());
-    }
-
-    #[test]
-    fn test_deserialize_rejects_mismatched_forward_length() {
-        let json = r#"{"n":3,"forward":[0,1],"inverse":[0,1,2]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("forward length"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_deserialize_rejects_mismatched_inverse_length() {
-        let json = r#"{"n":3,"forward":[0,1,2],"inverse":[0,1]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("inverse length"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_deserialize_rejects_out_of_range_forward() {
-        let json = r#"{"n":3,"forward":[0,1,5],"inverse":[0,1,2]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("out of range"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_deserialize_rejects_out_of_range_inverse() {
-        let json = r#"{"n":3,"forward":[0,1,2],"inverse":[0,1,5]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("out of range"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_deserialize_rejects_duplicate_in_forward() {
-        let json = r#"{"n":3,"forward":[0,1,1],"inverse":[0,1,2]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("duplicate"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_deserialize_rejects_duplicate_in_inverse() {
-        let json = r#"{"n":3,"forward":[0,1,2],"inverse":[0,0,2]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("duplicate"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_deserialize_rejects_inconsistent_forward_inverse() {
-        // Both are valid permutations individually, but they are not inverses
-        // forward: [1, 0, 2] (swap 0 and 1)
-        // inverse: [0, 2, 1] (swap 1 and 2)
-        let json = r#"{"n":3,"forward":[1,0,2],"inverse":[0,2,1]}"#;
-        let result: Result<SuccinctPermutation, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("inconsistent"), "unexpected error: {err}");
     }
 }

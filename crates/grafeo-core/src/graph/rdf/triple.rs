@@ -86,11 +86,75 @@ impl Triple {
     pub fn as_tuple(&self) -> (&Term, &Term, &Term) {
         (&self.subject, &self.predicate, &self.object)
     }
+
+    /// Returns the canonical RDF identity key without changing structural
+    /// equality or hashing of the lossless source representation.
+    #[must_use]
+    pub fn canonical_identity_key(&self) -> [String; 3] {
+        [
+            self.subject.canonical_identity_key(),
+            self.predicate.canonical_identity_key(),
+            self.object.canonical_identity_key(),
+        ]
+    }
+
+    /// Returns whether two triples denote the same RDF statement identity.
+    #[must_use]
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.subject.same_identity(&other.subject)
+            && self.predicate.same_identity(&other.predicate)
+            && self.object.same_identity(&other.object)
+    }
 }
 
 impl fmt::Display for Triple {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {} {} .", self.subject, self.predicate, self.object)
+    }
+}
+
+/// An RDF quad: a triple plus optional named-graph IRI (`None` = default graph).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Quad {
+    triple: Triple,
+    graph: Option<String>,
+}
+
+impl Quad {
+    /// Triple in the default graph.
+    #[must_use]
+    pub fn new(triple: Triple) -> Self {
+        Self {
+            triple,
+            graph: None,
+        }
+    }
+
+    /// Triple in a named graph.
+    #[must_use]
+    pub fn named(triple: Triple, graph: impl Into<String>) -> Self {
+        Self {
+            triple,
+            graph: Some(graph.into()),
+        }
+    }
+
+    /// The triple.
+    #[must_use]
+    pub fn triple(&self) -> &Triple {
+        &self.triple
+    }
+
+    /// Named graph IRI, or `None` for the default graph.
+    #[must_use]
+    pub fn graph(&self) -> Option<&str> {
+        self.graph.as_deref()
+    }
+
+    /// Consumes the quad into `(triple, graph)`.
+    #[must_use]
+    pub fn into_parts(self) -> (Triple, Option<String>) {
+        (self.triple, self.graph)
     }
 }
 
@@ -145,17 +209,17 @@ impl TriplePattern {
     /// Checks if a triple matches this pattern.
     pub fn matches(&self, triple: &Triple) -> bool {
         if let Some(ref s) = self.subject
-            && s != triple.subject()
+            && !s.same_identity(triple.subject())
         {
             return false;
         }
         if let Some(ref p) = self.predicate
-            && p != triple.predicate()
+            && !p.same_identity(triple.predicate())
         {
             return false;
         }
         if let Some(ref o) = self.object
-            && o != triple.object()
+            && !o.same_identity(triple.object())
         {
             return false;
         }
@@ -215,5 +279,18 @@ mod tests {
             TriplePattern::with_predicate(Term::iri("http://xmlns.com/foaf/0.1/name"))
                 .matches(&triple)
         );
+    }
+
+    #[test]
+    fn triple_pattern_matches_canonical_language_identity_only() {
+        let triple = Triple::new(
+            Term::iri("urn:s"),
+            Term::iri("urn:p"),
+            Term::lang_literal("x", "EN"),
+        );
+
+        assert!(TriplePattern::with_object(Term::lang_literal("x", "en")).matches(&triple));
+        assert!(!TriplePattern::with_object(Term::lang_literal("y", "en")).matches(&triple));
+        assert!(!TriplePattern::with_object(Term::iri("x")).matches(&triple));
     }
 }

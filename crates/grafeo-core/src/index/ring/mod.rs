@@ -54,7 +54,10 @@ mod permutation;
 pub mod section;
 pub mod triple_ring;
 
-pub use leapfrog::{AnnotatedPattern, LeapfrogRing, RingIterator};
+pub use leapfrog::{
+    AnnotatedPattern, CanonicalTermId, LeapfrogRing, PreparedRingJoin, RingIterator, RingJoinError,
+    RingJoinGuard, RingJoinState, RingSolution, UnboundedRingJoinGuard,
+};
 pub use packed_dict::{PackedDictError, PackedTermDictionary};
 pub use packed_format::{PackedRingError, deserialize_triple_ring, serialize_triple_ring};
 pub use packed_permutation::{

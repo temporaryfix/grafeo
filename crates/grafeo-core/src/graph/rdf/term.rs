@@ -120,44 +120,55 @@ impl Term {
             Some(Term::Iri(Iri::new(inner)))
         } else if let Some(id) = s.strip_prefix("_:") {
             Some(Term::BlankNode(BlankNode::new(id)))
-        } else if s.starts_with('"') {
-            // Find closing quote (handling escapes)
-            let bytes = s.as_bytes();
-            let mut pos = 1;
-            let mut value = String::new();
-            while pos < bytes.len() {
-                if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
-                    match bytes[pos + 1] {
-                        b'"' => value.push('"'),
-                        b'\\' => value.push('\\'),
-                        b'n' => value.push('\n'),
-                        b'r' => value.push('\r'),
-                        b't' => value.push('\t'),
-                        other => {
-                            value.push('\\');
-                            value.push(other as char);
-                        }
-                    }
-                    pos += 2;
-                } else if bytes[pos] == b'"' {
-                    pos += 1;
-                    break;
-                } else {
-                    value.push(bytes[pos] as char);
-                    pos += 1;
-                }
-            }
-            let rest = &s[pos..];
-            if let Some(lang) = rest.strip_prefix('@') {
+        } else if let Some(rest) = s.strip_prefix('"') {
+            let (value, after) = unescape_ntriples_literal(rest)?;
+            if let Some(lang) = after.strip_prefix('@') {
                 Some(Term::Literal(Literal::with_language(value, lang)))
-            } else if let Some(typed) = rest.strip_prefix("^^<").and_then(|s| s.strip_suffix('>')) {
+            } else if let Some(typed) = after.strip_prefix("^^<").and_then(|s| s.strip_suffix('>'))
+            {
                 Some(Term::Literal(Literal::typed(value, typed)))
-            } else {
+            } else if after.is_empty() {
                 Some(Term::Literal(Literal::simple(value)))
+            } else {
+                None
             }
         } else {
             None
         }
+    }
+
+    /// Parses exactly the canonical byte spelling emitted by this type's
+    /// N-Triples writer. Unlike [`from_ntriples`](Self::from_ntriples), this
+    /// rejects surrounding whitespace and alternate escape spellings while
+    /// decoding literals in a single pass.
+    #[cfg(any(test, feature = "ring-index"))]
+    pub(crate) fn from_canonical_ntriples(s: &str) -> Option<Self> {
+        if let Some(inner) = s
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            return Some(Self::Iri(Iri::new(inner)));
+        }
+        if let Some(id) = s.strip_prefix("_:") {
+            return Some(Self::BlankNode(BlankNode::new(id)));
+        }
+        let rest = s.strip_prefix('"')?;
+        let (value, suffix) = unescape_canonical_ntriples_literal(rest)?;
+        if let Some(language) = suffix.strip_prefix('@') {
+            return Some(Self::Literal(Literal::with_language(value, language)));
+        }
+        if let Some(datatype) = suffix
+            .strip_prefix("^^<")
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            if datatype == Literal::XSD_STRING {
+                return None;
+            }
+            return Some(Self::Literal(Literal::typed(value, datatype)));
+        }
+        suffix
+            .is_empty()
+            .then(|| Self::Literal(Literal::simple(value)))
     }
 
     /// Converts this term to its N-Triples string representation.
@@ -165,6 +176,140 @@ impl Term {
     /// Round-trips with [`from_ntriples`](Self::from_ntriples).
     pub fn to_ntriples(&self) -> String {
         self.to_string()
+    }
+
+    /// Returns the canonical key used for RDF term identity joins.
+    ///
+    /// RDF language tags are case-insensitive and are normalized to lowercase
+    /// in the abstract syntax. `Display` already canonicalizes an explicit
+    /// `xsd:string` datatype to the same spelling as a simple literal.
+    #[must_use]
+    pub fn canonical_identity_key(&self) -> String {
+        if let Self::Literal(literal) = self
+            && let Some(language) = literal.language()
+        {
+            return Self::lang_literal(literal.value().to_string(), language.to_ascii_lowercase())
+                .to_ntriples();
+        }
+        self.to_ntriples()
+    }
+
+    /// Returns whether two terms denote the same RDF term identity.
+    ///
+    /// Lossless source representations can differ only in language-tag case
+    /// while remaining the same RDF term. The structural fast path avoids
+    /// allocating canonical strings during ordinary pattern scans.
+    #[must_use]
+    pub fn same_identity(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        let (Self::Literal(left), Self::Literal(right)) = (self, other) else {
+            return false;
+        };
+        left.value() == right.value()
+            && left.datatype() == right.datatype()
+            && left
+                .language()
+                .zip(right.language())
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+    }
+}
+
+/// Unescape an N-Triples quoted literal body. `s` starts just after the opening `"`.
+///
+/// Returns `(lexical, remainder after closing quote)`.
+fn unescape_ntriples_literal(s: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some((value, chars.as_str())),
+            '\\' => {
+                let esc = chars.next()?;
+                match esc {
+                    '"' => value.push('"'),
+                    '\\' => value.push('\\'),
+                    '\'' => value.push('\''),
+                    'n' => value.push('\n'),
+                    'r' => value.push('\r'),
+                    't' => value.push('\t'),
+                    'b' => value.push('\u{0008}'),
+                    'f' => value.push('\u{000C}'),
+                    'u' => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        if hex.len() != 4 {
+                            return None;
+                        }
+                        let cp = u32::from_str_radix(&hex, 16).ok()?;
+                        value.push(char::from_u32(cp)?);
+                    }
+                    'U' => {
+                        let hex: String = chars.by_ref().take(8).collect();
+                        if hex.len() != 8 {
+                            return None;
+                        }
+                        let cp = u32::from_str_radix(&hex, 16).ok()?;
+                        value.push(char::from_u32(cp)?);
+                    }
+                    other => {
+                        value.push('\\');
+                        value.push(other);
+                    }
+                }
+            }
+            other => value.push(other),
+        }
+    }
+    None
+}
+
+/// Decode the writer's one canonical literal spelling in a single pass.
+#[cfg(any(test, feature = "ring-index"))]
+fn unescape_canonical_ntriples_literal(s: &str) -> Option<(String, &str)> {
+    let mut value = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some((value, chars.as_str())),
+            '\\' => match chars.next()? {
+                '"' => value.push('"'),
+                '\\' => value.push('\\'),
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                'b' => value.push('\u{0008}'),
+                'f' => value.push('\u{000C}'),
+                'u' => {
+                    let mut code = 0u32;
+                    for _ in 0..4 {
+                        code = code
+                            .checked_mul(16)?
+                            .checked_add(canonical_hex(chars.next()?)?)?;
+                    }
+                    let character = char::from_u32(code)?;
+                    if !(character <= '\u{001F}' || character == '\u{007F}')
+                        || matches!(character, '\u{0008}' | '\t' | '\n' | '\u{000C}' | '\r')
+                    {
+                        return None;
+                    }
+                    value.push(character);
+                }
+                _ => return None,
+            },
+            control if control <= '\u{001F}' || control == '\u{007F}' => return None,
+            other => value.push(other),
+        }
+    }
+    None
+}
+
+#[cfg(any(test, feature = "ring-index"))]
+fn canonical_hex(character: char) -> Option<u32> {
+    match character {
+        '0'..='9' => Some(u32::from(character) - u32::from('0')),
+        'A'..='F' => Some(u32::from(character) - u32::from('A') + 10),
+        _ => None,
     }
 }
 
@@ -308,6 +453,9 @@ impl Literal {
     /// xsd:dateTime datatype IRI.
     pub const XSD_DATETIME: &'static str = "http://www.w3.org/2001/XMLSchema#dateTime";
 
+    /// xsd:date datatype IRI.
+    pub const XSD_DATE: &'static str = "http://www.w3.org/2001/XMLSchema#date";
+
     /// rdf:langString datatype IRI.
     pub const RDF_LANG_STRING: &'static str =
         "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
@@ -429,6 +577,11 @@ impl fmt::Display for Literal {
                 '\n' => write!(f, "\\n")?,
                 '\r' => write!(f, "\\r")?,
                 '\t' => write!(f, "\\t")?,
+                '\u{0008}' => write!(f, "\\b")?,
+                '\u{000C}' => write!(f, "\\f")?,
+                control if control <= '\u{001F}' || control == '\u{007F}' => {
+                    write!(f, "\\u{:04X}", u32::from(control))?;
+                }
                 _ => write!(f, "{}", ch)?,
             }
         }
@@ -496,6 +649,29 @@ mod tests {
     }
 
     #[test]
+    fn canonical_identity_key_normalizes_language_and_xsd_string() {
+        assert_eq!(
+            Term::lang_literal("value", "EN").canonical_identity_key(),
+            Term::lang_literal("value", "en").canonical_identity_key()
+        );
+        assert_eq!(
+            Term::typed_literal("value", Literal::XSD_STRING).canonical_identity_key(),
+            Term::literal("value").canonical_identity_key()
+        );
+    }
+
+    #[test]
+    fn same_identity_is_structural_and_language_case_insensitive() {
+        assert!(
+            Term::lang_literal("value", "EN").same_identity(&Term::lang_literal("value", "en"))
+        );
+        assert!(
+            !Term::lang_literal("other", "EN").same_identity(&Term::lang_literal("value", "en"))
+        );
+        assert!(!Term::iri("value").same_identity(&Term::literal("value")));
+    }
+
+    #[test]
     fn test_term_display() {
         assert_eq!(
             Term::iri("http://example.org").to_string(),
@@ -511,5 +687,63 @@ mod tests {
             Term::typed_literal("42", Literal::XSD_INTEGER).to_string(),
             "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>"
         );
+    }
+
+    #[test]
+    fn canonical_ntriples_parser_matches_writer_in_one_pass() {
+        let terms = [
+            Term::iri("https://example.test/a"),
+            Term::blank("b0"),
+            Term::literal("plain"),
+            Term::literal("quote \" slash \\ newline\n control\u{0001} café"),
+            Term::lang_literal("bonjour", "fr"),
+            Term::typed_literal("42", Literal::XSD_INTEGER),
+        ];
+        for term in terms {
+            assert_eq!(
+                Term::from_canonical_ntriples(&term.to_ntriples()),
+                Some(term)
+            );
+        }
+
+        assert!(Term::from_canonical_ntriples(" <https://example.test/a>").is_none());
+        assert!(
+            Term::from_canonical_ntriples("\"value\"^^<http://www.w3.org/2001/XMLSchema#string>")
+                .is_none()
+        );
+        assert!(Term::from_canonical_ntriples("\"caf\\u00E9\"").is_none());
+        assert!(Term::from_canonical_ntriples("\"line\\u000A\"").is_none());
+        assert_eq!(
+            Term::from_canonical_ntriples("\"nul\\u0000\""),
+            Some(Term::literal("nul\0"))
+        );
+    }
+
+    #[test]
+    fn from_ntriples_unicode_plain_literal() {
+        let original = Term::literal("café 日本語 🎵");
+        let nt = original.to_ntriples();
+        let parsed = Term::from_ntriples(&nt).expect("parse");
+        assert_eq!(parsed, original, "nt={nt:?}");
+    }
+
+    #[test]
+    fn from_ntriples_unicode_lang_literal() {
+        let original = Term::lang_literal("日本語", "ja");
+        let parsed = Term::from_ntriples(&original.to_ntriples()).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn from_ntriples_unicode_typed_literal() {
+        let original = Term::typed_literal("Москва", "http://ex.org/City");
+        let parsed = Term::from_ntriples(&original.to_ntriples()).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn from_ntriples_unicode_escape() {
+        let parsed = Term::from_ntriples(r#""caf\u00E9""#).expect("parse");
+        assert_eq!(parsed, Term::literal("café"));
     }
 }

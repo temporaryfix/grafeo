@@ -4,21 +4,9 @@
 //! [`Section`] trait, enabling the Ring to survive database restarts
 //! without rebuilding from triples.
 //!
-//! ## Format versioning (Phase 6g)
-//!
-//! The section transparently handles two on-disk formats:
-//!
-//! - **v2 packed (current):** four packed sub-formats composed under a
-//!   `GRFR` envelope with a CRC32 trailer. Reads are mmap-friendly via
-//!   `Bytes::from_owner` + per-level `BitVector::from_mmap`. Writes
-//!   always use this format.
-//! - **v1 bincode (legacy):** preserved as a one-release fallback so
-//!   existing `.grafeo` files keep loading after upgrade. Detected by
-//!   the absence of the `GRFR` magic at offset 0; data flows through
-//!   `TripleRing::load_from_bytes`.
-//!
-//! On the next checkpoint after a v1→v2 read, the section serializes
-//! the in-memory ring as v2, completing the migration.
+//! The section has one canonical `GRFR` packed format with a CRC32 trailer.
+//! Reads are mmap-friendly via refcounted `Bytes` slices and reject every
+//! other grammar rather than carrying predecessor readers in the storage kernel.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,16 +18,16 @@ use grafeo_common::utils::error::{Error, Result};
 
 use crate::graph::rdf::RdfStore;
 
-/// On-disk version: bumped from 1 (bincode) to 2 (packed) in Phase 6g.
+/// On-disk version of the canonical packed Ring section.
 const RING_SECTION_VERSION: u8 = 2;
 
-/// First 4 bytes of the v2 envelope; absent in v1 bincode output.
-const V2_MAGIC: &[u8; 4] = b"GRFR";
+/// First four bytes of the canonical Ring envelope.
+#[cfg(test)]
+const RING_MAGIC: &[u8; 4] = b"GRFR";
 
 /// Section implementation for the RDF Ring Index.
 ///
-/// Wraps an `Arc<RdfStore>` and serializes/deserializes the Ring via
-/// `TripleRing::save_to_bytes()`/`load_from_bytes()`.
+/// Wraps an `Arc<RdfStore>` and serializes/deserializes its packed Ring.
 pub struct RdfRingSection {
     store: Arc<RdfStore>,
     dirty: AtomicBool,
@@ -72,7 +60,8 @@ impl Section for RdfRingSection {
 
     fn serialize(&self) -> Result<Vec<u8>> {
         match self.store.ring() {
-            Some(ring) => Ok(super::serialize_triple_ring(&ring)),
+            Some(ring) => super::serialize_triple_ring(&ring)
+                .map_err(|error| Error::Serialization(error.to_string())),
             None => Ok(Vec::new()),
         }
     }
@@ -81,16 +70,8 @@ impl Section for RdfRingSection {
         if data.is_empty() {
             return Ok(());
         }
-        // Phase 6g: detect v2 packed vs v1 bincode by magic bytes.
-        let ring = if data.len() >= 4 && &data[0..4] == V2_MAGIC {
-            super::deserialize_triple_ring(bytes::Bytes::copy_from_slice(data))
-                .map_err(|e| Error::Serialization(e.to_string()))?
-        } else {
-            // v1 fallback: bincode-encoded TripleRing. Existing files keep
-            // loading; the next checkpoint flushes them out as v2.
-            super::TripleRing::load_from_bytes(data)
-                .map_err(|e| Error::Serialization(e.to_string()))?
-        };
+        let ring = super::deserialize_triple_ring(bytes::Bytes::copy_from_slice(data))
+            .map_err(|error| Error::Serialization(error.to_string()))?;
         self.store.set_ring(ring);
         Ok(())
     }
@@ -109,22 +90,14 @@ impl Section for RdfRingSection {
 
     /// Swaps the ring backing to a `Bytes` view sourced from `fetcher`.
     ///
-    /// Phase 6 deferred → Phase 8 audit-fix: closes the loop on the v2
-    /// packed Ring format. After the section serializes to a spill file
+    /// After the section serializes to a spill file
     /// and the file is mmap'd, the buffer manager calls this with a
-    /// `MmapPageFetcher`. We copy the section bytes into a single
-    /// owning `Bytes`; the v2 deserializer then constructs the ring with
-    /// every bulk component (term dictionary, wavelet level bitvectors,
-    /// permutation forward arrays) refcount-sharing slices of that
-    /// `Bytes`. Reads thereafter are zero-copy against the shared buffer.
+    /// `MmapPageFetcher`. We copy the section into one owning `Bytes`; packed
+    /// wavelet level storage then retains refcounted slices of that buffer.
+    /// The term dictionary and permutation lookup structures are rebuilt and
+    /// own their query-hot state. A future `PageFetcher::owned_bytes` override
+    /// on the mmap implementation could eliminate the initial section copy.
     ///
-    /// The one allocation here is `~section_size` once, replacing the
-    /// previous eager-deserialize that allocated `~3x` that for the
-    /// reconstructed `HashMap`s. A future `PageFetcher::owned_bytes`
-    /// override on the mmap impl could drop that copy too.
-    ///
-    /// v1 bincode buffers fall through to the bincode `load_from_bytes`
-    /// path so legacy spill files still load.
     fn swap_to_mmap(&self, fetcher: Arc<dyn PageFetcher>) -> std::result::Result<(), SpillError> {
         let len = fetcher.len();
         if len == 0 {
@@ -136,12 +109,8 @@ impl Section for RdfRingSection {
             .map_err(|e| SpillError::IoError(e.to_string()))?;
         let data = bytes::Bytes::copy_from_slice(slice);
 
-        let ring = if data.len() >= 4 && &data[0..4] == V2_MAGIC {
-            super::deserialize_triple_ring(data).map_err(|e| SpillError::IoError(e.to_string()))?
-        } else {
-            super::TripleRing::load_from_bytes(&data)
-                .map_err(|e| SpillError::IoError(e.to_string()))?
-        };
+        let ring = super::deserialize_triple_ring(data)
+            .map_err(|error| SpillError::IoError(error.to_string()))?;
 
         self.store.set_ring(ring);
         Ok(())
@@ -180,7 +149,6 @@ mod tests {
         let store = test_store();
         let section = RdfRingSection::new(store);
         assert_eq!(section.section_type(), SectionType::RdfRing);
-        // Phase 6g: bumped from 1 (bincode) to 2 (packed).
         assert_eq!(section.version(), 2);
     }
 
@@ -238,45 +206,39 @@ mod tests {
         assert!(section.memory_usage() > 0);
     }
 
-    // ── Phase 6g: format detection + v1 → v2 migration ───────────────
-
-    /// New writes produce a v2 buffer (starts with `GRFR` magic).
+    /// Writes produce the canonical buffer (starting with `GRFR` magic).
     #[test]
-    fn alix_section_serialize_writes_v2_magic() {
+    fn alix_section_serialize_writes_ring_magic() {
         let store = test_store();
         let section = RdfRingSection::new(store);
         let bytes = section.serialize().unwrap();
         assert!(bytes.len() > 4);
-        assert_eq!(&bytes[0..4], V2_MAGIC, "new writes must use v2 magic");
+        assert_eq!(&bytes[0..4], RING_MAGIC);
     }
 
-    /// v1 bincode-encoded buffers still deserialize correctly (one-release
-    /// fallback). The check uses save_to_bytes which produces v1 format
-    /// directly — guaranteeing the migration path works for files written
-    /// by older Grafeo versions.
+    /// Unknown predecessor bytes are rejected without replacing an existing
+    /// in-memory Ring.
     #[test]
-    fn gus_section_v1_bincode_buffer_still_loads() {
-        let original = test_store();
-        let ring = original.ring().expect("ring built").as_ref().clone();
-        // Encode as v1 bincode directly (bypass the section entry point).
-        let v1_bytes = ring.save_to_bytes().unwrap();
-        // Sanity: v1 bytes do NOT start with GRFR.
-        assert_ne!(
-            &v1_bytes[0..4],
-            V2_MAGIC,
-            "v1 bincode must not have GRFR magic"
-        );
-
-        // Deserialize via the section: should detect v1 and use the
-        // bincode path.
-        let store2 = Arc::new(RdfStore::new());
+    fn gus_section_rejects_predecessor_without_mutating_store() {
+        let store2 = test_store();
+        let before = store2.ring().expect("ring built");
         let mut section2 = RdfRingSection::new(Arc::clone(&store2));
-        section2.deserialize(&v1_bytes).unwrap();
-        let restored = store2.ring().expect("ring loaded");
-        assert_eq!(restored.len(), 3);
+        assert!(section2.deserialize(&[0x01; 64]).is_err());
+        assert!(Arc::ptr_eq(&store2.ring().expect("ring retained"), &before));
     }
 
-    // ── Phase 6/8 audit-fix: swap_to_mmap end-to-end ──────────────────
+    #[test]
+    fn altered_version_is_rejected_without_mutating_store() {
+        let source = test_store();
+        let mut bytes = RdfRingSection::new(source).serialize().expect("serialize");
+        bytes[4] = 1;
+
+        let target = test_store();
+        let before = target.ring().expect("ring built");
+        let mut section = RdfRingSection::new(Arc::clone(&target));
+        assert!(section.deserialize(&bytes).is_err());
+        assert!(Arc::ptr_eq(&target.ring().expect("ring retained"), &before));
+    }
 
     /// Minimal in-memory PageFetcher for testing swap_to_mmap.
     struct MemFetcher(Vec<u8>);
@@ -305,12 +267,12 @@ mod tests {
         }
     }
 
-    /// `swap_to_mmap` rebuilds the ring from a `Bytes`-backed v2 buffer
+    /// `swap_to_mmap` rebuilds the ring from a `Bytes`-backed packed buffer
     /// and queries against the swapped-in ring give correct results.
     #[test]
     fn shosanna_swap_to_mmap_serves_queries_from_bytes() {
         let original = test_store();
-        let v2_bytes = {
+        let packed_bytes = {
             let section = RdfRingSection::new(Arc::clone(&original));
             section.serialize().unwrap()
         };
@@ -320,7 +282,7 @@ mod tests {
         assert!(store.ring().is_none());
 
         let section = RdfRingSection::new(Arc::clone(&store));
-        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(v2_bytes));
+        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(packed_bytes));
         section.swap_to_mmap(fetcher).expect("swap_to_mmap");
 
         // Ring is now populated from the fetcher bytes.
@@ -347,42 +309,17 @@ mod tests {
         assert!(store.ring().is_none());
     }
 
-    /// v1 bincode-encoded fetcher bytes still load via the legacy fallback.
     #[test]
-    fn django_swap_to_mmap_v1_bincode_fetcher_still_loads() {
-        let original = test_store();
-        let ring = original.ring().expect("ring built").as_ref().clone();
-        let v1_bytes = ring.save_to_bytes().unwrap();
-        assert_ne!(&v1_bytes[0..4], V2_MAGIC);
+    fn swap_to_mmap_rejects_altered_version_without_mutation() {
+        let source = test_store();
+        let mut bytes = RdfRingSection::new(source).serialize().expect("serialize");
+        bytes[4] = 1;
 
-        let store = Arc::new(RdfStore::new());
-        let section = RdfRingSection::new(Arc::clone(&store));
-        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(v1_bytes));
-        section.swap_to_mmap(fetcher).expect("v1 fallback in swap");
-
-        assert_eq!(store.ring().unwrap().len(), 3);
-    }
-
-    /// After a v1 read + a re-serialize, the new buffer is v2.
-    /// Demonstrates the on-checkpoint migration.
-    #[test]
-    fn vincent_section_v1_then_resersialize_yields_v2() {
-        let original = test_store();
-        let ring = original.ring().expect("ring built").as_ref().clone();
-        let v1_bytes = ring.save_to_bytes().unwrap();
-
-        let store2 = Arc::new(RdfStore::new());
-        let mut section2 = RdfRingSection::new(Arc::clone(&store2));
-        section2.deserialize(&v1_bytes).unwrap();
-
-        // Re-serialize: now in v2.
-        let v2_bytes = section2.serialize().unwrap();
-        assert_eq!(&v2_bytes[0..4], V2_MAGIC, "post-migration write is v2");
-
-        // And v2 round-trips cleanly.
-        let store3 = Arc::new(RdfStore::new());
-        let mut section3 = RdfRingSection::new(Arc::clone(&store3));
-        section3.deserialize(&v2_bytes).unwrap();
-        assert_eq!(store3.ring().unwrap().len(), 3);
+        let target = test_store();
+        let before = target.ring().expect("ring built");
+        let section = RdfRingSection::new(Arc::clone(&target));
+        let fetcher: Arc<dyn PageFetcher> = Arc::new(MemFetcher(bytes));
+        assert!(section.swap_to_mmap(fetcher).is_err());
+        assert!(Arc::ptr_eq(&target.ring().expect("ring retained"), &before));
     }
 }
