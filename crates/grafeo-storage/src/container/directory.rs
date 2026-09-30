@@ -190,6 +190,8 @@ fn read_entry(buf: &[u8]) -> Result<SectionDirectoryEntry> {
         3 => SectionType::RdfStore,
         4 => SectionType::CompactStore,
         5 => SectionType::OverlayDeletions,
+        6 => SectionType::WorldMetadata,
+        7 => SectionType::Cdc,
         10 => SectionType::VectorStore,
         11 => SectionType::TextIndex,
         12 => SectionType::RdfRing,
@@ -205,9 +207,13 @@ fn read_entry(buf: &[u8]) -> Result<SectionDirectoryEntry> {
         section_type,
         version: buf[4],
         flags: SectionFlags::from_byte(buf[5]),
-        offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-        length: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-        checksum: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+        offset: u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]),
+        length: u64::from_le_bytes([
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+        ]),
+        checksum: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
     })
 }
 
@@ -254,6 +260,26 @@ mod tests {
         assert_eq!(entry.offset, SECTION_DATA_OFFSET);
         assert_eq!(entry.length, 1024);
         assert_eq!(entry.checksum, 0xDEADBEEF);
+    }
+
+    #[test]
+    fn required_world_metadata_entry_round_trips() {
+        let mut dir = SectionDirectory::new();
+        dir.upsert(SectionDirectoryEntry {
+            section_type: SectionType::WorldMetadata,
+            version: 1,
+            flags: SectionType::WorldMetadata.default_flags(),
+            offset: SECTION_DATA_OFFSET,
+            length: 128,
+            checksum: 0xA11C_E5E1,
+        })
+        .unwrap();
+
+        let decoded = SectionDirectory::from_bytes(&dir.to_bytes()).unwrap();
+        let entry = decoded.find(SectionType::WorldMetadata).unwrap();
+        assert_eq!(entry.version, 1);
+        assert!(entry.flags.required);
+        assert!(!entry.flags.mmap_able);
     }
 
     #[test]

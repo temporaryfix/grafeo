@@ -26,6 +26,7 @@ crossbeam = { workspace = true, optional = true }
 
 # Checksums (always needed for section directory CRC)
 crc32fast.workspace = true
+blake3.workspace = true
 
 # I/O (optional, feature-gated)
 memmap2 = { workspace = true, optional = true }
@@ -36,6 +37,9 @@ tokio = { workspace = true, optional = true }
 
 # Tracing (optional, zero-cost when disabled)
 tracing = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -49,9 +53,9 @@ required-features = ["wal"]
 
 [features]
 default = ["wal"]
-wal = ["memmap2", "tokio", "crossbeam"]
+wal = ["memmap2", "tokio", "crossbeam", "fs2", "dep:windows-sys"]
 async-storage = ["wal"]
-grafeo-file = ["wal", "fs2"]
+grafeo-file = ["wal", "fs2", "dep:windows-sys"]
 tracing = ["dep:tracing", "grafeo-common/tracing"]
 testing-crash-injection = ["grafeo-common/testing-crash-injection"]
 encryption = ["grafeo-common/encryption"]

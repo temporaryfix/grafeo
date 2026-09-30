@@ -19,6 +19,7 @@
 //! use std::pin::Pin;
 //! use grafeo_storage::async_backend::{AsyncStorageBackend, SnapshotMetadata};
 //! use grafeo_common::utils::error::Result;
+//! use grafeo_storage::wal::WalCloseError;
 //!
 //! struct MyRemoteBackend { /* ... */ }
 //!
@@ -53,7 +54,7 @@
 //!         Box::pin(async move { todo!() })
 //!     }
 //!
-//!     fn close(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+//!     fn close(&self) -> Pin<Box<dyn Future<Output = std::result::Result<(), WalCloseError>> + Send + '_>> {
 //!         Box::pin(async move { Ok(()) })
 //!     }
 //! }
@@ -62,6 +63,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::wal::WalCloseError;
 use grafeo_common::utils::error::Result;
 
 /// Metadata for a stored database snapshot.
@@ -93,10 +95,16 @@ pub trait AsyncStorageBackend: Send + Sync {
     /// Backend name for diagnostics and logging.
     fn name(&self) -> &str;
 
-    /// Write a batch of serialized WAL records.
+    /// Write a batch of current-generation WAL record payloads.
     ///
-    /// Each element in `records` is a single serialized WAL frame (the output
-    /// of `bincode::encode_to_vec` for a `WalRecord`).
+    /// Each element is the complete output of [`crate::wal::encode_record`]:
+    /// `GRAFOWAL`, a little-endian `u16` generation, the group coordinate, and
+    /// the serialized record. Commit/abort payloads include a zeroed seal
+    /// reservation that the serialized WAL owner fills from accepted records.
+    /// It excludes the physical length/checksum or authenticated-encryption
+    /// framing, which the backend supplies. Bare bincode records and unsupported
+    /// generations must be rejected before that element is appended.
+    /// A batch is not atomic: an error can leave earlier valid elements appended.
     fn write_wal_batch<'a>(
         &'a self,
         records: &'a [Vec<u8>],
@@ -123,7 +131,9 @@ pub trait AsyncStorageBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SnapshotMetadata>>> + Send + '_>>;
 
     /// Close the backend, flushing any pending writes.
-    fn close(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn close(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), WalCloseError>> + Send + '_>>;
 }
 
 #[cfg(test)]
@@ -170,7 +180,10 @@ mod tests {
             Box::pin(async { Ok(vec![]) })
         }
 
-        fn close(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        fn close(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), WalCloseError>> + Send + '_>>
+        {
             Box::pin(async { Ok(()) })
         }
     }
@@ -260,7 +273,10 @@ mod tests {
                 })
             }
 
-            fn close(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            fn close(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = std::result::Result<(), WalCloseError>> + Send + '_>>
+            {
                 Box::pin(async { Ok(()) })
             }
         }

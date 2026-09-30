@@ -44,6 +44,9 @@ pub struct FileHeader {
     pub creation_timestamp_ms: u64,
     /// Grafeo version that created this file (UTF-8, zero-padded).
     pub creator_version: [u8; 32],
+    /// Graph model: 0 LPG, 1 RDF, 2 Both. Trailing field: old files decode as 0.
+    #[serde(default)]
+    pub graph_model: u8,
 }
 
 impl FileHeader {
@@ -70,6 +73,7 @@ impl FileHeader {
             page_size: FILE_HEADER_SIZE as u32,
             creation_timestamp_ms,
             creator_version,
+            graph_model: 0,
         }
     }
 }

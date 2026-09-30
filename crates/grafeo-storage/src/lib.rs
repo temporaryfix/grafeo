@@ -18,6 +18,9 @@ pub mod container;
 #[cfg(feature = "wal")]
 pub mod wal;
 
+#[cfg(feature = "wal")]
+mod ownership;
+
 #[cfg(feature = "grafeo-file")]
 pub mod file;
 

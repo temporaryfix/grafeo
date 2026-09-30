@@ -8,12 +8,99 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
 use grafeo_common::utils::error::{Error, Result};
 use parking_lot::Mutex;
 
 use super::format::{DATA_OFFSET, DbHeader, FileHeader};
 use super::header;
+use super::ownership::{
+    ContainerDestination, ContainerLease, LockedFile, check_single_link, sync_parent,
+};
+
+// Every I/O path holds this cut before header/slot locks. In each owner state
+// the primary descriptor is declared before the lease and retires first.
+enum FileState {
+    Open {
+        file: LockedFile,
+        lease: ContainerLease,
+    },
+    Failed {
+        file: Option<LockedFile>,
+        lease: ContainerLease,
+    },
+    Closed,
+}
+
+impl FileState {
+    fn file_mut(&mut self) -> Result<&mut File> {
+        match self {
+            Self::Open { file, .. } => Ok(file),
+            Self::Failed { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "database file manager failed; close or drop it before reopening",
+            )
+            .into()),
+            Self::Closed => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "database file manager is closed",
+            )
+            .into()),
+        }
+    }
+
+    fn enter_failed(&mut self) {
+        let previous = std::mem::replace(self, Self::Closed);
+        *self = match previous {
+            Self::Open { file, lease } => Self::Failed {
+                file: Some(file),
+                lease,
+            },
+            other => other,
+        };
+    }
+}
+
+/// One encoded container section with its serializer's exact wire version.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionWrite<'a> {
+    section_type: grafeo_common::storage::SectionType,
+    version: u8,
+    data: &'a [u8],
+}
+
+impl<'a> SectionWrite<'a> {
+    /// Creates a versioned section payload.
+    #[must_use]
+    pub const fn new(
+        section_type: grafeo_common::storage::SectionType,
+        version: u8,
+        data: &'a [u8],
+    ) -> Self {
+        Self {
+            section_type,
+            version,
+            data,
+        }
+    }
+
+    /// Section type written to the directory.
+    #[must_use]
+    pub const fn section_type(self) -> grafeo_common::storage::SectionType {
+        self.section_type
+    }
+
+    /// Exact serializer wire version.
+    #[must_use]
+    pub const fn version(self) -> u8 {
+        self.version
+    }
+
+    /// Opaque encoded payload.
+    #[must_use]
+    pub const fn data(self) -> &'a [u8] {
+        self.data
+    }
+}
 
 /// Manages a single `.grafeo` database file.
 ///
@@ -27,8 +114,8 @@ use super::header;
 pub struct GrafeoFileManager {
     /// Path to the `.grafeo` file.
     path: PathBuf,
-    /// Open file handle (read/write or read-only).
-    file: Mutex<File>,
+    /// Whole-operation admission; acquired before active header and slot locks.
+    state: Mutex<FileState>,
     /// File header (read once on open, immutable afterwards).
     file_header: FileHeader,
     /// Currently active database header.
@@ -42,6 +129,73 @@ pub struct GrafeoFileManager {
     section_encryptor: Option<grafeo_common::encryption::PageEncryptor>,
 }
 
+/// A source view retaining the container's whole-operation admission.
+pub struct ContainerCapture<'a> {
+    manager: &'a GrafeoFileManager,
+    state: parking_lot::MutexGuard<'a, FileState>,
+}
+
+impl ContainerCapture<'_> {
+    /// Streams the admitted container bytes without reopening its pathname.
+    ///
+    /// # Errors
+    /// Returns source seek/read or destination write errors.
+    pub fn write_image_to(&mut self, output: &mut impl std::io::Write) -> Result<u64> {
+        let file = self.state.file_mut()?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(std::io::copy(file, output)?)
+    }
+
+    /// Copies from the admitted source into an already-bound destination.
+    ///
+    /// # Errors
+    /// Returns checked copy errors or source/destination alias rejection.
+    pub fn copy_to_destination(&mut self, destination: &mut ContainerDestination) -> Result<u64> {
+        destination.overwrite_from(self.state.file_mut()?, &self.manager.path)
+    }
+}
+
+/// Writable container admission held through sidecar retirement and close.
+pub struct ContainerRetirement<'a> {
+    manager: &'a GrafeoFileManager,
+    state: parking_lot::MutexGuard<'a, FileState>,
+}
+
+impl ContainerRetirement<'_> {
+    /// Removes exactly this container's sidecar while borrowing its actual seal.
+    ///
+    /// # Errors
+    /// Rejects foreign seals and returns filesystem errors.
+    pub fn retire_sidecar(&mut self, wal: &mut crate::wal::SealedWal) -> Result<()> {
+        let sidecar = crate::ownership::resolve_components(&self.manager.sidecar_wal_path())?;
+        if wal.path() != sidecar {
+            return Err(Error::InvalidValue(
+                "WAL seal does not belong to this container".into(),
+            ));
+        }
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("sidecar-retire")?;
+        wal.retire_directory()
+    }
+
+    /// Acquires unopened sidecar authority before inspecting or removing it.
+    ///
+    /// # Errors
+    /// Returns contention, namespace or checked retirement errors.
+    pub fn remove_unopened_sidecar(&mut self) -> Result<()> {
+        let mut wal = crate::wal::WalDestination::acquire(self.manager.sidecar_wal_path())?;
+        wal.retire_directory()
+    }
+
+    /// Closes C through this admitted view without reacquiring its mutex.
+    ///
+    /// # Errors
+    /// Returns the original close error, retaining failed C ownership.
+    pub fn close(mut self) -> Result<()> {
+        self.manager.close_admitted(&mut self.state)
+    }
+}
+
 impl GrafeoFileManager {
     /// Creates a new `.grafeo` file at `path`.
     ///
@@ -52,7 +206,21 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if the file already exists or cannot be created.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        Self::create_with_graph_model(path, 0)
+    }
+
+    /// Creates a new `.grafeo` file tagged with a graph model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file already exists or cannot be created.
+    pub fn create_with_graph_model(path: impl AsRef<Path>, graph_model: u8) -> Result<Self> {
+        let lease = ContainerLease::acquire(path.as_ref(), false, true)?;
+        Self::create_with_lease(lease, graph_model)
+    }
+
+    pub(super) fn create_with_lease(lease: ContainerLease, graph_model: u8) -> Result<Self> {
+        let path = lease.path().to_path_buf();
 
         if path.exists() {
             return Err(Error::Internal(format!(
@@ -61,14 +229,7 @@ impl GrafeoFileManager {
             )));
         }
 
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -88,14 +249,11 @@ impl GrafeoFileManager {
             })?;
 
         // Acquire an exclusive lock: prevents other processes from opening the same file
-        file.try_lock_exclusive().map_err(|_| {
-            Error::Internal(format!(
-                "database file is locked by another process: {}",
-                path.display()
-            ))
-        })?;
+        let mut file = LockedFile::acquire(file, false)?;
+        check_single_link(&file)?;
 
-        let file_header = FileHeader::new();
+        let mut file_header = FileHeader::new();
+        file_header.graph_model = graph_model;
         header::write_file_header(&mut file, &file_header)?;
         header::write_db_header(&mut file, 0, &DbHeader::EMPTY)?;
         header::write_db_header(&mut file, 1, &DbHeader::EMPTY)?;
@@ -103,7 +261,7 @@ impl GrafeoFileManager {
 
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            state: Mutex::new(FileState::Open { file, lease }),
             file_header,
             active_header: Mutex::new(DbHeader::EMPTY),
             active_slot: Mutex::new(0),
@@ -120,20 +278,21 @@ impl GrafeoFileManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file does not exist, has invalid magic, or
-    /// an unsupported format version.
+    /// Returns an error if the file does not exist, cannot be exclusively
+    /// locked, has invalid headers, or its stale staging file cannot be removed.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let lease = ContainerLease::acquire(path.as_ref(), false, false)?;
+        Self::open_with_lease(lease)
+    }
 
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+    pub(super) fn open_with_lease(lease: ContainerLease) -> Result<Self> {
+        let path = lease.path().to_path_buf();
+
+        let file = crate::ownership::checked_file(&path, true, false)?;
 
         // Acquire an exclusive lock: prevents other processes from opening the same file
-        file.try_lock_exclusive().map_err(|_| {
-            Error::Internal(format!(
-                "database file is locked by another process: {}",
-                path.display()
-            ))
-        })?;
+        let mut file = LockedFile::acquire(file, false)?;
+        check_single_link(&file)?;
 
         let file_header = header::read_file_header(&mut file)?;
         header::validate_file_header(&file_header)?;
@@ -141,9 +300,17 @@ impl GrafeoFileManager {
         let (h0, h1) = header::read_db_headers(&mut file)?;
         let (active_slot, active_header) = header::active_db_header(&h0, &h1);
 
+        // Discard leftover staging only after locking and checking the primary
+        // headers. Rejected opens must preserve recovery evidence.
+        match fs::remove_file(Self::installing_path(&path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            state: Mutex::new(FileState::Open { file, lease }),
             file_header,
             active_header: Mutex::new(active_header),
             active_slot: Mutex::new(active_slot),
@@ -156,8 +323,8 @@ impl GrafeoFileManager {
     /// Opens an existing `.grafeo` file in read-only mode.
     ///
     /// Uses a **shared** file lock (`try_lock_shared`), allowing multiple
-    /// readers to open the same file concurrently, even while a writer holds
-    /// an exclusive lock (on platforms with advisory locking).
+    /// readers to open the same file concurrently. Readers and an exclusive
+    /// writer exclude each other, including throughout checkpoint replacement.
     ///
     /// The returned manager only supports [`read_snapshot`](Self::read_snapshot)
     /// and other read-only operations. Calling [`write_snapshot`](Self::write_snapshot)
@@ -168,18 +335,33 @@ impl GrafeoFileManager {
     /// Returns an error if the file does not exist, has invalid magic, or
     /// an unsupported format version.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let lease = ContainerLease::acquire(path.as_ref(), true, false)?;
+        Self::open_read_only_with_lease(lease)
+    }
 
-        let mut file = OpenOptions::new().read(true).open(&path)?;
+    /// Opens one checked backup image under canonical container ownership.
+    /// The same read-only descriptor supplies header decoding and later reads.
+    ///
+    /// # Errors
+    /// Rejects source links, reserved paths, contention, invalid headers and I/O errors.
+    pub fn open_backup_image(path: impl AsRef<Path>) -> Result<Self> {
+        let lease = ContainerLease::acquire(path.as_ref(), true, false)?;
+        let file = super::open_backup_source(path.as_ref())?;
+        Self::open_read_only_file(lease, file)
+    }
+
+    pub(super) fn open_read_only_with_lease(lease: ContainerLease) -> Result<Self> {
+        let file = crate::ownership::checked_file(lease.path(), false, false)?;
+        Self::open_read_only_file(lease, file)
+    }
+
+    fn open_read_only_file(lease: ContainerLease, file: File) -> Result<Self> {
+        let path = lease.path().to_path_buf();
 
         // Acquire a shared lock: coexists with other shared locks but
         // blocks if an exclusive lock cannot be shared (platform-dependent).
-        file.try_lock_shared().map_err(|_| {
-            Error::Internal(format!(
-                "database file cannot be locked for reading: {}",
-                path.display()
-            ))
-        })?;
+        let mut file = LockedFile::acquire(file, true)?;
+        check_single_link(&file)?;
 
         let file_header = header::read_file_header(&mut file)?;
         header::validate_file_header(&file_header)?;
@@ -189,7 +371,7 @@ impl GrafeoFileManager {
 
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            state: Mutex::new(FileState::Open { file, lease }),
             file_header,
             active_header: Mutex::new(active_header),
             active_slot: Mutex::new(active_slot),
@@ -215,6 +397,12 @@ impl GrafeoFileManager {
         self.read_only
     }
 
+    /// On-disk graph model tag (0 LPG, 1 RDF, 2 Both).
+    #[must_use]
+    pub fn graph_model_tag(&self) -> u8 {
+        self.file_header.graph_model
+    }
+
     /// Writes snapshot data into the file and updates the inactive DB header.
     ///
     /// Steps:
@@ -235,11 +423,14 @@ impl GrafeoFileManager {
         node_count: u64,
         edge_count: u64,
     ) -> Result<()> {
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         if self.read_only {
             return Err(Error::Internal(
                 "cannot write snapshot: database is open in read-only mode".to_string(),
             ));
         }
+        check_single_link(file)?;
 
         use grafeo_common::testing::crash::maybe_crash;
 
@@ -251,8 +442,7 @@ impl GrafeoFileManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut file = self.file.lock();
-        let active_header = self.active_header.lock();
+        let mut active_header = self.active_header.lock();
         let mut active_slot = self.active_slot.lock();
 
         let new_iteration = active_header.iteration + 1;
@@ -283,7 +473,7 @@ impl GrafeoFileManager {
             edge_count,
             timestamp_ms,
         };
-        header::write_db_header(&mut file, target_slot, &new_header)?;
+        header::write_db_header(file, target_slot, &new_header)?;
 
         maybe_crash("write_snapshot:after_header_write");
 
@@ -292,9 +482,7 @@ impl GrafeoFileManager {
 
         maybe_crash("write_snapshot:after_fsync");
 
-        // Update internal state: drop the old lock, reacquire to update
-        drop(active_header);
-        *self.active_header.lock() = new_header;
+        *active_header = new_header;
         *active_slot = target_slot;
 
         Ok(())
@@ -309,6 +497,8 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if the read fails or the CRC checksum does not match.
     pub fn read_snapshot(&self) -> Result<Vec<u8>> {
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         let active_header = self.active_header.lock();
 
         if active_header.is_empty() {
@@ -330,11 +520,10 @@ impl GrafeoFileManager {
         let expected_checksum = active_header.checksum;
         drop(active_header);
 
-        let mut file = self.file.lock();
         file.seek(SeekFrom::Start(DATA_OFFSET))?;
 
         let mut data = vec![0u8; length];
-        std::io::Read::read_exact(&mut *file, &mut data)?;
+        std::io::Read::read_exact(file, &mut data)?;
 
         // Verify CRC
         let actual_checksum = crc32fast::hash(&data);
@@ -357,7 +546,8 @@ impl GrafeoFileManager {
         PathBuf::from(wal_path)
     }
 
-    /// Returns `true` if a sidecar WAL directory exists.
+    /// Best-effort observation of sidecar existence, including after close.
+    /// This does not admit or authorize any filesystem mutation.
     #[must_use]
     pub fn has_sidecar_wal(&self) -> bool {
         self.sidecar_wal_path().exists()
@@ -369,11 +559,42 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if the directory exists but cannot be removed.
     pub fn remove_sidecar_wal(&self) -> Result<()> {
-        let wal_path = self.sidecar_wal_path();
-        if wal_path.exists() {
-            fs::remove_dir_all(&wal_path)?;
+        self.sidecar_retirement()?.remove_unopened_sidecar()
+    }
+
+    /// Admits a source view, including a read-only source.
+    ///
+    /// # Errors
+    /// Rejects a closed or failed container.
+    pub fn capture(&self) -> Result<ContainerCapture<'_>> {
+        let mut state = self.state.lock();
+        state.file_mut()?;
+        Ok(ContainerCapture {
+            manager: self,
+            state,
+        })
+    }
+
+    /// Admits writable retirement before acquiring any WAL operation.
+    ///
+    /// # Errors
+    /// Rejects closed, failed or read-only containers.
+    pub fn sidecar_retirement(&self) -> Result<ContainerRetirement<'_>> {
+        let mut state = self.state.lock();
+        state.file_mut()?;
+        if self.read_only {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot remove sidecar from a read-only manager",
+            )
+            .into());
         }
-        Ok(())
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("retirement-admission")?;
+        Ok(ContainerRetirement {
+            manager: self,
+            state,
+        })
     }
 
     /// Returns the file path.
@@ -400,7 +621,8 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if the file metadata cannot be read.
     pub fn file_size(&self) -> Result<u64> {
-        let file = self.file.lock();
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         let metadata = file.metadata()?;
         Ok(metadata.len())
     }
@@ -411,8 +633,9 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if sync fails.
     pub fn sync(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         if !self.read_only {
-            let file = self.file.lock();
             file.sync_all()?;
         }
         Ok(())
@@ -420,11 +643,67 @@ impl GrafeoFileManager {
 
     // ── Section-based I/O (v2 container format) ─────────────────────
 
-    /// Writes multiple sections to the file using the v2 container format.
+    fn installing_path(path: &Path) -> PathBuf {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".installing");
+        PathBuf::from(p)
+    }
+
+    fn reopen_primary(&self) -> Result<LockedFile> {
+        let new_file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let new_file = LockedFile::acquire(new_file, false)?;
+        check_single_link(&new_file)?;
+        Ok(new_file)
+    }
+
+    /// Atomically replace the primary file with a fully-written temp container.
     ///
-    /// Each section is written at a page-aligned offset. A section directory
-    /// is written at `DIRECTORY_OFFSET`, and a new DbHeader is committed to
-    /// the inactive slot.
+    /// The operation guard and permanent path lease survive closing the old
+    /// descriptor. Any error or unwind from that point retains Failed ownership.
+    fn install_tmp_container(&self, state: &mut FileState, tmp: &Path) -> Result<()> {
+        check_single_link(state.file_mut()?)?;
+        state.enter_failed();
+        if let FileState::Failed { file, .. } = state {
+            drop(file.take());
+        }
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("after-close")?;
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("before-rename")?;
+        fs::rename(tmp, &self.path)?;
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("after-rename")?;
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("before-parent-sync")?;
+        sync_parent(&self.path)?;
+        #[cfg(feature = "testing-crash-injection")]
+        ownership_test_point("before-reopen")?;
+        let file = self.reopen_primary()?;
+        match std::mem::replace(state, FileState::Closed) {
+            FileState::Failed {
+                file: previous,
+                lease,
+            } => {
+                drop(previous);
+                *state = FileState::Open { file, lease };
+                Ok(())
+            }
+            other => {
+                *state = other;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "replacement lost its admitted failed state",
+                )
+                .into())
+            }
+        }
+    }
+
+    /// Writes multiple sections using a temp file + atomic rename.
+    ///
+    /// The live `.grafeo` file is never overwritten in place. A crash during
+    /// installation leaves the previous container intact; the sidecar WAL can
+    /// replay records since that snapshot.
     ///
     /// # Errors
     ///
@@ -437,10 +716,38 @@ impl GrafeoFileManager {
         node_count: u64,
         edge_count: u64,
     ) -> Result<()> {
+        let versioned: Vec<_> = sections
+            .iter()
+            .map(|(section_type, data)| SectionWrite::new(*section_type, 1, data))
+            .collect();
+        self.write_versioned_sections(&versioned, epoch, transaction_id, node_count, edge_count)
+    }
+
+    /// Writes multiple sections with their exact independent wire versions.
+    ///
+    /// Version zero and duplicate section types are rejected before the temp
+    /// container is created. The live file is installed atomically only after
+    /// all payloads, the versioned directory, and both headers are durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid section metadata or any write/sync/install
+    /// failure.
+    pub fn write_versioned_sections(
+        &self,
+        sections: &[SectionWrite<'_>],
+        epoch: u64,
+        transaction_id: u64,
+        node_count: u64,
+        edge_count: u64,
+    ) -> Result<()> {
         use crate::container::SectionDirectory;
         use crate::container::directory::{DIRECTORY_OFFSET, SECTION_DATA_OFFSET};
         use grafeo_common::storage::SectionDirectoryEntry;
         use grafeo_common::testing::crash::maybe_crash;
+
+        let mut state = self.state.lock();
+        state.file_mut()?;
 
         if self.read_only {
             return Err(Error::Internal(
@@ -448,39 +755,65 @@ impl GrafeoFileManager {
             ));
         }
 
-        let mut dir = SectionDirectory::new();
-        let mut file = self.file.lock();
-        let active_header = self.active_header.lock();
-        let mut active_slot = self.active_slot.lock();
+        let mut section_types = std::collections::HashSet::with_capacity(sections.len());
+        for section in sections {
+            if section.version == 0 {
+                return Err(Error::Serialization(format!(
+                    "section {:?} uses reserved wire version zero",
+                    section.section_type
+                )));
+            }
+            if !section_types.insert(section.section_type) {
+                return Err(Error::Serialization(format!(
+                    "duplicate {:?} section in one container image",
+                    section.section_type
+                )));
+            }
+        }
+
+        let new_iteration = self.active_header.lock().iteration + 1;
+        #[cfg(feature = "encryption")]
+        #[allow(clippy::cast_possible_truncation)]
+        let nonce_iteration = new_iteration as u32;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Directory checksum is computed while writing the temp file.
+        let tmp = Self::installing_path(&self.path);
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut tmp_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+
+        header::write_file_header(&mut tmp_file, &self.file_header)?;
+        header::write_db_header(&mut tmp_file, 0, &DbHeader::EMPTY)?;
+        header::write_db_header(&mut tmp_file, 1, &DbHeader::EMPTY)?;
 
         maybe_crash("write_sections:before_data");
 
-        // Write each section at page-aligned offsets
+        let mut dir = SectionDirectory::new();
         let page_size = 4096u64;
         let mut current_offset = SECTION_DATA_OFFSET;
-        // Next checkpoint iteration, used as the high part of the nonce so that
-        // the same (section_type, offset) pair produces a different nonce across
-        // checkpoints. Without this, identical section layouts would reuse nonces.
-        #[cfg(feature = "encryption")]
-        // reason: iteration wraps at u32::MAX which takes billions of checkpoints (~100+ years at 1/s)
-        #[allow(clippy::cast_possible_truncation)]
-        let nonce_iteration = (active_header.iteration + 1) as u32;
 
-        for (section_type, data) in sections {
-            // Encrypt section data if encryption is enabled.
-            // Nonce high word: iteration in bits [31:8], section type in bits [7:0].
-            // Bit-packing (not XOR) ensures unique high words: XOR is commutative
-            // so `iter ^ type` can collide across different (iter, type) pairs,
-            // but packing into disjoint bit lanes is injective for type < 256.
-            // Nonce low word: page-aligned write offset (unique within a checkpoint).
-            // AAD binds the ciphertext to the section type, preventing relocation.
-            // Encrypt section data if an encryptor is configured, otherwise
-            // write the plaintext bytes directly (no allocation).
+        for section in sections {
+            let section_type = section.section_type;
+            let data = section.data;
             #[cfg(feature = "encryption")]
             let encrypted_buf: Option<Vec<u8>> = if let Some(ref enc) = self.section_encryptor {
-                let nonce_high = (nonce_iteration << 8) | (*section_type as u32 & 0xFF);
+                let nonce_high = (nonce_iteration << 8) | (section_type as u32 & 0xFF);
                 let nonce = grafeo_common::encryption::build_nonce(nonce_high, current_offset);
-                let aad = format!("grafeo-section:{}", *section_type as u32);
+                let aad = format!("grafeo-section:{}", section_type as u32);
                 Some(
                     enc.encrypt(data, &nonce, aad.as_bytes())
                         .map_err(|e| Error::Internal(format!("section encryption failed: {e}")))?,
@@ -488,7 +821,6 @@ impl GrafeoFileManager {
             } else {
                 None
             };
-
             #[cfg(feature = "encryption")]
             let write_data: &[u8] = encrypted_buf.as_deref().unwrap_or(data);
             #[cfg(not(feature = "encryption"))]
@@ -497,67 +829,51 @@ impl GrafeoFileManager {
             let checksum = crc32fast::hash(write_data);
             let length = write_data.len() as u64;
 
-            file.seek(SeekFrom::Start(current_offset))?;
-            file.write_all(write_data)?;
+            tmp_file.seek(SeekFrom::Start(current_offset))?;
+            tmp_file.write_all(write_data)?;
 
             dir.upsert(SectionDirectoryEntry {
-                section_type: *section_type,
-                version: 1,
+                section_type,
+                version: section.version,
                 flags: section_type.default_flags(),
                 offset: current_offset,
                 length,
                 checksum,
             })?;
 
-            // Align next section to page boundary
             let section_end = current_offset + length;
             current_offset = (section_end + page_size - 1) / page_size * page_size;
         }
 
         maybe_crash("write_sections:after_data");
 
-        // Truncate file to remove stale trailing data
-        file.set_len(current_offset)?;
-
-        // Write section directory
+        tmp_file.set_len(current_offset)?;
         let dir_bytes = dir.to_bytes();
-        file.seek(SeekFrom::Start(DIRECTORY_OFFSET))?;
-        file.write_all(&dir_bytes)?;
+        tmp_file.seek(SeekFrom::Start(DIRECTORY_OFFSET))?;
+        tmp_file.write_all(&dir_bytes)?;
 
         maybe_crash("write_sections:after_directory");
-
-        // Build and write new DbHeader to inactive slot
-        let new_iteration = active_header.iteration + 1;
-        let target_slot = u8::from(*active_slot == 0);
-        // reason: millis since UNIX epoch fits in u64 for ~585 million years
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
 
         let new_header = DbHeader {
             iteration: new_iteration,
             checksum: dir.checksum(),
-            snapshot_length: 0, // Not used in v2; directory CRC is in checksum field
+            snapshot_length: 0,
             epoch,
             transaction_id,
             node_count,
             edge_count,
             timestamp_ms,
         };
-        header::write_db_header(&mut file, target_slot, &new_header)?;
-
-        // Ensure everything is on disk
-        file.sync_all()?;
+        header::write_db_header(&mut tmp_file, 0, &new_header)?;
+        header::write_db_header(&mut tmp_file, 1, &DbHeader::EMPTY)?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
 
         maybe_crash("write_sections:after_fsync");
 
-        // Update internal state
-        drop(active_header);
+        self.install_tmp_container(&mut state, &tmp)?;
         *self.active_header.lock() = new_header;
-        *active_slot = target_slot;
-
+        *self.active_slot.lock() = 0;
         Ok(())
     }
 
@@ -585,6 +901,8 @@ impl GrafeoFileManager {
         use crate::container::SectionDirectory;
         use crate::container::directory::DIRECTORY_OFFSET;
 
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         let active_header = self.active_header.lock();
 
         // v1 files have snapshot_length > 0; v2 files set it to 0 and put the
@@ -600,7 +918,7 @@ impl GrafeoFileManager {
         // the directory is real corruption, not a v1/v2 misdetection. Surface
         // it instead of silently falling through to read_snapshot, where v1 CRC
         // logic would mask the underlying cause.
-        let file_size = self.file.lock().metadata()?.len();
+        let file_size = file.metadata()?.len();
         if file_size < DIRECTORY_OFFSET + 4096 {
             return Err(Error::Internal(format!(
                 "v2 header indicates section directory at offset {DIRECTORY_OFFSET:#X}, \
@@ -608,11 +926,10 @@ impl GrafeoFileManager {
             )));
         }
 
-        let mut file = self.file.lock();
         file.seek(SeekFrom::Start(DIRECTORY_OFFSET))?;
 
         let mut buf = vec![0u8; 4096];
-        std::io::Read::read_exact(&mut *file, &mut buf)?;
+        std::io::Read::read_exact(file, &mut buf)?;
 
         let dir = SectionDirectory::from_bytes(&buf).map_err(|e| {
             Error::Internal(format!(
@@ -649,7 +966,8 @@ impl GrafeoFileManager {
         &self,
         entry: &grafeo_common::storage::SectionDirectoryEntry,
     ) -> Result<Vec<u8>> {
-        let mut file = self.file.lock();
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         file.seek(SeekFrom::Start(entry.offset))?;
 
         // reason: section length is bounded by file size, which fits in usize on 64-bit targets;
@@ -657,7 +975,7 @@ impl GrafeoFileManager {
         // reason: value bounded by collection size, fits usize
         #[allow(clippy::cast_possible_truncation)]
         let mut data = vec![0u8; entry.length as usize];
-        std::io::Read::read_exact(&mut *file, &mut data)?;
+        std::io::Read::read_exact(file, &mut data)?;
 
         // Verify CRC on the raw bytes (encrypted or plaintext)
         let actual_crc = crc32fast::hash(&data);
@@ -708,6 +1026,8 @@ impl GrafeoFileManager {
         &self,
         entry: &grafeo_common::storage::SectionDirectoryEntry,
     ) -> Result<crate::container::MmapSection> {
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
         if !entry.flags.mmap_able {
             return Err(Error::Internal(format!(
                 "section {:?} is not mmap-able (data sections must be deserialized)",
@@ -721,8 +1041,6 @@ impl GrafeoFileManager {
                 entry.section_type
             )));
         }
-
-        let file = self.file.lock();
 
         // SAFETY: We hold an exclusive lock on the `.grafeo` file, preventing
         // concurrent modification by other processes. The mapping is read-only.
@@ -739,8 +1057,6 @@ impl GrafeoFileManager {
                 .map(&*file)
         }
         .map_err(Error::Io)?;
-
-        drop(file);
 
         // Verify CRC on the mmap'd bytes. This reads through the mapping,
         // which triggers page faults and warms the OS page cache: a free
@@ -770,45 +1086,297 @@ impl GrafeoFileManager {
     ///
     /// Returns an error if the read or write fails.
     pub fn copy_to(&self, dest: &Path) -> Result<u64> {
-        let mut file = self.file.lock();
-        file.seek(SeekFrom::Start(0))?;
-
-        let mut dest_file = fs::File::create(dest)?;
-        let bytes = std::io::copy(&mut *file, &mut dest_file).map_err(Error::Io)?;
-        dest_file.sync_all()?;
-        Ok(bytes)
+        let mut state = self.state.lock();
+        let file = state.file_mut()?;
+        let mut destination = ContainerDestination::acquire(dest)?;
+        destination.overwrite_from(file, &self.path)
     }
 
-    /// Releases the file lock and syncs.
+    /// Copies through checked handles while the caller retains destination
+    /// authority for subsequent checksum, manifest, and cursor publication.
+    ///
+    /// # Errors
+    /// Returns closed/source I/O errors or destination lock/link/copy failures.
+    pub fn copy_to_destination(&self, destination: &mut ContainerDestination) -> Result<u64> {
+        let mut state = self.state.lock();
+        destination.overwrite_from(state.file_mut()?, &self.path)
+    }
+
+    /// Terminal, idempotent close. A sync failure retains non-writable ownership;
+    /// another close retries the sync, or Drop releases it without a sync claim.
     ///
     /// # Errors
     ///
-    /// Returns an error if sync or unlock fails.
+    /// Returns the actual sync error without releasing the path lease.
     pub fn close(&self) -> Result<()> {
-        let file = self.file.lock();
-        if !self.read_only {
+        let mut state = self.state.lock();
+        self.close_admitted(&mut state)
+    }
+
+    fn close_admitted(&self, state: &mut FileState) -> Result<()> {
+        state.enter_failed();
+        if let FileState::Failed {
+            file: Some(file), ..
+        } = &*state
+            && !self.read_only
+        {
+            #[cfg(feature = "testing-crash-injection")]
+            ownership_test_point("close-sync")?;
             file.sync_all()?;
         }
-        file.unlock()
-            .map_err(|e| Error::Internal(format!("failed to unlock database file: {e}")))?;
+        // Enum fields retire in declaration order: primary before path lease.
+        *state = FileState::Closed;
         Ok(())
     }
 }
 
 impl Drop for GrafeoFileManager {
     fn drop(&mut self) {
-        let file = self.file.lock();
-        let _ = file.unlock();
+        *self.state.get_mut() = FileState::Closed;
     }
+}
+
+// Process-local opt-in rendezvous for owned child tests. The parent bounds the
+// handshake and kills/reaps its child on timeout or assertion failure.
+#[cfg(feature = "testing-crash-injection")]
+pub(super) fn ownership_test_point(point: &str) -> Result<()> {
+    #[cfg(test)]
+    OPERATION_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(point)?;
+        }
+        Ok::<(), Error>(())
+    })?;
+    if std::env::var_os("GRAFEO_OWNERSHIP_FAIL").as_deref() == Some(std::ffi::OsStr::new(point)) {
+        static FAILED_ONCE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !FAILED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("injected container ownership error at {point}"),
+            )
+            .into());
+        }
+    }
+    if std::env::var("GRAFEO_OWNERSHIP_RENDEZVOUS")
+        .is_ok_and(|points| points.split(',').any(|value| value == point))
+    {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "READY")?;
+        output.flush()?;
+        drop(output);
+        let mut response = String::new();
+        std::io::stdin().read_line(&mut response)?;
+        if response.trim() != "RELEASE" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ownership rendezvous requires RELEASE",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "testing-crash-injection"))]
+type OwnershipTestHook = Box<dyn Fn(&str) -> Result<()>>;
+#[cfg(all(test, feature = "testing-crash-injection"))]
+thread_local! {
+    static OPERATION_TEST_HOOK: std::cell::RefCell<Option<OwnershipTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn ownership_capture_holds_admission_until_copy_finishes_before_close() {
+        use std::sync::{Arc, mpsc};
+        let dir = test_dir();
+        let manager =
+            Arc::new(GrafeoFileManager::create(dir.path().join("source.grafeo")).unwrap());
+        let mut capture = manager.capture().unwrap();
+        assert!(manager.state.try_lock().is_none());
+        let other = Arc::clone(&manager);
+        let (attempt, attempted) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            attempt.send(()).unwrap();
+            other.close().unwrap();
+            done.send(()).unwrap();
+        });
+        attempted.recv().unwrap();
+        let mut destination =
+            ContainerDestination::acquire(dir.path().join("copy.grafeo")).unwrap();
+        assert!(capture.copy_to_destination(&mut destination).unwrap() > 0);
+        assert!(completed.try_recv().is_err());
+        assert!(manager.state.try_lock().is_none());
+        drop(capture);
+        completed.recv().unwrap();
+        worker.join().unwrap();
+        assert!(manager.capture().is_err());
+    }
 
     fn test_dir() -> TempDir {
         TempDir::new().expect("create temp dir")
+    }
+
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn ownership_same_manager_serializes_complete_checkpoints() {
+        use grafeo_common::storage::SectionType;
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let dir = test_dir();
+        let path = dir.path().join("serial.grafeo");
+        let manager = Arc::new(GrafeoFileManager::create(&path).unwrap());
+        manager.write_snapshot(b"initial", 1, 1, 0, 0).unwrap();
+        let (ready_send, ready_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let (first_done_send, first_done_receive) = mpsc::channel();
+        let first_manager = Arc::clone(&manager);
+        let first = std::thread::spawn(move || {
+            OPERATION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |point| {
+                    if point == "after-close" {
+                        ready_send.send(()).unwrap();
+                        release_receive
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                    Ok(())
+                }));
+            });
+            let result = first_manager.write_sections(
+                &[(SectionType::LpgStore, b"first complete cut")],
+                2,
+                2,
+                0,
+                0,
+            );
+            OPERATION_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+            first_done_send.send(result).unwrap();
+        });
+        ready_receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (attempt_send, attempt_receive) = mpsc::channel();
+        let (second_done_send, second_done_receive) = mpsc::channel();
+        let second_manager = Arc::clone(&manager);
+        let second = std::thread::spawn(move || {
+            attempt_send.send(()).unwrap();
+            let result = second_manager.write_sections(
+                &[(SectionType::LpgStore, b"second complete cut")],
+                3,
+                3,
+                0,
+                0,
+            );
+            second_done_send.send(result).unwrap();
+        });
+        attempt_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            second_done_receive.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_send.send(()).unwrap();
+        first_done_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        second_done_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(manager.active_header().iteration, 3);
+        let directory = manager.read_section_directory().unwrap().unwrap();
+        assert_eq!(
+            manager
+                .read_section_data(directory.find(SectionType::LpgStore).unwrap())
+                .unwrap(),
+            b"second complete cut"
+        );
+        manager.close().unwrap();
+        assert!(manager.write_snapshot(b"closed", 4, 4, 0, 0).is_err());
+        let reopened = GrafeoFileManager::open(path).unwrap();
+        assert_eq!(reopened.active_header().epoch, 3);
+    }
+
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn ownership_close_waits_for_complete_checkpoint_before_releasing_lease() {
+        use grafeo_common::storage::SectionType;
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let dir = test_dir();
+        let path = dir.path().join("closing.grafeo");
+        let manager = Arc::new(GrafeoFileManager::create(&path).unwrap());
+        let (ready_send, ready_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let (write_done_send, write_done_receive) = mpsc::channel();
+        let writer_manager = Arc::clone(&manager);
+        let writer = std::thread::spawn(move || {
+            OPERATION_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |point| {
+                    if point == "after-close" {
+                        ready_send.send(()).unwrap();
+                        release_receive
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                    Ok(())
+                }));
+            });
+            let result = writer_manager.write_sections(
+                &[(SectionType::LpgStore, b"completed before terminal close")],
+                1,
+                1,
+                0,
+                0,
+            );
+            OPERATION_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+            write_done_send.send(result).unwrap();
+        });
+        ready_receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (attempt_send, attempt_receive) = mpsc::channel();
+        let (close_done_send, close_done_receive) = mpsc::channel();
+        let close_manager = Arc::clone(&manager);
+        let closer = std::thread::spawn(move || {
+            attempt_send.send(()).unwrap();
+            close_done_send.send(close_manager.close()).unwrap();
+        });
+        attempt_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            close_done_receive.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(GrafeoFileManager::open(&path).is_err());
+        release_send.send(()).unwrap();
+        write_done_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        close_done_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        closer.join().unwrap();
+        assert!(manager.file_size().is_err());
+        let reopened = GrafeoFileManager::open(path).unwrap();
+        let directory = reopened.read_section_directory().unwrap().unwrap();
+        assert_eq!(
+            reopened
+                .read_section_data(directory.find(SectionType::LpgStore).unwrap())
+                .unwrap(),
+            b"completed before terminal close"
+        );
     }
 
     #[test]
@@ -844,6 +1412,169 @@ mod tests {
 
         let result = GrafeoFileManager::open(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_staging_cleanup_preserves_active_owners_files() {
+        let dir = test_dir();
+        let path = dir.path().join("locked.grafeo");
+        let staging = dir.path().join("locked.grafeo.installing");
+        let before = dir.path().join("primary-before");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager.copy_to(&before).unwrap();
+        fs::write(&staging, b"active owner's unfinished checkpoint").unwrap();
+
+        let error = GrafeoFileManager::open(&path)
+            .err()
+            .expect("competing opener must fail");
+        assert!(error.to_string().contains("locked"));
+        drop(manager);
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&before).unwrap());
+        assert!(staging.exists(), "rejected opener deleted active staging");
+        assert_eq!(
+            fs::read(&staging).unwrap(),
+            b"active owner's unfinished checkpoint"
+        );
+    }
+
+    #[test]
+    fn open_staging_cleanup_preserves_evidence_without_primary() {
+        let dir = test_dir();
+        let path = dir.path().join("missing.grafeo");
+        let staging = dir.path().join("missing.grafeo.installing");
+        fs::write(&staging, b"uninstalled evidence").unwrap();
+
+        let error = GrafeoFileManager::open(&path)
+            .err()
+            .expect("missing primary must fail");
+        assert!(matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound));
+        assert!(!path.exists());
+        assert!(staging.exists(), "missing primary must retain staging");
+        assert_eq!(fs::read(&staging).unwrap(), b"uninstalled evidence");
+    }
+
+    #[test]
+    fn open_staging_cleanup_preserves_evidence_with_invalid_file_header() {
+        let dir = test_dir();
+        let path = dir.path().join("invalid.grafeo");
+        let staging = dir.path().join("invalid.grafeo.installing");
+        let invalid_header = [0u8; 4096];
+        fs::write(&path, invalid_header).unwrap();
+        fs::write(&staging, b"recoverable staging evidence").unwrap();
+
+        let error = GrafeoFileManager::open(&path)
+            .err()
+            .expect("invalid primary must fail");
+        assert!(error.to_string().contains("invalid magic"));
+        assert_eq!(fs::read(&path).unwrap(), invalid_header);
+        assert!(staging.exists(), "invalid primary must retain staging");
+        assert_eq!(fs::read(&staging).unwrap(), b"recoverable staging evidence");
+    }
+
+    #[test]
+    fn open_staging_cleanup_preserves_evidence_with_truncated_db_headers() {
+        let dir = test_dir();
+        let path = dir.path().join("truncated.grafeo");
+        let staging = dir.path().join("truncated.grafeo.installing");
+        drop(GrafeoFileManager::create(&path).unwrap());
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(super::super::format::FILE_HEADER_SIZE)
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        fs::write(&staging, b"staging after incomplete primary headers").unwrap();
+
+        let error = GrafeoFileManager::open(&path)
+            .err()
+            .expect("incomplete database headers must fail");
+        assert!(
+            matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(
+            staging.exists(),
+            "unreadable database headers must retain staging"
+        );
+        assert_eq!(
+            fs::read(&staging).unwrap(),
+            b"staging after incomplete primary headers"
+        );
+    }
+
+    #[test]
+    fn open_staging_cleanup_removes_stale_file_and_preserves_committed_payload() {
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("valid.grafeo");
+        let staging = dir.path().join("valid.grafeo.installing");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_versioned_sections(
+                &[SectionWrite::new(
+                    SectionType::Catalog,
+                    1,
+                    b"committed payload",
+                )],
+                1,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+        drop(manager);
+        fs::write(&staging, b"stale uninstalled payload").unwrap();
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        assert!(!staging.exists());
+        let directory = manager.read_section_directory().unwrap().unwrap();
+        let entry = directory.find(SectionType::Catalog).unwrap();
+        assert_eq!(
+            manager.read_section_data(entry).unwrap(),
+            b"committed payload"
+        );
+    }
+
+    #[test]
+    fn open_staging_cleanup_accepts_absent_staging_file() {
+        let dir = test_dir();
+        let path = dir.path().join("no-staging.grafeo");
+        let staging = dir.path().join("no-staging.grafeo.installing");
+        drop(GrafeoFileManager::create(&path).unwrap());
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        assert!(manager.active_header().is_empty());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn open_staging_cleanup_reports_directory_error_and_releases_primary_lock() {
+        let dir = test_dir();
+        let path = dir.path().join("directory.grafeo");
+        let staging = dir.path().join("directory.grafeo.installing");
+        drop(GrafeoFileManager::create(&path).unwrap());
+        let before = fs::read(&path).unwrap();
+        fs::create_dir(&staging).unwrap();
+        let marker = staging.join("marker");
+        fs::write(&marker, b"not an ordinary staging file").unwrap();
+
+        let error = GrafeoFileManager::open(&path)
+            .err()
+            .expect("staging directory removal error must be returned");
+        assert!(matches!(error, Error::Io(error) if error.kind() != std::io::ErrorKind::NotFound));
+        assert!(staging.is_dir());
+        assert_eq!(fs::read(&marker).unwrap(), b"not an ordinary staging file");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let raw = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        raw.try_lock_exclusive()
+            .expect("failed open must release the primary lock");
+        raw.unlock().unwrap();
     }
 
     #[test]
@@ -955,6 +1686,72 @@ mod tests {
         let header = manager.active_header();
         assert_eq!(header.snapshot_length, 0);
         assert!(!header.is_empty());
+    }
+
+    #[test]
+    fn section_writer_preserves_each_encoder_version() {
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("section-versions.grafeo");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_versioned_sections(
+                &[
+                    SectionWrite::new(SectionType::WorldMetadata, 1, b"world"),
+                    SectionWrite::new(SectionType::LpgStore, 7, b"lpg"),
+                ],
+                1,
+                1,
+                0,
+                0,
+            )
+            .unwrap();
+
+        let directory = manager.read_section_directory().unwrap().unwrap();
+        assert_eq!(
+            directory.find(SectionType::WorldMetadata).unwrap().version,
+            1
+        );
+        assert_eq!(directory.find(SectionType::LpgStore).unwrap().version, 7);
+    }
+
+    #[test]
+    fn section_writer_rejects_zero_versions_and_duplicates_before_install() {
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("invalid-section-versions.grafeo");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+
+        assert!(
+            manager
+                .write_versioned_sections(
+                    &[SectionWrite::new(SectionType::WorldMetadata, 0, b"world")],
+                    1,
+                    1,
+                    0,
+                    0,
+                )
+                .is_err()
+        );
+        assert!(manager.active_header().is_empty());
+
+        assert!(
+            manager
+                .write_versioned_sections(
+                    &[
+                        SectionWrite::new(SectionType::WorldMetadata, 1, b"first"),
+                        SectionWrite::new(SectionType::WorldMetadata, 1, b"second"),
+                    ],
+                    1,
+                    1,
+                    0,
+                    0,
+                )
+                .is_err()
+        );
+        assert!(manager.active_header().is_empty());
     }
 
     #[test]
@@ -1407,11 +2204,11 @@ mod tests {
     }
 
     #[test]
-    fn path_returns_database_file_path() {
+    fn path_returns_resolved_database_file_path() {
         let dir = test_dir();
         let path = dir.path().join("alix.grafeo");
         let manager = GrafeoFileManager::create(&path).unwrap();
-        assert_eq!(manager.path(), path);
+        assert_eq!(manager.path(), fs::canonicalize(path).unwrap());
     }
 
     #[test]
@@ -1578,6 +2375,43 @@ mod tests {
         copy.close().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn admitted_capture_streams_and_copies_original_after_path_replacement() {
+        let dir = test_dir();
+        let src = dir.path().join("admitted_src.grafeo");
+        let moved = dir.path().join("admitted_src.moved.grafeo");
+        let dest = dir.path().join("admitted_dest.grafeo");
+        let manager = GrafeoFileManager::create(&src).unwrap();
+        manager
+            .write_snapshot(b"descriptor-bound image", 5, 3, 10, 20)
+            .unwrap();
+
+        let mut capture = manager.capture().unwrap();
+        let mut expected = Vec::new();
+        capture.write_image_to(&mut expected).unwrap();
+
+        std::fs::rename(&src, &moved).unwrap();
+        std::fs::write(&src, b"replacement at the old pathname").unwrap();
+
+        let mut streamed = Vec::new();
+        assert_eq!(
+            capture.write_image_to(&mut streamed).unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(streamed, expected);
+
+        let mut destination = ContainerDestination::acquire(&dest).unwrap();
+        assert_eq!(
+            capture.copy_to_destination(&mut destination).unwrap(),
+            expected.len() as u64
+        );
+        drop(destination);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected);
+        drop(capture);
+        manager.close().unwrap();
+    }
+
     #[test]
     #[cfg(all(feature = "encryption", not(miri)))]
     fn encrypted_section_roundtrip() {
@@ -1653,5 +2487,101 @@ mod tests {
             let result = manager.read_section_data(entry);
             assert!(result.is_err(), "decryption with wrong key should fail");
         }
+    }
+
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn write_sections_crash_after_data_keeps_previous_container() {
+        use grafeo_common::storage::SectionType;
+        use grafeo_common::testing::crash::{CrashResult, with_crash_named};
+
+        let dir = test_dir();
+        let path = dir.path().join("atomic.grafeo");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_sections(&[(SectionType::LpgStore, b"first-payload")], 1, 1, 1, 0)
+            .unwrap();
+
+        let crashed = with_crash_named("write_sections:after_data", || {
+            let _ = manager.write_sections(
+                &[(SectionType::LpgStore, b"second-payload-should-not-commit")],
+                2,
+                2,
+                2,
+                0,
+            );
+        });
+        assert!(
+            matches!(crashed, CrashResult::Crashed),
+            "must crash after writing temp section data"
+        );
+        assert!(
+            GrafeoFileManager::installing_path(&path).exists(),
+            "interrupted install must leave a leftover .installing, not a torn primary"
+        );
+        drop(manager);
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        assert!(
+            !GrafeoFileManager::installing_path(&path).exists(),
+            "open must discard leftover .installing"
+        );
+        let section_dir = manager
+            .read_section_directory()
+            .unwrap()
+            .expect("previous v2 directory must survive");
+        let entry = section_dir
+            .find(SectionType::LpgStore)
+            .expect("previous LPG section");
+        let bytes = manager.read_section_data(entry).unwrap();
+        assert_eq!(
+            bytes.as_slice(),
+            b"first-payload",
+            "in-place overwrite must not destroy the last committed container"
+        );
+    }
+
+    #[cfg(feature = "testing-crash-injection")]
+    #[test]
+    fn write_sections_crash_after_fsync_does_not_install_tmp() {
+        use grafeo_common::storage::SectionType;
+        use grafeo_common::testing::crash::{CrashResult, with_crash_named};
+
+        let dir = test_dir();
+        let path = dir.path().join("atomic_fsync.grafeo");
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_sections(&[(SectionType::LpgStore, b"first-payload")], 1, 1, 1, 0)
+            .unwrap();
+
+        let crashed = with_crash_named("write_sections:after_fsync", || {
+            let _ = manager.write_sections(
+                &[(SectionType::LpgStore, b"second-payload-should-not-commit")],
+                2,
+                2,
+                2,
+                0,
+            );
+        });
+        assert!(
+            matches!(crashed, CrashResult::Crashed),
+            "must crash after fsync of the temp container"
+        );
+        drop(manager);
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        let section_dir = manager
+            .read_section_directory()
+            .unwrap()
+            .expect("previous v2 directory must survive");
+        let entry = section_dir
+            .find(SectionType::LpgStore)
+            .expect("previous LPG section");
+        let bytes = manager.read_section_data(entry).unwrap();
+        assert_eq!(
+            bytes.as_slice(),
+            b"first-payload",
+            "uninstalled temp container must not replace the last-good primary"
+        );
     }
 }
