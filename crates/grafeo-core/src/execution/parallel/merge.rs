@@ -241,13 +241,7 @@ impl MergeEntry {
             let a = self.row.get(key.column);
             let b = other.row.get(key.column);
 
-            let ordering = compare_values_for_sort(a, b, key.nulls_first);
-
-            let ordering = if key.ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            };
+            let ordering = compare_values_for_sort(a, b, key.ascending, key.nulls_first);
 
             if ordering != Ordering::Equal {
                 return ordering;
@@ -278,7 +272,12 @@ impl Ord for MergeEntry {
     }
 }
 
-fn compare_values_for_sort(a: Option<&Value>, b: Option<&Value>, nulls_first: bool) -> Ordering {
+fn compare_values_for_sort(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    ascending: bool,
+    nulls_first: bool,
+) -> Ordering {
     match (a, b) {
         (None, None) | (Some(Value::Null), Some(Value::Null)) => Ordering::Equal,
         (None, _) | (Some(Value::Null), _) => {
@@ -295,7 +294,14 @@ fn compare_values_for_sort(a: Option<&Value>, b: Option<&Value>, nulls_first: bo
                 Ordering::Less
             }
         }
-        (Some(a), Some(b)) => compare_values(a, b),
+        (Some(a), Some(b)) => {
+            let ordering = compare_values(a, b);
+            if ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        }
     }
 }
 
@@ -471,7 +477,8 @@ fn hash_row(row: &[Value]) -> u64 {
             Value::Null => 0u8.hash(&mut hasher),
             Value::Bool(b) => b.hash(&mut hasher),
             Value::Int64(i) => i.hash(&mut hasher),
-            Value::Float64(f) => f.to_bits().hash(&mut hasher),
+            // Canonicalize -0.0 to +0.0 so the two zeros co-partition across workers.
+            Value::Float64(f) => grafeo_common::types::canonical_f64_bits(*f).hash(&mut hasher),
             Value::String(s) => s.hash(&mut hasher),
             _ => 0u8.hash(&mut hasher),
         }
@@ -580,6 +587,88 @@ mod tests {
         assert_eq!(result[0][0], Value::Int64(8));
         assert_eq!(result[1][0], Value::Int64(7));
         assert_eq!(result[5][0], Value::Int64(1));
+    }
+
+    #[test]
+    fn merge_sorted_runs_respects_final_null_placement_for_every_direction() {
+        let input = [
+            Value::Int64(2),
+            Value::Null,
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(3),
+        ];
+        let cases = [
+            (
+                SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: true,
+                },
+                vec![
+                    Value::Null,
+                    Value::Null,
+                    Value::Int64(1),
+                    Value::Int64(2),
+                    Value::Int64(3),
+                ],
+            ),
+            (
+                SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                },
+                vec![
+                    Value::Int64(1),
+                    Value::Int64(2),
+                    Value::Int64(3),
+                    Value::Null,
+                    Value::Null,
+                ],
+            ),
+            (
+                SortKey {
+                    column: 0,
+                    ascending: false,
+                    nulls_first: true,
+                },
+                vec![
+                    Value::Null,
+                    Value::Null,
+                    Value::Int64(3),
+                    Value::Int64(2),
+                    Value::Int64(1),
+                ],
+            ),
+            (
+                SortKey {
+                    column: 0,
+                    ascending: false,
+                    nulls_first: false,
+                },
+                vec![
+                    Value::Int64(3),
+                    Value::Int64(2),
+                    Value::Int64(1),
+                    Value::Null,
+                    Value::Null,
+                ],
+            ),
+        ];
+
+        for (key, expected) in cases {
+            let runs = input
+                .iter()
+                .cloned()
+                .map(|value| vec![vec![value]])
+                .collect();
+            let output = merge_sorted_runs(runs, &[key])
+                .into_iter()
+                .map(|row| row.into_iter().next().expect("test row has one value"))
+                .collect::<Vec<_>>();
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]

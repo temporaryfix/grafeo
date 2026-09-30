@@ -14,11 +14,13 @@
 
 use std::sync::Arc;
 
-use super::{FactorizedOperator, FactorizedResult, LazyFactorizedChainOperator, Operator};
+use super::{
+    FactorizedOperator, FactorizedResult, LazyFactorizedChainOperator, Operator, OperatorResult,
+};
 use crate::execution::chunk_state::{FactorizedSelection, LevelSelection};
 use crate::execution::factorized_chunk::FactorizedChunk;
 use crate::graph::GraphStoreSearch;
-use grafeo_common::types::{EpochId, PropertyKey, Value};
+use grafeo_common::types::{EpochId, PropertyKey, TransactionId, Value};
 
 /// A predicate that can be evaluated on factorized data at a specific level.
 ///
@@ -229,7 +231,7 @@ impl FactorizedPredicate for ColumnPredicate {
 ///
 /// # Performance
 ///
-/// Uses direct property lookup via `LpgStore::get_node_property()` which is
+/// Uses snapshot-aware property lookup via `read_node_property_visible()` which is
 /// O(1) per entity. This avoids the O(properties) overhead of loading all
 /// properties when only one is needed.
 pub struct PropertyPredicate {
@@ -247,6 +249,8 @@ pub struct PropertyPredicate {
     store: Arc<dyn GraphStoreSearch>,
     /// Optional epoch for time-travel property reads.
     viewing_epoch: Option<EpochId>,
+    /// Optional transaction id for read-your-writes visibility.
+    transaction_id: Option<TransactionId>,
 }
 
 impl PropertyPredicate {
@@ -267,6 +271,7 @@ impl PropertyPredicate {
             value,
             store,
             viewing_epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -279,6 +284,20 @@ impl PropertyPredicate {
         store: Arc<dyn GraphStoreSearch>,
     ) -> Self {
         Self::new(level, column, property, CompareOp::Eq, value, store)
+    }
+
+    /// Sets the transaction context for MVCC-aware property lookups.
+    ///
+    /// Mirrors `FilterOperator::with_transaction_context`.
+    #[must_use]
+    pub fn with_transaction_context(
+        mut self,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.viewing_epoch = Some(epoch);
+        self.transaction_id = transaction_id;
+        self
     }
 
     fn compare_values(&self, left: &Value) -> bool {
@@ -355,29 +374,31 @@ impl FactorizedPredicate for PropertyPredicate {
             return false;
         };
 
-        // Try as node first - use direct property lookup (O(1) vs O(properties))
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+
+        // Try as node first - use snapshot-aware property accessor (O(1) vs O(properties))
         if let Some(node_id) = column.get_node_id_physical(physical_idx) {
-            let prop_val = if let Some(epoch) = self.viewing_epoch {
-                self.store
-                    .get_node_at_epoch(node_id, epoch)
-                    .and_then(|n| n.get_property(self.property.as_str()).cloned())
-            } else {
-                self.store.get_node_property(node_id, &self.property)
-            };
+            let prop_val = self.store.read_node_property_visible(
+                node_id,
+                &self.property,
+                snap_epoch,
+                self.transaction_id,
+            );
             if let Some(val) = prop_val {
                 return self.compare_values(&val);
             }
         }
 
-        // Try as edge - use direct property lookup
+        // Try as edge - use snapshot-aware property accessor
         if let Some(edge_id) = column.get_edge_id_physical(physical_idx) {
-            let prop_val = if let Some(epoch) = self.viewing_epoch {
-                self.store
-                    .get_edge_at_epoch(edge_id, epoch)
-                    .and_then(|e| e.get_property(self.property.as_str()).cloned())
-            } else {
-                self.store.get_edge_property(edge_id, &self.property)
-            };
+            let prop_val = self.store.read_edge_property_visible(
+                edge_id,
+                &self.property,
+                snap_epoch,
+                self.transaction_id,
+            );
             if let Some(val) = prop_val {
                 return self.compare_values(&val);
             }
@@ -407,30 +428,32 @@ impl FactorizedPredicate for PropertyPredicate {
 
         let count = level_data.physical_value_count();
 
-        // Evaluate all at once using direct property lookups
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+
+        // Evaluate all at once using snapshot-aware property accessors
         LevelSelection::from_predicate(count, |idx| {
             // Try as node first
             if let Some(node_id) = column.get_node_id_physical(idx) {
-                let val = if let Some(epoch) = self.viewing_epoch {
-                    self.store
-                        .get_node_at_epoch(node_id, epoch)
-                        .and_then(|n| n.get_property(self.property.as_str()).cloned())
-                } else {
-                    self.store.get_node_property(node_id, &self.property)
-                };
+                let val = self.store.read_node_property_visible(
+                    node_id,
+                    &self.property,
+                    snap_epoch,
+                    self.transaction_id,
+                );
                 if let Some(v) = val {
                     return self.compare_values(&v);
                 }
             }
             // Try as edge
             if let Some(edge_id) = column.get_edge_id_physical(idx) {
-                let val = if let Some(epoch) = self.viewing_epoch {
-                    self.store
-                        .get_edge_at_epoch(edge_id, epoch)
-                        .and_then(|e| e.get_property(self.property.as_str()).cloned())
-                } else {
-                    self.store.get_edge_property(edge_id, &self.property)
-                };
+                let val = self.store.read_edge_property_visible(
+                    edge_id,
+                    &self.property,
+                    snap_epoch,
+                    self.transaction_id,
+                );
                 if let Some(v) = val {
                     return self.compare_values(&v);
                 }
@@ -607,6 +630,32 @@ impl FactorizedFilterOperator {
         }
 
         selection
+    }
+}
+
+impl Operator for FactorizedFilterOperator {
+    fn next(&mut self) -> OperatorResult {
+        match FactorizedOperator::next_factorized(self) {
+            Ok(Some(chunk)) => Ok(Some(chunk.flatten())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn reset(&mut self) {
+        Operator::reset(&mut self.input);
+    }
+
+    fn name(&self) -> &'static str {
+        "FactorizedFilter"
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+
+    fn as_factorized_mut(&mut self) -> Option<&mut dyn FactorizedOperator> {
+        Some(self)
     }
 }
 

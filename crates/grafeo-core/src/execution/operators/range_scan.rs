@@ -42,11 +42,11 @@
 use std::sync::Arc;
 
 use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId, Value};
-use grafeo_common::utils::hash::FxHashSet;
 
-use super::{Operator, OperatorResult};
+use super::{ExpressionPredicate, Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
-use crate::graph::GraphStoreSearch;
+use crate::graph::{GraphStoreSearch, PropertyIndexPredicate, PropertyIndexRequest};
+use grafeo_common::types::PropertyKey;
 
 /// Pull-based operator that emits node ids whose property value falls
 /// within a range. See the module docs for details.
@@ -104,9 +104,9 @@ impl RangeScanOperator {
 
     /// Sets a row-count cap that bounds the materialization step.
     ///
-    /// When set, the underlying iterator is consumed via `take(limit)`,
-    /// so blocks past the cap are never decoded. Wired by the planner
-    /// in Phase 4e when a downstream `LIMIT k` is known statically.
+    /// Stops consuming candidates after enough visible, label-qualified matches.
+    /// Lazy stores avoid decoding later blocks; eager stores still enumerate
+    /// candidates before this cap applies.
     #[must_use]
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
@@ -123,10 +123,8 @@ impl RangeScanOperator {
 
     /// Restricts the result to nodes carrying `label`.
     ///
-    /// Applied during materialization by intersecting the iterator's
-    /// output with `store.nodes_by_label(label)`. Mirrors the eager
-    /// `find_nodes_in_range` + `nodes_by_label` retain pattern that the
-    /// planner used pre-Phase-4d.
+    /// Applied during materialization with a point membership check, retaining
+    /// the store's projection and historical-label semantics.
     #[must_use]
     pub fn with_label_filter(mut self, label: impl Into<String>) -> Self {
         self.label_filter = Some(label.into());
@@ -148,40 +146,104 @@ impl RangeScanOperator {
         self
     }
 
-    fn ensure_materialized(&mut self) {
+    fn ensure_materialized(&mut self) -> OperatorResult {
         if self.materialized.is_some() {
-            return;
+            return Ok(None);
         }
 
-        // Pre-compute the label set once (avoids repeated lookups in the
-        // hot path).
-        let label_set: Option<FxHashSet<NodeId>> = self
-            .label_filter
-            .as_ref()
-            .map(|label| self.store.nodes_by_label(label).into_iter().collect());
-        let tx_ctx = self.transaction_context;
+        if self.limit == Some(0) {
+            self.materialized = Some(Vec::new());
+            return Ok(None);
+        }
 
-        let iter = self.store.find_nodes_in_range_iter(
-            &self.property,
-            self.min.as_ref(),
-            self.max.as_ref(),
-            self.min_inclusive,
-            self.max_inclusive,
-        );
+        // `SYSTEM` is the planner's sentinel for an ordinary snapshot read;
+        // it is not a real transaction and must not hide the committed index
+        // behind a transaction overlay.
+        let (epoch, transaction_id) = self
+            .transaction_context
+            .map_or((self.store.current_epoch(), None), |(epoch, tx)| {
+                (epoch, (tx != TransactionId::SYSTEM).then_some(tx))
+            });
+        if let Some(tx) = transaction_id {
+            if let Some(label) = &self.label_filter {
+                self.store.record_label_predicate_read(tx, label);
+            } else {
+                self.store.record_lpg_dataset_read(tx);
+            }
+        }
+
+        // An indexed result is complete, including an empty result.  Only
+        // `None` means that this property/range cannot be answered by an
+        // admitted index and should use the established iterator fallback.
+        let indexed = self
+            .store
+            .lookup_nodes_indexed(PropertyIndexRequest {
+                property: &self.property,
+                predicate: PropertyIndexPredicate::Range {
+                    min: self.min.as_ref(),
+                    max: self.max.as_ref(),
+                    min_inclusive: self.min_inclusive,
+                    max_inclusive: self.max_inclusive,
+                },
+                epoch,
+                transaction_id,
+            })
+            .map_err(|error| OperatorError::Execution(error.to_string()))?;
+
+        let candidates: Box<dyn Iterator<Item = NodeId> + '_> = match indexed {
+            Some(ids) => Box::new(ids.into_iter()),
+            // Latest-value range iteration cannot enumerate historical or
+            // transaction-local matches. Retain the complete identity fallback.
+            None if transaction_id.is_some() || epoch < self.store.current_epoch() => {
+                Box::new(self.store.all_node_ids().into_iter())
+            }
+            None => self.store.find_nodes_in_range_iter(
+                &self.property,
+                self.min.as_ref(),
+                self.max.as_ref(),
+                self.min_inclusive,
+                self.max_inclusive,
+            ),
+        };
+        let property_key = PropertyKey::new(&self.property);
 
         // Filter inline (label + MVCC) and stop only after `limit` matches
         // *survive* the filters. Applying limit before filtering would
         // under-return rows when early range hits are filtered out.
         let mut collected: Vec<NodeId> = Vec::new();
-        for id in iter {
-            if let Some(set) = label_set.as_ref()
-                && !set.contains(&id)
-            {
+        for id in candidates {
+            let visible = transaction_id.map_or_else(
+                || self.store.get_node_at_epoch(id, epoch).is_some(),
+                |tx| self.store.get_node_versioned(id, epoch, tx).is_some(),
+            );
+            if !visible {
                 continue;
             }
-            if let Some((epoch, tx)) = tx_ctx
-                && self.store.get_node_versioned(id, epoch, tx).is_none()
-            {
+            if self.label_filter.as_deref().is_some_and(|label| {
+                !self.store.node_has_label_at_epoch(
+                    id,
+                    label,
+                    epoch,
+                    transaction_id.unwrap_or(TransactionId::SYSTEM),
+                )
+            }) {
+                continue;
+            }
+            let Some(value) =
+                self.store
+                    .read_node_property_visible(id, &property_key, epoch, transaction_id)
+            else {
+                continue;
+            };
+            if !ExpressionPredicate::matches_property_index_predicate(
+                &value,
+                PropertyIndexPredicate::Range {
+                    min: self.min.as_ref(),
+                    max: self.max.as_ref(),
+                    min_inclusive: self.min_inclusive,
+                    max_inclusive: self.max_inclusive,
+                },
+            ) {
                 continue;
             }
             collected.push(id);
@@ -193,12 +255,13 @@ impl RangeScanOperator {
         }
 
         self.materialized = Some(collected);
+        Ok(None)
     }
 }
 
 impl Operator for RangeScanOperator {
     fn next(&mut self) -> OperatorResult {
-        self.ensure_materialized();
+        self.ensure_materialized()?;
         let nodes = self
             .materialized
             .as_ref()
@@ -249,6 +312,8 @@ mod tests {
     use super::*;
     use crate::graph::compact::CompactStore;
     use crate::graph::compact::builder::CompactStoreBuilder;
+    #[cfg(feature = "lpg")]
+    use crate::graph::lpg::LpgStore;
 
     fn build_person_store() -> Arc<dyn GraphStoreSearch> {
         Arc::new(
@@ -313,6 +378,10 @@ mod tests {
                 .unwrap(),
         );
 
+        let mut empty = RangeScanOperator::new(Arc::clone(&store), "v", None, None, true, true, 64)
+            .with_limit(0);
+        assert!(empty.next().unwrap().is_none());
+
         let mut op = RangeScanOperator::new(store, "v", None, None, true, true, 64).with_limit(5);
 
         let mut total = 0usize;
@@ -372,6 +441,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
+    fn range_scan_historical_and_transaction_views_use_complete_candidates() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let created = EpochId::new(1);
+        let current = EpochId::new(2);
+        store.set_epoch(created);
+        let changed = store.create_node(&[]);
+        let deleted = store.create_node(&[]);
+        store.set_node_property_at_epoch(changed, "score", Value::Int64(5), created);
+        store.set_node_property_at_epoch(deleted, "score", Value::Int64(5), created);
+        store.set_node_property_at_epoch(changed, "score", Value::Int64(50), current);
+        assert!(store.delete_node_at_epoch(deleted, current));
+        store.sync_epoch(current);
+
+        let mut historical = RangeScanOperator::new(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            "score",
+            Some(Value::Int64(5)),
+            Some(Value::Int64(5)),
+            true,
+            true,
+            2048,
+        )
+        .with_transaction_context(created, TransactionId::SYSTEM);
+        let mut historical_rows = 0;
+        while let Some(chunk) = historical.next().unwrap() {
+            historical_rows += chunk.row_count();
+        }
+        assert_eq!(
+            historical_rows, 2,
+            "old SET and deletion values remain visible"
+        );
+
+        let tx = TransactionId::new(77);
+        let own = store.create_node(&[]);
+        store.set_node_property(own, "score", Value::Int64(0));
+        store.set_node_property_buffered(own, "score", Value::Int64(5), tx);
+        let mut writer = RangeScanOperator::new(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            "score",
+            Some(Value::Int64(5)),
+            Some(Value::Int64(5)),
+            true,
+            true,
+            2048,
+        )
+        .with_transaction_context(current, tx)
+        .with_limit(1);
+        let first = writer.next().unwrap().expect("own buffered value matches");
+        assert_eq!(first.row_count(), 1);
+        assert!(writer.next().unwrap().is_none());
+    }
+
+    #[test]
     fn shosanna_range_scan_name_is_stable() {
         let store = build_person_store();
         let op = RangeScanOperator::new(store, "age", None, None, true, true, 2048);
@@ -420,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn django_range_scan_default_trait_impl_works_for_non_compact_stores() {
         // Validates the default `find_nodes_in_range_iter` impl on
         // `GraphStoreSearch`: a CompactStore exposed as `Arc<dyn>` should

@@ -25,6 +25,8 @@ pub(crate) mod spill_state;
 
 pub use aggregate::AggregatePushOperator;
 #[cfg(feature = "spill")]
+pub(crate) use aggregate::GroupState;
+#[cfg(feature = "spill")]
 pub use aggregate::{DEFAULT_AGGREGATE_SPILL_THRESHOLD, SpillableAggregatePushOperator};
 pub use distinct::{DistinctMaterializingOperator, DistinctPushOperator};
 pub use filter::{

@@ -2,9 +2,10 @@
 //!
 //! Sinks receive the output from pipelines and handle the final results.
 
+use super::AccountedDataChunk;
 use super::chunk::DataChunk;
 use super::operators::OperatorError;
-use super::pipeline::Sink;
+use super::pipeline::{AccountedSinkPermit, ChunkTransport, Sink, qualified_accounted_transport};
 
 /// Collects all chunks for final query result output.
 pub struct CollectorSink {
@@ -260,6 +261,19 @@ impl Sink for CountingSink {
         Ok(true)
     }
 
+    fn consume_accounted(&mut self, chunk: AccountedDataChunk) -> Result<bool, OperatorError> {
+        self.count += chunk.chunk().len();
+        Ok(true)
+    }
+
+    fn __accounted_sink_permit(&mut self) -> Option<AccountedSinkPermit<'_>> {
+        Some(AccountedSinkPermit::new(self))
+    }
+
+    fn admit_chunk_transport(&self, _input: ChunkTransport) -> Result<(), OperatorError> {
+        Ok(())
+    }
+
     fn finalize(&mut self) -> Result<(), OperatorError> {
         Ok(())
     }
@@ -270,6 +284,16 @@ impl Sink for CountingSink {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+}
+
+impl qualified_accounted_transport::QualifiedSink for CountingSink {
+    fn consume_accounted_qualified(
+        &mut self,
+        chunk: AccountedDataChunk,
+    ) -> Result<bool, OperatorError> {
+        self.count += chunk.chunk().len();
+        Ok(true)
     }
 }
 
@@ -296,6 +320,18 @@ impl Sink for NullSink {
         Ok(true)
     }
 
+    fn consume_accounted(&mut self, _chunk: AccountedDataChunk) -> Result<bool, OperatorError> {
+        Ok(true)
+    }
+
+    fn __accounted_sink_permit(&mut self) -> Option<AccountedSinkPermit<'_>> {
+        Some(AccountedSinkPermit::new(self))
+    }
+
+    fn admit_chunk_transport(&self, _input: ChunkTransport) -> Result<(), OperatorError> {
+        Ok(())
+    }
+
     fn finalize(&mut self) -> Result<(), OperatorError> {
         Ok(())
     }
@@ -306,6 +342,15 @@ impl Sink for NullSink {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+}
+
+impl qualified_accounted_transport::QualifiedSink for NullSink {
+    fn consume_accounted_qualified(
+        &mut self,
+        _chunk: AccountedDataChunk,
+    ) -> Result<bool, OperatorError> {
+        Ok(true)
     }
 }
 

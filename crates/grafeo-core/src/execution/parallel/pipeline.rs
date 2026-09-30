@@ -8,7 +8,10 @@ use super::scheduler::MorselScheduler;
 use super::source::ParallelSource;
 use crate::execution::chunk::DataChunk;
 use crate::execution::operators::OperatorError;
-use crate::execution::pipeline::{ChunkCollector, DEFAULT_CHUNK_SIZE, PushOperator, Sink};
+use crate::execution::pipeline::{
+    ChainProgress, ChunkCollector, DEFAULT_CHUNK_SIZE, PushOperator, Sink,
+    TerminalContinuationSink, finalize_operator_chain,
+};
 use grafeo_common::memory::buffer::PressureLevel;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -213,7 +216,6 @@ impl ParallelPipeline {
 
         // Create scheduler and submit morsels
         let scheduler = Arc::new(MorselScheduler::new(self.config.num_workers));
-        let total_morsels = morsels.len();
         scheduler.submit_batch(morsels);
         scheduler.finish_submission();
 
@@ -265,7 +267,16 @@ impl ParallelPipeline {
         Ok(ParallelPipelineResult {
             chunks,
             num_workers: self.config.num_workers,
-            morsels_processed: total_morsels,
+            // Submission counts pending work as active; after joining every
+            // worker, the difference is exactly the completed morsel count.
+            morsels_processed: scheduler
+                .total_submitted()
+                .checked_sub(scheduler.active_count())
+                .ok_or_else(|| {
+                    OperatorError::Execution(
+                        "scheduler pending morsels exceed submitted total".to_string(),
+                    )
+                })?,
             rows_processed: rows_processed.load(Ordering::Relaxed),
         })
     }
@@ -289,7 +300,8 @@ impl ParallelPipeline {
         let mut operators = factory.create_chain();
         let mut local_sink = CollectorSink::new();
 
-        // Process morsels
+        let mut progress = ChainProgress::Continue;
+        // Process morsels until this worker-local operator chain is exhausted.
         while let Some(morsel) = handle.get_work() {
             let mut partition = source.create_partition(&morsel);
             let mut morsel_rows = 0;
@@ -297,15 +309,21 @@ impl ParallelPipeline {
             // Process chunks within morsel
             while let Some(chunk) = partition.next_chunk(chunk_size)? {
                 morsel_rows += chunk.len();
-                Self::push_through_chain(&mut operators, chunk, &mut local_sink)?;
+                progress = Self::push_through_chain(&mut operators, chunk, &mut local_sink)?;
+                if !progress.continued() {
+                    break;
+                }
             }
 
             rows_processed.fetch_add(morsel_rows, Ordering::Relaxed);
             handle.complete_morsel();
+            if !progress.continued() {
+                break;
+            }
         }
 
         // Finalize operators (important for pipeline breakers)
-        Self::finalize_chain(&mut operators, &mut local_sink)?;
+        Self::finalize_chain(&mut operators, &mut local_sink, progress)?;
 
         // Collect results
         let chunks = local_sink.into_chunks();
@@ -316,69 +334,23 @@ impl ParallelPipeline {
         Ok(())
     }
 
-    /// Pushes a chunk through the operator chain.
+    /// Pushes a chunk through the worker-local operator chain.
     fn push_through_chain(
         operators: &mut [Box<dyn PushOperator>],
         chunk: DataChunk,
         sink: &mut dyn Sink,
-    ) -> Result<bool, OperatorError> {
-        if operators.is_empty() {
-            return sink.consume(chunk);
-        }
-
-        let num_operators = operators.len();
-        let mut current_chunk = chunk;
-
-        for i in 0..num_operators {
-            let is_last = i == num_operators - 1;
-
-            if is_last {
-                return operators[i].push(current_chunk, sink);
-            }
-
-            // Intermediate: collect output
-            let mut collector = ChunkCollector::new();
-            let continue_processing = operators[i].push(current_chunk, &mut collector)?;
-
-            if !continue_processing || collector.is_empty() {
-                return Ok(continue_processing);
-            }
-
-            current_chunk = collector.into_single_chunk();
-        }
-
-        Ok(true)
+    ) -> Result<ChainProgress, OperatorError> {
+        Self::push_through_from_index(operators, 0, chunk, sink)
     }
 
-    /// Finalizes all operators in the chain.
+    /// Reuses the serial finalization relay, including terminal guards and
+    /// the distinction between exhausted producers and downstream consumers.
     fn finalize_chain(
         operators: &mut [Box<dyn PushOperator>],
         sink: &mut dyn Sink,
+        progress: ChainProgress,
     ) -> Result<(), OperatorError> {
-        if operators.is_empty() {
-            return sink.finalize();
-        }
-
-        let num_operators = operators.len();
-
-        for i in 0..num_operators {
-            let is_last = i == num_operators - 1;
-
-            if is_last {
-                operators[i].finalize(sink)?;
-            } else {
-                // Collect finalize output and push through remaining operators
-                let mut collector = ChunkCollector::new();
-                operators[i].finalize(&mut collector)?;
-
-                // Push through remaining operators
-                for chunk in collector.into_chunks() {
-                    Self::push_through_from_index(operators, i + 1, chunk, sink)?;
-                }
-            }
-        }
-
-        sink.finalize()
+        finalize_operator_chain(operators, sink, None, progress)
     }
 
     /// Pushes a chunk through operators starting at index.
@@ -387,28 +359,55 @@ impl ParallelPipeline {
         start: usize,
         chunk: DataChunk,
         sink: &mut dyn Sink,
-    ) -> Result<bool, OperatorError> {
+    ) -> Result<ChainProgress, OperatorError> {
+        enum PendingChunk {
+            Chunk(usize, DataChunk),
+            Stop(usize),
+        }
+
         let num_operators = operators.len();
-        let mut current_chunk = chunk;
+        let mut pending = vec![PendingChunk::Chunk(start, chunk)];
+        while let Some(item) = pending.pop() {
+            let (branch_start, current_chunk) = match item {
+                PendingChunk::Chunk(index, chunk) => (index, chunk),
+                PendingChunk::Stop(index) => return Ok(ChainProgress::ExhaustedAfter(index)),
+            };
+            if branch_start >= num_operators {
+                return Ok(if sink.consume(current_chunk)? {
+                    ChainProgress::Continue
+                } else {
+                    ChainProgress::SinkStopped
+                });
+            }
 
-        for i in start..num_operators {
-            let is_last = i == num_operators - 1;
-
-            if is_last {
-                return operators[i].push(current_chunk, sink);
+            if branch_start == num_operators - 1 {
+                let mut terminal = TerminalContinuationSink {
+                    sink,
+                    stopped: false,
+                };
+                let continued = operators[branch_start].push(current_chunk, &mut terminal)?;
+                if terminal.stopped {
+                    return Ok(ChainProgress::SinkStopped);
+                }
+                if !continued {
+                    return Ok(ChainProgress::ExhaustedAfter(branch_start));
+                }
+                continue;
             }
 
             let mut collector = ChunkCollector::new();
-            let continue_processing = operators[i].push(current_chunk, &mut collector)?;
-
-            if !continue_processing || collector.is_empty() {
-                return Ok(continue_processing);
+            let continue_processing =
+                operators[branch_start].push(current_chunk, &mut collector)?;
+            let chunks = collector.into_chunks();
+            if !continue_processing {
+                pending.push(PendingChunk::Stop(branch_start));
             }
-
-            current_chunk = collector.into_single_chunk();
+            for next in chunks.into_iter().rev() {
+                pending.push(PendingChunk::Chunk(branch_start + 1, next));
+            }
         }
 
-        sink.consume(current_chunk)
+        Ok(ChainProgress::Continue)
     }
 }
 
@@ -469,9 +468,12 @@ impl Sink for CollectorSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::parallel::source::RangeSource;
+    use crate::execution::QueryResourceContext;
+    use crate::execution::operators::push::{SortKey, SortPushOperator};
+    use crate::execution::parallel::source::{ParallelVectorSource, RangeSource};
     use crate::execution::vector::ValueVector;
-    use grafeo_common::types::Value;
+    use grafeo_common::memory::buffer::BufferManager;
+    use grafeo_common::types::{LogicalType, Value};
 
     /// Pass-through operator for testing.
     struct PassThroughOp;
@@ -487,6 +489,57 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "PassThrough"
+        }
+    }
+
+    fn provenance_edge_chunk(id: i64) -> DataChunk {
+        let mut column = ValueVector::with_type(LogicalType::List(Box::new(LogicalType::Edge)));
+        column.push(Value::List(vec![Value::Int64(id)].into()));
+        DataChunk::new(vec![column])
+    }
+
+    fn provenance_any_chunk(id: i64) -> DataChunk {
+        let mut column = ValueVector::new();
+        column.push(Value::List(vec![Value::Int64(id)].into()));
+        DataChunk::new(vec![column])
+    }
+
+    struct MixedProvenanceEmitter;
+
+    impl PushOperator for MixedProvenanceEmitter {
+        fn push(&mut self, _chunk: DataChunk, sink: &mut dyn Sink) -> Result<bool, OperatorError> {
+            sink.consume(provenance_edge_chunk(1))?;
+            sink.consume(provenance_any_chunk(2))?;
+            Ok(true)
+        }
+
+        fn finalize(&mut self, _sink: &mut dyn Sink) -> Result<(), OperatorError> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "MixedProvenanceEmitter"
+        }
+    }
+
+    struct ProvenanceRecorder {
+        observed: Arc<Mutex<Vec<LogicalType>>>,
+    }
+
+    impl PushOperator for ProvenanceRecorder {
+        fn push(&mut self, chunk: DataChunk, sink: &mut dyn Sink) -> Result<bool, OperatorError> {
+            if let Some(column) = chunk.column(0) {
+                self.observed.lock().push(column.data_type().clone());
+            }
+            sink.consume(chunk)
+        }
+
+        fn finalize(&mut self, _sink: &mut dyn Sink) -> Result<(), OperatorError> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "ProvenanceRecorder"
         }
     }
 
@@ -575,6 +628,205 @@ mod tests {
         // Should have 50 even numbers (0, 2, 4, ..., 98)
         let total_rows: usize = result.chunks.iter().map(DataChunk::len).sum();
         assert_eq!(total_rows, 50);
+    }
+
+    struct TerminalStopSink {
+        consumes: usize,
+        finalizes: usize,
+    }
+
+    impl Sink for TerminalStopSink {
+        fn consume(&mut self, _chunk: DataChunk) -> Result<bool, OperatorError> {
+            self.consumes += 1;
+            Ok(false)
+        }
+        fn finalize(&mut self) -> Result<(), OperatorError> {
+            self.finalizes += 1;
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "TerminalStopSink"
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+            self
+        }
+    }
+
+    struct MustNotFinalizeAfterTerminal;
+
+    impl PushOperator for MustNotFinalizeAfterTerminal {
+        fn push(&mut self, chunk: DataChunk, sink: &mut dyn Sink) -> Result<bool, OperatorError> {
+            let _ = sink.consume(chunk.clone())?;
+            let _ = sink.consume(chunk)?;
+            Ok(true)
+        }
+        fn finalize(&mut self, _sink: &mut dyn Sink) -> Result<(), OperatorError> {
+            Err(OperatorError::Execution(
+                "terminal stop must suppress this finalizer".to_string(),
+            ))
+        }
+        fn name(&self) -> &'static str {
+            "MustNotFinalizeAfterTerminal"
+        }
+    }
+
+    #[test]
+    fn parallel_terminal_stop_suppresses_repeated_push_and_later_finalization() {
+        for during_finalize in [false, true] {
+            let mut operators: Vec<Box<dyn PushOperator>> = Vec::new();
+            if during_finalize {
+                let resources =
+                    QueryResourceContext::new(BufferManager::with_budget(1024 * 1024)).unwrap();
+                operators.push(Box::new(
+                    SortPushOperator::with_resource_context(vec![SortKey::ascending(0)], resources)
+                        .unwrap(),
+                ));
+            }
+            operators.push(Box::new(MustNotFinalizeAfterTerminal));
+            let mut sink = TerminalStopSink {
+                consumes: 0,
+                finalizes: 0,
+            };
+            let chunk = DataChunk::new(vec![ValueVector::from_values(&[
+                Value::Int64(1),
+                Value::Int64(2),
+            ])]);
+            let progress =
+                ParallelPipeline::push_through_chain(&mut operators, chunk, &mut sink).unwrap();
+            if !during_finalize {
+                assert_eq!(progress, ChainProgress::SinkStopped);
+            }
+            ParallelPipeline::finalize_chain(&mut operators, &mut sink, progress).unwrap();
+            assert_eq!(sink.consumes, 1);
+            assert_eq!(sink.finalizes, 1);
+        }
+    }
+
+    #[test]
+    fn parallel_limit_exhaustion_stops_source_and_finalizes_downstream_count() {
+        let factory = Arc::new(
+            CloneableOperatorFactory::new()
+                .with_operator(|| {
+                    Box::new(crate::execution::operators::push::LimitPushOperator::new(1))
+                })
+                .with_operator(|| {
+                    Box::new(
+                        crate::execution::operators::push::AggregatePushOperator::new(
+                            Vec::new(),
+                            vec![
+                                crate::execution::operators::accumulator::AggregateExpr::count_star(
+                                ),
+                            ],
+                        ),
+                    )
+                }),
+        );
+        let mut config = ParallelPipelineConfig::for_testing();
+        config.num_workers = 1;
+        config.chunk_size = 1;
+        let source = Arc::new(RangeSource::new(config.effective_morsel_size() * 3));
+        let result = ParallelPipeline::new(source, factory, config)
+            .execute()
+            .unwrap();
+        assert_eq!(
+            result.rows_processed, 1,
+            "exhausted operator must stop its source"
+        );
+        assert_eq!(
+            result.morsels_processed, 1,
+            "unvisited morsels must not be reported completed"
+        );
+        let values: Vec<_> = result
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .selected_indices()
+                    .map(|row| chunk.column(0).unwrap().get_value(row).unwrap())
+            })
+            .collect();
+        assert_eq!(values, vec![Value::Int64(1)]);
+    }
+
+    #[test]
+    fn parallel_sorter_limit_exhaustion_finalizes_downstream_count() {
+        let source = Arc::new(RangeSource::new(9));
+        let resources = QueryResourceContext::new(BufferManager::with_budget(1024 * 1024)).unwrap();
+        let factory = Arc::new(
+            CloneableOperatorFactory::new()
+                .with_operator(move || {
+                    Box::new(
+                        SortPushOperator::with_resource_context(
+                            vec![SortKey::ascending(0)],
+                            resources.clone(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .with_operator(|| {
+                    Box::new(crate::execution::operators::push::LimitPushOperator::new(1))
+                })
+                .with_operator(|| {
+                    Box::new(
+                        crate::execution::operators::push::AggregatePushOperator::new(
+                            Vec::new(),
+                            vec![
+                                crate::execution::operators::accumulator::AggregateExpr::count_star(
+                                ),
+                            ],
+                        ),
+                    )
+                }),
+        );
+        let mut config = ParallelPipelineConfig::for_testing();
+        config.num_workers = 1;
+        config.chunk_size = 1;
+        let result = ParallelPipeline::new(source, factory, config)
+            .execute()
+            .unwrap();
+        assert_eq!(
+            result.rows_processed, 9,
+            "sort must consume its input before finalization"
+        );
+        assert_eq!(result.morsels_processed, 1);
+        let values: Vec<_> = result
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .selected_indices()
+                    .map(|row| chunk.column(0).unwrap().get_value(row).unwrap())
+            })
+            .collect();
+        assert_eq!(values, vec![Value::Int64(1)]);
+    }
+
+    #[test]
+    fn parallel_intermediate_pipeline_preserves_mixed_provenance_runs() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorder_observed = Arc::clone(&observed);
+        let factory = Arc::new(
+            CloneableOperatorFactory::new()
+                .with_operator(|| Box::new(MixedProvenanceEmitter))
+                .with_operator(move || {
+                    Box::new(ProvenanceRecorder {
+                        observed: Arc::clone(&recorder_observed),
+                    })
+                }),
+        );
+        let source = Arc::new(ParallelVectorSource::single_column(vec![Value::Int64(0)]));
+        let pipeline =
+            ParallelPipeline::new(source, factory, ParallelPipelineConfig::for_testing());
+
+        pipeline.execute().unwrap();
+
+        assert_eq!(
+            *observed.lock(),
+            vec![
+                LogicalType::List(Box::new(LogicalType::Edge)),
+                LogicalType::Any,
+            ]
+        );
     }
 
     #[test]

@@ -20,7 +20,9 @@
 //! The execution model is push-based: sources push data through a pipeline of
 //! operators until it reaches a sink.
 
+mod accounted_chunk;
 pub mod adaptive;
+pub mod cancellation;
 pub mod chunk;
 pub mod chunk_state;
 pub mod collector;
@@ -28,19 +30,24 @@ pub mod factorized_chunk;
 pub mod factorized_iter;
 pub mod factorized_vector;
 pub mod memory;
+mod native_allocation;
 pub mod operators;
 #[cfg(feature = "parallel")]
 pub mod parallel;
 pub mod pipeline;
 pub mod pipeline_convert;
 pub mod profile;
+pub mod scheduler;
 pub mod selection;
 pub mod sink;
 pub mod source;
 #[cfg(feature = "spill")]
 pub mod spill;
+#[doc(hidden)]
+pub mod value_codec;
 pub mod vector;
 
+pub use accounted_chunk::AccountedDataChunk;
 pub use adaptive::{
     AdaptiveCheckpoint, AdaptiveContext, AdaptiveEvent, AdaptiveExecutionConfig,
     AdaptiveExecutionResult, AdaptivePipelineBuilder, AdaptivePipelineConfig,
@@ -48,27 +55,42 @@ pub use adaptive::{
     CardinalityTrackingOperator, CardinalityTrackingSink, CardinalityTrackingWrapper,
     ReoptimizationDecision, SharedAdaptiveContext, evaluate_reoptimization, execute_adaptive,
 };
+pub use cancellation::{
+    QueryCancellationError, QueryCancellationHandle, QueryCancellationToken, QueryDeadlineError,
+    QueryExecutionCheckpoint, QueryExecutionControl, QueryLifecycleError,
+};
 pub use chunk::{ChunkZoneHints, DataChunk};
 pub use collector::{
     Collector, CollectorStats, CountCollector, LimitCollector, MaterializeCollector,
     PartitionCollector, StatsCollector,
 };
-#[cfg(feature = "spill")]
-pub use memory::OperatorMemoryContext;
-pub use memory::{ExecutionMemoryContext, ExecutionMemoryContextBuilder};
+pub use memory::{
+    ExecutionMemoryContext, ExecutionMemoryContextBuilder, QueryExecutionId, QueryResourceContext,
+    QueryResourceContextError, QueryResourceStats,
+};
+pub use native_allocation::{NativeMapAllocationError, NativeMapAllocationKind};
 #[cfg(feature = "parallel")]
 pub use parallel::{
     CloneableOperatorFactory, MorselScheduler, ParallelPipeline, ParallelPipelineConfig,
     ParallelSource, RangeSource,
 };
-pub use pipeline::{ChunkCollector, ChunkSizeHint, Pipeline, PushOperator, Sink, Source};
+pub use pipeline::{
+    ChunkCollector, ChunkSizeHint, ChunkTransport, Pipeline, PushOperator, Sink, Source,
+    VariantCollector,
+};
 pub use profile::{ProfileStats, ProfiledOperator, SharedProfileStats};
+pub use scheduler::Scheduler;
 pub use selection::SelectionVector;
 pub use sink::{CollectorSink, CountingSink, LimitingSink, MaterializingSink, NullSink};
 pub use source::{ChunkSource, EmptySource, GeneratorSource, OperatorSource, VectorSource};
 #[cfg(feature = "spill")]
-pub use spill::{SpillFile, SpillFileReader, SpillManager};
-pub use vector::ValueVector;
+pub use spill::{
+    CleartextSpillRecordProvider, NoopSpillIo, OpenSpillRecord, SpillDiskQuota, SpillDiskStats,
+    SpillFile, SpillFileIdentity, SpillFileReader, SpillFileRole, SpillFrameLimits, SpillIo,
+    SpillIoOperation, SpillManager, SpillQueryIdentity, SpillQuotaExceeded, SpillRecordKind,
+    SpillRecordMeta, SpillRecordProvider,
+};
+pub use vector::{ResidentCapacityError, ValueVector};
 
 // Factorized execution types
 pub use chunk_state::{ChunkState, FactorizationState, FactorizedSelection, LevelSelection};
@@ -76,3 +98,24 @@ pub use factorized_chunk::{ChunkVariant, FactorizationLevel, FactorizedChunk};
 pub use factorized_iter::{PrecomputedIter, RowIndices, RowView, StreamingIter};
 pub use factorized_vector::{FactorizedState, FactorizedVector, UnflatMetadata};
 pub use operators::{FactorizedData, FlatDataWrapper};
+
+#[cfg(all(test, not(feature = "spill")))]
+mod value_codec_profile_tests {
+    use super::value_codec::{deserialize_row, serialize_row};
+    use grafeo_common::types::Value;
+    use std::io::Cursor;
+
+    #[test]
+    fn value_codec_is_available_without_disk_spill() {
+        let row = [Value::RdfLiteral {
+            lexical: "18446744073709551616".into(),
+            language: None,
+            datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+        }];
+        let mut encoded = Vec::new();
+
+        serialize_row(&row, &mut encoded).unwrap();
+
+        assert_eq!(deserialize_row(&mut Cursor::new(encoded), 1).unwrap(), row);
+    }
+}

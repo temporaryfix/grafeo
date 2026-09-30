@@ -49,9 +49,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use super::AccountedDataChunk;
 use super::chunk::DataChunk;
 use super::operators::OperatorError;
-use super::pipeline::{ChunkSizeHint, PushOperator, Sink};
+use super::pipeline::{
+    AccountedPushPermit, AccountedSinkPermit, ChunkSizeHint, ChunkTransport, PushOperator, Sink,
+    qualified_accounted_transport,
+};
 
 /// Threshold for deviation that triggers re-optimization consideration.
 /// A value of 2.0 means actual cardinality is 2x or 0.5x the estimate.
@@ -509,6 +513,31 @@ impl PushOperator for CardinalityTrackingOperator {
         self.inner.push(chunk, sink)
     }
 
+    fn push_accounted(
+        &mut self,
+        chunk: AccountedDataChunk,
+        sink: &mut dyn Sink,
+    ) -> Result<bool, OperatorError> {
+        self.row_count += chunk.chunk().len() as u64;
+        self.inner.push_accounted(chunk, sink)
+    }
+
+    fn __accounted_push_permit(&mut self) -> Option<AccountedPushPermit<'_>> {
+        let qualified = self.inner.__accounted_push_permit().is_some();
+        if qualified {
+            Some(AccountedPushPermit::new(self))
+        } else {
+            None
+        }
+    }
+
+    fn admit_chunk_transport(
+        &self,
+        input: ChunkTransport,
+    ) -> Result<ChunkTransport, OperatorError> {
+        self.inner.admit_chunk_transport(input)
+    }
+
     fn finalize(&mut self, sink: &mut dyn Sink) -> Result<(), OperatorError> {
         // Report final cardinality to context
         self.context
@@ -525,6 +554,22 @@ impl PushOperator for CardinalityTrackingOperator {
     fn name(&self) -> &'static str {
         // Return the inner operator's name
         self.inner.name()
+    }
+}
+
+impl qualified_accounted_transport::QualifiedPushOperator for CardinalityTrackingOperator {
+    fn push_accounted_qualified(
+        &mut self,
+        chunk: AccountedDataChunk,
+        sink: &mut AccountedSinkPermit<'_>,
+    ) -> Result<bool, OperatorError> {
+        self.row_count += chunk.chunk().len() as u64;
+        let consumer = self.inner.name();
+        let mut inner = self
+            .inner
+            .__accounted_push_permit()
+            .ok_or(OperatorError::UnsupportedAccountedTransport { consumer })?;
+        inner.push(chunk, sink)
     }
 }
 
@@ -564,6 +609,24 @@ impl Sink for CardinalityTrackingSink {
         self.inner.consume(chunk)
     }
 
+    fn consume_accounted(&mut self, chunk: AccountedDataChunk) -> Result<bool, OperatorError> {
+        self.row_count += chunk.chunk().len() as u64;
+        self.inner.consume_accounted(chunk)
+    }
+
+    fn __accounted_sink_permit(&mut self) -> Option<AccountedSinkPermit<'_>> {
+        let qualified = self.inner.__accounted_sink_permit().is_some();
+        if qualified {
+            Some(AccountedSinkPermit::new(self))
+        } else {
+            None
+        }
+    }
+
+    fn admit_chunk_transport(&self, input: ChunkTransport) -> Result<(), OperatorError> {
+        self.inner.admit_chunk_transport(input)
+    }
+
     fn finalize(&mut self) -> Result<(), OperatorError> {
         // Report final cardinality
         self.context
@@ -577,6 +640,21 @@ impl Sink for CardinalityTrackingSink {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+}
+
+impl qualified_accounted_transport::QualifiedSink for CardinalityTrackingSink {
+    fn consume_accounted_qualified(
+        &mut self,
+        chunk: AccountedDataChunk,
+    ) -> Result<bool, OperatorError> {
+        self.row_count += chunk.chunk().len() as u64;
+        let consumer = self.inner.name();
+        let mut inner = self
+            .inner
+            .__accounted_sink_permit()
+            .ok_or(OperatorError::UnsupportedAccountedTransport { consumer })?;
+        inner.consume(chunk)
     }
 }
 

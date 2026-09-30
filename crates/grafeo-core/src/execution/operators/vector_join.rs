@@ -20,7 +20,7 @@ use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::GraphStoreSearch;
 use crate::index::vector::{DistanceMetric, brute_force_knn};
-use grafeo_common::types::{LogicalType, NodeId, PropertyKey, Value};
+use grafeo_common::types::{EpochId, LogicalType, NodeId, PropertyKey, TransactionId, Value};
 use std::sync::Arc;
 
 #[cfg(feature = "vector-index")]
@@ -85,6 +85,10 @@ pub struct VectorJoinOperator {
     left_exhausted: bool,
     /// Uses index flag for name().
     uses_index: bool,
+    /// Snapshot epoch for MVCC-aware property reads.
+    viewing_epoch: Option<EpochId>,
+    /// Transaction ID for read-your-writes within an open transaction.
+    transaction_id: Option<TransactionId>,
 }
 
 impl VectorJoinOperator {
@@ -131,6 +135,8 @@ impl VectorJoinOperator {
             chunk_capacity: 1024,
             left_exhausted: false,
             uses_index: false,
+            viewing_epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -180,6 +186,8 @@ impl VectorJoinOperator {
             chunk_capacity: 1024,
             left_exhausted: false,
             uses_index: false,
+            viewing_epoch: None,
+            transaction_id: None,
         }
     }
 
@@ -227,6 +235,18 @@ impl VectorJoinOperator {
         self
     }
 
+    /// Sets the transaction context for MVCC-aware property lookups.
+    #[must_use]
+    pub fn with_transaction_context(
+        mut self,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.viewing_epoch = Some(epoch);
+        self.transaction_id = transaction_id;
+        self
+    }
+
     /// Gets the query vector for the current left row.
     fn get_query_vector(&self) -> Option<Vec<f32>> {
         // Static query vector (same for all left rows)
@@ -235,15 +255,21 @@ impl VectorJoinOperator {
         }
 
         // Entity-to-entity: fetch from left entity's property
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
         if let (Some(chunk), Some(col_idx), Some(prop)) = (
             &self.current_left_chunk,
             self.left_node_column,
             &self.left_property,
         ) && let Some(col) = chunk.column(col_idx)
             && let Some(node_id) = col.get_node_id(self.current_left_row)
-            && let Some(Value::Vector(vec)) = self
-                .store
-                .get_node_property(node_id, &PropertyKey::new(prop))
+            && let Some(Value::Vector(vec)) = self.store.read_node_property_visible(
+                node_id,
+                &PropertyKey::new(prop),
+                snap_epoch,
+                self.transaction_id,
+            )
         {
             return Some(vec.to_vec());
         }
@@ -253,6 +279,26 @@ impl VectorJoinOperator {
 
     /// Performs vector search for the current query.
     fn search_right_side(&self, query: &[f32]) -> Vec<(NodeId, f32)> {
+        // Under Serializable isolation both `viewing_epoch` and `transaction_id`
+        // are set and `right_label` must be present.  Route through
+        // `vector_search_visible` which records the index read in the SSI
+        // read-set and applies snapshot visibility + read-your-writes merging.
+        #[cfg(feature = "vector-index")]
+        if let (Some(epoch), Some(tx), Some(label)) =
+            (self.viewing_epoch, self.transaction_id, &self.right_label)
+        {
+            // vector_search_visible returns f64 distances; callers of
+            // search_right_side compare/filter using f32.  Precision loss is
+            // intentional: distances are embeddings-precision (f32 granularity).
+            #[allow(clippy::cast_possible_truncation)]
+            return self
+                .store
+                .vector_search_visible(label, &self.right_property, query, self.k, epoch, tx)
+                .into_iter()
+                .map(|(id, d)| (id, d as f32))
+                .collect();
+        }
+
         #[cfg(feature = "vector-index")]
         {
             if let Some(ref index) = self.index {
@@ -276,12 +322,21 @@ impl VectorJoinOperator {
             None => self.store.node_ids(),
         };
 
+        let snap_epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+
         // Collect vectors from node properties
         let vectors: Vec<(NodeId, Vec<f32>)> = node_ids
             .into_iter()
             .filter_map(|id| {
                 self.store
-                    .get_node_property(id, &PropertyKey::new(&self.right_property))
+                    .read_node_property_visible(
+                        id,
+                        &PropertyKey::new(&self.right_property),
+                        snap_epoch,
+                        self.transaction_id,
+                    )
                     .and_then(|v| {
                         if let Value::Vector(vec) = v {
                             Some((id, vec.to_vec()))

@@ -24,8 +24,7 @@ use std::sync::Arc;
 
 use grafeo_common::types::{LogicalType, Value};
 
-use super::sort::SortKey;
-use super::value_utils::compare_values_with_nulls;
+use super::sort::{SortKey, compare_sort_values};
 use super::{Operator, OperatorResult};
 use crate::execution::DataChunk;
 use crate::execution::chunk::DataChunkBuilder;
@@ -60,6 +59,9 @@ enum TopKState {
 struct HeapEntry {
     sort_values: Vec<Option<Value>>,
     row_values: Vec<Option<Value>>,
+    /// Effective output schema for this retained row. This is bounded by k
+    /// and preserves typed edge-list provenance after the child is drained.
+    row_schema: Arc<Vec<LogicalType>>,
     insertion_id: u64,
     /// Shared with the owning operator. Refcount-bumped per insertion.
     sort_keys: Arc<Vec<SortKey>>,
@@ -148,6 +150,35 @@ impl TopKOperator {
         let sort_keys = Arc::try_unwrap(self.sort_keys).unwrap_or_else(|arc| (*arc).clone());
         (self.child, sort_keys, self.limit)
     }
+
+    /// Resolves the schema carried by rows from one source chunk. An open
+    /// `Any` output preserves a typed edge-list source while ordinary values
+    /// remain open, so integer lists cannot acquire edge provenance.
+    fn effective_schema(&self, source: &DataChunk) -> Vec<LogicalType> {
+        self.output_schema
+            .iter()
+            .enumerate()
+            .map(|(index, configured)| {
+                if !matches!(configured, LogicalType::Any) {
+                    return configured.clone();
+                }
+                let Some(source_type) = source.column(index).map(|column| column.data_type())
+                else {
+                    return configured.clone();
+                };
+                if matches!(source_type, LogicalType::Node | LogicalType::Edge)
+                    || matches!(
+                        source_type,
+                        LogicalType::List(item) if item.as_ref() == &LogicalType::Edge
+                    )
+                {
+                    source_type.clone()
+                } else {
+                    configured.clone()
+                }
+            })
+            .collect()
+    }
 }
 
 impl Operator for TopKOperator {
@@ -163,6 +194,7 @@ impl Operator for TopKOperator {
 
             let mut schema_checked = false;
             while let Some(chunk) = self.child.next()? {
+                let mut chunk_schema = None;
                 if !schema_checked {
                     debug_assert_eq!(
                         chunk.column_count(),
@@ -190,12 +222,16 @@ impl Operator for TopKOperator {
                     }
 
                     let row_values = extract_row_values(&chunk, row_idx, self.output_schema.len());
+                    let row_schema = Arc::clone(
+                        chunk_schema.get_or_insert_with(|| Arc::new(self.effective_schema(&chunk))),
+                    );
                     #[cfg(test)]
                     self.materialized_rows
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let entry = HeapEntry {
                         sort_values: new_sort_values,
                         row_values,
+                        row_schema,
                         insertion_id: next_insertion_id,
                         sort_keys: Arc::clone(&self.sort_keys),
                     };
@@ -218,9 +254,13 @@ impl Operator for TopKOperator {
 
         if let TopKState::Draining { rows, position } = &mut self.state {
             if *position < rows.len() {
-                let mut builder = DataChunkBuilder::with_capacity(&self.output_schema, 2048);
+                let effective_schema = Arc::clone(&rows[*position].row_schema);
+                let mut builder = DataChunkBuilder::with_capacity(effective_schema.as_ref(), 2048);
                 while *position < rows.len() && !builder.is_full() {
                     let entry = &rows[*position];
+                    if entry.row_schema.as_ref() != effective_schema.as_ref() {
+                        break;
+                    }
                     for col_idx in 0..self.output_schema.len() {
                         if let Some(dst_col) = builder.column_mut(col_idx) {
                             let val = entry.row_values[col_idx].clone().unwrap_or(Value::Null);
@@ -291,13 +331,9 @@ fn extract_row_values(chunk: &DataChunk, row_idx: usize, n_cols: usize) -> Vec<O
 /// Inserting a new row that ties on every key must NOT displace the existing
 /// top. The existing top arrived first and wins ties (stability).
 fn row_beats_heap_top(new: &[Option<Value>], top: &HeapEntry, keys: &[SortKey]) -> bool {
-    use super::sort::SortDirection;
     for (i, key) in keys.iter().enumerate() {
-        let cmp = compare_values_with_nulls(&new[i], &top.sort_values[i], key.null_order);
-        let user_cmp = match key.direction {
-            SortDirection::Ascending => cmp,
-            SortDirection::Descending => cmp.reverse(),
-        };
+        let user_cmp =
+            compare_sort_values(&new[i], &top.sort_values[i], key.direction, key.null_order);
         match user_cmp {
             Ordering::Less => return true,
             Ordering::Greater => return false,
@@ -323,26 +359,20 @@ impl PartialOrd for HeapEntry {
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        use super::sort::SortDirection;
         // Both entries share the same Arc<Vec<SortKey>> (one per
         // TopKOperator); use self's view.
         //
         // Goal: BinaryHeap is a max-heap. peek() must return the
-        // worst-by-user-order so we can evict it on overflow.
-        //   User ASC:  worst = largest value, peek wants largest, so
-        //              Ord must say "larger is greater": heap_cmp = cmp.
-        //   User DESC: worst = smallest value, peek wants smallest, so
-        //              Ord must say "smaller is greater": heap_cmp = cmp.reverse().
+        // worst-by-user-order so we can evict it on overflow. The final user
+        // comparison already makes that worst row `Greater` for either
+        // direction while preserving independently requested null placement.
         for (i, key) in self.sort_keys.iter().enumerate() {
-            let cmp = compare_values_with_nulls(
+            let heap_cmp = compare_sort_values(
                 &self.sort_values[i],
                 &other.sort_values[i],
+                key.direction,
                 key.null_order,
             );
-            let heap_cmp = match key.direction {
-                SortDirection::Ascending => cmp,
-                SortDirection::Descending => cmp.reverse(),
-            };
             if heap_cmp != Ordering::Equal {
                 return heap_cmp;
             }
@@ -359,15 +389,18 @@ mod tests {
     use super::*;
     use crate::execution::DataChunk;
     use crate::execution::chunk::DataChunkBuilder;
+    use crate::execution::selection::SelectionVector;
 
     struct MockOperator {
         chunks: Vec<DataChunk>,
+        original_chunks: Vec<DataChunk>,
         position: usize,
     }
 
     impl MockOperator {
         fn new(chunks: Vec<DataChunk>) -> Self {
             Self {
+                original_chunks: chunks.clone(),
                 chunks,
                 position: 0,
             }
@@ -386,6 +419,7 @@ mod tests {
         }
 
         fn reset(&mut self) {
+            self.chunks.clone_from(&self.original_chunks);
             self.position = 0;
         }
 
@@ -417,6 +451,31 @@ mod tests {
         out
     }
 
+    fn chunk_values(values: &[Value]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Int64]);
+        for value in values {
+            builder.column_mut(0).unwrap().push_value(value.clone());
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn collect_values(op: &mut dyn Operator) -> Vec<Value> {
+        let mut values = Vec::new();
+        while let Some(chunk) = op.next().unwrap() {
+            for row in chunk.selected_indices() {
+                values.push(
+                    chunk
+                        .column(0)
+                        .unwrap()
+                        .get_value(row)
+                        .expect("test row has one value"),
+                );
+            }
+        }
+        values
+    }
+
     #[test]
     fn top_k_returns_top_k_descending() {
         let mock = MockOperator::new(vec![chunk_int64(&[19, 88, 33, 8, 319])]);
@@ -428,6 +487,60 @@ mod tests {
         );
         let out = collect_int64_col(&mut top_k);
         assert_eq!(out, vec![319, 88, 33]);
+    }
+
+    #[test]
+    fn top_k_respects_final_null_placement_for_every_direction() {
+        use super::super::sort::{NullOrder, SortDirection};
+
+        let input = [
+            Value::Int64(2),
+            Value::Null,
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(3),
+        ];
+        let cases = [
+            (
+                SortKey {
+                    column: 0,
+                    direction: SortDirection::Ascending,
+                    null_order: NullOrder::NullsFirst,
+                },
+                vec![Value::Null, Value::Null, Value::Int64(1)],
+            ),
+            (
+                SortKey {
+                    column: 0,
+                    direction: SortDirection::Ascending,
+                    null_order: NullOrder::NullsLast,
+                },
+                vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)],
+            ),
+            (
+                SortKey {
+                    column: 0,
+                    direction: SortDirection::Descending,
+                    null_order: NullOrder::NullsFirst,
+                },
+                vec![Value::Null, Value::Null, Value::Int64(3)],
+            ),
+            (
+                SortKey {
+                    column: 0,
+                    direction: SortDirection::Descending,
+                    null_order: NullOrder::NullsLast,
+                },
+                vec![Value::Int64(3), Value::Int64(2), Value::Int64(1)],
+            ),
+        ];
+
+        for (key, expected) in cases {
+            let mock = MockOperator::new(vec![chunk_values(&input)]);
+            let mut top_k =
+                TopKOperator::new(Box::new(mock), vec![key], 3, vec![LogicalType::Int64]);
+            assert_eq!(collect_values(&mut top_k), expected);
+        }
     }
 
     fn chunk_int_str(rows: &[(i64, &str)]) -> DataChunk {
@@ -722,5 +835,166 @@ mod tests {
         ));
         let any = op.into_any();
         assert!(any.downcast::<TopKOperator>().is_ok());
+    }
+
+    fn typed_edge_list_chunk(rows: &[(i64, i64)]) -> DataChunk {
+        let edge_list = LogicalType::List(Box::new(LogicalType::Edge));
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Int64, edge_list]);
+        for &(key, edge_id) in rows {
+            builder.column_mut(0).unwrap().push_int64(key);
+            builder
+                .column_mut(1)
+                .unwrap()
+                .push_value(Value::List(vec![Value::Int64(edge_id)].into()));
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn ordinary_list_chunk(rows: &[(i64, i64)]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[
+            LogicalType::Int64,
+            LogicalType::List(Box::new(LogicalType::Int64)),
+        ]);
+        for &(key, value) in rows {
+            builder.column_mut(0).unwrap().push_int64(key);
+            builder
+                .column_mut(1)
+                .unwrap()
+                .push_value(Value::List(vec![Value::Int64(value)].into()));
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn collect_mixed_list_rows(operator: &mut dyn Operator) -> Vec<(LogicalType, i64, Value)> {
+        let mut rows = Vec::new();
+        while let Some(chunk) = operator.next().unwrap() {
+            let schema = chunk.column(1).unwrap().data_type().clone();
+            for row in chunk.selected_indices() {
+                rows.push((
+                    schema.clone(),
+                    chunk.column(0).unwrap().get_int64(row).unwrap(),
+                    chunk.column(1).unwrap().get_value(row).unwrap(),
+                ));
+            }
+        }
+        rows
+    }
+
+    fn any_list_chunk(rows: &[(i64, i64)]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Int64, LogicalType::Any]);
+        for &(key, value) in rows {
+            builder.column_mut(0).unwrap().push_int64(key);
+            builder
+                .column_mut(1)
+                .unwrap()
+                .push_value(Value::List(vec![Value::Int64(value)].into()));
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn typed_entity_chunk(entity_type: LogicalType, rows: &[(i64, i64)]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Int64, entity_type]);
+        for &(key, entity_id) in rows {
+            builder.column_mut(0).unwrap().push_int64(key);
+            builder
+                .column_mut(1)
+                .unwrap()
+                .push_value(Value::Int64(entity_id));
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn collect_typed_entity_rows(operator: &mut dyn Operator) -> Vec<(LogicalType, i64, i64)> {
+        let mut rows = Vec::new();
+        while let Some(chunk) = operator.next().unwrap() {
+            let schema = chunk.column(1).unwrap().data_type().clone();
+            for row in chunk.selected_indices() {
+                rows.push((
+                    schema.clone(),
+                    chunk.column(0).unwrap().get_int64(row).unwrap(),
+                    chunk
+                        .column(1)
+                        .unwrap()
+                        .get_value(row)
+                        .and_then(|value| value.as_int64())
+                        .unwrap(),
+                ));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn top_k_preserves_mixed_row_provenance_for_selected_rows_and_reset() {
+        let mut edge = typed_edge_list_chunk(&[(2, 200), (1, 100), (99, 9900)]);
+        edge.set_selection(SelectionVector::from_predicate(3, |row| row != 2));
+        let ordinary = ordinary_list_chunk(&[(3, 300), (0, 0)]);
+        let expected = vec![
+            (
+                LogicalType::Any,
+                0,
+                Value::List(vec![Value::Int64(0)].into()),
+            ),
+            (
+                LogicalType::List(Box::new(LogicalType::Edge)),
+                1,
+                Value::List(vec![Value::Int64(100)].into()),
+            ),
+            (
+                LogicalType::List(Box::new(LogicalType::Edge)),
+                2,
+                Value::List(vec![Value::Int64(200)].into()),
+            ),
+        ];
+        let mut top_k = TopKOperator::new(
+            Box::new(MockOperator::new(vec![edge, ordinary])),
+            vec![SortKey::ascending(0)],
+            3,
+            vec![LogicalType::Int64, LogicalType::Any],
+        );
+
+        assert_eq!(collect_mixed_list_rows(&mut top_k), expected);
+        top_k.reset();
+        assert_eq!(collect_mixed_list_rows(&mut top_k), expected);
+    }
+
+    #[test]
+    fn top_k_keeps_tied_edge_and_ordinary_lists_stable_and_uninferred() {
+        let edge = typed_edge_list_chunk(&[(7, 700)]);
+        let ordinary = any_list_chunk(&[(7, 7)]);
+        let mut top_k = TopKOperator::new(
+            Box::new(MockOperator::new(vec![edge, ordinary])),
+            vec![SortKey::ascending(0)],
+            2,
+            vec![LogicalType::Int64, LogicalType::Any],
+        );
+
+        let rows = collect_mixed_list_rows(&mut top_k);
+        assert_eq!(rows[0].0, LogicalType::List(Box::new(LogicalType::Edge)));
+        assert_eq!(rows[0].2, Value::List(vec![Value::Int64(700)].into()));
+        assert_eq!(rows[1].0, LogicalType::Any);
+        assert_eq!(rows[1].2, Value::List(vec![Value::Int64(7)].into()));
+    }
+
+    #[test]
+    fn top_k_preserves_node_and_edge_provenance_for_selected_same_ids() {
+        let mut node = typed_entity_chunk(LogicalType::Node, &[(2, 42), (9, 42)]);
+        node.set_selection(SelectionVector::from_predicate(2, |row| row == 0));
+        let edge = typed_entity_chunk(LogicalType::Edge, &[(1, 42)]);
+        let mut top_k = TopKOperator::new(
+            Box::new(MockOperator::new(vec![node, edge])),
+            vec![SortKey::ascending(0)],
+            2,
+            vec![LogicalType::Int64, LogicalType::Any],
+        );
+
+        assert_eq!(
+            collect_typed_entity_rows(&mut top_k),
+            vec![(LogicalType::Edge, 1, 42), (LogicalType::Node, 2, 42)]
+        );
     }
 }

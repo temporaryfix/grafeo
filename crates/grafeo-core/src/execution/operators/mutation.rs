@@ -62,6 +62,55 @@ pub trait ConstraintValidator: Send + Sync {
         value: &Value,
     ) -> Result<(), OperatorError>;
 
+    /// Validates the authoritative post-mutation image of a node.
+    ///
+    /// `current_node` identifies an update target that must be excluded from
+    /// uniqueness comparisons. `viewing_epoch` and `transaction_id` let the
+    /// validator compare against the same transaction-visible graph view as
+    /// the mutation operator.
+    ///
+    /// The default preserves compatibility with lightweight validators by
+    /// composing the existing per-property and completeness hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the complete post-image violates a constraint.
+    fn validate_node_post_image(
+        &self,
+        current_node: Option<NodeId>,
+        labels: &[String],
+        properties: &[(String, Value)],
+        viewing_epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Result<(), OperatorError> {
+        let _ = (current_node, viewing_epoch, transaction_id);
+        for (key, value) in properties {
+            self.validate_node_property(labels, key, value)?;
+            self.check_unique_node_property(labels, key, value)?;
+        }
+        self.validate_node_complete(labels, properties)
+    }
+
+    /// Validates deletion of a node before any structural mutation occurs.
+    ///
+    /// Schema-only validators normally permit deletion. Engine validators can
+    /// override this hook for protected internal rows whose lifecycle is owned
+    /// by a narrowly-authorized maintenance operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the node is protected or its deletion would violate
+    /// an implementation-defined constraint.
+    fn validate_node_delete(
+        &self,
+        node_id: NodeId,
+        viewing_epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Result<(), OperatorError> {
+        let _ = (node_id, viewing_epoch, transaction_id);
+        Ok(())
+    }
+
     /// Validates a single property value for an edge of the given type.
     ///
     /// # Errors
@@ -84,6 +133,26 @@ pub trait ConstraintValidator: Send + Sync {
         edge_type: &str,
         properties: &[(String, Value)],
     ) -> Result<(), OperatorError>;
+
+    /// Validates the authoritative post-mutation image of an edge.
+    ///
+    /// The default composes per-property type checks with full requiredness,
+    /// keeping existing validators source-compatible.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any property or the complete edge post-image violates
+    /// its schema constraints.
+    fn validate_edge_post_image(
+        &self,
+        edge_type: &str,
+        properties: &[(String, Value)],
+    ) -> Result<(), OperatorError> {
+        for (key, value) in properties {
+            self.validate_edge_property(edge_type, key, value)?;
+        }
+        self.validate_edge_complete(edge_type, properties)
+    }
 
     /// Validates that the node labels are allowed by the bound graph type.
     ///
@@ -199,6 +268,8 @@ impl PropertySource {
         chunk: &crate::execution::chunk::DataChunk,
         row: usize,
         store: &dyn GraphStore,
+        epoch: Option<EpochId>,
+        transaction_id: Option<TransactionId>,
     ) -> Value {
         match self {
             PropertySource::Column(col_idx) => chunk
@@ -210,17 +281,27 @@ impl PropertySource {
                 let Some(col) = chunk.column(*column) else {
                     return Value::Null;
                 };
-                // Try node ID first, then edge ID, then map value
+                let prop_key = PropertyKey::new(property);
                 if let Some(node_id) = col.get_node_id(row) {
-                    store
-                        .get_node(node_id)
-                        .and_then(|node| node.get_property(property).cloned())
-                        .unwrap_or(Value::Null)
+                    match (epoch, transaction_id) {
+                        (Some(ep), Some(tx)) => store
+                            .read_node_property_visible(node_id, &prop_key, ep, Some(tx))
+                            .unwrap_or(Value::Null),
+                        _ => store
+                            .get_node(node_id)
+                            .and_then(|node| node.get_property(property).cloned())
+                            .unwrap_or(Value::Null),
+                    }
                 } else if let Some(edge_id) = col.get_edge_id(row) {
-                    store
-                        .get_edge(edge_id)
-                        .and_then(|edge| edge.get_property(property).cloned())
-                        .unwrap_or(Value::Null)
+                    match (epoch, transaction_id) {
+                        (Some(ep), Some(tx)) => store
+                            .read_edge_property_visible(edge_id, &prop_key, ep, Some(tx))
+                            .unwrap_or(Value::Null),
+                        _ => store
+                            .get_edge(edge_id)
+                            .and_then(|edge| edge.get_property(property).cloned())
+                            .unwrap_or(Value::Null),
+                    }
                 } else if let Some(Value::Map(map)) = col.get_value(row) {
                     let key = PropertyKey::new(property);
                     map.get(&key).cloned().unwrap_or(Value::Null)
@@ -309,21 +390,26 @@ impl CreateNodeOperator {
             validator.inject_defaults(&self.labels, resolved_props);
         }
 
-        // Phase 1: Validate each property value
+        // Validate the complete transaction-visible post-image in one pass.
+        // This is deliberately entity-level: composite keys, missing required
+        // properties, and NULL all depend on the final tuple rather than on an
+        // individual syntactic assignment.
         if let Some(ref validator) = self.validator {
-            for (name, value) in resolved_props.iter() {
-                validator.validate_node_property(&self.labels, name, value)?;
-                validator.check_unique_node_property(&self.labels, name, value)?;
-            }
-            // Phase 2: Validate completeness (NOT NULL checks for missing required properties)
-            validator.validate_node_complete(&self.labels, resolved_props)?;
+            validator.validate_node_post_image(
+                Some(node_id),
+                &self.labels,
+                resolved_props,
+                self.viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch()),
+                self.transaction_id,
+            )?;
         }
 
-        // Phase 3: Write properties to the store
+        // Write properties only after the complete post-image is accepted.
         if let Some(tid) = self.transaction_id {
             for (name, value) in resolved_props.iter() {
                 self.store
-                    .set_node_property_versioned(node_id, name, value.clone(), tid);
+                    .set_node_property_buffered(node_id, name, value.clone(), tid);
             }
         } else {
             for (name, value) in resolved_props.iter() {
@@ -354,8 +440,13 @@ impl Operator for CreateNodeOperator {
                         .properties
                         .iter()
                         .map(|(name, source)| {
-                            let value =
-                                source.resolve(&chunk, row, self.store.as_ref() as &dyn GraphStore);
+                            let value = source.resolve(
+                                &chunk,
+                                row,
+                                self.store.as_ref() as &dyn GraphStore,
+                                self.viewing_epoch,
+                                self.transaction_id,
+                            );
                             (name.clone(), value)
                         })
                         .collect();
@@ -455,6 +546,16 @@ impl Operator for CreateNodeOperator {
 
     fn name(&self) -> &'static str {
         "CreateNode"
+    }
+
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        match self.input.as_mut() {
+            Some(input) => input.install_resource_context(resources),
+            None => Ok(()),
+        }
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
@@ -614,17 +715,27 @@ impl Operator for CreateEdgeOperator {
                 if let Some(ref validator) = self.validator {
                     validator.validate_edge_type_allowed(&self.edge_type)?;
 
-                    // Look up source and target node labels for endpoint validation
+                    // Look up source and target node labels for endpoint
+                    // validation through the transaction-visible accessor, so a
+                    // label SET earlier in THIS transaction (buffered, not yet
+                    // committed) is honored — read-your-writes. `get_node` reads
+                    // committed-only labels and would wrongly reject/accept the
+                    // edge when an endpoint's required label is uncommitted.
+                    let snap_epoch = self
+                        .viewing_epoch
+                        .unwrap_or_else(|| self.store.current_epoch());
                     let source_labels: Vec<String> = self
                         .store
-                        .get_node(from_node_id)
-                        .map(|n| n.labels.iter().map(|l| l.to_string()).collect())
-                        .unwrap_or_default();
+                        .read_node_labels_visible(from_node_id, snap_epoch, self.transaction_id)
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect();
                     let target_labels: Vec<String> = self
                         .store
-                        .get_node(to_node_id)
-                        .map(|n| n.labels.iter().map(|l| l.to_string()).collect())
-                        .unwrap_or_default();
+                        .read_node_labels_visible(to_node_id, snap_epoch, self.transaction_id)
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect();
                     validator.validate_edge_endpoints(
                         &self.edge_type,
                         &source_labels,
@@ -637,18 +748,20 @@ impl Operator for CreateEdgeOperator {
                     .properties
                     .iter()
                     .map(|(name, source)| {
-                        let value =
-                            source.resolve(&chunk, row, self.store.as_ref() as &dyn GraphStore);
+                        let value = source.resolve(
+                            &chunk,
+                            row,
+                            self.store.as_ref() as &dyn GraphStore,
+                            self.viewing_epoch,
+                            self.transaction_id,
+                        );
                         (name.clone(), value)
                     })
                     .collect();
 
                 // Validate constraints before writing
                 if let Some(ref validator) = self.validator {
-                    for (name, value) in &resolved_props {
-                        validator.validate_edge_property(&self.edge_type, name, value)?;
-                    }
-                    validator.validate_edge_complete(&self.edge_type, &resolved_props)?;
+                    validator.validate_edge_post_image(&self.edge_type, &resolved_props)?;
                 }
 
                 // Create the edge with MVCC versioning
@@ -669,7 +782,7 @@ impl Operator for CreateEdgeOperator {
                 if let Some(tid) = self.transaction_id {
                     for (name, value) in resolved_props {
                         self.store
-                            .set_edge_property_versioned(edge_id, &name, value, tid);
+                            .set_edge_property_buffered(edge_id, &name, value, tid);
                     }
                 } else {
                     for (name, value) in resolved_props {
@@ -715,6 +828,13 @@ impl Operator for CreateEdgeOperator {
         "CreateEdge"
     }
 
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.input.install_resource_context(resources)
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
     }
@@ -738,6 +858,8 @@ pub struct DeleteNodeOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional validator for protected-node lifecycle enforcement.
+    validator: Option<Arc<dyn ConstraintValidator>>,
 }
 
 impl DeleteNodeOperator {
@@ -758,6 +880,7 @@ impl DeleteNodeOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            validator: None,
         }
     }
 
@@ -775,6 +898,12 @@ impl DeleteNodeOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Sets the constraint/protected-row validator.
+    pub fn with_validator(mut self, validator: Arc<dyn ConstraintValidator>) -> Self {
+        self.validator = Some(validator);
         self
     }
 }
@@ -811,6 +940,10 @@ impl Operator for DeleteNodeOperator {
                     }
                 };
 
+                if let Some(ref validator) = self.validator {
+                    validator.validate_node_delete(node_id, epoch, self.transaction_id)?;
+                }
+
                 if self.detach {
                     // Delete all connected edges first, using versioned deletion
                     // so rollback can restore them
@@ -829,8 +962,46 @@ impl Operator for DeleteNodeOperator {
                         }
                     }
                 } else {
-                    // NODETACH: check that node has no connected edges
-                    let degree = self.store.out_degree(node_id) + self.store.in_degree(node_id);
+                    // NODETACH must see its own edge deletions. Raw adjacency
+                    // retains those entries until commit. Check the current
+                    // committed frontier, not an older statement snapshot, so
+                    // a concurrently committed incident edge still blocks us.
+                    let degree = if self.transaction_id.is_some() {
+                        let current = self.store.current_epoch();
+                        let mut degree = self
+                            .store
+                            .edges_from_versioned(
+                                node_id,
+                                crate::graph::Direction::Both,
+                                current,
+                                tx,
+                            )
+                            .len();
+                        if !self.store.has_backward_adjacency() {
+                            // Reverse adjacency is optional; node deletion
+                            // cannot omit incoming edges in that configuration.
+                            let mut sources = self.store.node_ids();
+                            sources.extend(self.store.pending_node_creates(tx));
+                            sources.sort_unstable();
+                            sources.dedup();
+                            for source in sources {
+                                degree += self
+                                    .store
+                                    .edges_from_versioned(
+                                        source,
+                                        crate::graph::Direction::Outgoing,
+                                        current,
+                                        tx,
+                                    )
+                                    .iter()
+                                    .filter(|(target, _)| *target == node_id)
+                                    .count();
+                            }
+                        }
+                        degree
+                    } else {
+                        self.store.out_degree(node_id) + self.store.in_degree(node_id)
+                    };
                     if degree > 0 {
                         return Err(OperatorError::ConstraintViolation(format!(
                             "Cannot delete node with {} connected edge(s). Use DETACH DELETE.",
@@ -1004,6 +1175,13 @@ impl Operator for DeleteEdgeOperator {
         "DeleteEdge"
     }
 
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.input.install_resource_context(resources)
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
     }
@@ -1029,6 +1207,8 @@ pub struct AddLabelOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional constraint validator for schema enforcement.
+    validator: Option<Arc<dyn ConstraintValidator>>,
 }
 
 impl AddLabelOperator {
@@ -1051,6 +1231,7 @@ impl AddLabelOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            validator: None,
         }
     }
 
@@ -1068,6 +1249,12 @@ impl AddLabelOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Sets the constraint validator for schema enforcement.
+    pub fn with_validator(mut self, validator: Arc<dyn ConstraintValidator>) -> Self {
+        self.validator = Some(validator);
         self
     }
 }
@@ -1098,6 +1285,37 @@ impl Operator for AddLabelOperator {
                     }
                 };
 
+                if let Some(ref validator) = self.validator {
+                    let epoch = self
+                        .viewing_epoch
+                        .unwrap_or_else(|| self.store.current_epoch());
+                    let mut post_labels: Vec<String> = self
+                        .store
+                        .read_node_labels_visible(node_id, epoch, self.transaction_id)
+                        .iter()
+                        .map(|label| label.as_str().to_string())
+                        .collect();
+                    for label in &self.labels {
+                        if !post_labels.contains(label) {
+                            post_labels.push(label.clone());
+                        }
+                    }
+                    validator.validate_node_labels_allowed(&post_labels)?;
+                    let post_properties: Vec<(String, Value)> = self
+                        .store
+                        .read_node_properties_visible(node_id, epoch, self.transaction_id)
+                        .into_iter()
+                        .map(|(key, value)| (key.as_str().to_string(), value))
+                        .collect();
+                    validator.validate_node_post_image(
+                        Some(node_id),
+                        &post_labels,
+                        &post_properties,
+                        epoch,
+                        self.transaction_id,
+                    )?;
+                }
+
                 // Record write for conflict detection
                 if let (Some(tracker), Some(tid)) = (&self.write_tracker, self.transaction_id) {
                     tracker.record_node_write(tid, node_id)?;
@@ -1106,13 +1324,16 @@ impl Operator for AddLabelOperator {
                 // Add all labels
                 let mut row_count: i64 = 0;
                 for label in &self.labels {
-                    let added = if let Some(tid) = self.transaction_id {
-                        self.store.add_label_versioned(node_id, label, tid)
-                    } else {
-                        self.store.add_label(node_id, label)
-                    };
-                    if added {
+                    if let Some(tid) = self.transaction_id {
+                        // Buffer the label add into the tx delta — other sessions
+                        // cannot see it until commit (MVCC label isolation).
+                        self.store.add_label_buffered(node_id, label, tid);
                         row_count += 1;
+                    } else {
+                        let added = self.store.add_label(node_id, label);
+                        if added {
+                            row_count += 1;
+                        }
                     }
                 }
 
@@ -1149,6 +1370,13 @@ impl Operator for AddLabelOperator {
         "AddLabel"
     }
 
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.input.install_resource_context(resources)
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
     }
@@ -1174,6 +1402,8 @@ pub struct RemoveLabelOperator {
     transaction_id: Option<TransactionId>,
     /// Optional write tracker for conflict detection.
     write_tracker: Option<SharedWriteTracker>,
+    /// Optional constraint validator for the complete post-label image.
+    validator: Option<Arc<dyn ConstraintValidator>>,
 }
 
 impl RemoveLabelOperator {
@@ -1196,6 +1426,7 @@ impl RemoveLabelOperator {
             viewing_epoch: None,
             transaction_id: None,
             write_tracker: None,
+            validator: None,
         }
     }
 
@@ -1213,6 +1444,12 @@ impl RemoveLabelOperator {
     /// Sets the write tracker for conflict detection.
     pub fn with_write_tracker(mut self, tracker: SharedWriteTracker) -> Self {
         self.write_tracker = Some(tracker);
+        self
+    }
+
+    /// Sets the constraint/protected-row validator.
+    pub fn with_validator(mut self, validator: Arc<dyn ConstraintValidator>) -> Self {
+        self.validator = Some(validator);
         self
     }
 }
@@ -1243,6 +1480,33 @@ impl Operator for RemoveLabelOperator {
                     }
                 };
 
+                if let Some(ref validator) = self.validator {
+                    let epoch = self
+                        .viewing_epoch
+                        .unwrap_or_else(|| self.store.current_epoch());
+                    let mut post_labels: Vec<String> = self
+                        .store
+                        .read_node_labels_visible(node_id, epoch, self.transaction_id)
+                        .iter()
+                        .map(|label| label.as_str().to_string())
+                        .collect();
+                    post_labels.retain(|label| !self.labels.contains(label));
+                    validator.validate_node_labels_allowed(&post_labels)?;
+                    let post_properties: Vec<(String, Value)> = self
+                        .store
+                        .read_node_properties_visible(node_id, epoch, self.transaction_id)
+                        .into_iter()
+                        .map(|(key, value)| (key.as_str().to_string(), value))
+                        .collect();
+                    validator.validate_node_post_image(
+                        Some(node_id),
+                        &post_labels,
+                        &post_properties,
+                        epoch,
+                        self.transaction_id,
+                    )?;
+                }
+
                 // Record write for conflict detection
                 if let (Some(tracker), Some(tid)) = (&self.write_tracker, self.transaction_id) {
                     tracker.record_node_write(tid, node_id)?;
@@ -1251,13 +1515,16 @@ impl Operator for RemoveLabelOperator {
                 // Remove all labels
                 let mut row_count: i64 = 0;
                 for label in &self.labels {
-                    let removed = if let Some(tid) = self.transaction_id {
-                        self.store.remove_label_versioned(node_id, label, tid)
-                    } else {
-                        self.store.remove_label(node_id, label)
-                    };
-                    if removed {
+                    if let Some(tid) = self.transaction_id {
+                        // Buffer the label remove into the tx delta — other
+                        // sessions still see the label until commit.
+                        self.store.remove_label_buffered(node_id, label, tid);
                         row_count += 1;
+                    } else {
+                        let removed = self.store.remove_label(node_id, label);
+                        if removed {
+                            row_count += 1;
+                        }
                     }
                 }
 
@@ -1292,6 +1559,13 @@ impl Operator for RemoveLabelOperator {
 
     fn name(&self) -> &'static str {
         "RemoveLabel"
+    }
+
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.input.install_resource_context(resources)
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
@@ -1457,10 +1731,30 @@ impl Operator for SetPropertyOperator {
                     }
                 };
 
-                // Record write for conflict detection
+                // Record write for conflict detection.
+                // If exactly one named property is being set (a single `SET e.prop = …`),
+                // use the property-aware method so the engine bridge can record a finer tag.
+                // Map-merge (`prop_name == "*"`), multi-property, or whole-entity mutations
+                // stay entity-level (None wildcard is the conservative-correct choice).
                 if let (Some(tracker), Some(tid)) = (&self.write_tracker, self.transaction_id) {
+                    let single_prop = if self.properties.len() == 1 {
+                        let name = &self.properties[0].0;
+                        if name != "*" {
+                            Some(name.as_str())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     if self.is_edge {
-                        tracker.record_edge_write(tid, EdgeId(entity_id))?;
+                        if let Some(key) = single_prop {
+                            tracker.record_edge_property_write(tid, EdgeId(entity_id), key)?;
+                        } else {
+                            tracker.record_edge_write(tid, EdgeId(entity_id))?;
+                        }
+                    } else if let Some(key) = single_prop {
+                        tracker.record_node_property_write(tid, NodeId(entity_id), key)?;
                     } else {
                         tracker.record_node_write(tid, NodeId(entity_id))?;
                     }
@@ -1471,25 +1765,116 @@ impl Operator for SetPropertyOperator {
                     .properties
                     .iter()
                     .map(|(name, source)| {
-                        let value =
-                            source.resolve(&chunk, row, self.store.as_ref() as &dyn GraphStore);
+                        let value = source.resolve(
+                            &chunk,
+                            row,
+                            self.store.as_ref() as &dyn GraphStore,
+                            self.viewing_epoch,
+                            self.transaction_id,
+                        );
                         (name.clone(), value)
                     })
                     .collect();
 
-                // Validate constraints before writing
+                // Validate constraints before writing. Node constraints are
+                // checked against the complete post-image, not merely the SET
+                // expressions, so map replacement/removal and composite keys
+                // cannot bypass requiredness or uniqueness.
                 if let Some(ref validator) = self.validator {
                     if self.is_edge {
-                        if let Some(ref et) = self.edge_type_name {
+                        let edge_id = EdgeId(entity_id);
+                        let epoch = self
+                            .viewing_epoch
+                            .unwrap_or_else(|| self.store.current_epoch());
+                        let edge_type = self
+                            .transaction_id
+                            .and_then(|tid| self.store.edge_type_versioned(edge_id, epoch, tid))
+                            .or_else(|| {
+                                self.store
+                                    .get_edge_at_epoch(edge_id, epoch)
+                                    .map(|edge| edge.edge_type)
+                            })
+                            .or_else(|| self.store.edge_type(edge_id))
+                            .map(|name| name.as_str().to_string())
+                            .or_else(|| self.edge_type_name.clone());
+                        if let Some(edge_type) = edge_type {
+                            let mut post_properties = self.store.read_edge_properties_visible(
+                                edge_id,
+                                epoch,
+                                self.transaction_id,
+                            );
                             for (name, value) in &resolved_props {
-                                validator.validate_edge_property(et, name, value)?;
+                                if name == "*" {
+                                    if let Value::Map(map) = value {
+                                        if self.replace {
+                                            post_properties.clear();
+                                        }
+                                        for (key, map_value) in map.iter() {
+                                            if map_value.is_null() {
+                                                post_properties.remove(key);
+                                            } else {
+                                                post_properties
+                                                    .insert(key.clone(), map_value.clone());
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    post_properties
+                                        .insert(PropertyKey::new(name.as_str()), value.clone());
+                                }
                             }
+                            let post_properties: Vec<(String, Value)> = post_properties
+                                .into_iter()
+                                .map(|(key, value)| (key.as_str().to_string(), value))
+                                .collect();
+                            validator.validate_edge_post_image(&edge_type, &post_properties)?;
                         }
                     } else {
+                        let node_id = NodeId(entity_id);
+                        let epoch = self
+                            .viewing_epoch
+                            .unwrap_or_else(|| self.store.current_epoch());
+                        let labels: Vec<String> = self
+                            .store
+                            .read_node_labels_visible(node_id, epoch, self.transaction_id)
+                            .iter()
+                            .map(|label| label.as_str().to_string())
+                            .collect();
+                        let mut post_properties = self.store.read_node_properties_visible(
+                            node_id,
+                            epoch,
+                            self.transaction_id,
+                        );
                         for (name, value) in &resolved_props {
-                            validator.validate_node_property(&self.labels, name, value)?;
-                            validator.check_unique_node_property(&self.labels, name, value)?;
+                            if name == "*" {
+                                if let Value::Map(map) = value {
+                                    if self.replace {
+                                        post_properties.clear();
+                                    }
+                                    for (key, map_value) in map.iter() {
+                                        if map_value.is_null() {
+                                            post_properties.remove(key);
+                                        } else {
+                                            post_properties.insert(key.clone(), map_value.clone());
+                                        }
+                                    }
+                                }
+                            } else {
+                                post_properties
+                                    .insert(PropertyKey::new(name.as_str()), value.clone());
+                            }
                         }
+                        let post_properties: Vec<(String, Value)> = post_properties
+                            .into_iter()
+                            .map(|(key, value)| (key.as_str().to_string(), value))
+                            .collect();
+                        validator.validate_node_post_image(
+                            Some(node_id),
+                            &labels,
+                            &post_properties,
+                            epoch,
+                            self.transaction_id,
+                        )?;
                     }
                 }
 
@@ -1510,7 +1895,7 @@ impl Operator for SetPropertyOperator {
                                             .collect();
                                         for key in keys {
                                             if let Some(tid) = tx_id {
-                                                self.store.remove_edge_property_versioned(
+                                                self.store.remove_edge_property_buffered(
                                                     EdgeId(entity_id),
                                                     &key,
                                                     tid,
@@ -1529,7 +1914,7 @@ impl Operator for SetPropertyOperator {
                                         .collect();
                                     for key in keys {
                                         if let Some(tid) = tx_id {
-                                            self.store.remove_node_property_versioned(
+                                            self.store.remove_node_property_buffered(
                                                 NodeId(entity_id),
                                                 &key,
                                                 tid,
@@ -1547,7 +1932,7 @@ impl Operator for SetPropertyOperator {
                                     // Null in SET += removes the property (Cypher/GQL semantics)
                                     if self.is_edge {
                                         if let Some(tid) = tx_id {
-                                            self.store.remove_edge_property_versioned(
+                                            self.store.remove_edge_property_buffered(
                                                 EdgeId(entity_id),
                                                 key.as_str(),
                                                 tid,
@@ -1559,7 +1944,7 @@ impl Operator for SetPropertyOperator {
                                             );
                                         }
                                     } else if let Some(tid) = tx_id {
-                                        self.store.remove_node_property_versioned(
+                                        self.store.remove_node_property_buffered(
                                             NodeId(entity_id),
                                             key.as_str(),
                                             tid,
@@ -1570,7 +1955,7 @@ impl Operator for SetPropertyOperator {
                                     }
                                 } else if self.is_edge {
                                     if let Some(tid) = tx_id {
-                                        self.store.set_edge_property_versioned(
+                                        self.store.set_edge_property_buffered(
                                             EdgeId(entity_id),
                                             key.as_str(),
                                             val.clone(),
@@ -1584,7 +1969,7 @@ impl Operator for SetPropertyOperator {
                                         );
                                     }
                                 } else if let Some(tid) = tx_id {
-                                    self.store.set_node_property_versioned(
+                                    self.store.set_node_property_buffered(
                                         NodeId(entity_id),
                                         key.as_str(),
                                         val.clone(),
@@ -1601,7 +1986,7 @@ impl Operator for SetPropertyOperator {
                         }
                     } else if self.is_edge {
                         if let Some(tid) = tx_id {
-                            self.store.set_edge_property_versioned(
+                            self.store.set_edge_property_buffered(
                                 EdgeId(entity_id),
                                 &prop_name,
                                 value,
@@ -1612,7 +1997,7 @@ impl Operator for SetPropertyOperator {
                                 .set_edge_property(EdgeId(entity_id), &prop_name, value);
                         }
                     } else if let Some(tid) = tx_id {
-                        self.store.set_node_property_versioned(
+                        self.store.set_node_property_buffered(
                             NodeId(entity_id),
                             &prop_name,
                             value,
@@ -1651,6 +2036,16 @@ impl Operator for SetPropertyOperator {
 
     fn name(&self) -> &'static str {
         "SetProperty"
+    }
+
+    // A SET is a passthrough for resource installation, like CreateEdge above.
+    // Without this, any resident-scratch operator below a SET never receives
+    // the query's resource context and fails its installation invariant.
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.input.install_resource_context(resources)
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
@@ -2776,7 +3171,7 @@ mod tests {
         let chunk = builder.finish();
 
         let src = PropertySource::Column(0);
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Int64(42));
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Int64(42));
     }
 
     #[test]
@@ -2786,7 +3181,7 @@ mod tests {
 
         let src = PropertySource::Constant(Value::String("hello".into()));
         assert_eq!(
-            src.resolve(&chunk, 0, &store),
+            src.resolve(&chunk, 0, &store, None, None),
             Value::String("hello".into()),
         );
     }
@@ -2797,7 +3192,7 @@ mod tests {
         let chunk = DataChunk::empty();
 
         let src = PropertySource::Column(99);
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Null);
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Null);
     }
 
     #[test]
@@ -2818,7 +3213,7 @@ mod tests {
             column: 0,
             property: "age".to_string(),
         };
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Int64(30));
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Int64(30));
     }
 
     #[test]
@@ -2830,6 +3225,6 @@ mod tests {
             column: 99,
             property: "name".to_string(),
         };
-        assert_eq!(src.resolve(&chunk, 0, &store), Value::Null);
+        assert_eq!(src.resolve(&chunk, 0, &store, None, None), Value::Null);
     }
 }

@@ -11,6 +11,32 @@ use parking_lot::Mutex;
 
 use super::operators::{Operator, OperatorResult};
 
+/// Query-wide resource history, shared by all profiled operators.
+/// Counters saturate on overflow; they are not per-operator attribution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryProfileStats {
+    /// Resident bytes granted across the query at the last operator sample.
+    /// Sampling occurs after `next()`, `reset()` or engine finalization; later drops
+    /// can release grants before the profile is formatted.
+    pub resident_granted_bytes: usize,
+    /// High-water mark of committed query resident grants.
+    pub resident_peak_bytes: usize,
+    /// Cumulative bytes of successfully published spill files, including merge outputs.
+    pub spilled_bytes: u64,
+    /// Cumulative published sort-run files, including intermediate runs.
+    pub spill_runs: u64,
+    /// Cumulative published native-partition files (not RDF state fragments).
+    pub spill_partitions: u64,
+    /// Cumulative active sort-merge work; unavailable on wasm32.
+    pub merge_time_ns: Option<u64>,
+    /// Query-local physical reservation and cleanup history, when authenticated.
+    #[cfg(feature = "spill")]
+    pub spill_physical: Option<super::spill::SpillPhysicalStats>,
+    /// Last successful root-wide bounded cleanup pass, not current query usage.
+    #[cfg(feature = "spill")]
+    pub spill_recovery: Option<super::spill::SpillScavengeReport>,
+}
+
 /// Runtime statistics for a single operator in a profiled query.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileStats {
@@ -20,6 +46,8 @@ pub struct ProfileStats {
     pub time_ns: u64,
     /// Number of times `next()` was called on this operator.
     pub calls: u64,
+    /// Latest query-wide snapshot; repeated nodes must not be summed.
+    pub query_resources: Option<QueryProfileStats>,
 }
 
 /// Shared handle to profile stats, written by `ProfiledOperator` during
@@ -34,12 +62,17 @@ pub type SharedProfileStats = Arc<Mutex<ProfileStats>>;
 pub struct ProfiledOperator {
     inner: Box<dyn Operator>,
     stats: SharedProfileStats,
+    resources: Option<super::QueryResourceContext>,
 }
 
 impl ProfiledOperator {
     /// Creates a new profiled wrapper around the given operator.
     pub fn new(inner: Box<dyn Operator>, stats: SharedProfileStats) -> Self {
-        Self { inner, stats }
+        Self {
+            inner,
+            stats,
+            resources: None,
+        }
     }
 }
 
@@ -67,11 +100,20 @@ impl Operator for ProfiledOperator {
             self.stats.lock().rows_out += chunk.row_count() as u64;
         }
 
+        if let Some(resources) = &self.resources {
+            self.stats.lock().query_resources = Some(resources.profile_stats());
+        }
         result
     }
 
     fn reset(&mut self) {
         self.inner.reset();
+        if let Some(resources) = &self.resources {
+            // Capture the post-reset live grant count while retaining the
+            // cumulative spill and high-water counters for PROFILE output.
+            self.stats.lock().query_resources = Some(resources.profile_stats());
+        }
+        self.resources = None;
     }
 
     fn name(&self) -> &'static str {
@@ -80,6 +122,17 @@ impl Operator for ProfiledOperator {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
+    }
+
+    fn install_resource_context(
+        &mut self,
+        resources: &super::memory::QueryResourceContext,
+    ) -> Result<(), super::memory::QueryResourceContextError> {
+        self.inner.install_resource_context(resources)?;
+        #[cfg(feature = "spill")]
+        resources.enable_spill_profile_merge();
+        self.resources = Some(resources.clone());
+        Ok(())
     }
 }
 
@@ -100,7 +153,59 @@ mod tests {
     use super::*;
     use crate::execution::chunk::DataChunk;
     use crate::execution::vector::ValueVector;
+    use crate::execution::{QueryExecutionId, QueryResourceContext, QueryResourceContextError};
+    use grafeo_common::memory::buffer::BufferManager;
     use grafeo_common::types::LogicalType;
+
+    #[test]
+    fn query_peak_includes_released_growth_and_survives_operator_reset() {
+        let memory = BufferManager::with_budget(4096);
+        let resources = QueryResourceContext::new(memory.clone()).unwrap();
+        let stats = Arc::new(Mutex::new(ProfileStats::default()));
+        let mut profiled = ProfiledOperator::new(Box::new(MockOperator::new(0, 0)), stats.clone());
+        profiled.install_resource_context(&resources).unwrap();
+        let mut grant = resources.try_allocate(128).unwrap();
+        grant.try_resize(1024).unwrap();
+        grant.try_resize(16).unwrap();
+        drop(grant);
+        assert!(profiled.next().unwrap().is_none());
+        profiled.reset();
+        let snapshot = stats.lock().query_resources.unwrap();
+        assert_eq!(snapshot.resident_granted_bytes, 0);
+        assert_eq!(snapshot.resident_peak_bytes, 1024);
+        assert_eq!(memory.allocated(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn query_profile_preserves_published_runs_after_file_cleanup() {
+        use crate::execution::spill::SpillFileRole;
+        let directory = tempfile::tempdir().unwrap();
+        let manager_fixture = crate::execution::spill::BorrowedSpillFixture::new(directory.path());
+        let memory = BufferManager::with_budget(1 << 20);
+        let (resources, manager) = manager_fixture
+            .build_operator_resources(
+                memory,
+                crate::execution::QueryExecutionControl::new().token(),
+            )
+            .unwrap();
+        let stats = Arc::new(Mutex::new(ProfileStats::default()));
+        let mut profiled = ProfiledOperator::new(Box::new(MockOperator::new(0, 0)), stats.clone());
+        profiled.install_resource_context(&resources).unwrap();
+        let mut file = manager.create_file(SpillFileRole::SortRun).unwrap();
+        file.write_sort_run_start(1, 0).unwrap();
+        file.finish_write().unwrap();
+        let published = manager.spilled_bytes();
+        assert!(published > 0);
+        file.close_and_delete().unwrap();
+        assert_eq!(manager.spilled_bytes(), 0);
+        assert!(profiled.next().unwrap().is_none());
+        profiled.reset();
+        let snapshot = stats.lock().query_resources.unwrap();
+        assert_eq!(snapshot.spilled_bytes, published);
+        assert_eq!(snapshot.spill_runs, 1);
+        assert_eq!(snapshot.spill_partitions, 0);
+    }
 
     /// A mock operator that yields a fixed number of chunks, each with `rows_per_chunk` rows.
     struct MockOperator {
@@ -144,6 +249,34 @@ mod tests {
         }
     }
 
+    struct ResourceRecordingOperator {
+        installed_query_ids: Arc<Mutex<Vec<QueryExecutionId>>>,
+    }
+
+    impl Operator for ResourceRecordingOperator {
+        fn next(&mut self) -> OperatorResult {
+            Ok(None)
+        }
+
+        fn reset(&mut self) {}
+
+        fn name(&self) -> &'static str {
+            "ProfileResourceRecorder"
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+
+        fn install_resource_context(
+            &mut self,
+            resources: &QueryResourceContext,
+        ) -> Result<(), QueryResourceContextError> {
+            self.installed_query_ids.lock().push(resources.query_id());
+            Ok(())
+        }
+    }
+
     #[test]
     fn profile_stats_default_is_zero() {
         let stats = ProfileStats::default();
@@ -183,5 +316,26 @@ mod tests {
         let stats = Arc::new(Mutex::new(ProfileStats::default()));
         let profiled = ProfiledOperator::new(Box::new(mock), Arc::clone(&stats));
         assert_eq!(profiled.name(), "MockOperator");
+    }
+
+    #[test]
+    fn profiled_operator_forwards_exact_resource_context_to_child() {
+        let installed_query_ids = Arc::new(Mutex::new(Vec::new()));
+        let child = ResourceRecordingOperator {
+            installed_query_ids: Arc::clone(&installed_query_ids),
+        };
+        let stats = Arc::new(Mutex::new(ProfileStats::default()));
+        let mut profiled = ProfiledOperator::new(Box::new(child), stats);
+        let resources = QueryResourceContext::new(BufferManager::with_budget(1024 * 1024))
+            .expect("create query resources");
+
+        profiled
+            .install_resource_context(&resources)
+            .expect("install profiled resources");
+
+        assert_eq!(
+            installed_query_ids.lock().as_slice(),
+            &[resources.query_id()]
+        );
     }
 }

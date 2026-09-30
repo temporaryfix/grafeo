@@ -276,4 +276,73 @@ impl Operator for ApplyOperator {
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
     }
+
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.outer.install_resource_context(resources)?;
+        self.inner.install_resource_context(resources)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use grafeo_common::memory::buffer::BufferManager;
+
+    use super::*;
+    use crate::execution::{QueryExecutionId, QueryResourceContext, QueryResourceContextError};
+
+    struct ResourceProbe {
+        installed: Arc<Mutex<Vec<QueryExecutionId>>>,
+    }
+
+    impl Operator for ResourceProbe {
+        fn next(&mut self) -> OperatorResult {
+            Ok(None)
+        }
+
+        fn reset(&mut self) {}
+
+        fn name(&self) -> &'static str {
+            "ApplyResourceProbe"
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+
+        fn install_resource_context(
+            &mut self,
+            resources: &QueryResourceContext,
+        ) -> Result<(), QueryResourceContextError> {
+            self.installed.lock().unwrap().push(resources.query_id());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn apply_installs_the_exact_resource_context_into_both_branches() {
+        let outer_installed = Arc::new(Mutex::new(Vec::new()));
+        let inner_installed = Arc::new(Mutex::new(Vec::new()));
+        let mut apply = ApplyOperator::new(
+            Box::new(ResourceProbe {
+                installed: Arc::clone(&outer_installed),
+            }),
+            Box::new(ResourceProbe {
+                installed: Arc::clone(&inner_installed),
+            }),
+        );
+        let resources = QueryResourceContext::new(BufferManager::with_budget(1024 * 1024))
+            .expect("create query resources");
+
+        apply
+            .install_resource_context(&resources)
+            .expect("install Apply resources");
+
+        assert_eq!(*outer_installed.lock().unwrap(), vec![resources.query_id()]);
+        assert_eq!(*inner_installed.lock().unwrap(), vec![resources.query_id()]);
+    }
 }

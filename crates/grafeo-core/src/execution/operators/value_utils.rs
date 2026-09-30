@@ -5,7 +5,12 @@
 
 use std::cmp::Ordering;
 
+#[cfg(feature = "triple-store")]
+use grafeo_common::types::INTERNAL_RDF_TAGGED_TERM_MARKER;
 use grafeo_common::types::Value;
+
+#[cfg(feature = "triple-store")]
+use crate::graph::rdf::Term;
 
 use super::sort::NullOrder;
 
@@ -49,8 +54,50 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         (Value::Time(a), Value::Time(b)) => Some(a.cmp(b)),
+        // Internal RDF mutation aggregates carry sealed tagged pairs. Do not
+        // make ordinary user lists orderable as a side effect.
+        #[cfg(feature = "triple-store")]
+        (Value::List(a), Value::List(b)) => compare_tagged_rdf_terms(a, b),
         _ => None,
     }
+}
+
+#[cfg(feature = "triple-store")]
+fn compare_tagged_rdf_terms(a: &[Value], b: &[Value]) -> Option<Ordering> {
+    let (a_visible, a_exact, a_term) = decode_tagged_rdf_term(a)?;
+    let (b_visible, b_exact, b_term) = decode_tagged_rdf_term(b)?;
+
+    let kind_rank = |term: &Term| match term {
+        Term::BlankNode(_) => 0,
+        Term::Iri(_) => 1,
+        Term::Literal(_) => 2,
+    };
+    let kind_order = kind_rank(&a_term).cmp(&kind_rank(&b_term));
+    if kind_order != Ordering::Equal {
+        return Some(kind_order);
+    }
+
+    match (&a_term, &b_term) {
+        (Term::BlankNode(a), Term::BlankNode(b)) => Some(a.id().cmp(b.id())),
+        (Term::Iri(a), Term::Iri(b)) => Some(a.as_str().cmp(b.as_str())),
+        (Term::Literal(_), Term::Literal(_)) => match compare_values(a_visible, b_visible) {
+            Some(Ordering::Equal) | None => Some(a_exact.cmp(b_exact)),
+            ordering => ordering,
+        },
+        _ => Some(a_exact.cmp(b_exact)),
+    }
+}
+
+#[cfg(feature = "triple-store")]
+fn decode_tagged_rdf_term(values: &[Value]) -> Option<(&Value, &str, Term)> {
+    let [visible, Value::String(exact), Value::String(marker)] = values else {
+        return None;
+    };
+    if marker.as_str() != INTERNAL_RDF_TAGGED_TERM_MARKER {
+        return None;
+    }
+    let term = Term::from_ntriples(exact.as_str())?;
+    Some((visible, exact.as_str(), term))
 }
 
 /// Compares two values with total ordering (returns `Equal` for incomparable types).
@@ -174,6 +221,36 @@ mod tests {
     #[test]
     fn compare_incomparable() {
         assert_eq!(compare_values(&Value::Bool(true), &Value::Int64(1)), None);
+    }
+
+    #[test]
+    fn ordinary_lists_remain_incomparable() {
+        let left = Value::List(vec![Value::Int64(1)].into());
+        let right = Value::List(vec![Value::Int64(2)].into());
+        assert_eq!(compare_values(&left, &right), None);
+    }
+
+    #[cfg(feature = "triple-store")]
+    #[test]
+    fn sealed_rdf_pairs_compare_by_term_kind_and_preserve_exact_ties() {
+        let tagged = |visible: Value, exact: &str| {
+            Value::List(
+                vec![
+                    visible,
+                    Value::String(exact.into()),
+                    Value::String(INTERNAL_RDF_TAGGED_TERM_MARKER.into()),
+                ]
+                .into(),
+            )
+        };
+        let blank = tagged(Value::String("same".into()), "_:same");
+        let iri = tagged(Value::String("same".into()), "<same>");
+        let literal = tagged(Value::String("same".into()), "\"same\"");
+        let lang = tagged(Value::String("same".into()), "\"same\"@en");
+
+        assert_eq!(compare_values(&blank, &iri), Some(Ordering::Less));
+        assert_eq!(compare_values(&iri, &literal), Some(Ordering::Less));
+        assert_ne!(compare_values(&literal, &lang), Some(Ordering::Equal));
     }
 
     #[test]

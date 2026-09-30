@@ -38,7 +38,9 @@ impl UnwindOperator {
     /// * `child` - The input operator
     /// * `list_col_idx` - The column index containing the list to unwind
     /// * `variable_name` - The name of the new variable
-    /// * `output_schema` - The schema for output (should include the new column type)
+    /// * `output_schema` - An inherited input-column prefix, then the element,
+    ///   then any ordinality/offset columns. An empty prefix projects only the
+    ///   element; retaining all input columns also retains the original list.
     /// * `emit_ordinality` - Whether to emit a 1-based index column
     /// * `emit_offset` - Whether to emit a 0-based index column
     pub fn new(
@@ -129,39 +131,53 @@ impl UnwindOperator {
 
     /// Emits a single row with the current list element.
     fn emit_row(&mut self) -> Result<DataChunk, super::OperatorError> {
-        let chunk = self
-            .current_chunk
-            .as_ref()
-            .expect("current_chunk is Some: set before emit_row call");
-        let list = self
-            .current_list
-            .as_ref()
-            .expect("current_list is Some: set before emit_row call");
-        let element = list[self.current_list_idx].clone();
+        let chunk = self.current_chunk.as_ref().ok_or_else(|| {
+            super::OperatorError::Execution("UNWIND input chunk is absent".into())
+        })?;
+        let list = self.current_list.as_ref().ok_or_else(|| {
+            super::OperatorError::Execution("UNWIND active list is absent".into())
+        })?;
+        let element = list.get(self.current_list_idx).cloned().ok_or_else(|| {
+            super::OperatorError::Execution("UNWIND active list position is absent".into())
+        })?;
 
         // Build output row: copy all columns from input + add the unwound element
         let mut builder = DataChunkBuilder::new(&self.output_schema);
 
-        // Copy existing columns (except the list column which we're replacing)
-        for col_idx in 0..chunk.column_count() {
-            if col_idx == self.list_col_idx {
-                continue; // Skip the list column
-            }
-            if let Some(col) = chunk.column(col_idx)
-                && let Some(value) = col.get_value(self.current_row)
-                && let Some(out_col) = builder.column_mut(col_idx)
-            {
-                out_col.push_value(value);
-            }
+        // The output schema declares its inherited input prefix followed by
+        // the element and optional ordinality/offset. Preserve every declared
+        // input value, including the original list: the planner appends the
+        // element, it does not replace the list column with a sparse hole.
+        let extra_cols = usize::from(self.emit_ordinality) + usize::from(self.emit_offset);
+        let element_col_idx = self
+            .output_schema
+            .len()
+            .checked_sub(1 + extra_cols)
+            .ok_or_else(|| {
+                super::OperatorError::Execution(
+                    "UNWIND output schema lacks its element column".into(),
+                )
+            })?;
+        for col_idx in 0..element_col_idx {
+            let value = chunk
+                .column(col_idx)
+                .and_then(|col| col.get_value(self.current_row))
+                .ok_or_else(|| {
+                    super::OperatorError::ColumnNotFound(format!("UNWIND input column {col_idx}"))
+                })?;
+            builder
+                .column_mut(col_idx)
+                .ok_or_else(|| {
+                    super::OperatorError::ColumnNotFound(format!("UNWIND output column {col_idx}"))
+                })?
+                .push_value(value);
         }
 
-        // Add the unwound element column.
-        // It's at the end of the output schema, minus any ordinality/offset columns.
-        let extra_cols = usize::from(self.emit_ordinality) + usize::from(self.emit_offset);
-        let element_col_idx = self.output_schema.len() - 1 - extra_cols;
-        if let Some(out_col) = builder.column_mut(element_col_idx) {
-            out_col.push_value(element);
-        }
+        // Add the unwound element after the inherited prefix.
+        builder
+            .column_mut(element_col_idx)
+            .ok_or_else(|| super::OperatorError::ColumnNotFound("UNWIND output element".into()))?
+            .push_value(element);
 
         // Add ORDINALITY (1-based) if requested
         let mut next_col = element_col_idx + 1;
@@ -212,6 +228,13 @@ impl Operator for UnwindOperator {
         "Unwind"
     }
 
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.child.install_resource_context(resources)
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
     }
@@ -250,6 +273,52 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
             self
         }
+    }
+
+    #[test]
+    fn unwind_preserves_declared_list_and_null_input_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let list = Value::List(vec![Value::Int64(4), Value::Null].into());
+        let mut input = DataChunkBuilder::new(&[LogicalType::Any, LogicalType::Any]);
+        input
+            .column_mut(0)
+            .ok_or("missing fixture list column")?
+            .push_value(list.clone());
+        input
+            .column_mut(1)
+            .ok_or("missing fixture null column")?
+            .push_value(Value::Null);
+        input.advance_row();
+        let mut unwind = UnwindOperator::new(
+            Box::new(MockOperator {
+                chunks: vec![input.finish()],
+                position: 0,
+            }),
+            0,
+            "element".into(),
+            vec![LogicalType::Any, LogicalType::Any, LogicalType::Any],
+            false,
+            false,
+        );
+        for expected in [Value::Int64(4), Value::Null] {
+            let output = unwind.next()?.ok_or("missing UNWIND row")?;
+            assert_eq!(output.row_count(), 1);
+            assert_eq!(
+                output.column(0).and_then(|column| column.get_value(0)),
+                Some(list.clone())
+            );
+            assert_eq!(
+                output.column(1).and_then(|column| column.get_value(0)),
+                Some(Value::Null)
+            );
+            assert_eq!(
+                output.column(2).and_then(|column| column.get_value(0)),
+                Some(expected)
+            );
+            assert!(output.columns().iter().all(|column| column.len() == 1));
+        }
+        assert!(unwind.next()?.is_none());
+        Ok(())
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! Filter operator for applying predicates.
 
-use super::{Operator, OperatorResult};
-use crate::execution::{ChunkZoneHints, DataChunk, SelectionVector};
+use super::{Operator, OperatorPipelineDecomposition, OperatorResult};
+use crate::execution::{ChunkZoneHints, DataChunk, SelectionVector, ValueVector};
 use crate::graph::Direction;
 use crate::graph::GraphStoreSearch;
 use crate::graph::lpg::{Edge, Node};
 use grafeo_common::types::{
-    EdgeId, EpochId, HashableValue, NodeId, PropertyKey, TransactionId, Value,
+    EdgeId, EpochId, HashableValue, LogicalType, NodeId, PropertyKey, TransactionId, Value,
 };
+use grafeo_common::utils::hash::FxHashMap;
 #[cfg(feature = "regex")]
 use regex::Regex;
 #[cfg(all(feature = "regex-lite", not(feature = "regex")))]
@@ -75,7 +76,10 @@ fn map_int_or(m: &BTreeMap<PropertyKey, Value>, key: &str, default: i64) -> Opti
 /// A predicate for filtering rows.
 pub trait Predicate: Send + Sync {
     /// Evaluates the predicate for a single row.
-    fn evaluate(&self, chunk: &DataChunk, row: usize) -> bool;
+    ///
+    /// # Errors
+    /// Returns a query execution error instead of treating a failed read as false.
+    fn evaluate(&self, chunk: &DataChunk, row: usize) -> Result<bool, super::OperatorError>;
 
     /// Returns `false` if zone map proves no rows in this chunk can match.
     ///
@@ -91,8 +95,20 @@ pub trait Predicate: Send + Sync {
     }
 }
 
+/// Adapts a pull predicate to the push filter contract.
+///
+/// This remains public through `pipeline_convert` for compatibility, while
+/// the operator-owned decomposition hook now constructs it directly.
+pub struct PredicateAdapter(pub Box<dyn Predicate>);
+
+impl super::push::FilterPredicate for PredicateAdapter {
+    fn evaluate(&self, chunk: &DataChunk, row: usize) -> Result<bool, super::OperatorError> {
+        self.0.evaluate(chunk, row)
+    }
+}
+
 /// A comparison operator.
-#[cfg(test)]
+#[cfg(all(test, feature = "lpg"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompareOp {
     /// Equal.
@@ -110,7 +126,7 @@ pub(crate) enum CompareOp {
 }
 
 /// A simple comparison predicate.
-#[cfg(test)]
+#[cfg(all(test, feature = "lpg"))]
 pub(crate) struct ComparisonPredicate {
     /// Column index to compare.
     column: usize,
@@ -120,7 +136,7 @@ pub(crate) struct ComparisonPredicate {
     value: Value,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lpg"))]
 impl ComparisonPredicate {
     /// Creates a new comparison predicate.
     pub(crate) fn new(column: usize, op: CompareOp, value: Value) -> Self {
@@ -128,72 +144,78 @@ impl ComparisonPredicate {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lpg"))]
 impl Predicate for ComparisonPredicate {
-    fn evaluate(&self, chunk: &DataChunk, row: usize) -> bool {
-        let Some(col) = chunk.column(self.column) else {
-            return false;
-        };
+    fn evaluate(
+        &self,
+        chunk: &DataChunk,
+        row: usize,
+    ) -> Result<bool, crate::execution::operators::OperatorError> {
+        Ok((|| {
+            let Some(col) = chunk.column(self.column) else {
+                return false;
+            };
 
-        let Some(cell_value) = col.get_value(row) else {
-            return false;
-        };
+            let Some(cell_value) = col.get_value(row) else {
+                return false;
+            };
 
-        match (&cell_value, &self.value) {
-            (Value::Int64(a), Value::Int64(b)) => match self.op {
-                CompareOp::Eq => a == b,
-                CompareOp::Ne => a != b,
-                CompareOp::Lt => a < b,
-                CompareOp::Le => a <= b,
-                CompareOp::Gt => a > b,
-                CompareOp::Ge => a >= b,
-            },
-            (Value::Float64(a), Value::Float64(b)) => match self.op {
-                CompareOp::Eq => (a - b).abs() < f64::EPSILON,
-                CompareOp::Ne => (a - b).abs() >= f64::EPSILON,
-                CompareOp::Lt => a < b,
-                CompareOp::Le => a <= b,
-                CompareOp::Gt => a > b,
-                CompareOp::Ge => a >= b,
-            },
-            (Value::String(a), Value::String(b)) => match self.op {
-                CompareOp::Eq => a == b,
-                CompareOp::Ne => a != b,
-                CompareOp::Lt => a < b,
-                CompareOp::Le => a <= b,
-                CompareOp::Gt => a > b,
-                CompareOp::Ge => a >= b,
-            },
-            // Cross-type Int64/Float64 coercion
-            (Value::Int64(a), Value::Float64(b)) => {
-                let a = *a as f64;
-                match self.op {
+            match (&cell_value, &self.value) {
+                (Value::Int64(a), Value::Int64(b)) => match self.op {
+                    CompareOp::Eq => a == b,
+                    CompareOp::Ne => a != b,
+                    CompareOp::Lt => a < b,
+                    CompareOp::Le => a <= b,
+                    CompareOp::Gt => a > b,
+                    CompareOp::Ge => a >= b,
+                },
+                (Value::Float64(a), Value::Float64(b)) => match self.op {
                     CompareOp::Eq => (a - b).abs() < f64::EPSILON,
                     CompareOp::Ne => (a - b).abs() >= f64::EPSILON,
-                    CompareOp::Lt => a < *b,
-                    CompareOp::Le => a <= *b,
-                    CompareOp::Gt => a > *b,
-                    CompareOp::Ge => a >= *b,
+                    CompareOp::Lt => a < b,
+                    CompareOp::Le => a <= b,
+                    CompareOp::Gt => a > b,
+                    CompareOp::Ge => a >= b,
+                },
+                (Value::String(a), Value::String(b)) => match self.op {
+                    CompareOp::Eq => a == b,
+                    CompareOp::Ne => a != b,
+                    CompareOp::Lt => a < b,
+                    CompareOp::Le => a <= b,
+                    CompareOp::Gt => a > b,
+                    CompareOp::Ge => a >= b,
+                },
+                // Cross-type Int64/Float64 coercion
+                (Value::Int64(a), Value::Float64(b)) => {
+                    let a = *a as f64;
+                    match self.op {
+                        CompareOp::Eq => (a - b).abs() < f64::EPSILON,
+                        CompareOp::Ne => (a - b).abs() >= f64::EPSILON,
+                        CompareOp::Lt => a < *b,
+                        CompareOp::Le => a <= *b,
+                        CompareOp::Gt => a > *b,
+                        CompareOp::Ge => a >= *b,
+                    }
                 }
-            }
-            (Value::Float64(a), Value::Int64(b)) => {
-                let b = *b as f64;
-                match self.op {
-                    CompareOp::Eq => (a - b).abs() < f64::EPSILON,
-                    CompareOp::Ne => (a - b).abs() >= f64::EPSILON,
-                    CompareOp::Lt => *a < b,
-                    CompareOp::Le => *a <= b,
-                    CompareOp::Gt => *a > b,
-                    CompareOp::Ge => *a >= b,
+                (Value::Float64(a), Value::Int64(b)) => {
+                    let b = *b as f64;
+                    match self.op {
+                        CompareOp::Eq => (a - b).abs() < f64::EPSILON,
+                        CompareOp::Ne => (a - b).abs() >= f64::EPSILON,
+                        CompareOp::Lt => *a < b,
+                        CompareOp::Le => *a <= b,
+                        CompareOp::Gt => *a > b,
+                        CompareOp::Ge => *a >= b,
+                    }
                 }
+                (Value::Bool(a), Value::Bool(b)) => match self.op {
+                    CompareOp::Eq => a == b,
+                    CompareOp::Ne => a != b,
+                    _ => false, // Ordering on booleans doesn't make sense
+                },
+                _ => false, // Type mismatch
             }
-            (Value::Bool(a), Value::Bool(b)) => match self.op {
-                CompareOp::Eq => a == b,
-                CompareOp::Ne => a != b,
-                _ => false, // Ordering on booleans doesn't make sense
-            },
-            _ => false, // Type mismatch
-        }
+        })())
     }
 
     fn might_match_chunk(&self, hints: &ChunkZoneHints) -> bool {
@@ -503,6 +525,15 @@ pub enum UnaryFilterOp {
 }
 
 impl ExpressionPredicate {
+    /// Uses the expression evaluator's scalar rules for indexed residuals.
+    #[must_use]
+    pub fn matches_property_index_predicate(
+        value: &Value,
+        predicate: crate::graph::PropertyIndexPredicate<'_>,
+    ) -> bool {
+        ExpressionEvaluation::matches_property_index_predicate(value, predicate)
+    }
+
     /// Creates a new expression predicate.
     pub fn new(
         expression: FilterExpression,
@@ -557,6 +588,20 @@ impl ExpressionPredicate {
         edge_types: &[String],
         end_labels: &Option<Vec<String>>,
     ) -> bool {
+        // MVCC: a candidate edge from the (non-versioned) adjacency index must still be
+        // visible under the current snapshot — a writer's own PENDING-deleted edge must
+        // not satisfy EXISTS/COUNT (read-your-writes); mirrors the expand operators.
+        if let Some(epoch) = self.viewing_epoch {
+            let visible = if let Some(tx) = self.transaction_id {
+                self.store.is_edge_visible_versioned(edge_id, epoch, tx)
+            } else {
+                self.store.is_edge_visible_at_epoch(edge_id, epoch)
+            };
+            if !visible {
+                return false;
+            }
+        }
+
         // Check edge type if specified
         if !edge_types.is_empty() {
             let type_ok = if let Some(actual_type) = self.store.edge_type(edge_id) {
@@ -574,8 +619,21 @@ impl ExpressionPredicate {
         // Check end node labels if specified (e.g., (:Person)-[:KNOWS]->(n) requires
         // the other endpoint to have the Person label after direction flipping).
         if let Some(labels) = end_labels {
-            if let Some(node) = self.resolve_node(other_node_id) {
-                labels.iter().all(|l| node.has_label(l))
+            // Resolve existence first, then check labels via the snapshot-aware
+            // accessor so that uncommitted label ops in the writing transaction are
+            // reflected here (behavior-preserving until Task 4 buffers writes).
+            if self.resolve_node(other_node_id).is_some() {
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set = self.store.read_node_labels_visible(
+                    other_node_id,
+                    snap_epoch,
+                    self.transaction_id,
+                );
+                labels
+                    .iter()
+                    .all(|l| label_set.iter().any(|s| s.as_str() == l.as_str()))
             } else {
                 false
             }
@@ -595,43 +653,286 @@ impl ExpressionPredicate {
         }
     }
 
-    /// Evaluates the expression for a specific row in a chunk, returning the result value.
-    /// This is useful for evaluating expressions in contexts like RETURN clauses.
-    pub fn eval_at(&self, chunk: &DataChunk, row: usize) -> Option<Value> {
-        self.eval_expr(&self.expression, chunk, row)
+    /// Snapshot-consistent whole property set for a node: the writing tx's buffered
+    /// SET/REMOVE merged over the committed set (read-your-writes), else committed.
+    fn visible_node_properties(&self, id: NodeId) -> FxHashMap<PropertyKey, Value> {
+        let epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+        self.store
+            .read_node_properties_visible(id, epoch, self.transaction_id)
     }
 
-    /// Evaluates the expression for a row, returning the result value.
-    fn eval(&self, chunk: &DataChunk, row: usize) -> Option<Value> {
-        self.eval_expr(&self.expression, chunk, row)
+    /// Snapshot-consistent whole property set for an edge: the writing tx's buffered
+    /// SET/REMOVE merged over the committed set (read-your-writes), else committed.
+    fn visible_edge_properties(&self, id: EdgeId) -> FxHashMap<PropertyKey, Value> {
+        let epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+        self.store
+            .read_edge_properties_visible(id, epoch, self.transaction_id)
+    }
+
+    /// Evaluates the expression for a specific row in a chunk, returning the result value.
+    /// This is useful for evaluating expressions in contexts like RETURN clauses.
+    ///
+    /// # Errors
+    /// Returns any temporal Text read error rather than a missing value.
+    pub fn eval_at(
+        &self,
+        chunk: &DataChunk,
+        row: usize,
+    ) -> grafeo_common::utils::error::Result<Option<Value>> {
+        self.eval_with_provenance(chunk, row)
+            .map(|(value, _)| value)
+    }
+
+    /// Evaluates once and returns certified runtime entity provenance, if any.
+    /// Ordinary values, including integer IDs without a typed source, have no
+    /// entity type. Consumers must not infer one from their representation.
+    ///
+    /// # Errors
+    /// Returns the same evaluation errors as [`Self::eval_at`].
+    pub fn eval_at_with_type(
+        &self,
+        chunk: &DataChunk,
+        row: usize,
+    ) -> grafeo_common::utils::error::Result<(Option<Value>, Option<LogicalType>)> {
+        self.eval_with_provenance(chunk, row)
+            .map(|(value, provenance)| (value, provenance.logical_type()))
+    }
+
+    fn eval_with_provenance(
+        &self,
+        chunk: &DataChunk,
+        row: usize,
+    ) -> grafeo_common::utils::error::Result<(Option<Value>, ValueProvenance)> {
+        let error = std::cell::Cell::new(None);
+        let evaluation = ExpressionEvaluation {
+            predicate: self,
+            error: &error,
+            locals: None,
+        };
+        let (value, provenance) = evaluation.eval_typed(&self.expression, chunk, row);
+        match error.into_inner() {
+            Some(error) => Err(error),
+            None => Ok((value, provenance)),
+        }
+    }
+}
+
+/// Only typed bindings and evaluated entity-producing expressions establish
+/// provenance. Raw scalar results such as id(edge) remain ordinary values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ValueProvenance {
+    #[default]
+    Ordinary,
+    Node,
+    Edge,
+    EdgeList,
+}
+
+impl ValueProvenance {
+    fn from_type(data_type: &LogicalType) -> Self {
+        match data_type {
+            LogicalType::Node => Self::Node,
+            LogicalType::Edge => Self::Edge,
+            LogicalType::List(item) if item.as_ref() == &LogicalType::Edge => Self::EdgeList,
+            _ => Self::Ordinary,
+        }
+    }
+
+    fn logical_type(self) -> Option<LogicalType> {
+        match self {
+            Self::Ordinary => None,
+            Self::Node => Some(LogicalType::Node),
+            Self::Edge => Some(LogicalType::Edge),
+            Self::EdgeList => Some(LogicalType::List(Box::new(LogicalType::Edge))),
+        }
+    }
+
+    fn item(self) -> Self {
+        if self == Self::EdgeList {
+            Self::Edge
+        } else {
+            Self::Ordinary
+        }
+    }
+}
+
+/// A borrowed lexical frame lives only for its item's evaluation. A child
+/// shadows matching outer names without cloning the row, AST, or name map.
+struct LexicalBinding<'a> {
+    parent: Option<&'a LexicalBinding<'a>>,
+    name: &'a str,
+    value: &'a Value,
+    provenance: ValueProvenance,
+    // reduce historically returns NULL for missing local map properties;
+    // list comprehensions omit missing values instead.
+    missing_map_property_is_null: bool,
+}
+
+enum ResolvedBinding<'a> {
+    Column(&'a ValueVector),
+    Local(&'a LexicalBinding<'a>),
+}
+
+impl ResolvedBinding<'_> {
+    fn get_value(&self, row: usize) -> Option<Value> {
+        match self {
+            Self::Column(column) => column.get_value(row),
+            Self::Local(binding) => Some(binding.value.clone()),
+        }
+    }
+
+    fn provenance(&self) -> ValueProvenance {
+        match self {
+            Self::Column(column) => ValueProvenance::from_type(column.data_type()),
+            Self::Local(binding) => binding.provenance,
+        }
+    }
+
+    fn get_node_id(&self, row: usize) -> Option<NodeId> {
+        match self {
+            Self::Column(column) => column.get_node_id(row),
+            Self::Local(binding) if binding.provenance == ValueProvenance::Node => {
+                // reason: entity IDs use the established i64/u64 round-trip encoding
+                #[allow(clippy::cast_sign_loss)]
+                if let Value::Int64(id) = binding.value {
+                    Some(NodeId(*id as u64))
+                } else {
+                    None
+                }
+            }
+            Self::Local(_) => None,
+        }
+    }
+
+    fn get_edge_id(&self, row: usize) -> Option<EdgeId> {
+        match self {
+            Self::Column(column) => column.get_edge_id(row),
+            Self::Local(binding) if binding.provenance == ValueProvenance::Edge => {
+                // reason: entity IDs use the established i64/u64 round-trip encoding
+                #[allow(clippy::cast_sign_loss)]
+                if let Value::Int64(id) = binding.value {
+                    Some(EdgeId(*id as u64))
+                } else {
+                    None
+                }
+            }
+            Self::Local(_) => None,
+        }
+    }
+}
+
+/// One borrowed evaluation shares its first-error slot with lexical children.
+struct ExpressionEvaluation<'a> {
+    predicate: &'a ExpressionPredicate,
+    error: &'a std::cell::Cell<Option<grafeo_common::utils::error::Error>>,
+    locals: Option<&'a LexicalBinding<'a>>,
+}
+
+impl std::ops::Deref for ExpressionEvaluation<'_> {
+    type Target = ExpressionPredicate;
+
+    fn deref(&self) -> &Self::Target {
+        self.predicate
+    }
+}
+
+impl ExpressionEvaluation<'_> {
+    fn binding<'a>(&'a self, name: &str, chunk: &'a DataChunk) -> Option<ResolvedBinding<'a>> {
+        let mut local = self.locals;
+        while let Some(binding) = local {
+            if binding.name == name {
+                return Some(ResolvedBinding::Local(binding));
+            }
+            local = binding.parent;
+        }
+        let index = *self.variable_columns.get(name)?;
+        Some(ResolvedBinding::Column(chunk.column(index)?))
     }
 
     fn eval_expr(&self, expr: &FilterExpression, chunk: &DataChunk, row: usize) -> Option<Value> {
+        self.eval_typed(expr, chunk, row).0
+    }
+
+    fn eval_typed(
+        &self,
+        expr: &FilterExpression,
+        chunk: &DataChunk,
+        row: usize,
+    ) -> (Option<Value>, ValueProvenance) {
+        let mut provenance = ValueProvenance::Ordinary;
+        let value = self.eval_expr_inner(expr, chunk, row, &mut provenance);
+        if value.is_none() {
+            provenance = ValueProvenance::Ordinary;
+        }
+        (value, provenance)
+    }
+
+    fn eval_expr_inner(
+        &self,
+        expr: &FilterExpression,
+        chunk: &DataChunk,
+        row: usize,
+        provenance: &mut ValueProvenance,
+    ) -> Option<Value> {
         match expr {
             FilterExpression::Literal(v) => Some(v.clone()),
             FilterExpression::Variable(name) => {
-                let col_idx = *self.variable_columns.get(name)?;
-                chunk.column(col_idx)?.get_value(row)
+                let binding = self.binding(name, chunk)?;
+                *provenance = binding.provenance();
+                binding.get_value(row)
             }
             FilterExpression::Property { variable, property } => {
-                let col_idx = *self.variable_columns.get(variable)?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(variable, chunk)?;
+                if let ResolvedBinding::Local(binding) = &col
+                    && binding.missing_map_property_is_null
+                    && let Value::Map(map) = binding.value
+                {
+                    return Some(
+                        map.get(&PropertyKey::new(property))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                if let ResolvedBinding::Local(binding) = &col
+                    && binding.provenance == ValueProvenance::Edge
+                    && let Some(edge_id) = col.get_edge_id(row)
+                {
+                    return Some(
+                        self.resolve_edge(edge_id)
+                            .and_then(|edge| {
+                                edge.properties.get(&PropertyKey::new(property)).cloned()
+                            })
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                let prop_key = grafeo_common::types::PropertyKey::new(property.as_str());
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let tx = self.transaction_id;
                 // Try as node first
                 if let Some(node_id) = col.get_node_id(row)
-                    && let Some(node) = self.resolve_node(node_id)
+                    && let result @ Some(_) = self
+                        .store
+                        .read_node_property_visible(node_id, &prop_key, snap_epoch, tx)
                 {
-                    return node.get_property(property).cloned();
+                    return result;
                 }
-                // Try as edge if node lookup failed
+                // Try as edge if node lookup returned nothing
                 if let Some(edge_id) = col.get_edge_id(row)
-                    && let Some(edge) = self.resolve_edge(edge_id)
+                    && let result @ Some(_) = self
+                        .store
+                        .read_edge_property_visible(edge_id, &prop_key, snap_epoch, tx)
                 {
-                    return edge.get_property(property).cloned();
+                    return result;
                 }
                 // Try as map value (e.g. from UNWIND with map elements)
                 if let Some(Value::Map(map)) = col.get_value(row) {
-                    let key = grafeo_common::types::PropertyKey::new(property);
-                    return map.get(&key).cloned();
+                    return map.get(&prop_key).cloned();
                 }
                 None
             }
@@ -661,13 +962,21 @@ impl ExpressionPredicate {
                 self.eval_unary_op(*op, val)
             }
             FilterExpression::FunctionCall { name, args } => {
-                self.eval_function(name, args, chunk, row)
+                self.eval_function(name, args, chunk, row, provenance)
             }
             FilterExpression::List(items) => {
-                let values: Vec<Value> = items
-                    .iter()
-                    .filter_map(|item| self.eval_expr(item, chunk, row))
-                    .collect();
+                let mut values = Vec::new();
+                let mut all_edges = true;
+                for item in items {
+                    let (value, kind) = self.eval_typed(item, chunk, row);
+                    if let Some(value) = value {
+                        all_edges &= kind == ValueProvenance::Edge;
+                        values.push(value);
+                    }
+                }
+                if all_edges && !values.is_empty() {
+                    *provenance = ValueProvenance::EdgeList;
+                }
                 Some(Value::List(values.into()))
             }
             FilterExpression::Map(pairs) => {
@@ -687,7 +996,8 @@ impl ExpressionPredicate {
                 Some(Value::Map(Arc::new(map)))
             }
             FilterExpression::IndexAccess { base, index } => {
-                let base_val = self.eval_expr(base, chunk, row)?;
+                let (base_val, base_provenance) = self.eval_typed(base, chunk, row);
+                let base_val = base_val?;
                 let index_val = self.eval_expr(index, chunk, row)?;
                 match (&base_val, &index_val) {
                     (Value::List(items), Value::Int64(i)) => {
@@ -704,6 +1014,7 @@ impl ExpressionPredicate {
                         } else {
                             *i as usize
                         };
+                        *provenance = base_provenance.item();
                         items.get(idx).cloned()
                     }
                     (Value::String(s), Value::Int64(i)) => {
@@ -731,18 +1042,26 @@ impl ExpressionPredicate {
                         // Node/edge bracket access: n['name'] looks up a property
                         // via the store when the base variable refers to a node or edge.
                         if let FilterExpression::Variable(var) = base.as_ref()
-                            && let Some(&col_idx) = self.variable_columns.get(var)
-                            && let Some(col) = chunk.column(col_idx)
+                            && let Some(col) = self.binding(var, chunk)
                         {
+                            let prop_key = grafeo_common::types::PropertyKey::new(key.as_str());
+                            let snap_epoch = self
+                                .viewing_epoch
+                                .unwrap_or_else(|| self.store.current_epoch());
+                            let tx = self.transaction_id;
                             if let Some(node_id) = col.get_node_id(row)
-                                && let Some(node) = self.resolve_node(node_id)
+                                && let result @ Some(_) = self
+                                    .store
+                                    .read_node_property_visible(node_id, &prop_key, snap_epoch, tx)
                             {
-                                return node.get_property(key.as_str()).cloned();
+                                return result;
                             }
                             if let Some(edge_id) = col.get_edge_id(row)
-                                && let Some(edge) = self.resolve_edge(edge_id)
+                                && let result @ Some(_) = self
+                                    .store
+                                    .read_edge_property_visible(edge_id, &prop_key, snap_epoch, tx)
                             {
-                                return edge.get_property(key.as_str()).cloned();
+                                return result;
                             }
                         }
                         None
@@ -751,7 +1070,8 @@ impl ExpressionPredicate {
                 }
             }
             FilterExpression::SliceAccess { base, start, end } => {
-                let base_val = self.eval_expr(base, chunk, row)?;
+                let (base_val, base_provenance) = self.eval_typed(base, chunk, row);
+                let base_val = base_val?;
                 let start_idx = start
                     .as_ref()
                     .and_then(|s| self.eval_expr(s, chunk, row))
@@ -768,6 +1088,7 @@ impl ExpressionPredicate {
 
                 match &base_val {
                     Value::List(items) => {
+                        *provenance = base_provenance;
                         let end_idx = end
                             .as_ref()
                             .and_then(|e| self.eval_expr(e, chunk, row))
@@ -828,10 +1149,10 @@ impl ExpressionPredicate {
                 else_clause.as_deref(),
                 chunk,
                 row,
+                provenance,
             ),
             FilterExpression::Id(variable) => {
-                let col_idx = *self.variable_columns.get(variable)?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(variable, chunk)?;
                 // Try as node first, then as edge
                 if let Some(node_id) = col.get_node_id(row) {
                     // reason: entity IDs stored as i64 values, standard encoding
@@ -849,23 +1170,28 @@ impl ExpressionPredicate {
                 }
             }
             FilterExpression::Labels(variable) => {
-                let col_idx = *self.variable_columns.get(variable)?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(variable, chunk)?;
                 let node_id = col.get_node_id(row)?;
-                let node = self.resolve_node(node_id)?;
+                // Guard: skip if node does not exist (preserves prior None semantics).
+                self.resolve_node(node_id)?;
+                // Route through the snapshot-aware accessor so that uncommitted
+                // label ops in the writing transaction are reflected here.
+                // (Behavior-preserving: delta is empty until Task 4 buffers writes.)
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set =
+                    self.store
+                        .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
                 // Sort labels so sets with the same members always produce
                 // the same list, regardless of internal storage order.
-                let mut sorted: Vec<&arcstr::ArcStr> = node.labels.iter().collect();
+                let mut sorted: Vec<arcstr::ArcStr> = label_set.into_iter().collect();
                 sorted.sort();
-                let labels: Vec<Value> = sorted
-                    .into_iter()
-                    .map(|l| Value::String(l.clone()))
-                    .collect();
+                let labels: Vec<Value> = sorted.into_iter().map(Value::String).collect();
                 Some(Value::List(labels.into()))
             }
             FilterExpression::Type(variable) => {
-                let col_idx = *self.variable_columns.get(variable)?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(variable, chunk)?;
                 let edge_id = col.get_edge_id(row)?;
                 let edge = self.resolve_edge(edge_id)?;
                 Some(Value::String(edge.edge_type.clone()))
@@ -876,46 +1202,49 @@ impl ExpressionPredicate {
                 filter_expr,
                 map_expr,
             } => {
-                // Evaluate the source list (accept both List and Vector)
-                let list_val = self.eval_expr(list_expr, chunk, row)?;
+                let (list_val, list_provenance) = self.eval_typed(list_expr, chunk, row);
+                let list_val = list_val?;
                 let owned_items: Vec<Value>;
                 let items: &[Value] = match &list_val {
                     Value::List(list) => list,
-                    Value::Vector(vec) => {
-                        owned_items = vec.iter().map(|&f| Value::Float64(f64::from(f))).collect();
+                    Value::Vector(vector) => {
+                        owned_items = vector
+                            .iter()
+                            .map(|&value| Value::Float64(f64::from(value)))
+                            .collect();
                         &owned_items
                     }
                     _ => return None,
                 };
-
-                // Build the result list by iterating over source items
                 let mut result = Vec::new();
+                let mut all_edges = true;
                 for item in items {
-                    // Create a temporary context with the iteration variable bound
-                    // For now, we'll do a simplified version that works for literals
-                    // A full implementation would need to create a sub-evaluator
-
-                    // Check filter predicate if present
-                    let passes_filter = if let Some(filter) = filter_expr {
-                        // Simplified: evaluate filter with item as context
-                        // This works for simple cases like x > 5
-                        matches!(
-                            self.eval_comprehension_expr(filter, item, variable),
-                            Some(Value::Bool(true))
-                        )
-                    } else {
-                        true
+                    let binding = LexicalBinding {
+                        parent: self.locals,
+                        name: variable,
+                        value: item,
+                        provenance: list_provenance.item(),
+                        missing_map_property_is_null: false,
                     };
-
-                    if passes_filter {
-                        // Apply the mapping expression
-                        if let Some(mapped) = self.eval_comprehension_expr(map_expr, item, variable)
-                        {
+                    let child = ExpressionEvaluation {
+                        predicate: self.predicate,
+                        error: self.error,
+                        locals: Some(&binding),
+                    };
+                    let passes = filter_expr.as_ref().is_none_or(|filter| {
+                        matches!(child.eval_expr(filter, chunk, row), Some(Value::Bool(true)))
+                    });
+                    if passes {
+                        let (mapped, kind) = child.eval_typed(map_expr, chunk, row);
+                        if let Some(mapped) = mapped {
+                            all_edges &= kind == ValueProvenance::Edge;
                             result.push(mapped);
                         }
                     }
                 }
-
+                if all_edges && !result.is_empty() {
+                    *provenance = ValueProvenance::EdgeList;
+                }
                 Some(Value::List(result.into()))
             }
             FilterExpression::ListPredicate {
@@ -924,39 +1253,47 @@ impl ExpressionPredicate {
                 list_expr,
                 predicate,
             } => {
-                let list_val = self.eval_expr(list_expr, chunk, row)?;
-                // Accept both List and Vector as iterable sequences
-                let items: Vec<&Value>;
-                let vec_items: Vec<Value>;
-                match &list_val {
-                    Value::List(list) => {
-                        items = list.iter().collect();
-                    }
-                    Value::Vector(vec) => {
-                        vec_items = vec.iter().map(|&f| Value::Float64(f64::from(f))).collect();
-                        items = vec_items.iter().collect();
+                let (list_val, list_provenance) = self.eval_typed(list_expr, chunk, row);
+                let list_val = list_val?;
+                let owned_items: Vec<Value>;
+                let items: &[Value] = match &list_val {
+                    Value::List(list) => list,
+                    Value::Vector(vector) => {
+                        owned_items = vector
+                            .iter()
+                            .map(|&value| Value::Float64(f64::from(value)))
+                            .collect();
+                        &owned_items
                     }
                     _ => return None,
-                }
-
-                let mut match_count: u32 = 0;
-                for item in &items {
-                    let result = self.eval_comprehension_expr(predicate, item, variable);
-                    if matches!(result, Some(Value::Bool(true))) {
+                };
+                let mut match_count = 0usize;
+                for item in items {
+                    let binding = LexicalBinding {
+                        parent: self.locals,
+                        name: variable,
+                        value: item,
+                        provenance: list_provenance.item(),
+                        missing_map_property_is_null: false,
+                    };
+                    let child = ExpressionEvaluation {
+                        predicate: self.predicate,
+                        error: self.error,
+                        locals: Some(&binding),
+                    };
+                    if matches!(
+                        child.eval_expr(predicate, chunk, row),
+                        Some(Value::Bool(true))
+                    ) {
                         match_count += 1;
                     }
                 }
-
-                let result = match kind {
-                    // reason: list length is bounded by practical sizes, fits u32
-                    #[allow(clippy::cast_possible_truncation)]
-                    ListPredicateKind::All => match_count == items.len() as u32,
+                Some(Value::Bool(match kind {
+                    ListPredicateKind::All => match_count == items.len(),
                     ListPredicateKind::Any => match_count > 0,
                     ListPredicateKind::None => match_count == 0,
                     ListPredicateKind::Single => match_count == 1,
-                };
-
-                Some(Value::Bool(result))
+                }))
             }
             FilterExpression::ExistsSubquery {
                 start_var,
@@ -968,8 +1305,7 @@ impl ExpressionPredicate {
                 ..
             } => {
                 // Get the start node ID from the current row
-                let col_idx = *self.variable_columns.get(start_var)?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(start_var, chunk)?;
                 let start_node_id = col.get_node_id(row)?;
 
                 // Check if any matching edges exist
@@ -989,8 +1325,7 @@ impl ExpressionPredicate {
                 edge_types,
                 end_labels,
             } => {
-                let col_idx = *self.variable_columns.get(start_var)?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(start_var, chunk)?;
                 let start_node_id = col.get_node_id(row)?;
 
                 let count = self
@@ -1013,313 +1348,51 @@ impl ExpressionPredicate {
                 list,
                 expression,
             } => {
-                let init_val = self.eval_expr(initial, chunk, row)?;
-                let list_val = self.eval_expr(list, chunk, row)?;
+                let (initial_value, mut acc_provenance) = self.eval_typed(initial, chunk, row);
+                let mut acc = initial_value?;
+                let (list_value, list_provenance) = self.eval_typed(list, chunk, row);
+                let list_value = list_value?;
                 let owned_items: Vec<Value>;
-                let items: &[Value] = match &list_val {
+                let items: &[Value] = match &list_value {
                     Value::List(list) => list,
-                    Value::Vector(vec) => {
-                        owned_items = vec.iter().map(|&f| Value::Float64(f64::from(f))).collect();
+                    Value::Vector(vector) => {
+                        owned_items = vector
+                            .iter()
+                            .map(|&value| Value::Float64(f64::from(value)))
+                            .collect();
                         &owned_items
                     }
                     _ => return None,
                 };
-                let mut acc = init_val;
                 for item in items {
-                    acc = self.eval_reduce_expr(
-                        expression,
-                        &acc,
-                        accumulator,
-                        item,
-                        variable,
-                        (chunk, row),
-                    )?;
+                    let item_binding = LexicalBinding {
+                        parent: self.locals,
+                        name: variable,
+                        value: item,
+                        provenance: list_provenance.item(),
+                        missing_map_property_is_null: true,
+                    };
+                    // The old reducer resolves the accumulator first if the
+                    // two local names coincide; preserve that precedence.
+                    let acc_binding = LexicalBinding {
+                        parent: Some(&item_binding),
+                        name: accumulator,
+                        value: &acc,
+                        provenance: acc_provenance,
+                        missing_map_property_is_null: true,
+                    };
+                    let child = ExpressionEvaluation {
+                        predicate: self.predicate,
+                        error: self.error,
+                        locals: Some(&acc_binding),
+                    };
+                    let (value, kind) = child.eval_typed(expression, chunk, row);
+                    acc = value?;
+                    acc_provenance = kind;
                 }
+                *provenance = acc_provenance;
                 Some(acc)
             }
-        }
-    }
-
-    /// Evaluates an expression in the context of a reduce() call.
-    ///
-    /// Both the accumulator variable and the iteration variable are bound.
-    /// The `ctx` parameter provides chunk context `(chunk, row)` for resolving
-    /// outer-scope variables (variables not bound by reduce).
-    fn eval_reduce_expr(
-        &self,
-        expr: &FilterExpression,
-        acc_val: &Value,
-        acc_name: &str,
-        item_val: &Value,
-        item_name: &str,
-        ctx: (&DataChunk, usize),
-    ) -> Option<Value> {
-        // Closure for recursive calls with all bindings
-        let recurse = |e| self.eval_reduce_expr(e, acc_val, acc_name, item_val, item_name, ctx);
-        match expr {
-            FilterExpression::Variable(name) if name == acc_name => Some(acc_val.clone()),
-            FilterExpression::Variable(name) if name == item_name => Some(item_val.clone()),
-            FilterExpression::Literal(v) => Some(v.clone()),
-            FilterExpression::Binary { left, op, right } => {
-                // IN operator needs special handling: right side is a list
-                if *op == BinaryFilterOp::In {
-                    let l = recurse(left)?;
-                    let r = recurse(right)?;
-                    return match r {
-                        Value::List(items) => {
-                            if l.is_null() {
-                                return Some(Value::Null);
-                            }
-                            let mut has_null = false;
-                            for v in items.iter() {
-                                if v.is_null() {
-                                    has_null = true;
-                                } else if Self::values_equal(&l, v) {
-                                    return Some(Value::Bool(true));
-                                }
-                            }
-                            if has_null {
-                                Some(Value::Null)
-                            } else {
-                                Some(Value::Bool(false))
-                            }
-                        }
-                        _ => None,
-                    };
-                }
-                let l = recurse(left)?;
-                let r = recurse(right)?;
-                self.eval_binary_op(&l, *op, &r)
-            }
-            FilterExpression::Unary { op, operand } => {
-                let val = recurse(operand);
-                self.eval_unary_op(*op, val)
-            }
-            FilterExpression::Property {
-                variable: var,
-                property,
-            } if var == item_name => {
-                if let Value::Map(map) = item_val {
-                    Some(
-                        map.iter()
-                            .find(|(k, _)| k.as_str() == property)
-                            .map_or(Value::Null, |(_, v)| v.clone()),
-                    )
-                } else {
-                    None
-                }
-            }
-            FilterExpression::Property {
-                variable: var,
-                property,
-            } if var == acc_name => {
-                if let Value::Map(map) = acc_val {
-                    Some(
-                        map.iter()
-                            .find(|(k, _)| k.as_str() == property)
-                            .map_or(Value::Null, |(_, v)| v.clone()),
-                    )
-                } else {
-                    None
-                }
-            }
-            FilterExpression::List(items) => {
-                let values: Vec<Value> = items.iter().filter_map(&recurse).collect();
-                Some(Value::List(values.into()))
-            }
-            FilterExpression::Case {
-                operand,
-                when_clauses,
-                else_clause,
-            } => {
-                if let Some(test_expr) = operand.as_deref() {
-                    let test_val = recurse(test_expr)?;
-                    for (when_expr, then_expr) in when_clauses {
-                        let when_val = recurse(when_expr)?;
-                        if Self::values_equal(&test_val, &when_val) {
-                            return recurse(then_expr);
-                        }
-                    }
-                } else {
-                    for (when_expr, then_expr) in when_clauses {
-                        let when_val = recurse(when_expr)?;
-                        if when_val.as_bool() == Some(true) {
-                            return recurse(then_expr);
-                        }
-                    }
-                }
-                if let Some(else_expr) = else_clause.as_deref() {
-                    recurse(else_expr)
-                } else {
-                    Some(Value::Null)
-                }
-            }
-            FilterExpression::IndexAccess { base, index } => {
-                let base_val = recurse(base)?;
-                let index_val = recurse(index)?;
-                match (&base_val, &index_val) {
-                    (Value::List(items), Value::Int64(i)) => {
-                        // reason: list/string lengths fit i64; index values are user-provided
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_possible_wrap,
-                            clippy::cast_sign_loss
-                        )]
-                        let idx = if *i < 0 {
-                            let len = items.len() as i64;
-                            (len + i) as usize
-                        } else {
-                            *i as usize
-                        };
-                        items.get(idx).cloned()
-                    }
-                    (Value::String(s), Value::Int64(i)) => {
-                        // reason: list/string lengths fit i64; index values are user-provided
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_possible_wrap,
-                            clippy::cast_sign_loss
-                        )]
-                        let idx = if *i < 0 {
-                            let len = s.len() as i64;
-                            (len + i) as usize
-                        } else {
-                            *i as usize
-                        };
-                        s.chars()
-                            .nth(idx)
-                            .map(|c| Value::String(c.to_string().into()))
-                    }
-                    (Value::Map(m), Value::String(key)) => {
-                        let prop_key = PropertyKey::new(key.as_str());
-                        m.get(&prop_key).cloned()
-                    }
-                    _ => None,
-                }
-            }
-            // For expressions not referencing the local variables, resolve
-            // from the outer scope (chunk/row)
-            _ => self.eval_expr(expr, ctx.0, ctx.1),
-        }
-    }
-
-    /// Evaluates an expression in the context of a list comprehension.
-    /// The `item` is the current iteration value bound to `variable`.
-    fn eval_comprehension_expr(
-        &self,
-        expr: &FilterExpression,
-        item: &Value,
-        variable: &str,
-    ) -> Option<Value> {
-        match expr {
-            FilterExpression::Variable(name) if name == variable => Some(item.clone()),
-            FilterExpression::Literal(v) => Some(v.clone()),
-            FilterExpression::Binary { left, op, right } => {
-                // IN operator needs special handling: right side is a list
-                if *op == BinaryFilterOp::In {
-                    let left_val = self.eval_comprehension_expr(left, item, variable)?;
-                    let right_val = self.eval_comprehension_expr(right, item, variable)?;
-                    return match right_val {
-                        Value::List(items) => {
-                            if left_val.is_null() {
-                                return Some(Value::Null);
-                            }
-                            let mut has_null = false;
-                            for v in items.iter() {
-                                if v.is_null() {
-                                    has_null = true;
-                                } else if Self::values_equal(&left_val, v) {
-                                    return Some(Value::Bool(true));
-                                }
-                            }
-                            if has_null {
-                                Some(Value::Null)
-                            } else {
-                                Some(Value::Bool(false))
-                            }
-                        }
-                        _ => None,
-                    };
-                }
-                let left_val = self.eval_comprehension_expr(left, item, variable)?;
-                let right_val = self.eval_comprehension_expr(right, item, variable)?;
-                self.eval_binary_op(&left_val, *op, &right_val)
-            }
-            FilterExpression::Unary { op, operand } => {
-                let val = self.eval_comprehension_expr(operand, item, variable);
-                self.eval_unary_op(*op, val)
-            }
-            FilterExpression::Property {
-                variable: var,
-                property,
-            } if var == variable => {
-                // Property access on the iteration variable
-                if let Value::Map(m) = item {
-                    let key = PropertyKey::new(property.as_str());
-                    m.get(&key).cloned()
-                } else {
-                    None
-                }
-            }
-            FilterExpression::List(items) => {
-                let values: Vec<Value> = items
-                    .iter()
-                    .filter_map(|i| self.eval_comprehension_expr(i, item, variable))
-                    .collect();
-                Some(Value::List(values.into()))
-            }
-            FilterExpression::Case {
-                operand,
-                when_clauses,
-                else_clause,
-            } => self.eval_case_in_comprehension(
-                operand.as_deref(),
-                when_clauses,
-                else_clause.as_deref(),
-                item,
-                variable,
-            ),
-            // For other expression types, return None (unsupported in comprehension)
-            _ => None,
-        }
-    }
-
-    /// Evaluates a CASE expression inside a list comprehension or predicate context.
-    fn eval_case_in_comprehension(
-        &self,
-        operand: Option<&FilterExpression>,
-        when_clauses: &[(FilterExpression, FilterExpression)],
-        else_clause: Option<&FilterExpression>,
-        item: &Value,
-        variable: &str,
-    ) -> Option<Value> {
-        if let Some(test_expr) = operand {
-            let test_val = self
-                .eval_comprehension_expr(test_expr, item, variable)
-                .unwrap_or(Value::Null);
-            for (when_expr, then_expr) in when_clauses {
-                let when_val = self
-                    .eval_comprehension_expr(when_expr, item, variable)
-                    .unwrap_or(Value::Null);
-                if !test_val.is_null()
-                    && !when_val.is_null()
-                    && Self::values_equal(&test_val, &when_val)
-                {
-                    return self.eval_comprehension_expr(then_expr, item, variable);
-                }
-            }
-        } else {
-            for (when_expr, then_expr) in when_clauses {
-                let when_val = self.eval_comprehension_expr(when_expr, item, variable)?;
-                if when_val.as_bool() == Some(true) {
-                    return self.eval_comprehension_expr(then_expr, item, variable);
-                }
-            }
-        }
-        if let Some(else_expr) = else_clause {
-            self.eval_comprehension_expr(else_expr, item, variable)
-        } else {
-            Some(Value::Null)
         }
     }
 
@@ -1364,14 +1437,10 @@ impl ExpressionPredicate {
                     Some(Value::Bool(!Self::values_equal(left, right)))
                 }
             }
-            BinaryFilterOp::Lt => self.compare_values(left, right).map(|c| Value::Bool(c < 0)),
-            BinaryFilterOp::Le => self
-                .compare_values(left, right)
-                .map(|c| Value::Bool(c <= 0)),
-            BinaryFilterOp::Gt => self.compare_values(left, right).map(|c| Value::Bool(c > 0)),
-            BinaryFilterOp::Ge => self
-                .compare_values(left, right)
-                .map(|c| Value::Bool(c >= 0)),
+            BinaryFilterOp::Lt => Self::compare_values(left, right).map(|c| Value::Bool(c < 0)),
+            BinaryFilterOp::Le => Self::compare_values(left, right).map(|c| Value::Bool(c <= 0)),
+            BinaryFilterOp::Gt => Self::compare_values(left, right).map(|c| Value::Bool(c > 0)),
+            BinaryFilterOp::Ge => Self::compare_values(left, right).map(|c| Value::Bool(c >= 0)),
             // Arithmetic operators
             BinaryFilterOp::Add => {
                 // String concatenation: string + string, or string + other
@@ -1653,16 +1722,17 @@ impl ExpressionPredicate {
         args: &[FilterExpression],
         chunk: &DataChunk,
         row: usize,
+        provenance: &mut ValueProvenance,
     ) -> Option<Value> {
         let name_lower = name.to_lowercase();
         let name = name_lower.as_str();
         self.eval_graph_element_fn(name, args, chunk, row)
             .or_else(|| self.eval_type_fn(name, args, chunk, row))
-            .or_else(|| self.eval_collection_fn(name, args, chunk, row))
+            .or_else(|| self.eval_collection_fn(name, args, chunk, row, provenance))
             .or_else(|| self.eval_string_fn(name, args, chunk, row))
             .or_else(|| self.eval_numeric_fn(name, args, chunk, row))
             .or_else(|| self.eval_temporal_fn(name, args, chunk, row))
-            .or_else(|| self.eval_path_fn(name, args, chunk, row))
+            .or_else(|| self.eval_path_fn(name, args, chunk, row, provenance))
             .or_else(|| self.eval_vector_fn(name, args, chunk, row))
             .or_else(|| self.eval_text_fn(name, args, chunk, row))
             .or_else(|| self.eval_session_fn(name, args, chunk, row))
@@ -1681,8 +1751,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     if let Some(node_id) = col.get_node_id(row) {
                         // reason: entity IDs stored as i64, standard encoding
                         #[allow(clippy::cast_possible_wrap)]
@@ -1700,8 +1769,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     // Resolve ambiguity between node/edge by verifying against the
                     // store. VectorData::Generic stores raw Int64 values that both
                     // get_node_id and get_edge_id accept, so we must check which
@@ -1724,16 +1792,23 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     let node_id = col.get_node_id(row)?;
-                    let node = self.resolve_node(node_id)?;
-                    let mut sorted: Vec<&arcstr::ArcStr> = node.labels.iter().collect();
+                    // Guard: skip if node does not exist.
+                    self.resolve_node(node_id)?;
+                    // Route through the snapshot-aware accessor so that uncommitted
+                    // label ops in the writing transaction are reflected here.
+                    let snap_epoch = self
+                        .viewing_epoch
+                        .unwrap_or_else(|| self.store.current_epoch());
+                    let label_set = self.store.read_node_labels_visible(
+                        node_id,
+                        snap_epoch,
+                        self.transaction_id,
+                    );
+                    let mut sorted: Vec<arcstr::ArcStr> = label_set.into_iter().collect();
                     sorted.sort();
-                    let labels: Vec<Value> = sorted
-                        .into_iter()
-                        .map(|l| Value::String(l.clone()))
-                        .collect();
+                    let labels: Vec<Value> = sorted.into_iter().map(Value::String).collect();
                     return Some(Value::List(labels.into()));
                 }
                 None
@@ -1743,8 +1818,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     let edge_id = col.get_edge_id(row)?;
                     let edge = self.resolve_edge(edge_id)?;
                     return Some(Value::String(edge.edge_type.clone()));
@@ -1757,8 +1831,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     let edge_id = col.get_edge_id(row)?;
                     let edge = self.resolve_edge(edge_id)?;
                     // reason: entity IDs stored as i64, standard encoding
@@ -1773,8 +1846,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     let edge_id = col.get_edge_id(row)?;
                     let edge = self.resolve_edge(edge_id)?;
                     // reason: entity IDs stored as i64, standard encoding
@@ -1793,24 +1865,23 @@ impl ExpressionPredicate {
                 };
                 // Try node first, then edge
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     if let Some(nid) = col.get_node_id(row)
-                        && let Some(node) = self.resolve_node(nid)
+                        && self.resolve_node(nid).is_some()
                     {
-                        let exists = node
-                            .properties
-                            .iter()
-                            .any(|(k, _)| k.as_str() == key.as_str());
+                        let exists = self
+                            .visible_node_properties(nid)
+                            .keys()
+                            .any(|k| k.as_str() == key.as_str());
                         return Some(Value::Bool(exists));
                     }
                     if let Some(eid) = col.get_edge_id(row)
-                        && let Some(edge) = self.resolve_edge(eid)
+                        && self.resolve_edge(eid).is_some()
                     {
-                        let exists = edge
-                            .properties
-                            .iter()
-                            .any(|(k, _)| k.as_str() == key.as_str());
+                        let exists = self
+                            .visible_edge_properties(eid)
+                            .keys()
+                            .any(|k| k.as_str() == key.as_str());
                         return Some(Value::Bool(exists));
                     }
                 }
@@ -1823,8 +1894,7 @@ impl ExpressionPredicate {
                 }
                 // First arg is the node variable
                 let node_id = if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     col.get_node_id(row)?
                 } else {
                     return None;
@@ -1833,9 +1903,16 @@ impl ExpressionPredicate {
                 let Value::String(label) = self.eval_expr(&args[1], chunk, row)? else {
                     return None;
                 };
-                // Check if the node has this label
-                let node = self.resolve_node(node_id)?;
-                let has_label = node.labels.iter().any(|l| l.as_str() == label.as_str());
+                // Check if the node has this label via the snapshot-aware accessor
+                // so uncommitted label ops in the writing transaction are reflected.
+                self.resolve_node(node_id)?;
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set =
+                    self.store
+                        .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
+                let has_label = label_set.iter().any(|l| l.as_str() == label.as_str());
                 Some(Value::Bool(has_label))
             }
             "issource" => {
@@ -1844,15 +1921,13 @@ impl ExpressionPredicate {
                     return None;
                 }
                 let node_id = if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     col.get_node_id(row)?
                 } else {
                     return None;
                 };
                 let edge_id = if let FilterExpression::Variable(var) = &args[1] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     col.get_edge_id(row)?
                 } else {
                     return None;
@@ -1866,15 +1941,13 @@ impl ExpressionPredicate {
                     return None;
                 }
                 let node_id = if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     col.get_node_id(row)?
                 } else {
                     return None;
                 };
                 let edge_id = if let FilterExpression::Variable(var) = &args[1] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     col.get_edge_id(row)?
                 } else {
                     return None;
@@ -1889,8 +1962,7 @@ impl ExpressionPredicate {
                 }
                 // In LPG, all edges are directed
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     // If the column contains an edge ID, it's directed
                     if col.get_edge_id(row).is_some() {
                         return Some(Value::Bool(true));
@@ -2049,6 +2121,7 @@ impl ExpressionPredicate {
         args: &[FilterExpression],
         chunk: &DataChunk,
         row: usize,
+        provenance: &mut ValueProvenance,
     ) -> Option<Value> {
         match name {
             "size" | "length" | "cardinality" => {
@@ -2071,10 +2144,12 @@ impl ExpressionPredicate {
             }
             "coalesce" => {
                 for arg in args {
-                    if let Some(val) = self.eval_expr(arg, chunk, row)
-                        && !matches!(val, Value::Null)
+                    let (value, kind) = self.eval_typed(arg, chunk, row);
+                    if let Some(value) = value
+                        && !value.is_null()
                     {
-                        return Some(val);
+                        *provenance = kind;
+                        return Some(value);
                     }
                 }
                 Some(Value::Null)
@@ -2094,14 +2169,13 @@ impl ExpressionPredicate {
                 }
                 // keys(n) on a node variable: get property keys from the store
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     if let Some(node_id) = col.get_node_id(row) {
-                        let node = self.resolve_node(node_id)?;
-                        let keys: Vec<Value> = node
-                            .properties
-                            .iter()
-                            .map(|(k, _)| Value::String(k.as_str().into()))
+                        self.resolve_node(node_id)?;
+                        let keys: Vec<Value> = self
+                            .visible_node_properties(node_id)
+                            .keys()
+                            .map(|k| Value::String(k.as_str().into()))
                             .collect();
                         return Some(Value::List(keys.into()));
                     }
@@ -2124,23 +2198,16 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     if let Some(node_id) = col.get_node_id(row) {
-                        let node = self.resolve_node(node_id)?;
-                        let map: std::collections::BTreeMap<PropertyKey, Value> = node
-                            .properties
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
+                        self.resolve_node(node_id)?;
+                        let map: std::collections::BTreeMap<PropertyKey, Value> =
+                            self.visible_node_properties(node_id).into_iter().collect();
                         return Some(Value::Map(Arc::new(map)));
                     } else if let Some(edge_id) = col.get_edge_id(row) {
-                        let edge = self.resolve_edge(edge_id)?;
-                        let map: std::collections::BTreeMap<PropertyKey, Value> = edge
-                            .properties
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
+                        self.resolve_edge(edge_id)?;
+                        let map: std::collections::BTreeMap<PropertyKey, Value> =
+                            self.visible_edge_properties(edge_id).into_iter().collect();
                         return Some(Value::Map(Arc::new(map)));
                     }
                 }
@@ -2153,17 +2220,20 @@ impl ExpressionPredicate {
                     return None;
                 }
                 if let FilterExpression::Variable(var) = &args[0] {
-                    let col_idx = *self.variable_columns.get(var)?;
-                    let col = chunk.column(col_idx)?;
+                    let col = self.binding(var, chunk)?;
                     if let Some(node_id) = col.get_node_id(row) {
-                        let node = self.resolve_node(node_id)?;
-                        let vals: Vec<Value> =
-                            node.properties.iter().map(|(_, v)| v.clone()).collect();
+                        self.resolve_node(node_id)?;
+                        let vals: Vec<Value> = self
+                            .visible_node_properties(node_id)
+                            .into_values()
+                            .collect();
                         return Some(Value::List(vals.into()));
                     } else if let Some(edge_id) = col.get_edge_id(row) {
-                        let edge = self.resolve_edge(edge_id)?;
-                        let vals: Vec<Value> =
-                            edge.properties.iter().map(|(_, v)| v.clone()).collect();
+                        self.resolve_edge(edge_id)?;
+                        let vals: Vec<Value> = self
+                            .visible_edge_properties(edge_id)
+                            .into_values()
+                            .collect();
                         return Some(Value::List(vals.into()));
                     }
                 }
@@ -2174,9 +2244,13 @@ impl ExpressionPredicate {
                 if args.len() != 1 {
                     return None;
                 }
-                let val = self.eval_expr(&args[0], chunk, row)?;
+                let (val, list_provenance) = self.eval_typed(&args[0], chunk, row);
+                let val = val?;
                 match val {
-                    Value::List(items) => items.first().cloned(),
+                    Value::List(items) => {
+                        *provenance = list_provenance.item();
+                        items.first().cloned()
+                    }
                     _ => None,
                 }
             }
@@ -2185,9 +2259,11 @@ impl ExpressionPredicate {
                 if args.len() != 1 {
                     return None;
                 }
-                let val = self.eval_expr(&args[0], chunk, row)?;
+                let (val, list_provenance) = self.eval_typed(&args[0], chunk, row);
+                let val = val?;
                 match val {
                     Value::List(items) => {
+                        *provenance = list_provenance;
                         if items.is_empty() {
                             Some(Value::List(vec![].into()))
                         } else {
@@ -2202,9 +2278,13 @@ impl ExpressionPredicate {
                 if args.len() != 1 {
                     return None;
                 }
-                let val = self.eval_expr(&args[0], chunk, row)?;
+                let (val, list_provenance) = self.eval_typed(&args[0], chunk, row);
+                let val = val?;
                 match val {
-                    Value::List(items) => items.last().cloned(),
+                    Value::List(items) => {
+                        *provenance = list_provenance.item();
+                        items.last().cloned()
+                    }
                     _ => None,
                 }
             }
@@ -2213,9 +2293,11 @@ impl ExpressionPredicate {
                 if args.len() != 1 {
                     return None;
                 }
-                let val = self.eval_expr(&args[0], chunk, row)?;
+                let (val, list_provenance) = self.eval_typed(&args[0], chunk, row);
+                let val = val?;
                 match val {
                     Value::List(items) => {
+                        *provenance = list_provenance;
                         let reversed: Vec<Value> = items.iter().rev().cloned().collect();
                         Some(Value::List(reversed.into()))
                     }
@@ -2281,14 +2363,12 @@ impl ExpressionPredicate {
                 let mut ids: Vec<u64> = Vec::with_capacity(args.len());
                 for arg in args {
                     if let FilterExpression::Variable(var) = arg {
-                        let col_idx = *self.variable_columns.get(var)?;
-                        let col = chunk.column(col_idx)?;
+                        let col = self.binding(var, chunk)?;
                         if let Some(nid) = col.get_node_id(row) {
                             ids.push(nid.0);
-                        } else if let Some(eid) = col.get_edge_id(row) {
-                            ids.push(eid.0);
                         } else {
-                            return None;
+                            let eid = col.get_edge_id(row)?;
+                            ids.push(eid.0);
                         }
                     } else {
                         return None;
@@ -2326,14 +2406,11 @@ impl ExpressionPredicate {
                 let mut first_id: Option<u64> = None;
                 for arg in args {
                     if let FilterExpression::Variable(var) = arg {
-                        let col_idx = *self.variable_columns.get(var)?;
-                        let col = chunk.column(col_idx)?;
+                        let col = self.binding(var, chunk)?;
                         let current_id = if let Some(nid) = col.get_node_id(row) {
                             nid.0
-                        } else if let Some(eid) = col.get_edge_id(row) {
-                            eid.0
                         } else {
-                            return None;
+                            col.get_edge_id(row)?.0
                         };
                         match first_id {
                             None => first_id = Some(current_id),
@@ -3205,6 +3282,7 @@ impl ExpressionPredicate {
         args: &[FilterExpression],
         chunk: &DataChunk,
         row: usize,
+        provenance: &mut ValueProvenance,
     ) -> Option<Value> {
         match name {
             "path" => {
@@ -3255,6 +3333,9 @@ impl ExpressionPredicate {
                 match val {
                     Value::Path { nodes, .. } => {
                         // Resolve Int64 node IDs to property maps for property access
+                        let snap_epoch = self
+                            .viewing_epoch
+                            .unwrap_or_else(|| self.store.current_epoch());
                         let resolved: Vec<Value> = nodes
                             .iter()
                             .map(|n| {
@@ -3270,11 +3351,16 @@ impl ExpressionPredicate {
                                             PropertyKey::new("_id"),
                                             Value::Int64(node.id.as_u64() as i64),
                                         );
-                                        let labels: Vec<Value> = node
-                                            .labels
-                                            .iter()
-                                            .map(|l| Value::String(l.clone()))
-                                            .collect();
+                                        // Route through the snapshot-aware accessor so that
+                                        // uncommitted label ops in the writing transaction
+                                        // are reflected here.
+                                        let label_set = self.store.read_node_labels_visible(
+                                            node_id,
+                                            snap_epoch,
+                                            self.transaction_id,
+                                        );
+                                        let labels: Vec<Value> =
+                                            label_set.into_iter().map(Value::String).collect();
                                         map.insert(
                                             PropertyKey::new("_labels"),
                                             Value::List(labels.into()),
@@ -3308,7 +3394,7 @@ impl ExpressionPredicate {
                     return None;
                 }
                 let val = self.eval_expr(&args[0], chunk, row)?;
-                match val {
+                let result = match val {
                     Value::Path { edges, .. } => Some(Value::List(edges)),
                     Value::Map(map) => map.get(&PropertyKey::from("edges")).cloned(),
                     Value::List(items) => {
@@ -3317,7 +3403,11 @@ impl ExpressionPredicate {
                         Some(Value::List(edges.into()))
                     }
                     _ => None,
+                };
+                if matches!(result, Some(Value::List(_))) {
+                    *provenance = ValueProvenance::EdgeList;
                 }
+                result
             }
             "isacyclic" => {
                 // isAcyclic(path) - true if no node appears more than once
@@ -3519,8 +3609,7 @@ impl ExpressionPredicate {
                 };
 
                 // Get node_id from the chunk
-                let col_idx = *self.variable_columns.get(variable.as_str())?;
-                let col = chunk.column(col_idx)?;
+                let col = self.binding(variable.as_str(), chunk)?;
                 let node_id = col.get_node_id(row)?;
 
                 // Second arg: query string
@@ -3529,12 +3618,46 @@ impl ExpressionPredicate {
                     return None;
                 };
 
-                // Get the node's labels and try each for a text index match
-                let node = self.resolve_node(node_id)?;
-                let score = node
-                    .labels
-                    .iter()
-                    .find_map(|label| self.store.score_text(node_id, label, property, query_str))?;
+                // Guard: skip if node does not exist.
+                self.resolve_node(node_id)?;
+                // Route through the snapshot-aware accessor so that uncommitted
+                // label ops in the writing transaction are reflected here.
+                let snap_epoch = self
+                    .viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch());
+                let label_set =
+                    self.store
+                        .read_node_labels_visible(node_id, snap_epoch, self.transaction_id);
+                // A viewing epoch is authoritative even without a transaction.
+                // A valid transaction additionally enables overlays and SSI.
+                let score = if let Some(epoch) = self.viewing_epoch {
+                    let tx = self.transaction_id.unwrap_or(TransactionId::INVALID);
+                    let mut score = None;
+                    for label in &label_set {
+                        match self
+                            .store
+                            .score_text_visible(node_id, label, property, query_str, epoch, tx)
+                        {
+                            Ok(Some(value)) => {
+                                score = Some(value);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.error.set(Some(match self.error.take() {
+                                    Some(first) => first,
+                                    None => error,
+                                }));
+                                return None;
+                            }
+                        }
+                    }
+                    score?
+                } else {
+                    label_set.iter().find_map(|label| {
+                        self.store.score_text(node_id, label, property, query_str)
+                    })?
+                };
 
                 if name == "text_match" {
                     Some(Value::Bool(score > 0.0))
@@ -3614,6 +3737,7 @@ impl ExpressionPredicate {
         else_clause: Option<&FilterExpression>,
         chunk: &DataChunk,
         row: usize,
+        provenance: &mut ValueProvenance,
     ) -> Option<Value> {
         if let Some(test_expr) = operand {
             // Simple CASE: CASE expr WHEN val1 THEN res1 ...
@@ -3627,7 +3751,7 @@ impl ExpressionPredicate {
                     && !when_val.is_null()
                     && Self::values_equal(&test_val, &when_val)
                 {
-                    return self.eval_expr(then_expr, chunk, row);
+                    return self.eval_expr_inner(then_expr, chunk, row, provenance);
                 }
             }
         } else {
@@ -3637,13 +3761,13 @@ impl ExpressionPredicate {
             for (when_expr, then_expr) in when_clauses {
                 let when_val = self.eval_expr(when_expr, chunk, row).unwrap_or(Value::Null);
                 if when_val.as_bool() == Some(true) {
-                    return self.eval_expr(then_expr, chunk, row);
+                    return self.eval_expr_inner(then_expr, chunk, row, provenance);
                 }
             }
         }
         // No match - return ELSE or NULL
         if let Some(else_expr) = else_clause {
-            self.eval_expr(else_expr, chunk, row)
+            self.eval_expr_inner(else_expr, chunk, row, provenance)
         } else {
             Some(Value::Null)
         }
@@ -3680,6 +3804,11 @@ impl ExpressionPredicate {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int64(a), Value::Int64(b)) => a == b,
             (Value::Float64(a), Value::Float64(b)) => (a - b).abs() < f64::EPSILON,
+            (Value::Date(a), Value::Date(b)) => a == b,
+            (Value::Time(a), Value::Time(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::Duration(a), Value::Duration(b)) => a == b,
+            (Value::ZonedDatetime(a), Value::ZonedDatetime(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Int64(a), Value::Float64(b)) | (Value::Float64(b), Value::Int64(a)) => {
                 (*a as f64 - b).abs() < f64::EPSILON
@@ -3790,7 +3919,41 @@ impl ExpressionPredicate {
         }
     }
 
-    fn compare_values(&self, left: &Value, right: &Value) -> Option<i32> {
+    /// Applies the same scalar predicate used by expression evaluation to an
+    /// indexed candidate. NULL never passes a WHERE predicate.
+    pub fn matches_property_index_predicate(
+        value: &Value,
+        predicate: crate::graph::PropertyIndexPredicate<'_>,
+    ) -> bool {
+        use crate::graph::PropertyIndexPredicate;
+        if value.is_null() {
+            return false;
+        }
+        match predicate {
+            PropertyIndexPredicate::Equal(expected) => {
+                !expected.is_null() && Self::values_equal(value, expected)
+            }
+            PropertyIndexPredicate::In(values) => values
+                .iter()
+                .any(|expected| !expected.is_null() && Self::values_equal(value, expected)),
+            PropertyIndexPredicate::Range {
+                min,
+                max,
+                min_inclusive,
+                max_inclusive,
+            } => {
+                min.is_none_or(|bound| {
+                    Self::compare_values(value, bound)
+                        .is_some_and(|order| order > 0 || (min_inclusive && order == 0))
+                }) && max.is_none_or(|bound| {
+                    Self::compare_values(value, bound)
+                        .is_some_and(|order| order < 0 || (max_inclusive && order == 0))
+                })
+            }
+        }
+    }
+
+    fn compare_values(left: &Value, right: &Value) -> Option<i32> {
         match (left, right) {
             (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b) as i32),
             (Value::Float64(a), Value::Float64(b)) => {
@@ -3832,11 +3995,16 @@ impl ExpressionPredicate {
 }
 
 impl Predicate for ExpressionPredicate {
-    fn evaluate(&self, chunk: &DataChunk, row: usize) -> bool {
-        match self.eval(chunk, row) {
-            Some(Value::Bool(b)) => b,
-            _ => false,
-        }
+    fn evaluate(&self, chunk: &DataChunk, row: usize) -> Result<bool, super::OperatorError> {
+        Ok(
+            match self
+                .eval_at(chunk, row)
+                .map_err(|error| super::OperatorError::Execution(error.to_string()))?
+            {
+                Some(Value::Bool(b)) => b,
+                _ => false,
+            },
+        )
     }
 }
 
@@ -3846,25 +4014,158 @@ pub struct FilterOperator {
     child: Box<dyn Operator>,
     /// Predicate to apply.
     predicate: Box<dyn Predicate>,
+    /// The installed query owner must remain observable while all rows are rejected.
+    cancellation: Option<crate::execution::QueryCancellationToken>,
+    /// Text-index (label, property) pairs whose reads must be recorded for SSI
+    /// anti-phantom detection.  Set by the planner via `with_text_index_reads`
+    /// when the filter carries a `text_match`/`text_score` predicate that was
+    /// NOT pushed down to a `TextScanOperator`.
+    ///
+    /// The recording fires exactly once on the **first execution poll** (or when
+    /// the operator is decomposed for push-based execution), regardless of
+    /// whether any rows are produced.  This is robust to physical-plan caching
+    /// (the operator is freshly polled every execution) and to the 0-row case
+    /// (where the per-row `eval_text_fn` path is never reached).
+    #[cfg(feature = "text-index")]
+    text_index_reads: Vec<(String, String)>,
+    /// Guard: ensures the text-index reads are recorded exactly once.
+    #[cfg(feature = "text-index")]
+    text_reads_recorded: bool,
+    /// Graph store — used only to call `score_text_visible` for index-read
+    /// recording.  `None` when `text_index_reads` is empty (default).
+    #[cfg(feature = "text-index")]
+    text_store: Option<Arc<dyn GraphStoreSearch>>,
+    /// Snapshot epoch for the recording call.  Populated by `with_text_index_reads`.
+    #[cfg(feature = "text-index")]
+    text_epoch: Option<EpochId>,
+    /// Transaction ID for the recording call.  `None` → not Serializable → skip.
+    #[cfg(feature = "text-index")]
+    text_transaction_id: Option<TransactionId>,
 }
 
 impl FilterOperator {
-    /// Creates a new filter operator.
-    pub fn new(child: Box<dyn Operator>, predicate: Box<dyn Predicate>) -> Self {
-        Self { child, predicate }
+    fn check_cancellation(&self) -> Result<(), super::OperatorError> {
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
+        Ok(())
     }
 
-    /// Decomposes this operator into its child and predicate for push-based conversion.
-    pub fn into_parts(self) -> (Box<dyn Operator>, Box<dyn Predicate>) {
-        (self.child, self.predicate)
+    /// Creates a new filter operator.
+    pub fn new(child: Box<dyn Operator>, predicate: Box<dyn Predicate>) -> Self {
+        Self {
+            child,
+            predicate,
+            cancellation: None,
+            #[cfg(feature = "text-index")]
+            text_index_reads: Vec::new(),
+            #[cfg(feature = "text-index")]
+            text_reads_recorded: false,
+            #[cfg(feature = "text-index")]
+            text_store: None,
+            #[cfg(feature = "text-index")]
+            text_epoch: None,
+            #[cfg(feature = "text-index")]
+            text_transaction_id: None,
+        }
+    }
+
+    /// Attaches text-index read pairs and the transaction context needed to
+    /// record them at execution time.
+    ///
+    /// Called by the planner instead of the old plan-time side-effect call.
+    /// The `(label, property)` pairs are derived from the complete predicate
+    /// walk in `collect_text_predicate_pairs`.  Recording fires once on the
+    /// first poll (see `record_text_index_reads_once`).
+    #[cfg(feature = "text-index")]
+    pub fn with_text_index_reads(
+        mut self,
+        pairs: Vec<(String, String)>,
+        store: Arc<dyn GraphStoreSearch>,
+        epoch: EpochId,
+        transaction_id: Option<TransactionId>,
+    ) -> Self {
+        self.text_index_reads = pairs;
+        self.text_store = Some(store);
+        self.text_epoch = Some(epoch);
+        self.text_transaction_id = transaction_id;
+        self
+    }
+
+    /// Fires the text-index read recording exactly once.
+    ///
+    /// Recorded at execution time (first poll), not plan time, so it is robust
+    /// to logical-plan caching and fires per-transaction with live context.
+    ///
+    /// Qualifies the retained epoch even without an active transaction. Uses `score_text_visible` with
+    /// `NodeId::INVALID` as a sentinel — the implementation records the index
+    /// read before attempting to look up the node, so the recording fires even
+    /// for a non-existent node ID.
+    #[cfg(feature = "text-index")]
+    ///
+    /// # Errors
+    /// Propagates temporal index qualification failures.
+    pub fn record_text_index_reads_once(&mut self) -> Result<(), super::OperatorError> {
+        if self.text_reads_recorded {
+            return Ok(());
+        }
+
+        let tx = self.text_transaction_id.unwrap_or(TransactionId::INVALID);
+        let Some(epoch) = self.text_epoch else {
+            return Ok(());
+        };
+        let Some(store) = &self.text_store else {
+            return Ok(());
+        };
+
+        for (label, property) in &self.text_index_reads {
+            store
+                .score_text_visible(NodeId::INVALID, label, property, "", epoch, tx)
+                .map_err(|error| super::OperatorError::Execution(error.to_string()))?;
+        }
+        self.text_reads_recorded = true;
+        Ok(())
+    }
+
+    /// Decomposes this operator into its child and predicate for push-based
+    /// conversion.
+    ///
+    /// Fires any pending text-index read recording before decomposition so
+    /// that the recording still happens on the push-pipeline path (where
+    /// `next()` is never called on this operator directly).
+    ///
+    /// # Errors
+    /// Propagates pending temporal index qualification failures.
+    pub fn into_parts(
+        self,
+    ) -> Result<(Box<dyn Operator>, Box<dyn Predicate>), super::OperatorError> {
+        #[cfg(feature = "text-index")]
+        let mut this = self;
+        #[cfg(not(feature = "text-index"))]
+        let this = self;
+        // Fire text-index recording for the push-pipeline path.
+        // On the pull path this fires in `next()` instead.
+        #[cfg(feature = "text-index")]
+        this.record_text_index_reads_once()?;
+        Ok((this.child, this.predicate))
     }
 }
 
 impl Operator for FilterOperator {
     fn next(&mut self) -> OperatorResult {
+        self.check_cancellation()?;
+        // Recorded at execution time (first poll), not plan time, so it is
+        // robust to logical-plan caching and fires per-transaction with live
+        // context.
+        #[cfg(feature = "text-index")]
+        self.record_text_index_reads_once()?;
+
         loop {
             // Get next chunk from child
-            let Some(mut chunk) = self.child.next()? else {
+            self.check_cancellation()?;
+            let chunk = self.child.next()?;
+            self.check_cancellation()?;
+            let Some(mut chunk) = chunk else {
                 return Ok(None);
             };
 
@@ -3877,20 +4178,17 @@ impl Operator for FilterOperator {
 
             // Apply predicate to create selection vector, respecting any
             // existing selection from child operators (stacked filters).
-            let selection = if let Some(existing) = chunk.selection() {
-                let mut sel = SelectionVector::new_empty();
-                for pos in 0..existing.len() {
-                    if let Some(row) = existing.get(pos)
-                        && self.predicate.evaluate(&chunk, row)
-                    {
-                        sel.push(row);
-                    }
+            let mut selection = SelectionVector::new_empty();
+            for (position, row) in chunk.selected_indices().enumerate() {
+                if position % 128 == 0 {
+                    self.check_cancellation()?;
                 }
-                sel
-            } else {
-                let count = chunk.total_row_count();
-                SelectionVector::from_predicate(count, |row| self.predicate.evaluate(&chunk, row))
-            };
+                if self.predicate.evaluate(&chunk, row)? {
+                    selection.push(row);
+                }
+            }
+
+            self.check_cancellation()?;
 
             // If nothing passes, skip to next chunk
             if selection.is_empty() {
@@ -3904,6 +4202,12 @@ impl Operator for FilterOperator {
 
     fn reset(&mut self) {
         self.child.reset();
+        // Reset the recording guard so a re-executed plan records again on the
+        // next poll (e.g., correlated sub-plans that get reset per outer row).
+        #[cfg(feature = "text-index")]
+        {
+            self.text_reads_recorded = false;
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -3912,6 +4216,40 @@ impl Operator for FilterOperator {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
+    }
+
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.child.install_resource_context(resources)?;
+        self.cancellation = Some(resources.cancellation_token().clone());
+        Ok(())
+    }
+
+    fn decompose_pipeline_with_resources(
+        self: Box<Self>,
+        _resources: &crate::execution::QueryResourceContext,
+    ) -> Result<OperatorPipelineDecomposition, crate::execution::QueryResourceContextError> {
+        // Decomposition cannot report a read failure. Keep a pending Text
+        // admission on the existing pull boundary so next() can propagate it.
+        #[cfg(feature = "text-index")]
+        if !self.text_reads_recorded
+            && self.text_epoch.is_some()
+            && self.text_store.is_some()
+            && !self.text_index_reads.is_empty()
+        {
+            return Ok(OperatorPipelineDecomposition::boundary(self));
+        }
+        let Self {
+            child, predicate, ..
+        } = *self;
+        Ok(OperatorPipelineDecomposition::unary(
+            child,
+            Box::new(super::push::FilterPushOperator::new(Box::new(
+                PredicateAdapter(predicate),
+            ))),
+        ))
     }
 }
 
@@ -3972,6 +4310,97 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_after_rejected_chunk_stops_before_second_pull() {
+        use crate::execution::{
+            QueryCancellationToken, QueryExecutionControl, QueryResourceContext,
+        };
+        use grafeo_common::memory::buffer::BufferManager;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountedSource {
+            pulls: Arc<AtomicUsize>,
+            received: Arc<parking_lot::Mutex<Option<QueryCancellationToken>>>,
+        }
+        impl Operator for CountedSource {
+            fn next(&mut self) -> OperatorResult {
+                assert_eq!(
+                    self.pulls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "cancelled source must not be pulled twice"
+                );
+                let mut chunk = DataChunk::with_capacity(&[LogicalType::Int64], 1);
+                chunk.column_mut(0).unwrap().push_int64(1);
+                chunk.set_count(1);
+                Ok(Some(chunk))
+            }
+            fn reset(&mut self) {}
+            fn name(&self) -> &'static str {
+                "CancellationSource"
+            }
+            fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+                self
+            }
+            fn install_resource_context(
+                &mut self,
+                resources: &QueryResourceContext,
+            ) -> Result<(), crate::execution::QueryResourceContextError> {
+                *self.received.lock() = Some(resources.cancellation_token().clone());
+                Ok(())
+            }
+        }
+        struct CancelAndReject(crate::execution::QueryCancellationHandle);
+        impl Predicate for CancelAndReject {
+            fn evaluate(
+                &self,
+                _: &DataChunk,
+                _: usize,
+            ) -> Result<bool, super::super::OperatorError> {
+                self.0.cancel();
+                Ok(false)
+            }
+        }
+        for aggregate in [false, true] {
+            let control = QueryExecutionControl::new();
+            let resources = QueryResourceContext::new_with_cancellation(
+                BufferManager::with_budget(1 << 20),
+                control.token(),
+            )
+            .unwrap();
+            let pulls = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(parking_lot::Mutex::new(None));
+            let filter: Box<dyn Operator> = Box::new(FilterOperator::new(
+                Box::new(CountedSource {
+                    pulls: pulls.clone(),
+                    received: received.clone(),
+                }),
+                Box::new(CancelAndReject(control.cancellation_handle())),
+            ));
+            let mut root = if aggregate {
+                Box::new(super::super::SimpleAggregateOperator::new(
+                    filter,
+                    vec![super::super::AggregateExpr::count_star()],
+                    vec![LogicalType::Int64],
+                )) as Box<dyn Operator>
+            } else {
+                filter
+            };
+            root.install_resource_context(&resources).unwrap();
+            let error = root.next().unwrap_err();
+            assert!(matches!(
+                error,
+                super::super::OperatorError::QueryCancelled(
+                    crate::execution::QueryCancellationError::Cancelled,
+                )
+            ));
+            assert_eq!(pulls.load(Ordering::SeqCst), 1, "aggregate={aggregate}");
+            assert!(matches!(
+                received.lock().as_ref().unwrap().check(),
+                Err(crate::execution::QueryCancellationError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
     fn test_filter_comparison() {
         // Create a chunk with values [10, 20, 30, 40, 50]
         let mut builder = DataChunkBuilder::new(&[LogicalType::Int64]);
@@ -3997,7 +4426,7 @@ mod tests {
 
     #[cfg(any(feature = "regex", feature = "regex-lite"))]
     #[test]
-    fn test_regex_operator() {
+    fn test_regex_operator() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         // Create a store and expression predicate to test regex
@@ -4022,7 +4451,7 @@ mod tests {
         let chunk = builder.finish();
 
         // Should match
-        assert!(predicate.evaluate(&chunk, 0));
+        assert!(predicate.evaluate(&chunk, 0)?);
 
         // Test non-matching pattern
         let predicate_no_match = ExpressionPredicate::new(
@@ -4036,11 +4465,12 @@ mod tests {
         );
 
         // Should not match
-        assert!(!predicate_no_match.evaluate(&chunk, 0));
+        assert!(!predicate_no_match.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_pow_operator() {
+    fn test_pow_operator() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -4066,7 +4496,7 @@ mod tests {
         );
 
         // 2^3 should equal 8.0
-        assert!(predicate.evaluate(&chunk, 0));
+        assert!(predicate.evaluate(&chunk, 0)?);
 
         // Test with floats: 2.5^2.0 = 6.25
         let predicate_float = ExpressionPredicate::new(
@@ -4083,11 +4513,12 @@ mod tests {
             store,
         );
 
-        assert!(predicate_float.evaluate(&chunk, 0));
+        assert!(predicate_float.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_map_expression() {
+    fn test_map_expression() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -4114,7 +4545,7 @@ mod tests {
         );
 
         // Evaluate the map expression
-        let result = predicate.eval(&chunk, 0);
+        let result = predicate.eval_at(&chunk, 0)?;
         assert!(result.is_some());
 
         if let Some(Value::Map(m)) = result {
@@ -4126,10 +4557,11 @@ mod tests {
         } else {
             panic!("Expected Map value");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_index_access_list() {
+    fn test_index_access_list() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -4157,7 +4589,7 @@ mod tests {
             Arc::clone(&store),
         );
 
-        assert!(predicate.evaluate(&chunk, 0));
+        assert!(predicate.evaluate(&chunk, 0)?);
 
         // Test negative indexing: [1, 2, 3][-1] = 3
         let predicate_neg = ExpressionPredicate::new(
@@ -4177,11 +4609,12 @@ mod tests {
             store,
         );
 
-        assert!(predicate_neg.evaluate(&chunk, 0));
+        assert!(predicate_neg.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_slice_access() {
+    fn test_slice_access() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -4208,7 +4641,7 @@ mod tests {
             store,
         );
 
-        let result = predicate.eval(&chunk, 0);
+        let result = predicate.eval_at(&chunk, 0)?;
         assert!(result.is_some());
 
         if let Some(Value::List(items)) = result {
@@ -4218,6 +4651,7 @@ mod tests {
         } else {
             panic!("Expected List value");
         }
+        Ok(())
     }
 
     #[test]
@@ -4328,7 +4762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_comparison_string() {
+    fn test_comparison_string() -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = DataChunkBuilder::new(&[LogicalType::String]);
         builder.column_mut(0).unwrap().push_string("banana");
         builder.advance_row();
@@ -4336,21 +4770,22 @@ mod tests {
 
         // Test string equality
         let pred_eq = ComparisonPredicate::new(0, CompareOp::Eq, Value::String("banana".into()));
-        assert!(pred_eq.evaluate(&chunk, 0));
+        assert!(pred_eq.evaluate(&chunk, 0)?);
 
         let pred_ne = ComparisonPredicate::new(0, CompareOp::Ne, Value::String("apple".into()));
-        assert!(pred_ne.evaluate(&chunk, 0));
+        assert!(pred_ne.evaluate(&chunk, 0)?);
 
         // Test string ordering
         let pred_lt = ComparisonPredicate::new(0, CompareOp::Lt, Value::String("cherry".into()));
-        assert!(pred_lt.evaluate(&chunk, 0)); // "banana" < "cherry"
+        assert!(pred_lt.evaluate(&chunk, 0)?); // "banana" < "cherry"
 
         let pred_gt = ComparisonPredicate::new(0, CompareOp::Gt, Value::String("apple".into()));
-        assert!(pred_gt.evaluate(&chunk, 0)); // "banana" > "apple"
+        assert!(pred_gt.evaluate(&chunk, 0)?); // "banana" > "apple"
+        Ok(())
     }
 
     #[test]
-    fn test_comparison_float64() {
+    fn test_comparison_float64() -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = DataChunkBuilder::new(&[LogicalType::Float64]);
         builder
             .column_mut(0)
@@ -4362,39 +4797,41 @@ mod tests {
         // Test float equality (within epsilon)
         let pred_eq =
             ComparisonPredicate::new(0, CompareOp::Eq, Value::Float64(std::f64::consts::PI));
-        assert!(pred_eq.evaluate(&chunk, 0));
+        assert!(pred_eq.evaluate(&chunk, 0)?);
 
         let pred_ne = ComparisonPredicate::new(0, CompareOp::Ne, Value::Float64(2.71));
-        assert!(pred_ne.evaluate(&chunk, 0));
+        assert!(pred_ne.evaluate(&chunk, 0)?);
 
         let pred_lt = ComparisonPredicate::new(0, CompareOp::Lt, Value::Float64(4.0));
-        assert!(pred_lt.evaluate(&chunk, 0));
+        assert!(pred_lt.evaluate(&chunk, 0)?);
 
         let pred_ge =
             ComparisonPredicate::new(0, CompareOp::Ge, Value::Float64(std::f64::consts::PI));
-        assert!(pred_ge.evaluate(&chunk, 0));
+        assert!(pred_ge.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_comparison_bool() {
+    fn test_comparison_bool() -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = DataChunkBuilder::new(&[LogicalType::Bool]);
         builder.column_mut(0).unwrap().push_bool(true);
         builder.advance_row();
         let chunk = builder.finish();
 
         let pred_eq = ComparisonPredicate::new(0, CompareOp::Eq, Value::Bool(true));
-        assert!(pred_eq.evaluate(&chunk, 0));
+        assert!(pred_eq.evaluate(&chunk, 0)?);
 
         let pred_ne = ComparisonPredicate::new(0, CompareOp::Ne, Value::Bool(false));
-        assert!(pred_ne.evaluate(&chunk, 0));
+        assert!(pred_ne.evaluate(&chunk, 0)?);
 
         // Ordering on booleans returns false
         let pred_lt = ComparisonPredicate::new(0, CompareOp::Lt, Value::Bool(false));
-        assert!(!pred_lt.evaluate(&chunk, 0));
+        assert!(!pred_lt.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_unary_operators() {
+    fn test_unary_operators() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4410,7 +4847,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_not.evaluate(&chunk, 0));
+        assert!(pred_not.evaluate(&chunk, 0)?);
 
         // Test IS NULL
         let pred_is_null = ExpressionPredicate::new(
@@ -4421,7 +4858,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_is_null.evaluate(&chunk, 0));
+        assert!(pred_is_null.evaluate(&chunk, 0)?);
 
         // Test IS NOT NULL
         let pred_is_not_null = ExpressionPredicate::new(
@@ -4432,7 +4869,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_is_not_null.evaluate(&chunk, 0));
+        assert!(pred_is_not_null.evaluate(&chunk, 0)?);
 
         // Test negation
         let pred_neg = ExpressionPredicate::new(
@@ -4447,11 +4884,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_neg.evaluate(&chunk, 0));
+        assert!(pred_neg.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_arithmetic_operators() {
+    fn test_arithmetic_operators() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4472,7 +4910,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_add.evaluate(&chunk, 0));
+        assert!(pred_add.evaluate(&chunk, 0)?);
 
         // Test Sub: 10 - 4 = 6
         let pred_sub = ExpressionPredicate::new(
@@ -4488,7 +4926,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_sub.evaluate(&chunk, 0));
+        assert!(pred_sub.evaluate(&chunk, 0)?);
 
         // Test Mul: 3 * 4 = 12
         let pred_mul = ExpressionPredicate::new(
@@ -4504,7 +4942,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_mul.evaluate(&chunk, 0));
+        assert!(pred_mul.evaluate(&chunk, 0)?);
 
         // Test Div: 20 / 4 = 5
         let pred_div = ExpressionPredicate::new(
@@ -4520,7 +4958,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_div.evaluate(&chunk, 0));
+        assert!(pred_div.evaluate(&chunk, 0)?);
 
         // Test Mod: 17 % 5 = 2
         let pred_mod = ExpressionPredicate::new(
@@ -4536,11 +4974,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_mod.evaluate(&chunk, 0));
+        assert!(pred_mod.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_string_operators() {
+    fn test_string_operators() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4559,7 +4998,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_starts.evaluate(&chunk, 0));
+        assert!(pred_starts.evaluate(&chunk, 0)?);
 
         // Test ENDS WITH
         let pred_ends = ExpressionPredicate::new(
@@ -4573,7 +5012,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_ends.evaluate(&chunk, 0));
+        assert!(pred_ends.evaluate(&chunk, 0)?);
 
         // Test CONTAINS
         let pred_contains = ExpressionPredicate::new(
@@ -4587,11 +5026,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_contains.evaluate(&chunk, 0));
+        assert!(pred_contains.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_in_operator() {
+    fn test_in_operator() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4614,7 +5054,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_in.evaluate(&chunk, 0));
+        assert!(pred_in.evaluate(&chunk, 0)?);
 
         // Test 10 NOT IN [1, 2, 3]
         let pred_not_in = ExpressionPredicate::new(
@@ -4633,11 +5073,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_not_in.evaluate(&chunk, 0));
+        assert!(pred_not_in.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_logical_operators() {
+    fn test_logical_operators() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4654,7 +5095,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_and.evaluate(&chunk, 0));
+        assert!(pred_and.evaluate(&chunk, 0)?);
 
         // Test OR: false OR true = true
         let pred_or = ExpressionPredicate::new(
@@ -4666,7 +5107,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_or.evaluate(&chunk, 0));
+        assert!(pred_or.evaluate(&chunk, 0)?);
 
         // Test XOR: true XOR false = true
         let pred_xor = ExpressionPredicate::new(
@@ -4678,11 +5119,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_xor.evaluate(&chunk, 0));
+        assert!(pred_xor.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_case_expression_simple() {
+    fn test_case_expression_simple() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4714,11 +5156,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_case.evaluate(&chunk, 0));
+        assert!(pred_case.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_case_expression_searched() {
+    fn test_case_expression_searched() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4748,11 +5191,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_case.evaluate(&chunk, 0));
+        assert!(pred_case.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_list_functions() {
+    fn test_list_functions() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4776,7 +5220,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_head.evaluate(&chunk, 0));
+        assert!(pred_head.evaluate(&chunk, 0)?);
 
         // Test last([1, 2, 3]) = 3
         let pred_last = ExpressionPredicate::new(
@@ -4795,7 +5239,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_last.evaluate(&chunk, 0));
+        assert!(pred_last.evaluate(&chunk, 0)?);
 
         // Test size([1, 2, 3]) = 3
         let pred_size = ExpressionPredicate::new(
@@ -4814,11 +5258,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_size.evaluate(&chunk, 0));
+        assert!(pred_size.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_type_conversion_functions() {
+    fn test_type_conversion_functions() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4838,7 +5283,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_to_int.evaluate(&chunk, 0));
+        assert!(pred_to_int.evaluate(&chunk, 0)?);
 
         // Test toFloat(42) = 42.0
         let pred_to_float = ExpressionPredicate::new(
@@ -4853,7 +5298,7 @@ mod tests {
             variable_columns.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_to_float.evaluate(&chunk, 0));
+        assert!(pred_to_float.evaluate(&chunk, 0)?);
 
         // Test toBoolean("true") = true
         let pred_to_bool = ExpressionPredicate::new(
@@ -4868,11 +5313,12 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_to_bool.evaluate(&chunk, 0));
+        assert!(pred_to_bool.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_coalesce_function() {
+    fn test_coalesce_function() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4896,7 +5342,8 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_coalesce.evaluate(&chunk, 0));
+        assert!(pred_coalesce.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
@@ -4957,7 +5404,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_type_comparison_int_float() {
+    fn test_mixed_type_comparison_int_float() -> Result<(), Box<dyn std::error::Error>> {
         let store: Arc<dyn GraphStoreSearch> =
             Arc::new(crate::graph::lpg::LpgStore::new().unwrap());
         let variable_columns = HashMap::new();
@@ -4974,7 +5421,8 @@ mod tests {
             variable_columns,
             store,
         );
-        assert!(pred_mixed.evaluate(&chunk, 0));
+        assert!(pred_mixed.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
@@ -5093,7 +5541,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expression_predicate_with_labels_function() {
+    fn test_expression_predicate_with_labels_function() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::GraphStoreMut;
 
         // Test the labels() function in predicates
@@ -5126,11 +5574,12 @@ mod tests {
             store.clone() as Arc<dyn GraphStoreSearch>,
         );
 
-        assert!(pred.evaluate(&chunk, 0));
+        assert!(pred.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_comparison_with_boundary_values() {
+    fn test_comparison_with_boundary_values() -> Result<(), Box<dyn std::error::Error>> {
         // Test comparisons at exact boundary values
         let mut builder = DataChunkBuilder::new(&[LogicalType::Int64]);
         builder.column_mut(0).unwrap().push_int64(i64::MAX);
@@ -5143,15 +5592,16 @@ mod tests {
 
         // Test >= 0
         let pred_ge = ComparisonPredicate::new(0, CompareOp::Ge, Value::Int64(0));
-        assert!(pred_ge.evaluate(&chunk, 0)); // i64::MAX >= 0
-        assert!(!pred_ge.evaluate(&chunk, 1)); // i64::MIN >= 0 is false
-        assert!(pred_ge.evaluate(&chunk, 2)); // 0 >= 0
+        assert!(pred_ge.evaluate(&chunk, 0)?); // i64::MAX >= 0
+        assert!(!pred_ge.evaluate(&chunk, 1)?); // i64::MIN >= 0 is false
+        assert!(pred_ge.evaluate(&chunk, 2)?); // 0 >= 0
 
         // Test <= 0
         let pred_le = ComparisonPredicate::new(0, CompareOp::Le, Value::Int64(0));
-        assert!(!pred_le.evaluate(&chunk, 0)); // i64::MAX <= 0 is false
-        assert!(pred_le.evaluate(&chunk, 1)); // i64::MIN <= 0
-        assert!(pred_le.evaluate(&chunk, 2)); // 0 <= 0
+        assert!(!pred_le.evaluate(&chunk, 0)?); // i64::MAX <= 0 is false
+        assert!(pred_le.evaluate(&chunk, 1)?); // i64::MIN <= 0
+        assert!(pred_le.evaluate(&chunk, 2)?); // 0 <= 0
+        Ok(())
     }
 
     // ── Cross-type equality (String ↔ numeric) ──────────────────────────
@@ -5160,7 +5610,7 @@ mod tests {
     /// like `FILTER(?age = 30)` compare `Value::String("30")` with
     /// `Value::Int64(30)`.  The `values_equal` path must coerce.
     #[test]
-    fn test_cross_type_string_int_equality() {
+    fn test_cross_type_string_int_equality() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -5178,7 +5628,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert!(pred.evaluate(&chunk, 0));
+        assert!(pred.evaluate(&chunk, 0)?);
 
         // String "42" != Int64(99)
         let pred_ne = ExpressionPredicate::new(
@@ -5190,7 +5640,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_ne.evaluate(&chunk, 0));
+        assert!(pred_ne.evaluate(&chunk, 0)?);
 
         // Non-numeric string should NOT equal any integer
         let pred_bad = ExpressionPredicate::new(
@@ -5202,12 +5652,13 @@ mod tests {
             vc,
             store,
         );
-        assert!(!pred_bad.evaluate(&chunk, 0));
+        assert!(!pred_bad.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     /// String ↔ Float64 equality: "7.25" == Float64(7.25)
     #[test]
-    fn test_cross_type_string_float_equality() {
+    fn test_cross_type_string_float_equality() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -5224,7 +5675,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert!(pred.evaluate(&chunk, 0));
+        assert!(pred.evaluate(&chunk, 0)?);
 
         // "7.25" != 2.5
         let pred_ne = ExpressionPredicate::new(
@@ -5236,7 +5687,8 @@ mod tests {
             vc,
             store,
         );
-        assert!(pred_ne.evaluate(&chunk, 0));
+        assert!(pred_ne.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     // ── Cross-type ordering (String ↔ numeric) ──────────────────────────
@@ -5244,7 +5696,7 @@ mod tests {
     /// Regression test: String-encoded numbers must support range comparisons
     /// so that `FILTER(?age > 25)` works when `?age` is stored as "30".
     #[test]
-    fn test_cross_type_string_numeric_ordering() {
+    fn test_cross_type_string_numeric_ordering() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -5262,7 +5714,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_gt.evaluate(&chunk, 0));
+        assert!(pred_gt.evaluate(&chunk, 0)?);
 
         // Int64(10) < "20.5" (cross Float64 path)
         let pred_lt = ExpressionPredicate::new(
@@ -5274,7 +5726,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_lt.evaluate(&chunk, 0));
+        assert!(pred_lt.evaluate(&chunk, 0)?);
 
         // "2.5" <= Float64(2.5)
         let pred_le = ExpressionPredicate::new(
@@ -5286,7 +5738,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert!(pred_le.evaluate(&chunk, 0));
+        assert!(pred_le.evaluate(&chunk, 0)?);
 
         // Float64(100.0) >= "99.9"
         let pred_ge = ExpressionPredicate::new(
@@ -5298,7 +5750,8 @@ mod tests {
             vc,
             store,
         );
-        assert!(pred_ge.evaluate(&chunk, 0));
+        assert!(pred_ge.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     // ── Stacked filter (selection vector preservation) ───────────────────
@@ -5344,7 +5797,9 @@ mod tests {
 
     /// Helper: creates an `ExpressionPredicate` wrapping a literal expression,
     /// evaluates it against an empty chunk, and returns the result `Value`.
-    fn eval_literal_expr(expr: FilterExpression) -> Option<Value> {
+    fn eval_literal_expr(
+        expr: FilterExpression,
+    ) -> grafeo_common::utils::error::Result<Option<Value>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -5370,302 +5825,324 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_binary_addition_int() {
+    fn test_eval_binary_addition_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(10),
             BinaryFilterOp::Add,
             Value::Int64(20),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Int64(30)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_binary_subtraction_int() {
+    fn test_eval_binary_subtraction_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(50),
             BinaryFilterOp::Sub,
             Value::Int64(18),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Int64(32)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_binary_multiplication_int() {
+    fn test_eval_binary_multiplication_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(7),
             BinaryFilterOp::Mul,
             Value::Int64(6),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Int64(42)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_binary_division_int() {
+    fn test_eval_binary_division_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(100),
             BinaryFilterOp::Div,
             Value::Int64(4),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Int64(25)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_binary_modulo_int() {
+    fn test_eval_binary_modulo_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(17),
             BinaryFilterOp::Mod,
             Value::Int64(5),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Int64(2)));
+        Ok(())
     }
 
     // === eval_binary_op: Comparisons ===
 
     #[test]
-    fn test_eval_comparison_lt() {
+    fn test_eval_comparison_lt() -> Result<(), Box<dyn std::error::Error>> {
         let result =
-            eval_literal_expr(binary(Value::Int64(3), BinaryFilterOp::Lt, Value::Int64(5)));
+            eval_literal_expr(binary(Value::Int64(3), BinaryFilterOp::Lt, Value::Int64(5)))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result =
-            eval_literal_expr(binary(Value::Int64(5), BinaryFilterOp::Lt, Value::Int64(3)));
+            eval_literal_expr(binary(Value::Int64(5), BinaryFilterOp::Lt, Value::Int64(3)))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_comparison_gt() {
+    fn test_eval_comparison_gt() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(10),
             BinaryFilterOp::Gt,
             Value::Int64(5),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_comparison_eq() {
+    fn test_eval_comparison_eq() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(42),
             BinaryFilterOp::Eq,
             Value::Int64(42),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::Int64(42),
             BinaryFilterOp::Eq,
             Value::Int64(43),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_comparison_ne() {
+    fn test_eval_comparison_ne() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("hello".into()),
             BinaryFilterOp::Ne,
             Value::String("world".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::String("same".into()),
             BinaryFilterOp::Ne,
             Value::String("same".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_comparison_le_ge() {
+    fn test_eval_comparison_le_ge() -> Result<(), Box<dyn std::error::Error>> {
         // <=
         let result =
-            eval_literal_expr(binary(Value::Int64(5), BinaryFilterOp::Le, Value::Int64(5)));
+            eval_literal_expr(binary(Value::Int64(5), BinaryFilterOp::Le, Value::Int64(5)))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result =
-            eval_literal_expr(binary(Value::Int64(6), BinaryFilterOp::Le, Value::Int64(5)));
+            eval_literal_expr(binary(Value::Int64(6), BinaryFilterOp::Le, Value::Int64(5)))?;
         assert_eq!(result, Some(Value::Bool(false)));
 
         // >=
         let result =
-            eval_literal_expr(binary(Value::Int64(5), BinaryFilterOp::Ge, Value::Int64(5)));
+            eval_literal_expr(binary(Value::Int64(5), BinaryFilterOp::Ge, Value::Int64(5)))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result =
-            eval_literal_expr(binary(Value::Int64(4), BinaryFilterOp::Ge, Value::Int64(5)));
+            eval_literal_expr(binary(Value::Int64(4), BinaryFilterOp::Ge, Value::Int64(5)))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     // === eval_binary_op: Logical Operators ===
 
     #[test]
-    fn test_eval_logical_and() {
+    fn test_eval_logical_and() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Bool(true),
             BinaryFilterOp::And,
             Value::Bool(true),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::Bool(true),
             BinaryFilterOp::And,
             Value::Bool(false),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_logical_or() {
+    fn test_eval_logical_or() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Bool(false),
             BinaryFilterOp::Or,
             Value::Bool(true),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::Bool(false),
             BinaryFilterOp::Or,
             Value::Bool(false),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_logical_xor() {
+    fn test_eval_logical_xor() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Bool(true),
             BinaryFilterOp::Xor,
             Value::Bool(false),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::Bool(true),
             BinaryFilterOp::Xor,
             Value::Bool(true),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     // === Type Coercion: Int + Float Arithmetic ===
 
     #[test]
-    fn test_eval_type_coercion_int_plus_float() {
+    fn test_eval_type_coercion_int_plus_float() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(10),
             BinaryFilterOp::Add,
             Value::Float64(2.5),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Float64(12.5)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_type_coercion_float_minus_int() {
+    fn test_eval_type_coercion_float_minus_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Float64(10.0),
             BinaryFilterOp::Sub,
             Value::Int64(3),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Float64(7.0)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_type_coercion_int_mul_float() {
+    fn test_eval_type_coercion_int_mul_float() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(4),
             BinaryFilterOp::Mul,
             Value::Float64(2.5),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Float64(10.0)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_type_coercion_int_eq_float() {
+    fn test_eval_type_coercion_int_eq_float() -> Result<(), Box<dyn std::error::Error>> {
         // Int 42 should equal Float 42.0
         let result = eval_literal_expr(binary(
             Value::Int64(42),
             BinaryFilterOp::Eq,
             Value::Float64(42.0),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_type_coercion_int_lt_float() {
+    fn test_eval_type_coercion_int_lt_float() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(3),
             BinaryFilterOp::Lt,
             Value::Float64(3.5),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     // === String Comparison ===
 
     #[test]
-    fn test_eval_string_comparison() {
+    fn test_eval_string_comparison() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("apple".into()),
             BinaryFilterOp::Lt,
             Value::String("banana".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::String("zebra".into()),
             BinaryFilterOp::Gt,
             Value::String("apple".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_string_concatenation() {
+    fn test_eval_string_concatenation() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("Hello".into()),
             BinaryFilterOp::Add,
             Value::String(" World".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::String("Hello World".into())));
+        Ok(())
     }
 
     // === IS NULL / IS NOT NULL ===
 
     #[test]
-    fn test_eval_is_null() {
+    fn test_eval_is_null() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(unary(
             UnaryFilterOp::IsNull,
             FilterExpression::Literal(Value::Null),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(unary(
             UnaryFilterOp::IsNull,
             FilterExpression::Literal(Value::Int64(42)),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_is_not_null() {
+    fn test_eval_is_not_null() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(unary(
             UnaryFilterOp::IsNotNull,
             FilterExpression::Literal(Value::Int64(42)),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(unary(
             UnaryFilterOp::IsNotNull,
             FilterExpression::Literal(Value::Null),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_is_null_on_missing_variable() {
+    fn test_eval_is_null_on_missing_variable() -> Result<(), Box<dyn std::error::Error>> {
         // Accessing a non-existent variable should produce None,
         // which IS NULL treats as true
         use crate::graph::lpg::LpgStore;
@@ -5678,67 +6155,71 @@ mod tests {
         let pred = ExpressionPredicate::new(expr, HashMap::new(), store);
         let builder = DataChunkBuilder::new(&[LogicalType::Int64]);
         let chunk = builder.finish();
-        let result = pred.eval_at(&chunk, 0);
+        let result = pred.eval_at(&chunk, 0)?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     // === STARTS WITH / ENDS WITH / CONTAINS ===
 
     #[test]
-    fn test_eval_starts_with() {
+    fn test_eval_starts_with() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::StartsWith,
             Value::String("hello".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::StartsWith,
             Value::String("world".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_ends_with() {
+    fn test_eval_ends_with() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::EndsWith,
             Value::String("world".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::EndsWith,
             Value::String("hello".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_contains() {
+    fn test_eval_contains() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::Contains,
             Value::String("lo wo".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::Contains,
             Value::String("xyz".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     // === List Operations: IN Operator ===
 
     #[test]
-    fn test_eval_in_operator() {
+    fn test_eval_in_operator() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -5756,7 +6237,7 @@ mod tests {
             ])),
         };
         let pred = ExpressionPredicate::new(expr, HashMap::new(), Arc::clone(&store));
-        let result = pred.eval_at(&chunk, 0);
+        let result = pred.eval_at(&chunk, 0)?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         // 5 IN [1, 2, 3] should be false
@@ -5770,12 +6251,13 @@ mod tests {
             ])),
         };
         let pred = ExpressionPredicate::new(expr, HashMap::new(), Arc::clone(&store));
-        let result = pred.eval_at(&chunk, 0);
+        let result = pred.eval_at(&chunk, 0)?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_in_operator_strings() {
+    fn test_eval_in_operator_strings() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
 
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
@@ -5793,14 +6275,15 @@ mod tests {
             ])),
         };
         let pred = ExpressionPredicate::new(expr, HashMap::new(), store);
-        let result = pred.eval_at(&chunk, 0);
+        let result = pred.eval_at(&chunk, 0)?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     // === List Index Access ===
 
     #[test]
-    fn test_eval_list_index_access() {
+    fn test_eval_list_index_access() -> Result<(), Box<dyn std::error::Error>> {
         // [10, 20, 30][2] = 30
         let result = eval_literal_expr(FilterExpression::IndexAccess {
             base: Box::new(FilterExpression::List(vec![
@@ -5809,12 +6292,13 @@ mod tests {
                 FilterExpression::Literal(Value::Int64(30)),
             ])),
             index: Box::new(FilterExpression::Literal(Value::Int64(2))),
-        });
+        })?;
         assert_eq!(result, Some(Value::Int64(30)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_list_negative_index() {
+    fn test_eval_list_negative_index() -> Result<(), Box<dyn std::error::Error>> {
         // [10, 20, 30][-2] = 20
         let result = eval_literal_expr(FilterExpression::IndexAccess {
             base: Box::new(FilterExpression::List(vec![
@@ -5823,14 +6307,15 @@ mod tests {
                 FilterExpression::Literal(Value::Int64(30)),
             ])),
             index: Box::new(FilterExpression::Literal(Value::Int64(-2))),
-        });
+        })?;
         assert_eq!(result, Some(Value::Int64(20)));
+        Ok(())
     }
 
     // === CASE / NULLIF Pattern ===
 
     #[test]
-    fn test_eval_case_simple() {
+    fn test_eval_case_simple() -> Result<(), Box<dyn std::error::Error>> {
         // CASE WHEN true THEN 'yes' ELSE 'no' END
         let result = eval_literal_expr(FilterExpression::Case {
             operand: None,
@@ -5841,12 +6326,13 @@ mod tests {
             else_clause: Some(Box::new(FilterExpression::Literal(Value::String(
                 "no".into(),
             )))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("yes".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_case_falls_to_else() {
+    fn test_eval_case_falls_to_else() -> Result<(), Box<dyn std::error::Error>> {
         // CASE WHEN false THEN 'yes' ELSE 'no' END
         let result = eval_literal_expr(FilterExpression::Case {
             operand: None,
@@ -5857,12 +6343,13 @@ mod tests {
             else_clause: Some(Box::new(FilterExpression::Literal(Value::String(
                 "no".into(),
             )))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("no".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_case_no_else_returns_null() {
+    fn test_eval_case_no_else_returns_null() -> Result<(), Box<dyn std::error::Error>> {
         // CASE WHEN false THEN 'yes' END (no ELSE, so NULL)
         let result = eval_literal_expr(FilterExpression::Case {
             operand: None,
@@ -5871,12 +6358,13 @@ mod tests {
                 FilterExpression::Literal(Value::String("yes".into())),
             )],
             else_clause: None,
-        });
+        })?;
         assert_eq!(result, Some(Value::Null));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_nullif_via_case() {
+    fn test_eval_nullif_via_case() -> Result<(), Box<dyn std::error::Error>> {
         // NULLIF(a, b) is equivalent to: CASE WHEN a = b THEN NULL ELSE a END
         // Test NULLIF(5, 5) => NULL
         let result = eval_literal_expr(FilterExpression::Case {
@@ -5890,7 +6378,7 @@ mod tests {
                 FilterExpression::Literal(Value::Null),
             )],
             else_clause: Some(Box::new(FilterExpression::Literal(Value::Int64(5)))),
-        });
+        })?;
         assert_eq!(result, Some(Value::Null));
 
         // NULLIF(5, 3) => 5
@@ -5905,12 +6393,13 @@ mod tests {
                 FilterExpression::Literal(Value::Null),
             )],
             else_clause: Some(Box::new(FilterExpression::Literal(Value::Int64(5)))),
-        });
+        })?;
         assert_eq!(result, Some(Value::Int64(5)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_simple_case_with_operand() {
+    fn test_eval_simple_case_with_operand() -> Result<(), Box<dyn std::error::Error>> {
         // CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END
         let result = eval_literal_expr(FilterExpression::Case {
             operand: Some(Box::new(FilterExpression::Literal(Value::Int64(2)))),
@@ -5927,46 +6416,49 @@ mod tests {
             else_clause: Some(Box::new(FilterExpression::Literal(Value::String(
                 "other".into(),
             )))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("two".into())));
+        Ok(())
     }
 
     // === Unary Operators ===
 
     #[test]
-    fn test_eval_unary_not() {
+    fn test_eval_unary_not() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(unary(
             UnaryFilterOp::Not,
             FilterExpression::Literal(Value::Bool(true)),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
 
         let result = eval_literal_expr(unary(
             UnaryFilterOp::Not,
             FilterExpression::Literal(Value::Bool(false)),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_unary_neg() {
+    fn test_eval_unary_neg() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(unary(
             UnaryFilterOp::Neg,
             FilterExpression::Literal(Value::Int64(42)),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Int64(-42)));
 
         let result = eval_literal_expr(unary(
             UnaryFilterOp::Neg,
             FilterExpression::Literal(Value::Float64(7.25)),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Float64(-7.25)));
+        Ok(())
     }
 
     // === Reduce Expression Evaluation ===
 
     #[test]
-    fn test_eval_reduce_sum() {
+    fn test_eval_reduce_sum() -> Result<(), Box<dyn std::error::Error>> {
         // reduce(acc = 0, x IN [1, 2, 3] | acc + x) = 6
         let result = eval_literal_expr(FilterExpression::Reduce {
             accumulator: "acc".to_string(),
@@ -5982,12 +6474,13 @@ mod tests {
                 op: BinaryFilterOp::Add,
                 right: Box::new(FilterExpression::Variable("x".to_string())),
             }),
-        });
+        })?;
         assert_eq!(result, Some(Value::Int64(6)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_reduce_product() {
+    fn test_eval_reduce_product() -> Result<(), Box<dyn std::error::Error>> {
         // reduce(acc = 1, x IN [2, 3, 4] | acc * x) = 24
         let result = eval_literal_expr(FilterExpression::Reduce {
             accumulator: "acc".to_string(),
@@ -6003,14 +6496,15 @@ mod tests {
                 op: BinaryFilterOp::Mul,
                 right: Box::new(FilterExpression::Variable("x".to_string())),
             }),
-        });
+        })?;
         assert_eq!(result, Some(Value::Int64(24)));
+        Ok(())
     }
 
     // === List Comprehension ===
 
     #[test]
-    fn test_eval_list_comprehension_with_filter() {
+    fn test_eval_list_comprehension_with_filter() -> Result<(), Box<dyn std::error::Error>> {
         // [x IN [1, 2, 3, 4, 5] WHERE x > 2 | x * 10]
         // Should produce [30, 40, 50]
         let result = eval_literal_expr(FilterExpression::ListComprehension {
@@ -6032,7 +6526,7 @@ mod tests {
                 op: BinaryFilterOp::Mul,
                 right: Box::new(FilterExpression::Literal(Value::Int64(10))),
             }),
-        });
+        })?;
 
         if let Some(Value::List(items)) = result {
             assert_eq!(items.len(), 3);
@@ -6042,12 +6536,1121 @@ mod tests {
         } else {
             panic!("Expected List, got {:?}", result);
         }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn path_edges_unwind_preserves_id_type_and_endpoints() {
+        use crate::execution::operators::unwind::UnwindOperator;
+        use crate::graph::lpg::LpgStore;
+
+        let store = Arc::new(LpgStore::new().unwrap());
+        let source = store.create_node(&[]);
+        let target = store.create_node(&[]);
+        let edge = store.create_edge(source, target, "REL");
+        for name in ["edges", "relationships"] {
+            let predicate = ExpressionPredicate::new(
+                FilterExpression::FunctionCall {
+                    name: name.into(),
+                    args: vec![FilterExpression::Literal(Value::Path {
+                        nodes: Arc::from([
+                            Value::Int64(source.as_u64() as i64),
+                            Value::Int64(target.as_u64() as i64),
+                        ]),
+                        edges: Arc::from([Value::Int64(edge.as_u64() as i64)]),
+                    })],
+                },
+                HashMap::new(),
+                store.clone(),
+            );
+            let values = predicate.eval_at(&DataChunk::empty(), 0).unwrap().unwrap();
+            let mut builder = DataChunkBuilder::new(&[LogicalType::Any]);
+            builder.column_mut(0).unwrap().push_value(values);
+            builder.advance_row();
+            let mut unwind = UnwindOperator::new(
+                Box::new(MockScanOperator {
+                    chunks: vec![builder.finish()],
+                    position: 0,
+                }),
+                0,
+                "e".into(),
+                vec![LogicalType::Any],
+                false,
+                false,
+            );
+            let chunk = unwind.next().unwrap().unwrap();
+            for (function, expected) in [
+                ("id", Value::Int64(edge.as_u64() as i64)),
+                ("type", Value::String("REL".into())),
+                ("startNode", Value::Int64(source.as_u64() as i64)),
+                ("endNode", Value::Int64(target.as_u64() as i64)),
+            ] {
+                let predicate = ExpressionPredicate::new(
+                    FilterExpression::FunctionCall {
+                        name: function.into(),
+                        args: vec![FilterExpression::Variable("e".into())],
+                    },
+                    HashMap::from([("e".into(), 0)]),
+                    store.clone(),
+                );
+                assert_eq!(
+                    predicate.eval_at(&chunk, 0).unwrap(),
+                    Some(expected),
+                    "{name}: {function}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn path_edges_parallel_identity_survives_user_id_property() {
+        use crate::execution::operators::accumulator::AggregateExpr;
+        use crate::execution::operators::aggregate::SimpleAggregateOperator;
+        use crate::execution::operators::unwind::UnwindOperator;
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let source = store.create_node(&[]);
+        let target = store.create_node(&[]);
+        let edges = [
+            store.create_edge(source, target, "REL"),
+            store.create_edge(source, target, "REL"),
+        ];
+        for edge in edges {
+            store.set_edge_property(edge, "_id", Value::Int64(0));
+        }
+        let predicate = ExpressionPredicate::new(
+            FilterExpression::FunctionCall {
+                name: "relationships".into(),
+                args: vec![FilterExpression::Literal(Value::Path {
+                    nodes: Arc::from([
+                        Value::Int64(source.as_u64() as i64),
+                        Value::Int64(target.as_u64() as i64),
+                        Value::Int64(source.as_u64() as i64),
+                    ]),
+                    edges: edges.map(|edge| Value::Int64(edge.as_u64() as i64)).into(),
+                })],
+            },
+            HashMap::new(),
+            store,
+        );
+        let values = predicate.eval_at(&DataChunk::empty(), 0).unwrap().unwrap();
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Any]);
+        builder.column_mut(0).unwrap().push_value(values);
+        builder.advance_row();
+        let unwind = UnwindOperator::new(
+            Box::new(MockScanOperator {
+                chunks: vec![builder.finish()],
+                position: 0,
+            }),
+            0,
+            "e".into(),
+            vec![LogicalType::Any],
+            false,
+            false,
+        );
+        let mut aggregate = SimpleAggregateOperator::new(
+            Box::new(unwind),
+            vec![AggregateExpr::count(0).with_distinct()],
+            vec![LogicalType::Int64],
+        );
+        let result = aggregate.next().unwrap().unwrap();
+        assert_eq!(
+            result.column(0).unwrap().get_value(0),
+            Some(Value::Int64(2))
+        );
+    }
+
+    fn nested_path_edge_call(name: &str, args: Vec<FilterExpression>) -> FilterExpression {
+        FilterExpression::FunctionCall {
+            name: name.into(),
+            args,
+        }
+    }
+
+    fn nested_path_edge_map(source: FilterExpression, body: FilterExpression) -> FilterExpression {
+        FilterExpression::ListComprehension {
+            variable: "e".into(),
+            list_expr: Box::new(source),
+            filter_expr: None,
+            map_expr: Box::new(body),
+        }
+    }
+
+    fn nested_path_edge_property(name: &str) -> FilterExpression {
+        FilterExpression::Property {
+            variable: "e".into(),
+            property: name.into(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_functions_preserve_identity_and_null_cardinality() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&[]);
+        let b = store.create_node(&[]);
+        let edge = store.create_edge(a, b, "REL");
+        store.set_edge_property(edge, "cost", Value::Int64(7));
+        store.set_edge_property(edge, "_id", Value::Int64(-10));
+        store.set_node_property(a, "cost", Value::Int64(700));
+        let source = nested_path_edge_call(
+            "edges",
+            vec![FilterExpression::Literal(Value::Path {
+                nodes: Arc::from([
+                    Value::Int64(a.as_u64() as i64),
+                    Value::Int64(b.as_u64() as i64),
+                ]),
+                edges: Arc::from([Value::Int64(edge.as_u64() as i64)]),
+            })],
+        );
+        let var = || FilterExpression::Variable("e".into());
+        let body = FilterExpression::List(vec![
+            var(),
+            nested_path_edge_call("id", vec![var()]),
+            nested_path_edge_call("type", vec![var()]),
+            nested_path_edge_call("startNode", vec![var()]),
+            nested_path_edge_call("endNode", vec![var()]),
+            nested_path_edge_call(
+                "coalesce",
+                vec![
+                    nested_path_edge_property("cost"),
+                    FilterExpression::Literal(Value::Int64(0)),
+                ],
+            ),
+            nested_path_edge_call(
+                "coalesce",
+                vec![
+                    nested_path_edge_property("missing"),
+                    FilterExpression::Literal(Value::Int64(0)),
+                ],
+            ),
+            nested_path_edge_property("_id"),
+            nested_path_edge_property("missing"),
+        ]);
+        let predicate = ExpressionPredicate::new(
+            nested_path_edge_map(source.clone(), body),
+            HashMap::new(),
+            store.clone(),
+        );
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::List(Arc::from([Value::List(Arc::from([
+                Value::Int64(edge.as_u64() as i64),
+                Value::Int64(edge.as_u64() as i64),
+                Value::String("REL".into()),
+                Value::Int64(a.as_u64() as i64),
+                Value::Int64(b.as_u64() as i64),
+                Value::Int64(7),
+                Value::Int64(0),
+                Value::Int64(-10),
+                Value::Null,
+            ]))])))
+        );
+        let predicate = ExpressionPredicate::new(
+            FilterExpression::ListPredicate {
+                kind: ListPredicateKind::All,
+                variable: "e".into(),
+                list_expr: Box::new(source),
+                predicate: Box::new(FilterExpression::Binary {
+                    left: Box::new(nested_path_edge_call(
+                        "coalesce",
+                        vec![
+                            nested_path_edge_property("cost"),
+                            FilterExpression::Literal(Value::Int64(0)),
+                        ],
+                    )),
+                    op: BinaryFilterOp::Gt,
+                    right: Box::new(FilterExpression::Literal(Value::Int64(0))),
+                }),
+            },
+            HashMap::new(),
+            store,
+        );
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_lexical_outer_and_shadowed_bindings() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&[]);
+        let edge = store.create_edge(a, a, "REL");
+        store.set_edge_property(edge, "cost", Value::Int64(7));
+        let typed = LogicalType::List(Box::new(LogicalType::Edge));
+        let mut builder = DataChunkBuilder::new(&[typed, LogicalType::Int64]);
+        builder
+            .column_mut(0)
+            .unwrap()
+            .push_value(Value::List(Arc::from([Value::Int64(edge.as_u64() as i64)])));
+        builder.column_mut(1).unwrap().push_value(Value::Int64(5));
+        builder.advance_row();
+        let source = FilterExpression::Variable("rels".into());
+        let inner = FilterExpression::ListComprehension {
+            variable: "x".into(),
+            list_expr: Box::new(FilterExpression::List(vec![FilterExpression::Literal(
+                Value::Int64(2),
+            )])),
+            filter_expr: None,
+            map_expr: Box::new(FilterExpression::Binary {
+                left: Box::new(nested_path_edge_property("cost")),
+                op: BinaryFilterOp::Add,
+                right: Box::new(FilterExpression::Binary {
+                    left: Box::new(FilterExpression::Variable("x".into())),
+                    op: BinaryFilterOp::Add,
+                    right: Box::new(FilterExpression::Variable("offset".into())),
+                }),
+            }),
+        };
+        // The nested scalar named e must hide, then restore, the outer edge.
+        let shadow = nested_path_edge_map(
+            FilterExpression::List(vec![FilterExpression::Literal(Value::Int64(3))]),
+            FilterExpression::Variable("e".into()),
+        );
+        let body = FilterExpression::List(vec![inner, shadow, nested_path_edge_property("cost")]);
+        let predicate = ExpressionPredicate::new(
+            nested_path_edge_map(source, body),
+            HashMap::from([("rels".into(), 0), ("offset".into(), 1)]),
+            store,
+        );
+        assert_eq!(
+            predicate.eval_at(&builder.finish(), 0).unwrap(),
+            Some(Value::List(Arc::from([Value::List(Arc::from([
+                Value::List(Arc::from([Value::Int64(14)])),
+                Value::List(Arc::from([Value::Int64(3)])),
+                Value::Int64(7),
+            ]))])))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_evaluated_sources_keep_only_selected_provenance() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let node = store.create_node(&[]);
+        let edge = store.create_edge(node, node, "REL");
+        store.set_edge_property(edge, "cost", Value::Int64(7));
+        store.set_node_property(node, "cost", Value::Int64(700));
+        let list = Value::List(Arc::from([Value::Int64(edge.as_u64() as i64)]));
+        for (first, second, first_type, second_type, expected) in [
+            (
+                Value::Null,
+                list.clone(),
+                LogicalType::Any,
+                LogicalType::List(Box::new(LogicalType::Edge)),
+                7,
+            ),
+            (
+                list.clone(),
+                list.clone(),
+                LogicalType::Any,
+                LogicalType::List(Box::new(LogicalType::Edge)),
+                -1,
+            ),
+            (
+                list.clone(),
+                list.clone(),
+                LogicalType::List(Box::new(LogicalType::Edge)),
+                LogicalType::Any,
+                7,
+            ),
+            (
+                Value::Null,
+                list,
+                LogicalType::Any,
+                LogicalType::List(Box::new(LogicalType::Int64)),
+                -1,
+            ),
+        ] {
+            let mut builder = DataChunkBuilder::new(&[first_type, second_type]);
+            builder.column_mut(0).unwrap().push_value(first);
+            builder.column_mut(1).unwrap().push_value(second);
+            builder.advance_row();
+            let source = FilterExpression::SliceAccess {
+                base: Box::new(nested_path_edge_call(
+                    "coalesce",
+                    vec![
+                        FilterExpression::Variable("first".into()),
+                        FilterExpression::Variable("second".into()),
+                    ],
+                )),
+                start: Some(Box::new(FilterExpression::Literal(Value::Int64(0)))),
+                end: Some(Box::new(FilterExpression::Literal(Value::Int64(1)))),
+            };
+            let body = nested_path_edge_call(
+                "coalesce",
+                vec![
+                    nested_path_edge_property("cost"),
+                    FilterExpression::Literal(Value::Int64(-1)),
+                ],
+            );
+            let predicate = ExpressionPredicate::new(
+                nested_path_edge_map(source, body),
+                HashMap::from([("first".into(), 0), ("second".into(), 1)]),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at(&builder.finish(), 0).unwrap(),
+                Some(Value::List(Arc::from([Value::Int64(expected)])))
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_functions_keep_projected_snapshot_transaction_and_session() {
+        use crate::graph::lpg::LpgStore;
+        use crate::graph::projection::{GraphProjection, ProjectionSpec};
+        let store = Arc::new(LpgStore::new().unwrap());
+        let old = EpochId::new(1);
+        let new = EpochId::new(5);
+        let node = store.create_node_versioned(&[], old, TransactionId::SYSTEM);
+        let edge = store.create_edge_versioned(node, node, "REL", old, TransactionId::SYSTEM);
+        store.set_edge_property_at_epoch(edge, "cost", Value::Int64(10), old);
+        store.set_edge_property_at_epoch(edge, "cost", Value::Int64(50), new);
+        store.set_epoch(new);
+        let tx = TransactionId::new(42);
+        store.set_edge_property_buffered(edge, "cost", Value::Int64(99), tx);
+        for (spec, epoch, transaction, expected) in [
+            (ProjectionSpec::default(), old, None, 10),
+            (ProjectionSpec::default(), new, None, 50),
+            (ProjectionSpec::default(), old, Some(tx), 99),
+            (
+                ProjectionSpec::default().with_edge_types(["HIDDEN"]),
+                old,
+                None,
+                -1,
+            ),
+        ] {
+            let projection: Arc<dyn GraphStoreSearch> =
+                Arc::new(GraphProjection::new(store.clone(), spec));
+            let source = nested_path_edge_call(
+                "relationships",
+                vec![FilterExpression::Literal(Value::Path {
+                    nodes: Arc::from([
+                        Value::Int64(node.as_u64() as i64),
+                        Value::Int64(node.as_u64() as i64),
+                    ]),
+                    edges: Arc::from([Value::Int64(edge.as_u64() as i64)]),
+                })],
+            );
+            let expression = nested_path_edge_map(
+                source,
+                FilterExpression::List(vec![
+                    nested_path_edge_call(
+                        "coalesce",
+                        vec![
+                            nested_path_edge_property("cost"),
+                            FilterExpression::Literal(Value::Int64(-1)),
+                        ],
+                    ),
+                    nested_path_edge_call("current_schema", vec![]),
+                ]),
+            );
+            let predicate = ExpressionPredicate::new(expression, HashMap::new(), projection)
+                .with_transaction_context(epoch, transaction)
+                .with_session_context(SessionContext {
+                    current_schema: Some("private".into()),
+                    ..SessionContext::default()
+                });
+            assert_eq!(
+                predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+                Some(Value::List(Arc::from([Value::List(Arc::from([
+                    Value::Int64(expected),
+                    Value::String("private".into()),
+                ]))])))
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_selected_case_type_and_plain_id_results() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let node = store.create_node(&[]);
+        let edge = store.create_edge(node, node, "REL");
+        let list = Value::List(Arc::from([Value::Int64(edge.as_u64() as i64)]));
+        let edge_list = LogicalType::List(Box::new(LogicalType::Edge));
+        let mut builder = DataChunkBuilder::new(&[edge_list.clone(), LogicalType::Any]);
+        builder.column_mut(0).unwrap().push_value(list.clone());
+        builder.column_mut(1).unwrap().push_value(list.clone());
+        builder.advance_row();
+        let chunk = builder.finish();
+        let columns = HashMap::from([("typed".into(), 0), ("plain".into(), 1)]);
+        for select_typed in [true, false] {
+            let expression = FilterExpression::Case {
+                operand: None,
+                when_clauses: vec![(
+                    FilterExpression::Literal(Value::Bool(select_typed)),
+                    FilterExpression::Variable("typed".into()),
+                )],
+                else_clause: Some(Box::new(FilterExpression::Variable("plain".into()))),
+            };
+            let predicate = ExpressionPredicate::new(expression, columns.clone(), store.clone());
+            assert_eq!(
+                predicate.eval_at_with_type(&chunk, 0).unwrap(),
+                (Some(list.clone()), select_typed.then(|| edge_list.clone()))
+            );
+        }
+        for (body, expected_type) in [
+            (FilterExpression::Variable("e".into()), Some(edge_list)),
+            (
+                nested_path_edge_call("id", vec![FilterExpression::Variable("e".into())]),
+                None,
+            ),
+        ] {
+            let predicate = ExpressionPredicate::new(
+                nested_path_edge_map(FilterExpression::Variable("typed".into()), body),
+                columns.clone(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at_with_type(&chunk, 0).unwrap(),
+                (Some(list.clone()), expected_type)
+            );
+        }
+        let predicate = ExpressionPredicate::new(
+            nested_path_edge_map(
+                FilterExpression::Variable("plain".into()),
+                nested_path_edge_call(
+                    "coalesce",
+                    vec![
+                        nested_path_edge_call("id", vec![FilterExpression::Variable("e".into())]),
+                        FilterExpression::Literal(Value::Int64(-1)),
+                    ],
+                ),
+            ),
+            columns,
+            store,
+        );
+        assert_eq!(
+            predicate.eval_at_with_type(&chunk, 0).unwrap(),
+            (Some(Value::List(Arc::from([Value::Int64(-1)]))), None)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_collection_wrappers_preserve_provenance_and_properties() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let node = store.create_node(&[]);
+        let target = store.create_node(&[]);
+        let first = store.create_edge(node, target, "REL");
+        let second = store.create_edge(node, target, "REL");
+        store.set_edge_property(first, "cost", Value::Int64(7));
+        store.set_edge_property(second, "cost", Value::Int64(8));
+        let edge_list_type = LogicalType::List(Box::new(LogicalType::Edge));
+        let list = Value::List(Arc::from([
+            Value::Int64(first.as_u64() as i64),
+            Value::Int64(second.as_u64() as i64),
+        ]));
+        let mut builder = DataChunkBuilder::new(std::slice::from_ref(&edge_list_type));
+        builder.column_mut(0).unwrap().push_value(list.clone());
+        builder.advance_row();
+        let chunk = builder.finish();
+        let columns = HashMap::from([("rels".into(), 0)]);
+
+        for (name, expected_type, expected_value) in [
+            (
+                "head",
+                Some(LogicalType::Edge),
+                Value::Int64(first.as_u64() as i64),
+            ),
+            (
+                "last",
+                Some(LogicalType::Edge),
+                Value::Int64(second.as_u64() as i64),
+            ),
+        ] {
+            let predicate = ExpressionPredicate::new(
+                nested_path_edge_call(name, vec![FilterExpression::Variable("rels".into())]),
+                columns.clone(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at_with_type(&chunk, 0).unwrap(),
+                (Some(expected_value), expected_type)
+            );
+        }
+
+        for (name, expected) in [("tail", vec![8]), ("reverse", vec![8, 7])] {
+            let source =
+                nested_path_edge_call(name, vec![FilterExpression::Variable("rels".into())]);
+            let predicate = ExpressionPredicate::new(
+                nested_path_edge_map(source, nested_path_edge_property("cost")),
+                columns.clone(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at(&chunk, 0).unwrap(),
+                Some(Value::List(
+                    expected
+                        .into_iter()
+                        .map(Value::Int64)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ))
+            );
+        }
+
+        let empty = FilterExpression::List(Vec::new());
+        for name in ["head", "last"] {
+            let predicate = ExpressionPredicate::new(
+                nested_path_edge_call(name, vec![empty.clone()]),
+                HashMap::new(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at_with_type(&DataChunk::empty(), 0).unwrap(),
+                (None, None)
+            );
+        }
+        for name in ["tail", "reverse"] {
+            let predicate = ExpressionPredicate::new(
+                nested_path_edge_call(name, vec![empty.clone()]),
+                HashMap::new(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at_with_type(&DataChunk::empty(), 0).unwrap(),
+                (Some(Value::List(Arc::from([]))), None)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn nested_path_edge_reduce_functions_share_accumulator_item_and_outer_scope() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let node = store.create_node(&[]);
+        let edge = store.create_edge(node, node, "REL");
+        store.set_edge_property(edge, "cost", Value::Int64(7));
+        let source = nested_path_edge_call(
+            "edges",
+            vec![FilterExpression::Literal(Value::Path {
+                nodes: Arc::from([
+                    Value::Int64(node.as_u64() as i64),
+                    Value::Int64(node.as_u64() as i64),
+                ]),
+                edges: Arc::from([Value::Int64(edge.as_u64() as i64)]),
+            })],
+        );
+        let add = |left, right| FilterExpression::Binary {
+            left: Box::new(left),
+            op: BinaryFilterOp::Add,
+            right: Box::new(right),
+        };
+        let var = |name: &str| FilterExpression::Variable(name.into());
+        let coalesce = |value| {
+            nested_path_edge_call(
+                "coalesce",
+                vec![value, FilterExpression::Literal(Value::Int64(0))],
+            )
+        };
+        let numbers = || {
+            FilterExpression::List(vec![
+                FilterExpression::Literal(Value::Int64(1)),
+                FilterExpression::Literal(Value::Int64(2)),
+            ])
+        };
+        let reduce = |variable: &str, list, expression| FilterExpression::Reduce {
+            accumulator: "total".into(),
+            initial: Box::new(FilterExpression::Literal(Value::Int64(0))),
+            variable: variable.into(),
+            list: Box::new(list),
+            expression: Box::new(expression),
+        };
+        let correlated = reduce(
+            "x",
+            numbers(),
+            add(
+                add(coalesce(var("total")), nested_path_edge_property("cost")),
+                var("x"),
+            ),
+        );
+        let edge_item = reduce(
+            "x",
+            FilterExpression::List(vec![var("e")]),
+            add(
+                var("total"),
+                coalesce(FilterExpression::Property {
+                    variable: "x".into(),
+                    property: "cost".into(),
+                }),
+            ),
+        );
+        let shadow = reduce("e", numbers(), add(var("total"), coalesce(var("e"))));
+        // Existing reduce map-property semantics retain NULL rather than omit it.
+        let missing = FilterExpression::Reduce {
+            accumulator: "total".into(),
+            initial: Box::new(FilterExpression::Map(vec![])),
+            variable: "x".into(),
+            list: Box::new(FilterExpression::List(vec![FilterExpression::Literal(
+                Value::Int64(1),
+            )])),
+            expression: Box::new(FilterExpression::Property {
+                variable: "total".into(),
+                property: "absent".into(),
+            }),
+        };
+        let expression = nested_path_edge_map(
+            source,
+            FilterExpression::List(vec![
+                correlated,
+                edge_item,
+                shadow,
+                missing,
+                nested_path_edge_property("cost"),
+            ]),
+        );
+        let predicate = ExpressionPredicate::new(expression, HashMap::new(), store.clone());
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::List(Arc::from([Value::List(Arc::from([
+                Value::Int64(17),
+                Value::Int64(7),
+                Value::Int64(3),
+                Value::Null,
+                Value::Int64(7),
+            ]))])))
+        );
+        let same_name = reduce(
+            "total",
+            numbers(),
+            add(
+                coalesce(var("total")),
+                FilterExpression::Literal(Value::Int64(1)),
+            ),
+        );
+        let predicate = ExpressionPredicate::new(same_name, HashMap::new(), store.clone());
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::Int64(2)),
+            "accumulator wins when local names coincide"
+        );
+        // Duplicate names are accepted by the public parsers/binder. The old
+        // mini-dispatcher inconsistently selected the item for x.v but the
+        // accumulator for x['v']. Both now obey one lexical accumulator binding;
+        // this intentionally corrects the observable old [2, 1] result.
+        let map = |value| {
+            FilterExpression::Map(vec![(
+                "v".into(),
+                FilterExpression::Literal(Value::Int64(value)),
+            )])
+        };
+        let duplicate_map = FilterExpression::Reduce {
+            accumulator: "x".into(),
+            initial: Box::new(map(1)),
+            variable: "x".into(),
+            list: Box::new(FilterExpression::List(vec![map(2)])),
+            expression: Box::new(FilterExpression::List(vec![
+                FilterExpression::Property {
+                    variable: "x".into(),
+                    property: "v".into(),
+                },
+                FilterExpression::IndexAccess {
+                    base: Box::new(var("x")),
+                    index: Box::new(FilterExpression::Literal(Value::String("v".into()))),
+                },
+            ])),
+        };
+        let predicate = ExpressionPredicate::new(duplicate_map, HashMap::new(), store);
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::List(Arc::from([Value::Int64(1), Value::Int64(1)])))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn typed_path_edge_alias_uses_snapshot_transaction_and_scope() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let old = EpochId::new(1);
+        let current = EpochId::new(5);
+        let source = store.create_node_versioned(&[], old, TransactionId::SYSTEM);
+        let target = store.create_node_versioned(&[], old, TransactionId::SYSTEM);
+        let edge = store.create_edge_versioned(source, target, "REL", old, TransactionId::SYSTEM);
+        store.set_edge_property_at_epoch(edge, "tag", Value::Int64(10), old);
+        store.set_edge_property_at_epoch(edge, "tag", Value::Int64(50), current);
+        store.set_epoch(current);
+        let tx = TransactionId::new(42);
+        store.set_edge_property_buffered(edge, "tag", Value::Int64(99), tx);
+        let list = Value::List(Arc::from([Value::Int64(edge.as_u64() as i64)]));
+        let typed = LogicalType::List(Box::new(LogicalType::Edge));
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Any, typed.clone()]);
+        builder.column_mut(0).unwrap().push_value(Value::Null);
+        builder.column_mut(1).unwrap().push_value(list.clone());
+        builder.advance_row();
+        let chunk = builder.finish();
+        assert_eq!(chunk.column(1).unwrap().data_type(), &typed);
+        for alias in ["rels", "renamed"] {
+            // The iterator deliberately shadows its outer source alias.
+            let expression = FilterExpression::ListComprehension {
+                variable: alias.into(),
+                list_expr: Box::new(FilterExpression::Variable(alias.into())),
+                filter_expr: None,
+                map_expr: Box::new(FilterExpression::List(vec![
+                    FilterExpression::Variable(alias.into()),
+                    FilterExpression::Property {
+                        variable: alias.into(),
+                        property: "tag".into(),
+                    },
+                ])),
+            };
+            for (transaction, expected) in [(None, 10), (Some(tx), 99)] {
+                let predicate = ExpressionPredicate::new(
+                    expression.clone(),
+                    HashMap::from([(alias.into(), 1)]),
+                    store.clone(),
+                )
+                .with_transaction_context(old, transaction);
+                assert_eq!(
+                    predicate.eval_at(&chunk, 0).unwrap(),
+                    Some(Value::List(Arc::from([Value::List(Arc::from([
+                        Value::Int64(edge.as_u64() as i64),
+                        Value::Int64(expected)
+                    ]))])))
+                );
+                // Provenance belongs to the actual chunk column, not a cached
+                // alias-name decision from an earlier evaluation.
+                let mut untyped = DataChunkBuilder::new(&[LogicalType::Any, LogicalType::Any]);
+                untyped.column_mut(0).unwrap().push_value(Value::Null);
+                untyped.column_mut(1).unwrap().push_value(list.clone());
+                untyped.advance_row();
+                assert_eq!(
+                    predicate.eval_at(&untyped.finish(), 0).unwrap(),
+                    Some(Value::List(Arc::from([Value::List(Arc::from([
+                        Value::Int64(edge.as_u64() as i64)
+                    ]))])))
+                );
+            }
+        }
+        let predicate = ExpressionPredicate::new(
+            FilterExpression::ListPredicate {
+                kind: ListPredicateKind::All,
+                variable: "e".into(),
+                list_expr: Box::new(FilterExpression::Variable("rels".into())),
+                predicate: Box::new(FilterExpression::Binary {
+                    left: Box::new(FilterExpression::Property {
+                        variable: "e".into(),
+                        property: "tag".into(),
+                    }),
+                    op: BinaryFilterOp::Eq,
+                    right: Box::new(FilterExpression::Literal(Value::Int64(10))),
+                }),
+            },
+            HashMap::from([("rels".into(), 1)]),
+            store,
+        )
+        .with_transaction_context(old, None);
+        assert_eq!(
+            predicate.eval_at(&chunk, 0).unwrap(),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn path_edge_alias_requires_exact_edge_list_type() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let node = store.create_node(&[]);
+        let edge = store.create_edge(node, node, "REL");
+        assert_eq!(
+            node.as_u64(),
+            edge.as_u64(),
+            "fixture requires colliding entity IDs"
+        );
+        store.set_node_property(node, "tag", Value::String("node".into()));
+        store.set_edge_property(edge, "tag", Value::String("edge".into()));
+        let predicate = ExpressionPredicate::new(
+            FilterExpression::ListComprehension {
+                variable: "e".into(),
+                list_expr: Box::new(FilterExpression::Variable("values".into())),
+                filter_expr: None,
+                map_expr: Box::new(FilterExpression::Property {
+                    variable: "e".into(),
+                    property: "tag".into(),
+                }),
+            },
+            HashMap::from([("values".into(), 0)]),
+            store,
+        );
+        for data_type in [
+            LogicalType::Any,
+            LogicalType::List(Box::new(LogicalType::Int64)),
+            LogicalType::List(Box::new(LogicalType::Any)),
+            LogicalType::List(Box::new(LogicalType::Node)),
+        ] {
+            let mut builder = DataChunkBuilder::new(std::slice::from_ref(&data_type));
+            builder
+                .column_mut(0)
+                .unwrap()
+                .push_value(Value::List(Arc::from([Value::Int64(edge.as_u64() as i64)])));
+            builder.advance_row();
+            assert_eq!(
+                predicate.eval_at(&builder.finish(), 0).unwrap(),
+                Some(Value::List(Arc::from([]))),
+                "{data_type:?} must not infer edge identity from integers"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn path_edge_binding_preserves_identity_and_user_properties() {
+        use crate::graph::lpg::LpgStore;
+        let store = Arc::new(LpgStore::new().unwrap());
+        let source = store.create_node(&[]);
+        let target = store.create_node(&[]);
+        let _ = store.create_edge(source, target, "OTHER");
+        let edge = store.create_edge(source, target, "REL");
+        store.set_edge_property(edge, "_id", Value::Int64(-7));
+        store.set_edge_property(edge, "tag", Value::String("edge".into()));
+        for node in [source, target] {
+            store.set_node_property(node, "tag", Value::String("node".into()));
+        }
+        let edge_value = Value::Int64(edge.as_u64() as i64);
+        let edge_list = Value::List(Arc::from([edge_value.clone()]));
+        for path in [
+            Value::Path {
+                nodes: Arc::from([
+                    Value::Int64(source.as_u64() as i64),
+                    Value::Int64(target.as_u64() as i64),
+                ]),
+                edges: Arc::from([edge_value.clone()]),
+            },
+            Value::Map(Arc::new(BTreeMap::from([(
+                PropertyKey::new("edges"),
+                edge_list,
+            )]))),
+            Value::List(Arc::from([
+                Value::Int64(source.as_u64() as i64),
+                edge_value.clone(),
+                Value::Int64(target.as_u64() as i64),
+            ])),
+        ] {
+            let list_expr = FilterExpression::FunctionCall {
+                name: "relationships".into(),
+                args: vec![FilterExpression::Literal(path)],
+            };
+            let property = |name: &str| FilterExpression::Property {
+                variable: "e".into(),
+                property: name.into(),
+            };
+            let predicate = ExpressionPredicate::new(
+                FilterExpression::ListComprehension {
+                    variable: "e".into(),
+                    list_expr: Box::new(list_expr.clone()),
+                    filter_expr: Some(Box::new(FilterExpression::Binary {
+                        left: Box::new(property("tag")),
+                        op: BinaryFilterOp::Eq,
+                        right: Box::new(FilterExpression::Literal(Value::String("edge".into()))),
+                    })),
+                    map_expr: Box::new(FilterExpression::List(vec![
+                        FilterExpression::Variable("e".into()),
+                        property("_id"),
+                        property("missing"),
+                    ])),
+                },
+                HashMap::new(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+                Some(Value::List(Arc::from([Value::List(Arc::from([
+                    edge_value.clone(),
+                    Value::Int64(-7),
+                    Value::Null
+                ]))])))
+            );
+            let predicate = ExpressionPredicate::new(
+                FilterExpression::ListPredicate {
+                    kind: ListPredicateKind::All,
+                    variable: "e".into(),
+                    list_expr: Box::new(list_expr),
+                    predicate: Box::new(FilterExpression::Binary {
+                        left: Box::new(property("tag")),
+                        op: BinaryFilterOp::Eq,
+                        right: Box::new(FilterExpression::Literal(Value::String("edge".into()))),
+                    }),
+                },
+                HashMap::new(),
+                store.clone(),
+            );
+            assert_eq!(
+                predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+                Some(Value::Bool(true))
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn path_edge_properties_preserve_projected_snapshot_and_transaction() {
+        use crate::graph::lpg::LpgStore;
+        use crate::graph::projection::{GraphProjection, ProjectionSpec};
+        let store = Arc::new(LpgStore::new().unwrap());
+        let old = EpochId::new(1);
+        let newer = EpochId::new(5);
+        let source = store.create_node_versioned(&[], old, TransactionId::SYSTEM);
+        let target = store.create_node_versioned(&[], old, TransactionId::SYSTEM);
+        let edge = store.create_edge_versioned(source, target, "REL", old, TransactionId::SYSTEM);
+        store.set_edge_property_at_epoch(edge, "tag", Value::Int64(10), old);
+        store.set_edge_property_at_epoch(edge, "tag", Value::Int64(50), newer);
+        // Finish the replay fixture by publishing its frontier. Otherwise both
+        // supplied epochs are future requests relative to INITIAL, rather than
+        // an old snapshot followed by a newer committed value.
+        store.set_epoch(newer);
+        assert_eq!(
+            store
+                .get_edge_at_epoch(edge, old)
+                .unwrap()
+                .properties
+                .get(&PropertyKey::new("tag")),
+            Some(&Value::Int64(10))
+        );
+        let projection: Arc<dyn GraphStoreSearch> = Arc::new(GraphProjection::new(
+            store.clone(),
+            ProjectionSpec::default(),
+        ));
+        assert_eq!(
+            projection
+                .get_edge_at_epoch(edge, old)
+                .unwrap()
+                .properties
+                .get(&PropertyKey::new("tag")),
+            Some(&Value::Int64(10))
+        );
+        let expression = FilterExpression::ListComprehension {
+            variable: "e".into(),
+            list_expr: Box::new(FilterExpression::FunctionCall {
+                name: "edges".into(),
+                args: vec![FilterExpression::Literal(Value::Path {
+                    nodes: Arc::from([
+                        Value::Int64(source.as_u64() as i64),
+                        Value::Int64(target.as_u64() as i64),
+                    ]),
+                    edges: Arc::from([Value::Int64(edge.as_u64() as i64)]),
+                })],
+            }),
+            filter_expr: None,
+            map_expr: Box::new(FilterExpression::Property {
+                variable: "e".into(),
+                property: "tag".into(),
+            }),
+        };
+        let tx = TransactionId::new(42);
+        store.set_edge_property_buffered(edge, "tag", Value::Int64(99), tx);
+        for (epoch, transaction, expected) in
+            [(old, None, 10), (newer, None, 50), (old, Some(tx), 99)]
+        {
+            let predicate =
+                ExpressionPredicate::new(expression.clone(), HashMap::new(), projection.clone())
+                    .with_transaction_context(epoch, transaction);
+            assert_eq!(
+                predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+                Some(Value::List(Arc::from([Value::Int64(expected)]))),
+                "epoch={epoch:?}, transaction={transaction:?}"
+            );
+        }
+        store.remove_edge_property_buffered(edge, "tag", tx);
+        let predicate = ExpressionPredicate::new(expression.clone(), HashMap::new(), projection)
+            .with_transaction_context(old, Some(tx));
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::List(Arc::from([Value::Null])))
+        );
+        let hidden: Arc<dyn GraphStoreSearch> = Arc::new(GraphProjection::new(
+            store,
+            ProjectionSpec::default().with_edge_types(["HIDDEN"]),
+        ));
+        let predicate = ExpressionPredicate::new(expression, HashMap::new(), hidden)
+            .with_transaction_context(old, None);
+        assert_eq!(
+            predicate.eval_at(&DataChunk::empty(), 0).unwrap(),
+            Some(Value::List(Arc::from([Value::Null]))),
+            "property binding must not bypass the projection's edge visibility"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn test_edges_path_list_comprehension_reads_edge_properties() {
+        use crate::graph::lpg::LpgStore;
+        use grafeo_common::types::LogicalType;
+
+        let store = Arc::new(LpgStore::new().unwrap());
+        let source = store.create_node(&[]);
+        let target = store.create_node(&[]);
+        let edge = store.create_edge(source, target, "REL");
+        store.set_edge_property(edge, "tag", Value::String("s-t".into()));
+
+        #[allow(clippy::cast_possible_wrap)]
+        let path = Value::Path {
+            nodes: Arc::from([
+                Value::Int64(source.as_u64() as i64),
+                Value::Int64(target.as_u64() as i64),
+            ]),
+            edges: Arc::from([Value::Int64(edge.as_u64() as i64)]),
+        };
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Any]);
+        builder.column_mut(0).unwrap().push_value(path);
+        builder.advance_row();
+        let chunk = builder.finish();
+
+        let edge_list = ExpressionPredicate::new(
+            FilterExpression::FunctionCall {
+                name: "edges".to_string(),
+                args: vec![FilterExpression::Variable("p".to_string())],
+            },
+            HashMap::from([("p".to_string(), 0)]),
+            store.clone(),
+        );
+        let Some(Value::List(edges)) = edge_list.eval_at(&chunk, 0).unwrap() else {
+            panic!("edges(path) should return a list");
+        };
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0], Value::Int64(edge.as_u64() as i64));
+
+        let predicate = ExpressionPredicate::new(
+            FilterExpression::ListComprehension {
+                variable: "e".to_string(),
+                list_expr: Box::new(FilterExpression::FunctionCall {
+                    name: "edges".to_string(),
+                    args: vec![FilterExpression::Variable("p".to_string())],
+                }),
+                filter_expr: None,
+                map_expr: Box::new(FilterExpression::Property {
+                    variable: "e".to_string(),
+                    property: "tag".to_string(),
+                }),
+            },
+            HashMap::from([("p".to_string(), 0)]),
+            store,
+        );
+
+        assert_eq!(
+            predicate.eval_at(&chunk, 0).unwrap(),
+            Some(Value::List(Arc::from([Value::String("s-t".into())])))
+        );
     }
 
     // === List Predicate (any/all/none/single) ===
 
     #[test]
-    fn test_eval_list_predicate_any() {
+    fn test_eval_list_predicate_any() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::ListPredicate {
             kind: ListPredicateKind::Any,
             variable: "x".to_string(),
@@ -6061,12 +7664,13 @@ mod tests {
                 op: BinaryFilterOp::Gt,
                 right: Box::new(FilterExpression::Literal(Value::Int64(4))),
             }),
-        });
+        })?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_list_predicate_all() {
+    fn test_eval_list_predicate_all() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::ListPredicate {
             kind: ListPredicateKind::All,
             variable: "x".to_string(),
@@ -6080,12 +7684,13 @@ mod tests {
                 op: BinaryFilterOp::Gt,
                 right: Box::new(FilterExpression::Literal(Value::Int64(5))),
             }),
-        });
+        })?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_list_predicate_none() {
+    fn test_eval_list_predicate_none() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::ListPredicate {
             kind: ListPredicateKind::None,
             variable: "x".to_string(),
@@ -6099,12 +7704,13 @@ mod tests {
                 op: BinaryFilterOp::Gt,
                 right: Box::new(FilterExpression::Literal(Value::Int64(10))),
             }),
-        });
+        })?;
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_list_predicate_single() {
+    fn test_eval_list_predicate_single() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::ListPredicate {
             kind: ListPredicateKind::Single,
             variable: "x".to_string(),
@@ -6118,15 +7724,16 @@ mod tests {
                 op: BinaryFilterOp::Gt,
                 right: Box::new(FilterExpression::Literal(Value::Int64(4))),
             }),
-        });
+        })?;
         // Only x=5 satisfies x > 4, so exactly one
         assert_eq!(result, Some(Value::Bool(true)));
+        Ok(())
     }
 
     // === Map key access via index ===
 
     #[test]
-    fn test_eval_map_key_access() {
+    fn test_eval_map_key_access() -> Result<(), Box<dyn std::error::Error>> {
         // {name: 'Alix'}['name'] = 'Alix'
         let result = eval_literal_expr(FilterExpression::IndexAccess {
             base: Box::new(FilterExpression::Map(vec![(
@@ -6134,21 +7741,22 @@ mod tests {
                 FilterExpression::Literal(Value::String("Alix".into())),
             )])),
             index: Box::new(FilterExpression::Literal(Value::String("name".into()))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("Alix".into())));
+        Ok(())
     }
 
     // === LIKE operator tests (require regex for pattern conversion) ===
 
     #[cfg(any(feature = "regex", feature = "regex-lite"))]
     #[test]
-    fn test_eval_like_wildcard() {
+    fn test_eval_like_wildcard() -> Result<(), Box<dyn std::error::Error>> {
         // 'hello world' LIKE 'hello%'
         let result = eval_literal_expr(binary(
             Value::String("hello world".into()),
             BinaryFilterOp::Like,
             Value::String("hello%".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         // 'hello world' LIKE '%world'
@@ -6156,7 +7764,7 @@ mod tests {
             Value::String("hello world".into()),
             BinaryFilterOp::Like,
             Value::String("%world".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         // 'hello world' LIKE '%llo%'
@@ -6164,7 +7772,7 @@ mod tests {
             Value::String("hello world".into()),
             BinaryFilterOp::Like,
             Value::String("%llo%".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         // 'hello' LIKE 'world%'
@@ -6172,19 +7780,20 @@ mod tests {
             Value::String("hello".into()),
             BinaryFilterOp::Like,
             Value::String("world%".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[cfg(any(feature = "regex", feature = "regex-lite"))]
     #[test]
-    fn test_eval_like_single_char() {
+    fn test_eval_like_single_char() -> Result<(), Box<dyn std::error::Error>> {
         // 'cat' LIKE 'c_t'
         let result = eval_literal_expr(binary(
             Value::String("cat".into()),
             BinaryFilterOp::Like,
             Value::String("c_t".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         // 'cart' LIKE 'c_t'
@@ -6192,85 +7801,92 @@ mod tests {
             Value::String("cart".into()),
             BinaryFilterOp::Like,
             Value::String("c_t".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[cfg(any(feature = "regex", feature = "regex-lite"))]
     #[test]
-    fn test_eval_like_null() {
+    fn test_eval_like_null() -> Result<(), Box<dyn std::error::Error>> {
         // NULL LIKE '%' -> NULL
         let result = eval_literal_expr(binary(
             Value::Null,
             BinaryFilterOp::Like,
             Value::String("%".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Null));
+        Ok(())
     }
 
     // === Concat operator (||) tests ===
 
     #[test]
-    fn test_eval_concat_strings() {
+    fn test_eval_concat_strings() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("hello".into()),
             BinaryFilterOp::Concat,
             Value::String(" world".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::String("hello world".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_concat_string_with_int() {
+    fn test_eval_concat_string_with_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("count: ".into()),
             BinaryFilterOp::Concat,
             Value::Int64(42),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::String("count: 42".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_concat_int_with_string() {
+    fn test_eval_concat_int_with_string() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(42),
             BinaryFilterOp::Concat,
             Value::String(" items".into()),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::String("42 items".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_concat_null() {
+    fn test_eval_concat_null() -> Result<(), Box<dyn std::error::Error>> {
         // Null || Null -> Null (hits the null arm)
-        let result = eval_literal_expr(binary(Value::Null, BinaryFilterOp::Concat, Value::Null));
+        let result = eval_literal_expr(binary(Value::Null, BinaryFilterOp::Concat, Value::Null))?;
         assert_eq!(result, Some(Value::Null));
+        Ok(())
     }
 
     // === Modulo operator tests ===
 
     #[test]
-    fn test_eval_modulo_float() {
+    fn test_eval_modulo_float() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Float64(10.5),
             BinaryFilterOp::Mod,
             Value::Float64(3.0),
-        ));
+        ))?;
         if let Some(Value::Float64(v)) = result {
             assert!((v - 1.5).abs() < 0.001);
         } else {
             panic!("Expected Float64");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_eval_modulo_mixed() {
+    fn test_eval_modulo_mixed() -> Result<(), Box<dyn std::error::Error>> {
         // int % float
         let result = eval_literal_expr(binary(
             Value::Int64(10),
             BinaryFilterOp::Mod,
             Value::Float64(3.0),
-        ));
+        ))?;
         if let Some(Value::Float64(v)) = result {
             assert!((v - 1.0).abs() < 0.001);
         } else {
@@ -6282,100 +7898,108 @@ mod tests {
             Value::Float64(10.0),
             BinaryFilterOp::Mod,
             Value::Int64(3),
-        ));
+        ))?;
         if let Some(Value::Float64(v)) = result {
             assert!((v - 1.0).abs() < 0.001);
         } else {
             panic!("Expected Float64");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_eval_modulo_by_zero() {
+    fn test_eval_modulo_by_zero() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::Int64(10),
             BinaryFilterOp::Mod,
             Value::Int64(0),
-        ));
+        ))?;
         assert_eq!(result, None);
 
         let result = eval_literal_expr(binary(
             Value::Float64(10.0),
             BinaryFilterOp::Mod,
             Value::Float64(0.0),
-        ));
+        ))?;
         assert_eq!(result, None);
+        Ok(())
     }
 
     // === String addition with type coercion ===
 
     #[test]
-    fn test_eval_string_add_int() {
+    fn test_eval_string_add_int() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("val:".into()),
             BinaryFilterOp::Add,
             Value::Int64(42),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::String("val:42".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_string_add_bool() {
+    fn test_eval_string_add_bool() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("is:".into()),
             BinaryFilterOp::Add,
             Value::Bool(true),
-        ));
+        ))?;
         assert_eq!(result, Some(Value::String("is:true".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_string_add_null() {
+    fn test_eval_string_add_null() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(binary(
             Value::String("val:".into()),
             BinaryFilterOp::Add,
             Value::Null,
-        ));
+        ))?;
         assert_eq!(result, Some(Value::Null));
+        Ok(())
     }
 
     // === Slice access tests ===
 
     #[test]
-    fn test_eval_string_slice() {
+    fn test_eval_string_slice() -> Result<(), Box<dyn std::error::Error>> {
         // "hello"[1..3] = "el"
         let result = eval_literal_expr(FilterExpression::SliceAccess {
             base: Box::new(FilterExpression::Literal(Value::String("hello".into()))),
             start: Some(Box::new(FilterExpression::Literal(Value::Int64(1)))),
             end: Some(Box::new(FilterExpression::Literal(Value::Int64(3)))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("el".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_string_index_access() {
+    fn test_eval_string_index_access() -> Result<(), Box<dyn std::error::Error>> {
         // "hello"[1] = "e"
         let result = eval_literal_expr(FilterExpression::IndexAccess {
             base: Box::new(FilterExpression::Literal(Value::String("hello".into()))),
             index: Box::new(FilterExpression::Literal(Value::Int64(1))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("e".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_string_negative_index() {
+    fn test_eval_string_negative_index() -> Result<(), Box<dyn std::error::Error>> {
         // "hello"[-1] = "o"
         let result = eval_literal_expr(FilterExpression::IndexAccess {
             base: Box::new(FilterExpression::Literal(Value::String("hello".into()))),
             index: Box::new(FilterExpression::Literal(Value::Int64(-1))),
-        });
+        })?;
         assert_eq!(result, Some(Value::String("o".into())));
+        Ok(())
     }
 
     // === Function tests for uncovered branches ===
 
     #[test]
-    fn test_eval_tostring_types() {
+    fn test_eval_tostring_types() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let vc = HashMap::new();
@@ -6391,7 +8015,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::String("true".into())));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::String("true".into())));
 
         // Float -> String
         let pred = ExpressionPredicate::new(
@@ -6402,7 +8026,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::String("2.72".into())));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::String("2.72".into())));
 
         // Null -> Null
         let pred = ExpressionPredicate::new(
@@ -6413,11 +8037,12 @@ mod tests {
             vc,
             store,
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::Null));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::Null));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_toboolean() {
+    fn test_eval_toboolean() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let vc = HashMap::new();
@@ -6432,7 +8057,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::Bool(true)));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::Bool(true)));
 
         let pred = ExpressionPredicate::new(
             FilterExpression::FunctionCall {
@@ -6442,7 +8067,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::Bool(false)));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::Bool(false)));
 
         let pred = ExpressionPredicate::new(
             FilterExpression::FunctionCall {
@@ -6452,11 +8077,12 @@ mod tests {
             vc,
             store,
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::Bool(true)));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::Bool(true)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_tofloat() {
+    fn test_eval_tofloat() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let vc = HashMap::new();
@@ -6471,7 +8097,7 @@ mod tests {
             vc.clone(),
             Arc::clone(&store),
         );
-        if let Some(Value::Float64(v)) = pred.eval_at(&chunk, 0) {
+        if let Some(Value::Float64(v)) = pred.eval_at(&chunk, 0)? {
             assert!((v - 2.72).abs() < 0.001);
         } else {
             panic!("Expected Float64");
@@ -6485,11 +8111,12 @@ mod tests {
             vc,
             store,
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::Float64(42.0)));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::Float64(42.0)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_tointeger_from_float() {
+    fn test_eval_tointeger_from_float() -> Result<(), Box<dyn std::error::Error>> {
         use crate::graph::lpg::LpgStore;
         let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let vc = HashMap::new();
@@ -6504,11 +8131,12 @@ mod tests {
             vc,
             store,
         );
-        assert_eq!(pred.eval_at(&chunk, 0), Some(Value::Int64(3)));
+        assert_eq!(pred.eval_at(&chunk, 0)?, Some(Value::Int64(3)));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_reverse_list() {
+    fn test_eval_reverse_list() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::FunctionCall {
             name: "reverse".to_string(),
             args: vec![FilterExpression::List(vec![
@@ -6516,37 +8144,40 @@ mod tests {
                 FilterExpression::Literal(Value::Int64(2)),
                 FilterExpression::Literal(Value::Int64(3)),
             ])],
-        });
+        })?;
         assert_eq!(
             result,
             Some(Value::List(
                 vec![Value::Int64(3), Value::Int64(2), Value::Int64(1)].into()
             ))
         );
+        Ok(())
     }
 
     #[test]
-    fn test_eval_reverse_string() {
+    fn test_eval_reverse_string() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::FunctionCall {
             name: "reverse".to_string(),
             args: vec![FilterExpression::Literal(Value::String("abc".into()))],
-        });
+        })?;
         assert_eq!(result, Some(Value::String("cba".into())));
+        Ok(())
     }
 
     #[test]
-    fn test_eval_exists_function() {
+    fn test_eval_exists_function() -> Result<(), Box<dyn std::error::Error>> {
         let result = eval_literal_expr(FilterExpression::FunctionCall {
             name: "exists".to_string(),
             args: vec![FilterExpression::Literal(Value::Int64(42))],
-        });
+        })?;
         assert_eq!(result, Some(Value::Bool(true)));
 
         let result = eval_literal_expr(FilterExpression::FunctionCall {
             name: "exists".to_string(),
             args: vec![FilterExpression::Literal(Value::Null)],
-        });
+        })?;
         assert_eq!(result, Some(Value::Bool(false)));
+        Ok(())
     }
 
     #[test]
@@ -6562,15 +8193,16 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_into_parts() {
+    fn test_filter_into_parts() -> Result<(), Box<dyn std::error::Error>> {
         let mock = MockScanOperator {
             chunks: vec![],
             position: 0,
         };
         let predicate = ComparisonPredicate::new(0, CompareOp::Gt, Value::Int64(5));
         let op = FilterOperator::new(Box::new(mock), Box::new(predicate));
-        let (mut child, _predicate) = op.into_parts();
+        let (mut child, _predicate) = op.into_parts()?;
         assert!(child.next().unwrap().is_none());
+        Ok(())
     }
 }
 
@@ -6613,7 +8245,7 @@ mod text_fn_tests {
     }
 
     #[test]
-    fn test_text_score_function() {
+    fn test_text_score_function() -> Result<(), Box<dyn std::error::Error>> {
         let (store, n1, n2) = setup_store_with_text_index();
 
         // Build a chunk with two rows: n1 in row 0, n2 in row 1
@@ -6649,18 +8281,19 @@ mod text_fn_tests {
 
         // n1 matches "rust database" — should pass
         assert!(
-            predicate.evaluate(&chunk, 0),
+            predicate.evaluate(&chunk, 0)?,
             "n1 should score > 0 for 'rust database'"
         );
         // n2 does not match — should fail
         assert!(
-            !predicate.evaluate(&chunk, 1),
+            !predicate.evaluate(&chunk, 1)?,
             "n2 should score 0 for 'rust database'"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_text_match_function() {
+    fn test_text_match_function() -> Result<(), Box<dyn std::error::Error>> {
         let (store, n1, n2) = setup_store_with_text_index();
 
         // Build a chunk with two rows
@@ -6691,13 +8324,17 @@ mod text_fn_tests {
         );
 
         // n1 contains "rust" — text_match should return Bool(true) → evaluates to true
-        assert!(predicate.evaluate(&chunk, 0), "n1 should match 'rust'");
+        assert!(predicate.evaluate(&chunk, 0)?, "n1 should match 'rust'");
         // n2 does not contain "rust" — text_match should return Bool(false)
-        assert!(!predicate.evaluate(&chunk, 1), "n2 should not match 'rust'");
+        assert!(
+            !predicate.evaluate(&chunk, 1)?,
+            "n2 should not match 'rust'"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_text_score_wrong_arg_count_returns_none() {
+    fn test_text_score_wrong_arg_count_returns_none() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(LpgStore::new().unwrap());
         let builder = DataChunkBuilder::new(&[LogicalType::Node]);
         let chunk = builder.finish();
@@ -6712,11 +8349,12 @@ mod text_fn_tests {
             variable_columns,
             store as Arc<dyn GraphStoreSearch>,
         );
-        assert!(!predicate.evaluate(&chunk, 0));
+        assert!(!predicate.evaluate(&chunk, 0)?);
+        Ok(())
     }
 
     #[test]
-    fn test_text_score_no_index_returns_none() {
+    fn test_text_score_no_index_returns_none() -> Result<(), Box<dyn std::error::Error>> {
         // Node has a label but no text index for that label+property
         let store = Arc::new(LpgStore::new().unwrap());
         let n1 = store.create_node(&["Article"]);
@@ -6746,6 +8384,7 @@ mod text_fn_tests {
             store as Arc<dyn GraphStoreSearch>,
         );
         // No index → score_text returns None → eval returns None → evaluate returns false
-        assert!(!predicate.evaluate(&chunk, 0));
+        assert!(!predicate.evaluate(&chunk, 0)?);
+        Ok(())
     }
 }

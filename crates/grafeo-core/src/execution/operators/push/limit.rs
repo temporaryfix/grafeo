@@ -56,8 +56,12 @@ impl PushOperator for LimitPushOperator {
             // Need to truncate chunk
             self.passed += remaining;
 
-            // Create selection for first `remaining` rows
-            let selection = SelectionVector::new_all(remaining);
+            // Select the first `remaining` physical rows from the active
+            // selection, rather than treating selection positions as rows.
+            let mut selection = SelectionVector::with_capacity(remaining);
+            for row in chunk.selected_indices().take(remaining) {
+                selection.push(row);
+            }
             let truncated = chunk.filter(&selection);
 
             sink.consume(truncated)?;
@@ -131,8 +135,10 @@ impl PushOperator for SkipPushOperator {
             // Skip first `remaining_to_skip` rows, pass the rest
             self.skipped = self.skip;
 
-            let start = remaining_to_skip;
-            let selection = SelectionVector::from_predicate(chunk_len, |i| i >= start);
+            let mut selection = SelectionVector::with_capacity(chunk_len - remaining_to_skip);
+            for row in chunk.selected_indices().skip(remaining_to_skip) {
+                selection.push(row);
+            }
             let passed = chunk.filter(&selection);
 
             sink.consume(passed)
@@ -186,8 +192,10 @@ impl PushOperator for SkipLimitPushOperator {
 
             // Partial skip
             self.skip.skipped = self.skip.skip;
-            let start = remaining_to_skip;
-            let selection = SelectionVector::from_predicate(chunk_len, |i| i >= start);
+            let mut selection = SelectionVector::with_capacity(chunk_len - remaining_to_skip);
+            for row in chunk.selected_indices().skip(remaining_to_skip) {
+                selection.push(row);
+            }
             let passed = chunk.filter(&selection);
 
             return self.limit.push(passed, sink);
@@ -214,14 +222,134 @@ impl PushOperator for SkipLimitPushOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::selection::SelectionVector;
     use crate::execution::sink::CollectorSink;
     use crate::execution::vector::ValueVector;
-    use grafeo_common::types::Value;
+    use grafeo_common::types::{LogicalType, Value};
 
     fn create_test_chunk(values: &[i64]) -> DataChunk {
         let v: Vec<Value> = values.iter().map(|&i| Value::Int64(i)).collect();
         let vector = ValueVector::from_values(&v);
         DataChunk::new(vec![vector])
+    }
+
+    fn create_typed_edge_list_chunk(rows: &[&[i64]]) -> DataChunk {
+        let edge_list_type = LogicalType::List(Box::new(LogicalType::Edge));
+        let mut column = ValueVector::with_type(edge_list_type);
+        for ids in rows {
+            let values = ids.iter().map(|&id| Value::Int64(id)).collect::<Vec<_>>();
+            column.push_value(Value::List(values.into()));
+        }
+        DataChunk::new(vec![column])
+    }
+
+    #[test]
+    fn limit_push_preserves_typed_edge_lists_when_truncating() {
+        let mut limit = LimitPushOperator::new(2);
+        let mut sink = CollectorSink::new();
+
+        limit
+            .push(
+                create_typed_edge_list_chunk(&[&[11], &[22], &[33]]),
+                &mut sink,
+            )
+            .unwrap();
+
+        let chunks = sink.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].column(0).unwrap().data_type(),
+            &LogicalType::List(Box::new(LogicalType::Edge))
+        );
+        assert_eq!(
+            chunks[0].column(0).unwrap().get_value(0),
+            Some(Value::List(vec![Value::Int64(11)].into()))
+        );
+        assert_eq!(
+            chunks[0].column(0).unwrap().get_value(1),
+            Some(Value::List(vec![Value::Int64(22)].into()))
+        );
+    }
+
+    #[test]
+    fn limit_push_preserves_preselected_physical_rows_when_truncating() {
+        let mut chunk = create_typed_edge_list_chunk(&[&[10], &[11], &[12], &[13]]);
+        chunk.set_selection(SelectionVector::from_predicate(4, |row| {
+            row == 1 || row == 3
+        }));
+
+        let mut limit = LimitPushOperator::new(1);
+        let mut sink = CollectorSink::new();
+        limit.push(chunk, &mut sink).unwrap();
+
+        assert_eq!(sink.row_count(), 1);
+        assert_eq!(
+            sink.chunks()[0].column(0).unwrap().get_value(0),
+            Some(Value::List(vec![Value::Int64(11)].into()))
+        );
+    }
+
+    #[test]
+    fn skip_limit_push_preserves_typed_edge_lists_across_partial_boundaries() {
+        let mut op = SkipLimitPushOperator::new(1, 2);
+        let mut sink = CollectorSink::new();
+
+        op.push(
+            create_typed_edge_list_chunk(&[&[11], &[22], &[33], &[44]]),
+            &mut sink,
+        )
+        .unwrap();
+
+        let chunks = sink.chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].column(0).unwrap().data_type(),
+            &LogicalType::List(Box::new(LogicalType::Edge))
+        );
+        assert_eq!(
+            chunks[0].column(0).unwrap().get_value(0),
+            Some(Value::List(vec![Value::Int64(22)].into()))
+        );
+        assert_eq!(
+            chunks[0].column(0).unwrap().get_value(1),
+            Some(Value::List(vec![Value::Int64(33)].into()))
+        );
+    }
+
+    #[test]
+    fn skip_push_preserves_preselected_physical_rows() {
+        let mut chunk = create_typed_edge_list_chunk(&[&[10], &[11], &[12], &[13]]);
+        chunk.set_selection(SelectionVector::from_predicate(4, |row| {
+            row == 1 || row == 3
+        }));
+
+        let mut skip = SkipPushOperator::new(1);
+        let mut sink = CollectorSink::new();
+        skip.push(chunk, &mut sink).unwrap();
+
+        assert_eq!(sink.row_count(), 1);
+        assert_eq!(
+            sink.chunks()[0].column(0).unwrap().get_value(0),
+            Some(Value::List(vec![Value::Int64(13)].into()))
+        );
+    }
+
+    #[test]
+    fn skip_limit_push_preserves_preselected_physical_rows() {
+        let mut chunk = create_typed_edge_list_chunk(&[&[10], &[11], &[12], &[13]]);
+        chunk.set_selection(SelectionVector::from_predicate(4, |row| {
+            row == 1 || row == 3
+        }));
+
+        let mut op = SkipLimitPushOperator::new(1, 1);
+        let mut sink = CollectorSink::new();
+        op.push(chunk, &mut sink).unwrap();
+
+        assert_eq!(sink.row_count(), 1);
+        assert_eq!(
+            sink.chunks()[0].column(0).unwrap().get_value(0),
+            Some(Value::List(vec![Value::Int64(13)].into()))
+        );
     }
 
     #[test]

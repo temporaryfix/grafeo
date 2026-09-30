@@ -5,7 +5,8 @@
 //! - `NestedLoopJoinOperator`: General-purpose join for any condition
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+
+use grafeo_common::utils::hash::FxHashMap;
 
 use arcstr::ArcStr;
 use grafeo_common::types::{LogicalType, Value};
@@ -89,10 +90,11 @@ impl HashKey {
             Value::Bool(b) => HashKey::Bool(*b),
             Value::Int64(i) => HashKey::Int64(*i),
             Value::Float64(f) => {
-                // Convert float to bits for consistent hashing
+                // Convert float to bits for consistent hashing; canonicalize
+                // -0.0 to +0.0 so the two zeros join as equal.
                 // reason: intentional bit-level reinterpretation for hashing
                 #[allow(clippy::cast_possible_wrap)]
-                HashKey::Int64(f.to_bits() as i64)
+                HashKey::Int64(grafeo_common::types::canonical_f64_bits(*f) as i64)
             }
             Value::String(s) => HashKey::String(s.clone()),
             Value::Bytes(b) => HashKey::Bytes(b.to_vec()),
@@ -154,6 +156,15 @@ impl HashKey {
                 let n: i64 = neg.values().copied().map(|v| v as i64).sum();
                 HashKey::Int64(p - n)
             }
+            Value::RdfLiteral {
+                lexical,
+                language,
+                datatype,
+            } => HashKey::Composite(vec![
+                HashKey::String(lexical.clone()),
+                HashKey::String(language.clone().unwrap_or_default()),
+                HashKey::String(datatype.clone().unwrap_or_default()),
+            ]),
             _ => HashKey::Null,
         }
     }
@@ -182,7 +193,7 @@ pub struct HashJoinOperator {
     /// Output schema (combined from both sides).
     output_schema: Vec<LogicalType>,
     /// Hash table: key -> list of (chunk_index, row_index).
-    hash_table: HashMap<HashKey, Vec<(usize, usize)>>,
+    hash_table: FxHashMap<HashKey, Vec<(usize, usize)>>,
     /// Materialized build side chunks.
     build_chunks: Vec<DataChunk>,
     /// Whether the build phase is complete.
@@ -232,7 +243,7 @@ impl HashJoinOperator {
             build_keys,
             join_type,
             output_schema,
-            hash_table: HashMap::new(),
+            hash_table: FxHashMap::default(),
             build_chunks: Vec::new(),
             build_complete: false,
             current_probe_chunk: None,
@@ -261,13 +272,12 @@ impl HashJoinOperator {
             for row in chunk.selected_indices() {
                 let key = self.extract_key(&chunk, row, &self.build_keys)?;
 
-                // Skip null keys for inner/semi/anti joins
-                if matches!(key, HashKey::Null)
-                    && !matches!(
-                        self.join_type,
-                        JoinType::Left | JoinType::Right | JoinType::Full
-                    )
-                {
+                // NULL never equals NULL in a join key (three-valued logic), so
+                // NULL keys are never inserted into the hash table for any join
+                // type. Outer-join unmatched rows are still emitted via the
+                // build_matched/probe_matched tracking and the no-match null-pad
+                // path, neither of which depends on NULL being in the table.
+                if matches!(key, HashKey::Null) {
                     continue;
                 }
 
@@ -363,20 +373,21 @@ impl HashJoinOperator {
             }
             _ => {
                 // Emit nulls for build side (left outer join case)
-                if !self.build_chunks.is_empty() {
-                    let build_col_count = self.build_chunks[0].column_count();
-                    for col_idx in 0..build_col_count {
-                        let dst_col =
-                            builder
-                                .column_mut(probe_col_count + col_idx)
-                                .ok_or_else(|| {
-                                    OperatorError::ColumnNotFound(format!(
-                                        "output column {}",
-                                        probe_col_count + col_idx
-                                    ))
-                                })?;
-                        dst_col.push_value(Value::Null);
-                    }
+                // The build side can be completely empty, in which case there
+                // is no materialized chunk from which to recover its width.
+                // The declared output schema still contains those columns.
+                let build_col_count = self.output_schema.len().saturating_sub(probe_col_count);
+                for col_idx in 0..build_col_count {
+                    let dst_col =
+                        builder
+                            .column_mut(probe_col_count + col_idx)
+                            .ok_or_else(|| {
+                                OperatorError::ColumnNotFound(format!(
+                                    "output column {}",
+                                    probe_col_count + col_idx
+                                ))
+                            })?;
+                    dst_col.push_value(Value::Null);
                 }
             }
         }
@@ -504,6 +515,18 @@ impl Operator for HashJoinOperator {
                 .as_ref()
                 .expect("probe chunk is Some: guard at line 396 ensures this");
             let probe_rows: Vec<usize> = probe_chunk.selected_indices().collect();
+
+            // A semi or anti join emits probe rows unchanged, so its output keeps
+            // the probe's column types; the declared schema may say `Any` for a
+            // `Node` column, which would key the same node differently in DISTINCT.
+            if matches!(self.join_type, JoinType::Semi | JoinType::Anti) && builder.row_count() == 0
+            {
+                let probe_types: Vec<LogicalType> = (0..probe_chunk.column_count())
+                    .filter_map(|index| probe_chunk.column(index))
+                    .map(|column| column.data_type().clone())
+                    .collect();
+                builder = DataChunkBuilder::with_capacity(&probe_types, 2048);
+            }
 
             while self.current_probe_row < probe_rows.len() {
                 let probe_row = probe_rows[self.current_probe_row];
@@ -1036,6 +1059,102 @@ mod tests {
         builder.finish()
     }
 
+    fn create_nullable_int_chunk(values: &[Option<i64>]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Int64]);
+        for v in values {
+            match v {
+                Some(x) => builder.column_mut(0).unwrap().push_int64(*x),
+                None => builder.column_mut(0).unwrap().push_value(Value::Null),
+            }
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    fn create_nullable_int_chunk_2col(rows: &[(Option<i64>, Option<i64>)]) -> DataChunk {
+        let mut b = DataChunkBuilder::new(&[LogicalType::Int64, LogicalType::Int64]);
+        for (k, p) in rows {
+            match k {
+                Some(x) => b.column_mut(0).unwrap().push_int64(*x),
+                None => b.column_mut(0).unwrap().push_value(Value::Null),
+            }
+            match p {
+                Some(x) => b.column_mut(1).unwrap().push_int64(*x),
+                None => b.column_mut(1).unwrap().push_value(Value::Null),
+            }
+            b.advance_row();
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn test_hash_join_left_outer_null_key_is_null_padded_not_matched() {
+        // Left keys: [1, NULL]; Right rows: [(key=1, payload=100), (key=NULL, payload=999)].
+        // LEFT join must emit (1 -> matched 100) and (NULL -> null-padded). The
+        // distinguishing payload column proves the NULL left row is null-padded
+        // (payload NULL), NOT matched to the right's NULL key (payload 999).
+        let left = MockOperator::new(vec![create_nullable_int_chunk(&[Some(1), None])]);
+        let right = MockOperator::new(vec![create_nullable_int_chunk_2col(&[
+            (Some(1), Some(100)),
+            (None, Some(999)),
+        ])]);
+        let output_schema = vec![LogicalType::Int64, LogicalType::Int64, LogicalType::Int64];
+        let mut join = HashJoinOperator::new(
+            Box::new(left),
+            Box::new(right),
+            vec![0],
+            vec![0],
+            JoinType::Left,
+            output_schema,
+        );
+
+        let mut total = 0;
+        let mut payload_for_null_left: Option<Option<Value>> = None;
+        while let Some(chunk) = join.next().unwrap() {
+            for row in chunk.selected_indices() {
+                total += 1;
+                let lk = chunk.column(0).unwrap().get_value(row);
+                if matches!(lk, None | Some(Value::Null)) {
+                    payload_for_null_left = Some(chunk.column(2).unwrap().get_value(row));
+                }
+            }
+        }
+        assert_eq!(total, 2, "LEFT join must emit each left row exactly once");
+        let p = payload_for_null_left.expect("null-key left row must be present");
+        assert!(
+            matches!(p, None | Some(Value::Null)),
+            "NULL left key must be null-padded, not matched to a NULL right key; got {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_hash_join_left_outer_empty_build_null_pads_declared_columns() {
+        let left = super::super::SingleRowOperator::new();
+        let right = MockOperator::new(Vec::new());
+        let mut join = HashJoinOperator::new(
+            Box::new(left),
+            Box::new(right),
+            Vec::new(),
+            Vec::new(),
+            JoinType::Left,
+            vec![LogicalType::Int64],
+        );
+
+        let chunk = join
+            .next()
+            .expect("empty-build LEFT join executes")
+            .expect("the unit left row survives an empty build side");
+        assert_eq!(chunk.row_count(), 1);
+        assert!(
+            chunk
+                .column(0)
+                .expect("declared right column exists")
+                .is_null(0),
+            "the absent build row is represented by a NULL in every declared right column"
+        );
+        assert!(join.next().expect("LEFT join reaches EOF").is_none());
+    }
+
     #[test]
     fn test_hash_join_inner() {
         // Left: [1, 2, 3, 4]
@@ -1195,6 +1314,47 @@ mod tests {
 
         results.sort_unstable();
         assert_eq!(results, vec![1, 3]);
+    }
+
+    fn create_node_chunk(ids: &[u64]) -> DataChunk {
+        let mut builder = DataChunkBuilder::new(&[LogicalType::Node]);
+        for &id in ids {
+            builder
+                .column_mut(0)
+                .unwrap()
+                .push_node_id(grafeo_common::types::NodeId::new(id));
+            builder.advance_row();
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn test_semi_and_anti_join_keep_probe_column_types() {
+        // The planner declares a node column as `Any`. A semi or anti join
+        // outputs probe rows unchanged, so it must keep the probe's `Node`
+        // type: DISTINCT keys a node apart from an integer by that type, and a
+        // node from this join must equal the same node from a scan.
+        for join_type in [JoinType::Semi, JoinType::Anti] {
+            let left = MockOperator::new(vec![create_node_chunk(&[1, 2])]);
+            let right = MockOperator::new(vec![create_node_chunk(&[2])]);
+            let mut join = HashJoinOperator::new(
+                Box::new(left),
+                Box::new(right),
+                vec![0],
+                vec![0],
+                join_type,
+                vec![LogicalType::Any],
+            );
+            let chunk = join.next().unwrap().expect("one output row");
+            let column = chunk.column(0).unwrap();
+            assert_eq!(column.data_type(), &LogicalType::Node, "{join_type:?}");
+            let row = chunk.selected_indices().next().unwrap();
+            let expected = if join_type == JoinType::Semi { 2 } else { 1 };
+            assert_eq!(
+                column.get_node_id(row),
+                Some(grafeo_common::types::NodeId::new(expected))
+            );
+        }
     }
 
     #[test]

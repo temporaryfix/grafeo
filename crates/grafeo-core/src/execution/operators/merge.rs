@@ -10,7 +10,9 @@ use super::{
     SessionContext,
 };
 use crate::execution::chunk::{DataChunk, DataChunkBuilder};
-use crate::graph::{GraphStore, GraphStoreMut, GraphStoreSearch};
+use crate::graph::{
+    GraphStore, GraphStoreMut, GraphStoreSearch, PropertyIndexPredicate, PropertyIndexRequest,
+};
 use grafeo_common::types::{
     EdgeId, EpochId, LogicalType, NodeId, PropertyKey, TransactionId, Value,
 };
@@ -136,12 +138,14 @@ impl MergeOperator {
         chunk: Option<&DataChunk>,
         row: usize,
         store: &dyn GraphStore,
+        epoch: Option<EpochId>,
+        transaction_id: Option<TransactionId>,
     ) -> Vec<(String, Value)> {
         props
             .iter()
             .map(|(name, source)| {
                 let value = if let Some(chunk) = chunk {
-                    source.resolve(chunk, row, store)
+                    source.resolve(chunk, row, store, epoch, transaction_id)
                 } else {
                     // Standalone mode: only constants are valid
                     match source {
@@ -213,6 +217,8 @@ impl MergeOperator {
                 chunk,
                 row,
                 self.store.as_ref(),
+                self.viewing_epoch,
+                self.transaction_id,
             ));
         }
 
@@ -239,9 +245,18 @@ impl MergeOperator {
                     if let Some(epoch) = self.viewing_epoch {
                         predicate = predicate.with_transaction_context(epoch, self.transaction_id);
                     }
-                    predicate.eval_at(&augmented, 0).unwrap_or(Value::Null)
+                    predicate
+                        .eval_at(&augmented, 0)
+                        .map_err(|error| super::OperatorError::Execution(error.to_string()))?
+                        .unwrap_or(Value::Null)
                 }
-                _ => source.resolve(&augmented, 0, self.store.as_ref()),
+                _ => source.resolve(
+                    &augmented,
+                    0,
+                    self.store.as_ref(),
+                    self.viewing_epoch,
+                    self.transaction_id,
+                ),
             };
             out.push((name.clone(), value));
         }
@@ -249,18 +264,61 @@ impl MergeOperator {
     }
 
     /// Tries to find a matching node with the given resolved properties.
-    fn find_matching_node(&self, resolved_match_props: &[(String, Value)]) -> Option<NodeId> {
-        // Use a property index when available to avoid a full label scan.
-        // Null conditions are excluded from the index query and verified in the loop.
-        let use_index = resolved_match_props
+    fn find_matching_node(
+        &self,
+        resolved_match_props: &[(String, Value)],
+    ) -> Result<Option<NodeId>, super::OperatorError> {
+        let epoch = self
+            .viewing_epoch
+            .unwrap_or_else(|| self.store.current_epoch());
+        if let Some(tx) = self.transaction_id {
+            if self.config.labels.is_empty() {
+                self.store.record_lpg_dataset_read(tx);
+            } else {
+                for label in &self.config.labels {
+                    self.store.record_label_predicate_read(tx, label);
+                }
+            }
+        }
+        // This API promises complete candidates for the requested historical
+        // view, including this transaction's property overlay. Exact MERGE
+        // equality remains a residual: index predicates may admit coercions.
+        let mut indexed = None;
+        if let Some(search) = &self.search_store {
+            for (property, value) in resolved_match_props {
+                if value.is_null() {
+                    continue;
+                }
+                indexed = search
+                    .lookup_nodes_indexed(PropertyIndexRequest {
+                        property,
+                        predicate: PropertyIndexPredicate::Equal(value),
+                        epoch,
+                        transaction_id: self.transaction_id,
+                    })
+                    .map_err(|error| super::OperatorError::Execution(error.to_string()))?;
+                if indexed.is_some() {
+                    break;
+                }
+            }
+        }
+        let complete_index = indexed.is_some();
+        let mut candidates = if let Some(candidates) = indexed {
+            candidates
+        } else if self.viewing_epoch.is_some() || self.transaction_id.is_some() {
+            // Label membership is committed-latest plus own delta, not a
+            // historical candidate contract. Keep the complete fallback.
+            self.store.all_node_ids()
+        } else if resolved_match_props
             .iter()
-            .any(|(k, v)| !v.is_null() && self.store.has_property_index(k));
-
-        let candidates: Vec<NodeId> = if use_index {
-            let conditions: Vec<(&str, Value)> = resolved_match_props
+            .any(|(key, value)| !value.is_null() && self.store.has_property_index(key))
+        {
+            // Preserve the context-free native operator's existing index path
+            // when no search-store handle was attached by a planner.
+            let conditions: Vec<_> = resolved_match_props
                 .iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k.as_str(), v.clone()))
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key.as_str(), value.clone()))
                 .collect();
             self.store.find_nodes_by_properties(&conditions)
         } else if let Some(first_label) = self.config.labels.first() {
@@ -268,6 +326,17 @@ impl MergeOperator {
         } else {
             self.store.node_ids()
         };
+
+        // Only fallback enumeration needs an explicit union of own creates;
+        // Some(indexed) already promises a complete transaction-visible set.
+        if !complete_index && let Some(tid) = self.transaction_id {
+            let existing: std::collections::HashSet<NodeId> = candidates.iter().copied().collect();
+            for nid in self.store.pending_node_creates(tid) {
+                if !existing.contains(&nid) {
+                    candidates.push(nid);
+                }
+            }
+        }
 
         for node_id in candidates {
             // Transactional creates write their version at `EpochId::PENDING`,
@@ -278,31 +347,47 @@ impl MergeOperator {
             // transaction context attached.
             let node_opt = match (self.viewing_epoch, self.transaction_id) {
                 (Some(epoch), Some(tid)) => self.store.get_node_versioned(node_id, epoch, tid),
+                (Some(epoch), None) => self.store.get_node_at_epoch(node_id, epoch),
                 _ => self.store.get_node(node_id),
             };
-            let Some(node) = node_opt else { continue };
+            let Some(_node) = node_opt else { continue };
 
-            let has_all_labels = self.config.labels.iter().all(|label| node.has_label(label));
+            // Route through the snapshot-aware accessor so that uncommitted label
+            // ops in the writing transaction are reflected here.
+            let label_set =
+                self.store
+                    .read_node_labels_visible(node_id, epoch, self.transaction_id);
+            let has_all_labels = self
+                .config
+                .labels
+                .iter()
+                .all(|label| label_set.iter().any(|s| s.as_str() == label.as_str()));
             if !has_all_labels {
                 continue;
             }
 
             let has_all_props = resolved_match_props.iter().all(|(key, expected_value)| {
-                let prop = node.properties.get(&PropertyKey::new(key.as_str()));
+                let prop_key = PropertyKey::new(key.as_str());
+                let prop = self.store.read_node_property_visible(
+                    node_id,
+                    &prop_key,
+                    epoch,
+                    self.transaction_id,
+                );
                 if expected_value.is_null() {
                     // Null in a MERGE pattern matches both absent and explicitly null properties
-                    prop.map_or(true, |v| v.is_null())
+                    prop.as_ref().map_or(true, |v| v.is_null())
                 } else {
-                    prop.is_some_and(|v| v == expected_value)
+                    prop.as_ref().is_some_and(|v| v == expected_value)
                 }
             });
 
             if has_all_props {
-                return Some(node_id);
+                return Ok(Some(node_id));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Merges match and ON CREATE property lists, with ON CREATE values
@@ -331,7 +416,7 @@ impl MergeOperator {
         if let Some(tid) = self.transaction_id {
             for (key, value) in props {
                 self.store
-                    .set_node_property_versioned(id, key.as_str(), value.clone(), tid);
+                    .set_node_property_buffered(id, key.as_str(), value.clone(), tid);
             }
         } else {
             for (key, value) in props {
@@ -361,16 +446,20 @@ impl MergeOperator {
         resolved_match_props: &[(String, Value)],
         resolved_create_props: &[(String, Value)],
     ) -> Result<NodeId, super::OperatorError> {
-        let all_props = Self::merge_node_props(resolved_match_props, resolved_create_props);
+        let mut all_props = Self::merge_node_props(resolved_match_props, resolved_create_props);
 
         // Validate constraints before creating the node
         if let Some(ref validator) = self.validator {
             validator.validate_node_labels_allowed(&self.config.labels)?;
-            for (name, value) in &all_props {
-                validator.validate_node_property(&self.config.labels, name, value)?;
-                validator.check_unique_node_property(&self.config.labels, name, value)?;
-            }
-            validator.validate_node_complete(&self.config.labels, &all_props)?;
+            validator.inject_defaults(&self.config.labels, &mut all_props);
+            validator.validate_node_post_image(
+                None,
+                &self.config.labels,
+                &all_props,
+                self.viewing_epoch
+                    .unwrap_or_else(|| self.store.current_epoch()),
+                self.transaction_id,
+            )?;
         }
 
         let prop_pairs: Vec<(PropertyKey, Value)> = all_props
@@ -389,7 +478,8 @@ impl MergeOperator {
     /// expression properties are resolved (since those properties may
     /// satisfy NOT NULL / PRIMARY KEY requirements that match props alone
     /// would fail). Per-property type checks and uniqueness checks for the
-    /// match properties still run here.
+    /// match properties still run here. Tuple uniqueness is deliberately
+    /// deferred until phase two has the authoritative complete post-image.
     ///
     /// Both the create and the property writes go through the versioned
     /// API, so a failure in phase two (or in `apply_on_match`) is undone
@@ -403,7 +493,6 @@ impl MergeOperator {
             validator.validate_node_labels_allowed(&self.config.labels)?;
             for (name, value) in resolved_match_props {
                 validator.validate_node_property(&self.config.labels, name, value)?;
-                validator.check_unique_node_property(&self.config.labels, name, value)?;
             }
         }
 
@@ -418,27 +507,39 @@ impl MergeOperator {
         Ok(id)
     }
 
-    /// Phase two of the two-phase create path: validates ON CREATE
-    /// properties (type, uniqueness) and the full property set
-    /// (completeness) after expressions have been evaluated against the
-    /// freshly created node, but before the values are written. The just
-    /// created node holds only match properties at this point, so a
-    /// uniqueness check on an ON CREATE property cannot conflict with the
-    /// node itself.
+    /// Phase two of the two-phase create path: validates and writes the full
+    /// post-image after ON CREATE expressions have been evaluated. The
+    /// freshly created node is excluded from its own uniqueness comparison.
     fn validate_on_create_phase_two(
         &self,
+        node_id: NodeId,
         resolved_match_props: &[(String, Value)],
         resolved_create_props: &[(String, Value)],
     ) -> Result<(), super::OperatorError> {
         let Some(ref validator) = self.validator else {
+            let props: Vec<(PropertyKey, Value)> =
+                Self::merge_node_props(resolved_match_props, resolved_create_props)
+                    .into_iter()
+                    .map(|(key, value)| (PropertyKey::new(key.as_str()), value))
+                    .collect();
+            self.write_node_props(node_id, &props);
             return Ok(());
         };
-        for (name, value) in resolved_create_props {
-            validator.validate_node_property(&self.config.labels, name, value)?;
-            validator.check_unique_node_property(&self.config.labels, name, value)?;
-        }
-        let all_props = Self::merge_node_props(resolved_match_props, resolved_create_props);
-        validator.validate_node_complete(&self.config.labels, &all_props)?;
+        let mut all_props = Self::merge_node_props(resolved_match_props, resolved_create_props);
+        validator.inject_defaults(&self.config.labels, &mut all_props);
+        validator.validate_node_post_image(
+            Some(node_id),
+            &self.config.labels,
+            &all_props,
+            self.viewing_epoch
+                .unwrap_or_else(|| self.store.current_epoch()),
+            self.transaction_id,
+        )?;
+        let props: Vec<(PropertyKey, Value)> = all_props
+            .into_iter()
+            .map(|(key, value)| (PropertyKey::new(key.as_str()), value))
+            .collect();
+        self.write_node_props(node_id, &props);
         Ok(())
     }
 
@@ -451,10 +552,16 @@ impl MergeOperator {
         let store_ref: &dyn GraphStore = self.store.as_ref();
         // Match properties cannot reference the MERGE variable (ISO §15.5),
         // so they resolve against the input chunk directly.
-        let resolved_match =
-            Self::resolve_properties(&self.config.match_properties, chunk, row, store_ref);
+        let resolved_match = Self::resolve_properties(
+            &self.config.match_properties,
+            chunk,
+            row,
+            store_ref,
+            self.viewing_epoch,
+            self.transaction_id,
+        );
 
-        if let Some(existing_id) = self.find_matching_node(&resolved_match) {
+        if let Some(existing_id) = self.find_matching_node(&resolved_match)? {
             // Resolve ON MATCH SET against an augmented row containing the
             // matched node id, so `coalesce(n.x, 0)` can read the live value.
             let resolved_on_match = self.resolve_action_properties(
@@ -482,13 +589,18 @@ impl MergeOperator {
                 row,
                 new_id,
             )?;
-            self.validate_on_create_phase_two(&resolved_match, &resolved_on_create)?;
-            self.apply_on_match(new_id, &resolved_on_create)?;
+            self.validate_on_create_phase_two(new_id, &resolved_match, &resolved_on_create)?;
             Ok(new_id)
         } else {
             // Fast path: no runtime expressions; create with all properties at once.
-            let resolved_on_create =
-                Self::resolve_properties(&self.config.on_create_properties, chunk, row, store_ref);
+            let resolved_on_create = Self::resolve_properties(
+                &self.config.on_create_properties,
+                chunk,
+                row,
+                store_ref,
+                self.viewing_epoch,
+                self.transaction_id,
+            );
             self.create_node(&resolved_match, &resolved_on_create)
         }
     }
@@ -499,13 +611,38 @@ impl MergeOperator {
         node_id: NodeId,
         resolved_on_match: &[(String, Value)],
     ) -> Result<(), super::OperatorError> {
-        for (key, value) in resolved_on_match {
-            if let Some(ref validator) = self.validator {
-                validator.validate_node_property(&self.config.labels, key, value)?;
+        if let Some(ref validator) = self.validator {
+            let epoch = self
+                .viewing_epoch
+                .unwrap_or_else(|| self.store.current_epoch());
+            let labels: Vec<String> = self
+                .store
+                .read_node_labels_visible(node_id, epoch, self.transaction_id)
+                .iter()
+                .map(|label| label.as_str().to_string())
+                .collect();
+            let mut post_properties =
+                self.store
+                    .read_node_properties_visible(node_id, epoch, self.transaction_id);
+            for (key, value) in resolved_on_match {
+                post_properties.insert(PropertyKey::new(key.as_str()), value.clone());
             }
+            let post_properties: Vec<(String, Value)> = post_properties
+                .into_iter()
+                .map(|(key, value)| (key.as_str().to_string(), value))
+                .collect();
+            validator.validate_node_post_image(
+                Some(node_id),
+                &labels,
+                &post_properties,
+                epoch,
+                self.transaction_id,
+            )?;
+        }
+        for (key, value) in resolved_on_match {
             if let Some(tid) = self.transaction_id {
                 self.store
-                    .set_node_property_versioned(node_id, key.as_str(), value.clone(), tid);
+                    .set_node_property_buffered(node_id, key.as_str(), value.clone(), tid);
             } else {
                 self.store
                     .set_node_property(node_id, key.as_str(), value.clone());
@@ -516,6 +653,16 @@ impl MergeOperator {
 }
 
 impl Operator for MergeOperator {
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        match self.input.as_mut() {
+            Some(input) => input.install_resource_context(resources),
+            None => Ok(()),
+        }
+    }
+
     fn next(&mut self) -> OperatorResult {
         // When we have an input operator, pass through input rows with the
         // merged node ID appended (used for chained inline MERGE patterns).
@@ -741,6 +888,8 @@ impl MergeRelationshipOperator {
                 Some(chunk),
                 row,
                 self.store.as_ref(),
+                self.viewing_epoch,
+                self.transaction_id,
             ));
         }
 
@@ -767,9 +916,18 @@ impl MergeRelationshipOperator {
                     if let Some(epoch) = self.viewing_epoch {
                         predicate = predicate.with_transaction_context(epoch, self.transaction_id);
                     }
-                    predicate.eval_at(&augmented, 0).unwrap_or(Value::Null)
+                    predicate
+                        .eval_at(&augmented, 0)
+                        .map_err(|error| super::OperatorError::Execution(error.to_string()))?
+                        .unwrap_or(Value::Null)
                 }
-                _ => source.resolve(&augmented, 0, self.store.as_ref()),
+                _ => source.resolve(
+                    &augmented,
+                    0,
+                    self.store.as_ref(),
+                    self.viewing_epoch,
+                    self.transaction_id,
+                ),
             };
             out.push((name.clone(), value));
         }
@@ -790,14 +948,41 @@ impl MergeRelationshipOperator {
                 continue;
             }
 
-            if let Some(edge) = self.store.get_edge(edge_id) {
+            // The adjacency index is non-MVCC and still returns a PENDING-deleted
+            // edge as a candidate until commit, so resolve through tx-aware
+            // visibility (mirrors `filter.rs::resolve_edge` / `project.rs`).
+            // Without this, a MERGE issued after deleting the edge in the same tx
+            // would match the dead edge and create nothing (read-your-writes +
+            // MERGE-contract violation).
+            let resolved = if let (Some(ep), Some(tx)) = (self.viewing_epoch, self.transaction_id) {
+                self.store.get_edge_versioned(edge_id, ep, tx)
+            } else if let Some(ep) = self.viewing_epoch {
+                self.store.get_edge_at_epoch(edge_id, ep)
+            } else {
+                self.store.get_edge(edge_id)
+            };
+
+            if let Some(edge) = resolved {
                 if edge.edge_type.as_str() != self.config.edge_type {
                     continue;
                 }
 
-                let has_all_props = resolved_match_props
-                    .iter()
-                    .all(|(key, expected)| edge.get_property(key).is_some_and(|v| v == expected));
+                let has_all_props = resolved_match_props.iter().all(|(key, expected)| {
+                    // Delta-aware: a property SET earlier in this tx is visible here (read-your-writes),
+                    // mirroring find_matching_node's read_node_property_visible routing. Absent a tx
+                    // context, fall back to the committed snapshot already resolved above.
+                    let prop_key = PropertyKey::new(key.as_str());
+                    let actual = match (self.viewing_epoch, self.transaction_id) {
+                        (Some(epoch), Some(tid)) => self.store.read_edge_property_visible(
+                            edge_id,
+                            &prop_key,
+                            epoch,
+                            Some(tid),
+                        ),
+                        _ => edge.get_property(key).cloned(),
+                    };
+                    actual.as_ref().is_some_and(|v| v == expected)
+                });
 
                 if has_all_props {
                     return Some(edge_id);
@@ -827,7 +1012,7 @@ impl MergeRelationshipOperator {
         if let Some(tid) = self.transaction_id {
             for (key, value) in props {
                 self.store
-                    .set_edge_property_versioned(id, key.as_str(), value.clone(), tid);
+                    .set_edge_property_buffered(id, key.as_str(), value.clone(), tid);
             }
         } else {
             for (key, value) in props {
@@ -851,10 +1036,7 @@ impl MergeRelationshipOperator {
         // Validate constraints before creating the edge
         if let Some(ref validator) = self.validator {
             validator.validate_edge_type_allowed(&self.config.edge_type)?;
-            for (name, value) in &all_props {
-                validator.validate_edge_property(&self.config.edge_type, name, value)?;
-            }
-            validator.validate_edge_complete(&self.config.edge_type, &all_props)?;
+            validator.validate_edge_post_image(&self.config.edge_type, &all_props)?;
         }
 
         let prop_pairs: Vec<(PropertyKey, Value)> = all_props
@@ -909,12 +1091,9 @@ impl MergeRelationshipOperator {
         let Some(ref validator) = self.validator else {
             return Ok(());
         };
-        for (name, value) in resolved_create_props {
-            validator.validate_edge_property(&self.config.edge_type, name, value)?;
-        }
         let all_props =
             MergeOperator::merge_node_props(resolved_match_props, resolved_create_props);
-        validator.validate_edge_complete(&self.config.edge_type, &all_props)?;
+        validator.validate_edge_post_image(&self.config.edge_type, &all_props)?;
         Ok(())
     }
 
@@ -924,13 +1103,26 @@ impl MergeRelationshipOperator {
         edge_id: EdgeId,
         resolved_on_match: &[(String, Value)],
     ) -> Result<(), super::OperatorError> {
-        for (key, value) in resolved_on_match {
-            if let Some(ref validator) = self.validator {
-                validator.validate_edge_property(&self.config.edge_type, key, value)?;
+        if let Some(ref validator) = self.validator {
+            let epoch = self
+                .viewing_epoch
+                .unwrap_or_else(|| self.store.current_epoch());
+            let mut post_properties =
+                self.store
+                    .read_edge_properties_visible(edge_id, epoch, self.transaction_id);
+            for (key, value) in resolved_on_match {
+                post_properties.insert(PropertyKey::new(key.as_str()), value.clone());
             }
+            let post_properties: Vec<(String, Value)> = post_properties
+                .into_iter()
+                .map(|(key, value)| (key.as_str().to_string(), value))
+                .collect();
+            validator.validate_edge_post_image(&self.config.edge_type, &post_properties)?;
+        }
+        for (key, value) in resolved_on_match {
             if let Some(tid) = self.transaction_id {
                 self.store
-                    .set_edge_property_versioned(edge_id, key.as_str(), value.clone(), tid);
+                    .set_edge_property_buffered(edge_id, key.as_str(), value.clone(), tid);
             } else {
                 self.store
                     .set_edge_property(edge_id, key.as_str(), value.clone());
@@ -941,6 +1133,13 @@ impl MergeRelationshipOperator {
 }
 
 impl Operator for MergeRelationshipOperator {
+    fn install_resource_context(
+        &mut self,
+        resources: &crate::execution::QueryResourceContext,
+    ) -> Result<(), crate::execution::QueryResourceContextError> {
+        self.input.install_resource_context(resources)
+    }
+
     fn next(&mut self) -> OperatorResult {
         use super::OperatorError;
 
@@ -977,6 +1176,8 @@ impl Operator for MergeRelationshipOperator {
                     Some(&chunk),
                     row,
                     store_ref,
+                    self.viewing_epoch,
+                    self.transaction_id,
                 );
 
                 let edge_id = if let Some(existing) =
@@ -1012,6 +1213,8 @@ impl Operator for MergeRelationshipOperator {
                         Some(&chunk),
                         row,
                         store_ref,
+                        self.viewing_epoch,
+                        self.transaction_id,
                     );
                     self.create_edge(src_val, dst_val, &resolved_match, &resolved_on_create)?
                 };
@@ -1062,6 +1265,86 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), PropertySource::Constant(v)))
             .collect()
+    }
+
+    #[test]
+    fn indexed_merge_preserves_exact_residuals_and_own_property_writes() {
+        let lpg = Arc::new(LpgStore::new().unwrap());
+        lpg.create_property_index("id");
+        let store: Arc<dyn GraphStoreMut> = lpg.clone();
+        let search: Arc<dyn GraphStoreSearch> = lpg.clone();
+        let wrong_label =
+            store.create_node_with_props(&["Other"], &[(PropertyKey::new("id"), Value::Int64(7))]);
+        let target =
+            store.create_node_with_props(&["Item"], &[(PropertyKey::new("id"), Value::Int64(8))]);
+        let tx = TransactionId::new(71);
+        store.set_node_property_buffered(target, "id", Value::Int64(7), tx);
+        let merge = MergeOperator::new(
+            store,
+            None,
+            MergeConfig {
+                variable: "n".into(),
+                labels: vec!["Item".into()],
+                match_properties: Vec::new(),
+                on_create_properties: Vec::new(),
+                on_match_properties: Vec::new(),
+                output_schema: vec![LogicalType::Node],
+                output_column: 0,
+                bound_variable_column: None,
+            },
+        )
+        .with_search_store(search)
+        .with_transaction_context(lpg.current_epoch(), Some(tx));
+        assert_ne!(wrong_label, target);
+        assert_eq!(
+            merge
+                .find_matching_node(&[
+                    ("id".into(), Value::Int64(7)),
+                    ("missing".into(), Value::Null)
+                ])
+                .unwrap(),
+            Some(target)
+        );
+        assert_eq!(
+            merge
+                .find_matching_node(&[("id".into(), Value::Int64(8))])
+                .unwrap(),
+            None
+        );
+        // Index comparison may coerce numbers; MERGE still requires exact Value equality.
+        assert_eq!(
+            merge
+                .find_matching_node(&[("id".into(), Value::Float64(7.0))])
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn indexed_merge_propagates_unavailable_history_without_creating() {
+        let lpg = Arc::new(LpgStore::new().unwrap());
+        lpg.create_property_index("id");
+        let store: Arc<dyn GraphStoreMut> = lpg.clone();
+        let search: Arc<dyn GraphStoreSearch> = lpg.clone();
+        let mut merge = MergeOperator::new(
+            store,
+            None,
+            MergeConfig {
+                variable: "n".into(),
+                labels: vec!["Item".into()],
+                match_properties: const_props(vec![("id", Value::Int64(1))]),
+                on_create_properties: Vec::new(),
+                on_match_properties: Vec::new(),
+                output_schema: vec![LogicalType::Node],
+                output_column: 0,
+                bound_variable_column: None,
+            },
+        )
+        .with_search_store(search)
+        .with_transaction_context(EpochId::INITIAL, None);
+        lpg.advance_retained_history_floor(EpochId::new(10));
+        assert!(merge.next().is_err());
+        assert_eq!(lpg.node_count(), 0);
     }
 
     #[test]

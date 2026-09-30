@@ -10,6 +10,12 @@ pub struct SelectionVector {
 }
 
 impl SelectionVector {
+    pub(crate) fn output_retained_bytes(&self) -> Option<usize> {
+        self.indices
+            .capacity()
+            .checked_mul(std::mem::size_of::<u16>())
+    }
+
     /// Maximum capacity (limited to u16 for space efficiency).
     pub const MAX_CAPACITY: usize = u16::MAX as usize;
 
