@@ -13,6 +13,7 @@ mod wal {
     use grafeo_engine::GrafeoDB;
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_persistent_db_roundtrip() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("test.grafeo");
@@ -21,10 +22,13 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open for write");
             let a = db.create_node(&["Person"]);
-            db.set_node_property(a, "name", Value::String("Alix".into()));
-            db.set_node_property(a, "age", Value::Int64(30));
+            db.set_node_property(a, "name", Value::String("Alix".into()))
+                .expect("set node property");
+            db.set_node_property(a, "age", Value::Int64(30))
+                .expect("set node property");
             let b = db.create_node(&["Person"]);
-            db.set_node_property(b, "name", Value::String("Gus".into()));
+            db.set_node_property(b, "name", Value::String("Gus".into()))
+                .expect("set node property");
             db.create_edge(a, b, "KNOWS");
             db.close().expect("close");
         }
@@ -47,6 +51,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_labels() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("labels.grafeo");
@@ -68,6 +73,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_deletes() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("deletes.grafeo");
@@ -75,11 +81,14 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let a = db.create_node(&["Person"]);
-            db.set_node_property(a, "name", Value::String("Alix".into()));
+            db.set_node_property(a, "name", Value::String("Alix".into()))
+                .expect("set node property");
             let b = db.create_node(&["Person"]);
-            db.set_node_property(b, "name", Value::String("Gus".into()));
+            db.set_node_property(b, "name", Value::String("Gus".into()))
+                .expect("set node property");
             let c = db.create_node(&["Person"]);
-            db.set_node_property(c, "name", Value::String("Harm".into()));
+            db.set_node_property(c, "name", Value::String("Harm".into()))
+                .expect("set node property");
             db.create_edge(a, b, "KNOWS");
 
             // Delete Harm (no edges)
@@ -100,15 +109,18 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_save_to_new_location() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let save_path = dir.path().join("saved.grafeo");
 
         let db = GrafeoDB::new_in_memory();
         let a = db.create_node(&["Person"]);
-        db.set_node_property(a, "name", Value::String("Alix".into()));
+        db.set_node_property(a, "name", Value::String("Alix".into()))
+            .expect("set node property");
         let b = db.create_node(&["Person"]);
-        db.set_node_property(b, "name", Value::String("Gus".into()));
+        db.set_node_property(b, "name", Value::String("Gus".into()))
+            .expect("set node property");
         db.create_edge(a, b, "KNOWS");
 
         // Save in-memory database to disk
@@ -122,6 +134,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_open_in_memory_from_file() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("source.grafeo");
@@ -130,7 +143,8 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let n = db.create_node(&["Person"]);
-            db.set_node_property(n, "name", Value::String("Alix".into()));
+            db.set_node_property(n, "name", Value::String("Alix".into()))
+                .expect("set node property");
             db.close().expect("close");
         }
 
@@ -153,6 +167,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_status_persistent() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("status.grafeo");
@@ -160,13 +175,14 @@ mod wal {
         let db = GrafeoDB::open(&path).expect("open");
         db.create_node(&["N"]);
 
-        let status = db.wal_status();
+        let status = db.wal_status().unwrap();
         assert!(status.enabled, "persistent db should have WAL enabled");
 
         db.close().expect("close");
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_query_mutations_persist() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("query_persist.grafeo");
@@ -220,6 +236,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_query_delete_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("query_delete.grafeo");
@@ -251,6 +268,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_query_set_property_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("query_set.grafeo");
@@ -280,13 +298,15 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_checkpoint_succeeds() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("checkpoint.grafeo");
 
         let db = GrafeoDB::open(&path).expect("open");
         let n = db.create_node(&["Person"]);
-        db.set_node_property(n, "name", Value::String("Alix".into()));
+        db.set_node_property(n, "name", Value::String("Alix".into()))
+            .expect("set node property");
 
         // Explicit checkpoint should not error
         db.wal_checkpoint().expect("checkpoint should succeed");
@@ -302,6 +322,7 @@ mod wal {
     // =========================================================================
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_named_graph_persists_across_restart() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("named_graph.grafeo");
@@ -337,6 +358,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_drop_named_graph_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("drop_graph.grafeo");
@@ -367,6 +389,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_multiple_named_graphs_persist() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("multi_graph.grafeo");
@@ -420,6 +443,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_named_graph_wal_interleaved_with_default() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("interleaved.grafeo");
@@ -471,6 +495,7 @@ mod wal {
     // =========================================================================
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_map_property() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("map_prop.grafeo");
@@ -478,7 +503,8 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let n = db.create_node(&["Config"]);
-            db.set_node_property(n, "name", Value::String("settings".into()));
+            db.set_node_property(n, "name", Value::String("settings".into()))
+                .expect("set node property");
             let mut map = std::collections::BTreeMap::new();
             map.insert(
                 grafeo_common::types::PropertyKey::from("theme"),
@@ -488,7 +514,8 @@ mod wal {
                 grafeo_common::types::PropertyKey::from("font_size"),
                 Value::Int64(14),
             );
-            db.set_node_property(n, "prefs", Value::Map(std::sync::Arc::new(map)));
+            db.set_node_property(n, "prefs", Value::Map(std::sync::Arc::new(map)))
+                .expect("set node property");
             db.close().expect("close");
         }
 
@@ -514,6 +541,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_vector_property() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("vector_prop.grafeo");
@@ -521,10 +549,12 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let n = db.create_node(&["Document"]);
-            db.set_node_property(n, "name", Value::String("doc1".into()));
+            db.set_node_property(n, "name", Value::String("doc1".into()))
+                .expect("set node property");
             let embedding: std::sync::Arc<[f32]> =
                 std::sync::Arc::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
-            db.set_node_property(n, "embedding", Value::Vector(embedding));
+            db.set_node_property(n, "embedding", Value::Vector(embedding))
+                .expect("set node property");
             db.close().expect("close");
         }
 
@@ -547,6 +577,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_timestamp_property() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("timestamp_prop.grafeo");
@@ -554,9 +585,11 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let n = db.create_node(&["Event"]);
-            db.set_node_property(n, "name", Value::String("launch".into()));
+            db.set_node_property(n, "name", Value::String("launch".into()))
+                .expect("set node property");
             let ts = grafeo_common::types::Timestamp::from_secs(1_700_000_000);
-            db.set_node_property(n, "occurred_at", Value::Timestamp(ts));
+            db.set_node_property(n, "occurred_at", Value::Timestamp(ts))
+                .expect("set node property");
             db.close().expect("close");
         }
 
@@ -578,6 +611,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_zoned_datetime_property() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("zdt_prop.grafeo");
@@ -585,10 +619,12 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let n = db.create_node(&["Meeting"]);
-            db.set_node_property(n, "name", Value::String("standup".into()));
+            db.set_node_property(n, "name", Value::String("standup".into()))
+                .expect("set node property");
             let ts = grafeo_common::types::Timestamp::from_secs(1_700_000_000);
             let zdt = grafeo_common::types::ZonedDatetime::from_timestamp_offset(ts, 3600);
-            db.set_node_property(n, "scheduled_at", Value::ZonedDatetime(zdt));
+            db.set_node_property(n, "scheduled_at", Value::ZonedDatetime(zdt))
+                .expect("set node property");
             db.close().expect("close");
         }
 
@@ -611,6 +647,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_wal_recovery_duration_property() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("duration_prop.grafeo");
@@ -618,9 +655,11 @@ mod wal {
         {
             let db = GrafeoDB::open(&path).expect("open");
             let n = db.create_node(&["Task"]);
-            db.set_node_property(n, "name", Value::String("sprint".into()));
+            db.set_node_property(n, "name", Value::String("sprint".into()))
+                .expect("set node property");
             let dur = grafeo_common::types::Duration::new(0, 14, 0); // 14 days
-            db.set_node_property(n, "duration", Value::Duration(dur));
+            db.set_node_property(n, "duration", Value::Duration(dur))
+                .expect("set node property");
             db.close().expect("close");
         }
 
@@ -647,6 +686,7 @@ mod wal {
     // =========================================================================
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_create_node_type_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("ddl_node_type");
@@ -681,6 +721,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_create_edge_type_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("ddl_edge_type");
@@ -715,6 +756,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_drop_node_type_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("ddl_drop_type");
@@ -750,6 +792,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_schema_with_data_persists() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("ddl_with_data");
@@ -1036,10 +1079,38 @@ mod wal {
             )
             .unwrap();
 
+        let epoch = db.current_epoch();
+        let identity = db.world_identity();
+        let cut = db.world_cut().unwrap();
+        let mut pending = db.session();
+        pending.begin_transaction().unwrap();
+        pending
+            .execute_sparql(r#"INSERT DATA { <urn:pending> <urn:p> "uncommitted" }"#)
+            .unwrap();
+        assert!(db.save(&save_path).is_err());
+        assert!(!save_path.exists());
+        pending.rollback().unwrap();
         db.save(&save_path).expect("save");
+        let saved_bytes = std::fs::read(&save_path).unwrap();
+        assert!(db.save(&save_path).is_err());
+        assert_eq!(std::fs::read(&save_path).unwrap(), saved_bytes);
+        assert_eq!(db.current_epoch(), epoch);
+        assert_eq!(db.world_cut().unwrap(), cut);
 
         let restored = GrafeoDB::open(&save_path).expect("open saved");
+        assert_eq!(restored.current_epoch(), epoch);
+        assert_eq!(restored.world_identity(), identity);
+        assert_eq!(restored.world_cut().unwrap(), cut);
+        db.execute_sparql(r#"INSERT DATA { <urn:later> <urn:p> "source-only" }"#)
+            .unwrap();
         let session2 = restored.session();
+        assert_eq!(
+            session2
+                .execute_sparql("SELECT ?s WHERE { ?s <urn:p> ?o }")
+                .unwrap()
+                .row_count(),
+            0
+        );
         let result = session2
             .execute_sparql("SELECT ?name WHERE { ?s <http://ex.org/name> ?name }")
             .unwrap();
@@ -1059,6 +1130,7 @@ mod wal {
     }
 
     #[test]
+    #[cfg(feature = "lpg")]
     fn test_save_preserves_named_graphs() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let save_path = dir.path().join("saved_graphs.grafeo");
@@ -1084,5 +1156,133 @@ mod wal {
         assert_eq!(result.rows().len(), 1);
         assert_eq!(result.rows()[0][0], Value::String("views".into()));
         restored.close().expect("close");
+    }
+
+    #[cfg(feature = "grafeo-file")]
+    #[cfg(feature = "lpg")]
+    fn sidecar_wal_dir(path: &std::path::Path) -> std::path::PathBuf {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".wal");
+        std::path::PathBuf::from(p)
+    }
+
+    #[cfg(feature = "grafeo-file")]
+    #[cfg(feature = "lpg")]
+    fn first_wal_log(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .expect("sidecar WAL log")
+    }
+
+    #[cfg(feature = "grafeo-file")]
+    #[cfg(feature = "lpg")]
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), to).unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "grafeo-file")]
+    #[cfg(feature = "lpg")]
+    fn snapshot_sidecar(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::copy(src, dst).unwrap();
+        copy_tree(&sidecar_wal_dir(src), &sidecar_wal_dir(dst));
+    }
+
+    #[cfg(feature = "grafeo-file")]
+    #[test]
+    #[cfg(feature = "lpg")]
+    fn incomplete_wal_tail_then_new_commit_survives_reopen() {
+        use std::io::Write;
+
+        use grafeo_engine::{Config, DurabilityMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.grafeo");
+        let copy = dir.path().join("tail_copy.grafeo");
+        {
+            let db = GrafeoDB::with_config(
+                Config::persistent(&path).with_wal_durability(DurabilityMode::Sync),
+            )
+            .unwrap();
+            db.session()
+                .execute("INSERT (:Person {name: 'Alix'})")
+                .unwrap();
+            db.wal().unwrap().sync().unwrap();
+            snapshot_sidecar(&path, &copy);
+            db.close().unwrap();
+        }
+        let log = first_wal_log(&sidecar_wal_dir(&copy));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(&100u32.to_le_bytes())
+            .unwrap();
+
+        let db = GrafeoDB::open(&copy).expect("open after torn WAL tail");
+        assert_eq!(db.node_count(), 1);
+        db.session()
+            .execute("INSERT (:Person {name: 'Gus'})")
+            .unwrap();
+        db.close().unwrap();
+        let db = GrafeoDB::open(&copy).unwrap();
+        assert_eq!(
+            db.node_count(),
+            2,
+            "commit after truncated tail must survive"
+        );
+    }
+
+    #[cfg(feature = "grafeo-file")]
+    #[test]
+    #[cfg(feature = "lpg")]
+    fn checksum_mismatch_refuses_open() {
+        use grafeo_common::utils::error::ErrorCode;
+        use grafeo_engine::{Config, DurabilityMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.grafeo");
+        let copy = dir.path().join("corrupt_copy.grafeo");
+        {
+            let db = GrafeoDB::with_config(
+                Config::persistent(&path).with_wal_durability(DurabilityMode::Sync),
+            )
+            .unwrap();
+            db.session()
+                .execute("INSERT (:Person {name: 'Alix'})")
+                .unwrap();
+            db.wal().unwrap().sync().unwrap();
+            snapshot_sidecar(&path, &copy);
+            db.close().unwrap();
+        }
+        let log = first_wal_log(&sidecar_wal_dir(&copy));
+        let mut data = std::fs::read(&log).unwrap();
+        if data.len() > 8 {
+            data[6] ^= 0xFF;
+        }
+        std::fs::write(&log, &data).unwrap();
+        let Err(err) = GrafeoDB::open(&copy) else {
+            panic!("corrupt WAL must fail closed");
+        };
+        assert_eq!(err.error_code(), ErrorCode::StorageCorrupted, "got {err}");
+        let Err(retry) = GrafeoDB::open(&copy) else {
+            panic!("retry open must not omit the quarantined WAL segment");
+        };
+        assert_eq!(
+            retry.error_code(),
+            ErrorCode::StorageCorrupted,
+            "retry got {retry}"
+        );
     }
 }

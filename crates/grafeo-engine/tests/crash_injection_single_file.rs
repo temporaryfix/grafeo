@@ -347,10 +347,9 @@ fn crash_before_sidecar_wal_removal_recovered_on_reopen() {
 
 /// Helper: build a WAL-disabled persistent config for a `.grafeo` path.
 fn wal_disabled_config(path: &std::path::Path) -> Config {
-    Config {
-        wal_enabled: false,
-        ..Config::persistent(path)
-    }
+    let mut config = Config::persistent(path);
+    config.wal_enabled = false;
+    config
 }
 
 /// With WAL disabled, a clean close triggers `checkpoint_to_file` which writes

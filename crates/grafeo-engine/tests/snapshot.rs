@@ -1,76 +1,14 @@
 //! Integration tests for snapshot export/import.
 
-use grafeo_common::types::{EdgeId, EpochId, NodeId, Value};
+#[cfg(feature = "lpg")]
+use grafeo_common::types::{EpochId, NodeId, Value};
 use grafeo_engine::GrafeoDB;
 
-/// Mirror of the private Snapshot struct for crafting test payloads.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TestSnapshot {
-    version: u8,
-    nodes: Vec<TestNode>,
-    edges: Vec<TestEdge>,
-    named_graphs: Vec<()>,
-    rdf_triples: Vec<()>,
-    rdf_named_graphs: Vec<()>,
-    schema: TestSnapshotSchema,
-    indexes: TestSnapshotIndexes,
-    epoch: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct TestSnapshotSchema {
-    node_types: Vec<()>,
-    edge_types: Vec<()>,
-    graph_types: Vec<()>,
-    procedures: Vec<()>,
-    schemas: Vec<()>,
-    graph_type_bindings: Vec<()>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct TestSnapshotIndexes {
-    property_indexes: Vec<()>,
-    vector_indexes: Vec<()>,
-    text_indexes: Vec<()>,
-}
-
-impl TestSnapshot {
-    fn new(version: u8, nodes: Vec<TestNode>, edges: Vec<TestEdge>) -> Self {
-        Self {
-            version,
-            nodes,
-            edges,
-            named_graphs: vec![],
-            rdf_triples: vec![],
-            rdf_named_graphs: vec![],
-            schema: TestSnapshotSchema::default(),
-            indexes: TestSnapshotIndexes::default(),
-            epoch: 0,
-        }
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TestNode {
-    id: NodeId,
-    labels: Vec<String>,
-    properties: Vec<(String, Vec<(EpochId, Value)>)>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TestEdge {
-    id: EdgeId,
-    src: NodeId,
-    dst: NodeId,
-    edge_type: String,
-    properties: Vec<(String, Vec<(EpochId, Value)>)>,
-}
-
-fn encode_snapshot(snap: &TestSnapshot) -> Vec<u8> {
-    bincode::serde::encode_to_vec(snap, bincode::config::standard()).unwrap()
-}
+#[cfg(feature = "lpg")]
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_empty_database() {
     let db = GrafeoDB::new_in_memory();
     let bytes = db.export_snapshot().unwrap();
@@ -80,6 +18,7 @@ fn export_import_empty_database() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_nodes() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -103,12 +42,15 @@ fn export_import_preserves_nodes() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_edges() {
     let db = GrafeoDB::new_in_memory();
     let alix = db.create_node(&["Person"]);
-    db.set_node_property(alix, "name", "Alix".into());
+    db.set_node_property(alix, "name", "Alix".into())
+        .expect("set node property");
     let gus = db.create_node(&["Person"]);
-    db.set_node_property(gus, "name", "Gus".into());
+    db.set_node_property(gus, "name", "Gus".into())
+        .expect("set node property");
     db.create_edge(alix, gus, "KNOWS");
 
     let bytes = db.export_snapshot().unwrap();
@@ -125,6 +67,7 @@ fn export_import_preserves_edges() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_properties() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -149,12 +92,15 @@ fn import_rejects_invalid_data() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn snapshot_round_trip_schema() {
     let db = GrafeoDB::new_in_memory();
     let alix = db.create_node(&["Person"]);
-    db.set_node_property(alix, "name", "Alix".into());
+    db.set_node_property(alix, "name", "Alix".into())
+        .expect("set node property");
     let gus = db.create_node(&["Person"]);
-    db.set_node_property(gus, "name", "Gus".into());
+    db.set_node_property(gus, "name", "Gus".into())
+        .expect("set node property");
     db.create_edge(alix, gus, "KNOWS");
 
     let schema_before = db.schema();
@@ -171,13 +117,16 @@ fn snapshot_round_trip_schema() {
 // --- Edge property round-trip ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_edge_properties() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Person"]);
     let b = db.create_node(&["Person"]);
     let edge = db.create_edge(a, b, "KNOWS");
-    db.set_edge_property(edge, "since", Value::Int64(2020));
-    db.set_edge_property(edge, "strength", Value::Float64(0.95));
+    db.set_edge_property(edge, "since", Value::Int64(2020))
+        .expect("set edge property");
+    db.set_edge_property(edge, "strength", Value::Float64(0.95))
+        .expect("set edge property");
 
     let bytes = db.export_snapshot().unwrap();
     let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
@@ -194,6 +143,7 @@ fn export_import_preserves_edge_properties() {
 // --- Multi-label nodes ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_multiple_labels() {
     let db = GrafeoDB::new_in_memory();
     db.create_node(&["Person", "Employee"]);
@@ -222,6 +172,7 @@ fn export_import_preserves_multiple_labels() {
 // --- Temporal Value types ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_temporal_values() {
     use grafeo_common::types::{Date, Duration, Time, Timestamp, ZonedDatetime};
 
@@ -234,11 +185,16 @@ fn export_import_preserves_temporal_values() {
     let duration = Duration::new(1, 15, 3_600_000_000_000); // 1 month, 15 days, 1 hour
     let zoned = ZonedDatetime::from_timestamp_offset(Timestamp::from_secs(1_700_000_000), 3600);
 
-    db.set_node_property(id, "date_val", Value::Date(date));
-    db.set_node_property(id, "time_val", Value::Time(time));
-    db.set_node_property(id, "ts_val", Value::Timestamp(timestamp));
-    db.set_node_property(id, "dur_val", Value::Duration(duration));
-    db.set_node_property(id, "zdt_val", Value::ZonedDatetime(zoned));
+    db.set_node_property(id, "date_val", Value::Date(date))
+        .expect("set node property");
+    db.set_node_property(id, "time_val", Value::Time(time))
+        .expect("set node property");
+    db.set_node_property(id, "ts_val", Value::Timestamp(timestamp))
+        .expect("set node property");
+    db.set_node_property(id, "dur_val", Value::Duration(duration))
+        .expect("set node property");
+    db.set_node_property(id, "zdt_val", Value::ZonedDatetime(zoned))
+        .expect("set node property");
 
     let bytes = db.export_snapshot().unwrap();
     let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
@@ -258,19 +214,26 @@ fn export_import_preserves_temporal_values() {
 // --- All scalar Value types ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_all_value_types() {
     let db = GrafeoDB::new_in_memory();
     let id = db.create_node(&["Test"]);
-    db.set_node_property(id, "str_val", Value::String("hello".into()));
-    db.set_node_property(id, "int_val", Value::Int64(42));
-    db.set_node_property(id, "float_val", Value::Float64(9.81));
-    db.set_node_property(id, "bool_val", Value::Bool(true));
-    db.set_node_property(id, "null_val", Value::Null);
+    db.set_node_property(id, "str_val", Value::String("hello".into()))
+        .expect("set node property");
+    db.set_node_property(id, "int_val", Value::Int64(42))
+        .expect("set node property");
+    db.set_node_property(id, "float_val", Value::Float64(9.81))
+        .expect("set node property");
+    db.set_node_property(id, "bool_val", Value::Bool(true))
+        .expect("set node property");
+    db.set_node_property(id, "null_val", Value::Null)
+        .expect("set node property");
     db.set_node_property(
         id,
         "bytes_val",
         Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF].into()),
-    );
+    )
+    .expect("set node property");
 
     let bytes = db.export_snapshot().unwrap();
     let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
@@ -294,6 +257,7 @@ fn export_import_preserves_all_value_types() {
 // --- List and Map values ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_collection_values() {
     let db = GrafeoDB::new_in_memory();
     let id = db.create_node(&["Test"]);
@@ -301,7 +265,8 @@ fn export_import_preserves_collection_values() {
         id,
         "tags",
         Value::List(vec![Value::String("a".into()), Value::String("b".into())].into()),
-    );
+    )
+    .expect("set node property");
 
     let bytes = db.export_snapshot().unwrap();
     let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
@@ -318,6 +283,7 @@ fn export_import_preserves_collection_values() {
 // --- Multiple edge types ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_multiple_edge_types() {
     let db = GrafeoDB::new_in_memory();
     let a = db.create_node(&["Person"]);
@@ -347,6 +313,7 @@ fn export_import_preserves_multiple_edge_types() {
 // --- Nodes with no properties ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_empty_property_nodes() {
     let db = GrafeoDB::new_in_memory();
     db.create_node(&["Empty"]);
@@ -365,6 +332,7 @@ fn export_import_preserves_empty_property_nodes() {
 // --- Moderate dataset ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_moderate_dataset() {
     let db = GrafeoDB::new_in_memory();
 
@@ -372,8 +340,10 @@ fn export_import_moderate_dataset() {
     let mut ids = Vec::new();
     for i in 0..100 {
         let id = db.create_node(&["Item"]);
-        db.set_node_property(id, "index", Value::Int64(i));
-        db.set_node_property(id, "name", Value::String(format!("item_{i}").into()));
+        db.set_node_property(id, "index", Value::Int64(i))
+            .expect("set node property");
+        db.set_node_property(id, "name", Value::String(format!("item_{i}").into()))
+            .expect("set node property");
         ids.push(id);
     }
 
@@ -410,6 +380,7 @@ fn import_rejects_empty_bytes() {
 // --- Snapshot version mismatch ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn import_rejects_unsupported_version() {
     // Export a valid snapshot, then tamper with the version byte to trigger the
     // "unsupported snapshot version" error path.
@@ -440,6 +411,7 @@ fn import_rejects_unsupported_version() {
 // --- Double export produces identical bytes ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn double_export_is_deterministic() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -452,157 +424,196 @@ fn double_export_is_deterministic() {
 
 // --- Edge reference validation ---
 
+/// Builds a malformed current image without relying on recovery insertion:
+/// that API deliberately does not create an edge with an absent endpoint.
+#[cfg(feature = "lpg")]
+fn current_snapshot_with_dangling_endpoint(source_is_missing: bool) -> Vec<u8> {
+    let db = GrafeoDB::new_in_memory();
+    let source = db.create_node(&["Source"]);
+    let destination = db.create_node(&["Destination"]);
+    let edge_type = "DANGLING_ENDPOINT_VALIDATION_WITNESS";
+    let edge = db.create_edge(source, destination, edge_type);
+    let mut bytes = db.export_snapshot().expect("genuine current writer");
+    assert_eq!(
+        GrafeoDB::import_snapshot(&bytes)
+            .expect("valid control image")
+            .edge_count(),
+        1
+    );
+
+    // A tuple has the same current bincode field sequence as SnapshotEdge.
+    // Include its retained history to locate exactly one complete edge record,
+    // not an incidental copy of the type name in catalog metadata.
+    let lifetimes: Vec<_> = grafeo_engine::database::testing::root_lpg_store(&db)
+        .get_edge_history(edge)
+        .into_iter()
+        .map(|(created, deleted, _)| (created, deleted))
+        .collect();
+    let properties: Vec<(String, Vec<(EpochId, Vec<u8>)>)> = Vec::new();
+    let encode_edge = |src, dst| {
+        bincode::serde::encode_to_vec(
+            (edge, src, dst, edge_type, &lifetimes, &properties),
+            bincode::config::standard(),
+        )
+        .expect("current edge field encoding")
+    };
+    let original = encode_edge(source, destination);
+    let positions: Vec<_> = bytes
+        .windows(original.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == original).then_some(offset))
+        .collect();
+    assert_eq!(
+        positions.len(),
+        1,
+        "fixture must identify exactly one encoded edge"
+    );
+    let absent = NodeId::new(999);
+    let corrupt = if source_is_missing {
+        encode_edge(absent, destination)
+    } else {
+        encode_edge(source, absent)
+    };
+    let offset = positions[0];
+    bytes.splice(offset..offset + original.len(), corrupt);
+    let body_len = u64::try_from(bytes.len() - 13).expect("bounded current snapshot");
+    bytes[5..13].copy_from_slice(&body_len.to_le_bytes());
+    let info = grafeo_engine::snapshot_info(&bytes).expect("well-formed current image");
+    assert_eq!((info.node_count, info.edge_count), (2, 1));
+    bytes
+}
+
 #[test]
+#[cfg(feature = "lpg")]
 fn import_rejects_dangling_edge_source() {
-    // Create a valid snapshot, then re-export after deleting the source node
-    // to create a snapshot with a dangling edge reference.
-    let db = GrafeoDB::new_in_memory();
-    let a = db.create_node(&["Person"]);
-    let b = db.create_node(&["Person"]);
-    db.create_edge(a, b, "KNOWS");
-
-    // Export valid snapshot
-    let bytes = db.export_snapshot().unwrap();
-    let restored = GrafeoDB::import_snapshot(&bytes).unwrap();
-    assert_eq!(restored.edge_count(), 1);
-
-    // Now create a corrupted snapshot by exporting nodes only from a db
-    // that has 1 node, then manually crafting a snapshot with an edge
-    // that references a non-existent source node.
-    // The simplest way: delete a node, re-export (edge still exists in store)
-    // Actually, let's tamper with binary data at a higher level:
-    // Build a snapshot where edge references node ID 999 which doesn't exist.
-    let db2 = GrafeoDB::new_in_memory();
-    let n = db2.create_node(&["Person"]);
-    // Create an edge referencing a non-existent source node
-    // We need to use the direct store API since create_edge validates at a higher level
-    db2.store()
-        .create_edge_with_id(
-            grafeo_common::types::EdgeId::new(0),
-            grafeo_common::types::NodeId::new(999), // doesn't exist
-            n,
-            "KNOWS",
-        )
-        .unwrap();
-
-    let bytes = db2.export_snapshot().unwrap();
-    let result = GrafeoDB::import_snapshot(&bytes);
-    match result {
-        Ok(_) => panic!("Expected error for dangling source node"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(
-                err.contains("non-existent source node"),
-                "Expected dangling source error, got: {err}"
-            );
-        }
-    }
+    let bytes = current_snapshot_with_dangling_endpoint(true);
+    let error = GrafeoDB::import_snapshot(&bytes)
+        .err()
+        .expect("dangling source must be rejected");
+    assert!(
+        error.to_string().contains("non-existent source node"),
+        "{error}"
+    );
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn import_rejects_dangling_edge_destination() {
+    let bytes = current_snapshot_with_dangling_endpoint(false);
+    let error = GrafeoDB::import_snapshot(&bytes)
+        .err()
+        .expect("dangling destination must be rejected");
+    assert!(
+        error.to_string().contains("non-existent destination node"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "lpg")]
+fn replace_unique_snapshot_record(
+    bytes: &mut Vec<u8>,
+    original: &[u8],
+    replacement: Vec<u8>,
+) -> TestResult {
+    let mut positions = bytes
+        .windows(original.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == original).then_some(offset));
+    let offset = positions
+        .next()
+        .ok_or("current record was not found in writer output")?;
+    assert!(
+        positions.next().is_none(),
+        "fixture must identify exactly one complete record"
+    );
+    bytes.splice(offset..offset + original.len(), replacement);
+    let body_len = u64::try_from(bytes.len() - 13).expect("bounded current snapshot");
+    bytes[5..13].copy_from_slice(&body_len.to_le_bytes());
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "lpg")]
+fn import_rejects_duplicate_node_ids() -> TestResult {
     let db = GrafeoDB::new_in_memory();
-    let n = db.create_node(&["Person"]);
-    db.store()
-        .create_edge_with_id(
-            grafeo_common::types::EdgeId::new(0),
-            n,
-            grafeo_common::types::NodeId::new(999), // doesn't exist
-            "KNOWS",
+    let first = db.create_node(&["A"]);
+    let second = db.create_node(&["DUPLICATE_NODE_ID_VALIDATION_WITNESS"]);
+    let mut bytes = db.export_snapshot()?;
+    assert_eq!(GrafeoDB::import_snapshot(&bytes)?.node_count(), 2);
+
+    let lifetimes: Vec<_> = grafeo_engine::database::testing::root_lpg_store(&db)
+        .get_node_history(second)
+        .into_iter()
+        .map(|(created, deleted, _)| (created, deleted))
+        .collect();
+    let label_versions: Vec<_> = grafeo_engine::database::testing::root_lpg_store(&db)
+        .node_label_history(second)
+        .into_iter()
+        .map(|(epoch, labels)| {
+            (
+                epoch,
+                labels
+                    .into_iter()
+                    .map(|label| label.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let properties: Vec<(String, Vec<(EpochId, Vec<u8>)>)> = Vec::new();
+    // Change only the record ID, retaining the real writer's label and
+    // structural history, catalog, identity and allocator state.
+    let encode_node = |id| {
+        bincode::serde::encode_to_vec(
+            (id, &lifetimes, &label_versions, &properties),
+            bincode::config::standard(),
         )
-        .unwrap();
-
-    let bytes = db.export_snapshot().unwrap();
-    let result = GrafeoDB::import_snapshot(&bytes);
-    match result {
-        Ok(_) => panic!("Expected error for dangling destination node"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(
-                err.contains("non-existent destination node"),
-                "Expected dangling destination error, got: {err}"
-            );
-        }
-    }
+    };
+    replace_unique_snapshot_record(&mut bytes, &encode_node(second)?, encode_node(first)?)?;
+    let error = GrafeoDB::import_snapshot(&bytes)
+        .err()
+        .ok_or("Expected error for duplicate node ID")?;
+    let err = error.to_string();
+    assert!(
+        err.contains("duplicate node ID"),
+        "Expected duplicate node error, got: {err}"
+    );
+    Ok(())
 }
 
 #[test]
-fn import_rejects_duplicate_node_ids() {
-    let snap = TestSnapshot::new(
-        4,
-        vec![
-            TestNode {
-                id: NodeId::new(0),
-                labels: vec!["A".into()],
-                properties: vec![],
-            },
-            TestNode {
-                id: NodeId::new(0), // duplicate
-                labels: vec!["B".into()],
-                properties: vec![],
-            },
-        ],
-        vec![],
-    );
-    let bytes = encode_snapshot(&snap);
-    let result = GrafeoDB::import_snapshot(&bytes);
-    match result {
-        Ok(_) => panic!("Expected error for duplicate node ID"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(
-                err.contains("duplicate node ID"),
-                "Expected duplicate node error, got: {err}"
-            );
-        }
-    }
-}
+#[cfg(feature = "lpg")]
+fn import_rejects_duplicate_edge_ids() -> TestResult {
+    let db = GrafeoDB::new_in_memory();
+    let source = db.create_node(&["Source"]);
+    let destination = db.create_node(&["Destination"]);
+    let edge_type = "DUPLICATE_EDGE_ID_VALIDATION_WITNESS";
+    let first = db.create_edge(source, destination, edge_type);
+    let second = db.create_edge(source, destination, edge_type);
+    let mut bytes = db.export_snapshot()?;
+    assert_eq!(GrafeoDB::import_snapshot(&bytes)?.edge_count(), 2);
 
-#[test]
-fn import_rejects_duplicate_edge_ids() {
-    let snap = TestSnapshot::new(
-        4,
-        vec![
-            TestNode {
-                id: NodeId::new(0),
-                labels: vec![],
-                properties: vec![],
-            },
-            TestNode {
-                id: NodeId::new(1),
-                labels: vec![],
-                properties: vec![],
-            },
-        ],
-        vec![
-            TestEdge {
-                id: EdgeId::new(0),
-                src: NodeId::new(0),
-                dst: NodeId::new(1),
-                edge_type: "REL".into(),
-                properties: vec![],
-            },
-            TestEdge {
-                id: EdgeId::new(0), // duplicate
-                src: NodeId::new(0),
-                dst: NodeId::new(1),
-                edge_type: "REL".into(),
-                properties: vec![],
-            },
-        ],
+    let lifetimes: Vec<_> = grafeo_engine::database::testing::root_lpg_store(&db)
+        .get_edge_history(second)
+        .into_iter()
+        .map(|(created, deleted, _)| (created, deleted))
+        .collect();
+    let properties: Vec<(String, Vec<(EpochId, Vec<u8>)>)> = Vec::new();
+    let encode_edge = |id| {
+        bincode::serde::encode_to_vec(
+            (id, source, destination, edge_type, &lifetimes, &properties),
+            bincode::config::standard(),
+        )
+    };
+    replace_unique_snapshot_record(&mut bytes, &encode_edge(second)?, encode_edge(first)?)?;
+    let error = GrafeoDB::import_snapshot(&bytes)
+        .err()
+        .ok_or("Expected error for duplicate edge ID")?;
+    let err = error.to_string();
+    assert!(
+        err.contains("duplicate edge ID"),
+        "Expected duplicate edge error, got: {err}"
     );
-    let bytes = encode_snapshot(&snap);
-    let result = GrafeoDB::import_snapshot(&bytes);
-    match result {
-        Ok(_) => panic!("Expected error for duplicate edge ID"),
-        Err(e) => {
-            let err = e.to_string();
-            assert!(
-                err.contains("duplicate edge ID"),
-                "Expected duplicate edge error, got: {err}"
-            );
-        }
-    }
+    Ok(())
 }
 
 // =========================================================================
@@ -610,6 +621,7 @@ fn import_rejects_duplicate_edge_ids() {
 // =========================================================================
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_named_graphs() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -642,6 +654,7 @@ fn export_import_preserves_named_graphs() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn export_import_preserves_multiple_named_graphs() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -678,6 +691,7 @@ fn export_import_preserves_multiple_named_graphs() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn restore_snapshot_includes_named_graphs() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -707,22 +721,8 @@ fn restore_snapshot_includes_named_graphs() {
 
 #[test]
 fn import_v1_snapshot_is_rejected() {
-    // V1 snapshots are no longer supported (current version is V4).
-    let snap = TestSnapshot::new(
-        1,
-        vec![TestNode {
-            id: NodeId::new(0),
-            labels: vec!["Person".into()],
-            properties: vec![(
-                "name".into(),
-                vec![(EpochId::new(0), Value::String("Alix".into()))],
-            )],
-        }],
-        vec![],
-    );
-    let bytes = encode_snapshot(&snap);
-
-    let result = GrafeoDB::import_snapshot(&bytes);
+    // Reject the predecessor header before attempting any payload decode.
+    let result = GrafeoDB::import_snapshot(&[1]);
     assert!(result.is_err(), "V1 snapshots should be rejected");
     let err = result.err().unwrap().to_string();
     assert!(
@@ -732,6 +732,7 @@ fn import_v1_snapshot_is_rejected() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn to_memory_copies_named_graphs() {
     let db = GrafeoDB::new_in_memory();
     let session = db.session();
@@ -948,6 +949,269 @@ mod rdf_snapshots {
             "typed and lang literals should survive"
         );
     }
+
+    fn rdf_history_fixture() -> GrafeoDB {
+        use grafeo_core::graph::rdf::{Term, Triple};
+        let db = rdf_db();
+        db.execute_sparql("CREATE GRAPH <urn:empty>").unwrap();
+        db.execute_sparql(
+            r#"INSERT DATA {
+                <urn:default> <urn:p> "30"^^<http://www.w3.org/2001/XMLSchema#integer> .
+                GRAPH <urn:versions> { <urn:named> <urn:p> "Bonjour"@fr . }
+            }"#,
+        )
+        .unwrap();
+        db.execute_sparql("DROP GRAPH <urn:versions>").unwrap();
+        db.execute_sparql("CREATE GRAPH <urn:versions>").unwrap();
+        db.execute_sparql(r#"INSERT DATA { GRAPH <urn:versions> { <urn:new> <urn:p> "new" } }"#)
+            .unwrap();
+        db.insert_rdf_valid_tai_ns(
+            [Triple::new(
+                Term::iri("urn:valid"),
+                Term::iri("urn:p"),
+                Term::literal("interval"),
+            )],
+            -7,
+            13,
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn portable_rdf_history_identity_and_fork_are_exact_across_profiles() {
+        let source = rdf_history_fixture();
+        let history = source.rdf_dataset_history().unwrap();
+        let artifact = source.export_snapshot_artifact().unwrap();
+        let restored = GrafeoDB::import_snapshot_artifact(&artifact).unwrap();
+        let restored_history = restored.rdf_dataset_history().unwrap();
+        assert_eq!(restored.world_identity(), source.world_identity());
+        assert_eq!(restored.current_epoch(), source.current_epoch());
+        assert_eq!(restored.rdf_store_commit_epoch(), source.current_epoch());
+        assert_eq!(restored_history.graph_lives(), history.graph_lives());
+        assert_eq!(restored_history.quad_versions(), history.quad_versions());
+        assert_eq!(
+            restored_history.next_graph_incarnation(),
+            history.next_graph_incarnation()
+        );
+        assert_eq!(restored.export_snapshot().unwrap(), artifact.bytes());
+        assert_eq!(history.graph_lives().len(), 3);
+        assert_eq!(history.quad_versions().len(), 4);
+
+        let fork = source.to_memory().unwrap();
+        assert_ne!(fork.store_id(), source.store_id());
+        assert_eq!(fork.current_epoch(), source.current_epoch());
+        let fork_history = fork.rdf_dataset_history().unwrap();
+        assert_eq!(fork_history.graph_lives(), history.graph_lives());
+        assert_eq!(
+            fork_history.quad_versions().len(),
+            history.quad_versions().len()
+        );
+        for original in history.quad_versions() {
+            let copied = fork_history
+                .quad_versions()
+                .iter()
+                .find(|row| {
+                    row.quad() == original.quad()
+                        && row.tx() == original.tx()
+                        && row.graph_incarnation() == original.graph_incarnation()
+                })
+                .unwrap();
+            assert_eq!(copied.valid(), original.valid());
+            assert_ne!(copied.statement(), original.statement());
+        }
+        fork.execute_sparql(r#"INSERT DATA { <urn:fork-only> <urn:p> "independent" }"#)
+            .unwrap();
+        assert_eq!(source.export_snapshot().unwrap(), artifact.bytes());
+
+        // Qualification exchanges these same current bytes between separately
+        // compiled full and RDF-only binaries. Ordinary runs still execute all
+        // history, lineage and independent-write assertions above.
+        if let Some(path) = std::env::var_os("GRAFEO_RDF_PORTABLE_EXPORT") {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+                .write_all(artifact.bytes())
+                .unwrap();
+        }
+        if let Some(path) = std::env::var_os("GRAFEO_RDF_PORTABLE_IMPORT") {
+            let bytes = std::fs::read(path).unwrap();
+            let cross_profile = GrafeoDB::import_snapshot(&bytes).unwrap();
+            assert_eq!(cross_profile.config().graph_model, GraphModel::Rdf);
+            assert_eq!(cross_profile.export_snapshot().unwrap(), bytes);
+            let cross_history = cross_profile.rdf_dataset_history().unwrap();
+            assert_eq!(cross_history.graph_lives(), history.graph_lives());
+            assert_eq!(
+                cross_history.quad_versions().len(),
+                history.quad_versions().len()
+            );
+            for original in history.quad_versions() {
+                assert!(cross_history.quad_versions().iter().any(|row| row.quad()
+                    == original.quad()
+                    && row.tx() == original.tx()
+                    && row.valid() == original.valid()
+                    && row.graph_incarnation() == original.graph_incarnation()));
+            }
+        }
+    }
+
+    #[test]
+    fn portable_rdf_restore_rejects_corruption_and_busy_targets_before_replacement() {
+        let source = rdf_history_fixture();
+        let bytes = source.export_snapshot().unwrap();
+        let target = rdf_db();
+        for id in 0..10 {
+            target
+                .execute_sparql(&format!(
+                    "INSERT DATA {{ <urn:target:{id}> <urn:p> \"target\" }}"
+                ))
+                .unwrap();
+        }
+        assert!(target.current_epoch() > source.current_epoch());
+        let before = target.export_snapshot().unwrap();
+        let before_epoch = target.current_epoch();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let mut invalid_cdc = bytes.clone();
+        let last = invalid_cdc.len() - 1;
+        invalid_cdc[last] ^= 0xff;
+        for corrupt in [
+            &bytes[..bytes.len() - 1],
+            trailing.as_slice(),
+            invalid_cdc.as_slice(),
+            &[99],
+        ] {
+            assert!(GrafeoDB::import_snapshot(corrupt).is_err());
+            assert!(target.restore_snapshot(corrupt).is_err());
+            assert_eq!(target.export_snapshot().unwrap(), before);
+        }
+        if let Some(directory) = std::env::var_os("GRAFEO_RDF_PORTABLE_BAD_IMAGES") {
+            for family in ["text", "vector", "projection"] {
+                let malformed =
+                    std::fs::read(std::path::Path::new(&directory).join(format!("{family}.bin")))
+                        .unwrap();
+                assert!(GrafeoDB::import_snapshot(&malformed).is_err(), "{family}");
+                assert!(target.restore_snapshot(&malformed).is_err(), "{family}");
+                assert_eq!(target.export_snapshot().unwrap(), before);
+            }
+        }
+        let mut reader = target.session();
+        reader.begin_transaction().unwrap();
+        assert!(target.restore_snapshot(&bytes).is_err());
+        assert_eq!(target.current_epoch(), before_epoch);
+        reader.rollback().unwrap();
+        assert_eq!(target.export_snapshot().unwrap(), before);
+        let mut writer = source.session();
+        writer.begin_transaction().unwrap();
+        writer
+            .execute_sparql(r#"INSERT DATA { <urn:pending> <urn:p> "pending" }"#)
+            .unwrap();
+        assert!(source.export_snapshot().is_err());
+        writer.rollback().unwrap();
+        target.restore_snapshot(&bytes).unwrap();
+        assert_eq!(target.export_snapshot().unwrap(), bytes);
+        assert_eq!(target.world_identity(), source.world_identity());
+        assert_eq!(target.current_epoch(), source.current_epoch());
+        assert_eq!(target.rdf_store_commit_epoch(), source.current_epoch());
+        reader
+            .execute_sparql("SELECT ?s WHERE { ?s <urn:p> ?o }")
+            .unwrap();
+        target
+            .execute_sparql(r#"INSERT DATA { <urn:after-restore> <urn:p> "new" }"#)
+            .unwrap();
+        assert!(target.current_epoch() > source.current_epoch());
+        assert_eq!(source.export_snapshot().unwrap(), bytes);
+    }
+
+    #[test]
+    fn portable_rdf_artifact_rejects_a_valid_seal_over_false_identity() {
+        use grafeo_engine::{SnapshotArtifact, StoreId, WorldCutDescriptor};
+        let artifact = rdf_history_fixture().export_snapshot_artifact().unwrap();
+        let authentic = artifact.cut().descriptor();
+        let forged = WorldCutDescriptor::new(
+            StoreId::generate().unwrap(),
+            authentic.epoch(),
+            authentic.graph_model(),
+            authentic.formats().to_vec(),
+            authentic.schema().clone(),
+            authentic.projections().to_vec(),
+            authentic.history(),
+        )
+        .unwrap();
+        let forged = SnapshotArtifact::new(artifact.bytes().to_vec(), forged).unwrap();
+        forged.verify().unwrap();
+        assert!(GrafeoDB::import_snapshot_artifact(&forged).is_err());
+    }
+
+    #[cfg(feature = "cdc")]
+    #[test]
+    fn portable_rdf_cdc_resumes_after_exact_import_and_restore_but_not_fork() {
+        use grafeo_common::utils::error::ErrorCode;
+        let source = GrafeoDB::with_config(
+            Config::in_memory()
+                .with_graph_model(GraphModel::Rdf)
+                .with_cdc(),
+        )
+        .unwrap();
+        for subject in ["a", "b", "c"] {
+            source
+                .execute_sparql(&format!(
+                    "INSERT DATA {{ GRAPH <urn:feed> {{ <urn:{subject}> <urn:p> \"value\" }} }}"
+                ))
+                .unwrap();
+        }
+        let first = source.changes_after(None, 1, 64 * 1024).unwrap();
+        assert_eq!(first.events.len(), 1);
+        let expected = source
+            .changes_after(Some(&first.next), 4, 64 * 1024)
+            .unwrap();
+        assert_eq!(expected.events.len(), 2);
+        let encode = |events: &[grafeo_engine::cdc::ChangeEvent]| {
+            bincode::serde::encode_to_vec(events, bincode::config::standard()).unwrap()
+        };
+        let bytes = source.export_snapshot().unwrap();
+        let imported = GrafeoDB::import_snapshot(&bytes).unwrap();
+        let target = rdf_db();
+        target.restore_snapshot(&bytes).unwrap();
+        for copy in [&imported, &target] {
+            let resumed = copy.changes_after(Some(&first.next), 4, 64 * 1024).unwrap();
+            assert_eq!(resumed.next, expected.next);
+            assert_eq!(encode(&resumed.events), encode(&expected.events));
+            assert_eq!(copy.export_snapshot().unwrap(), bytes);
+        }
+        let fork = source.to_memory().unwrap();
+        let error = fork
+            .changes_after(Some(&first.next), 4, 64 * 1024)
+            .unwrap_err();
+        assert_eq!(error.error_code(), ErrorCode::CursorForeign);
+        assert_eq!(
+            fork.changes_after(None, 4, 64 * 1024).unwrap().events.len(),
+            3
+        );
+    }
+
+    #[cfg(feature = "wal")]
+    #[test]
+    fn portable_rdf_restore_refuses_a_wal_backed_target_without_mutation() {
+        let bytes = rdf_history_fixture().export_snapshot().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("portable-target.grafeo");
+        let target =
+            GrafeoDB::with_config(Config::persistent(&path).with_graph_model(GraphModel::Rdf))
+                .unwrap();
+        target
+            .execute_sparql(r#"INSERT DATA { <urn:target> <urn:p> "kept" }"#)
+            .unwrap();
+        let before = target.export_snapshot().unwrap();
+        assert!(target.restore_snapshot(&bytes).is_err());
+        assert_eq!(target.export_snapshot().unwrap(), before);
+        target.close().unwrap();
+        let reopened = GrafeoDB::open(&path).unwrap();
+        assert_eq!(reopened.export_snapshot().unwrap(), before);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -956,10 +1220,8 @@ mod rdf_snapshots {
 
 #[test]
 fn import_unknown_snapshot_version_returns_clear_error() {
-    // Craft a snapshot with version 99 (unknown future version)
-    let snap = TestSnapshot::new(99, vec![], vec![]);
-    let bytes = encode_snapshot(&snap);
-    let result = GrafeoDB::import_snapshot(&bytes);
+    // Unknown future headers are refused without a fabricated payload.
+    let result = GrafeoDB::import_snapshot(&[99]);
     match result {
         Err(e) => {
             let err = e.to_string();
@@ -973,6 +1235,7 @@ fn import_unknown_snapshot_version_returns_clear_error() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn import_truncated_snapshot_returns_error() {
     let db = GrafeoDB::new_in_memory();
     db.create_node(&["Test"]);
@@ -996,6 +1259,7 @@ fn import_empty_bytes_returns_error() {
 // --- Multi-schema round-trip (ISO/IEC 39075 catalog hierarchy) ---
 
 #[test]
+#[cfg(feature = "lpg")]
 fn snapshot_round_trip_multi_schema_isolation() {
     let db = GrafeoDB::new_in_memory();
     let s = db.session();
@@ -1040,6 +1304,7 @@ fn snapshot_round_trip_multi_schema_isolation() {
 }
 
 #[test]
+#[cfg(feature = "lpg")]
 fn snapshot_round_trip_named_graph_within_schema() {
     let db = GrafeoDB::new_in_memory();
     let s = db.session();

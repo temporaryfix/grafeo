@@ -1,17 +1,185 @@
-//! Integration tests for WAL directory-format persistence.
+//! Integration tests for operational WAL directories and exact saved containers.
 //!
-//! Proves that data survives a close/reopen cycle when using the legacy
-//! WAL directory format, including after WAL rotation.
+//! Proves that data survives a close/reopen cycle in operational WAL directories,
+//! including after rotation, and that saved containers recover subsequent tails.
 //!
 //! ```bash
 //! cargo test -p grafeo-engine --features full --test wal_directory
 //! ```
 
+#![cfg(feature = "lpg")]
+
 #[cfg(feature = "wal")]
 mod wal_directory {
     use grafeo_common::types::Value;
     use grafeo_engine::config::StorageFormat;
-    use grafeo_engine::{Config, GrafeoDB};
+    use grafeo_engine::{Config, DurabilityMode, GrafeoDB};
+
+    #[cfg(feature = "lpg")]
+    #[test]
+    fn exact_save_auto_detects_both_suffixes_and_recovers_later_wal_tail() {
+        use grafeo_common::types::GraphPath;
+        use grafeo_engine::{CreateIndexRequest, IndexCreateKind};
+        use std::path::{Path, PathBuf};
+
+        fn sidecar(path: &Path) -> PathBuf {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".wal");
+            PathBuf::from(name)
+        }
+
+        fn copy_tree(source: &Path, destination: &Path) {
+            std::fs::create_dir(destination).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let source = GrafeoDB::new_in_memory();
+        let first = source
+            .create_node_with_props(&["Doc"], [("body", Value::from("exact retained document"))]);
+        let second = source.create_node(&["Peer"]);
+        let edge = source.create_edge(first, second, "LINKS");
+        source
+            .set_node_property(first, "state", Value::from("before"))
+            .unwrap();
+        let historical_epoch = source.current_epoch();
+        source
+            .set_node_property(first, "state", Value::from("saved"))
+            .unwrap();
+        let burned = source.create_node(&["Burned"]);
+        assert!(source.delete_node(burned));
+        let retired_owner = source
+            .create_index(CreateIndexRequest {
+                graph: GraphPath::root(),
+                name: Some("retired".into()),
+                label: None,
+                property: "retired".into(),
+                kind: IndexCreateKind::Property,
+            })
+            .unwrap();
+        assert!(source.drop_index(retired_owner).unwrap());
+        let owner = source
+            .create_index(CreateIndexRequest {
+                graph: GraphPath::root(),
+                name: Some("state_owner".into()),
+                label: None,
+                property: "state".into(),
+                kind: IndexCreateKind::Property,
+            })
+            .unwrap();
+        assert!(owner.as_u32() > retired_owner.as_u32());
+        #[cfg(feature = "text-index")]
+        source
+            .create_index(CreateIndexRequest {
+                graph: GraphPath::root(),
+                name: Some("text_owner".into()),
+                label: Some("Doc".into()),
+                property: "body".into(),
+                kind: IndexCreateKind::Text {
+                    min_token_length: None,
+                },
+            })
+            .unwrap();
+        #[cfg(feature = "vector-index")]
+        {
+            source
+                .set_node_property(first, "embedding", Value::Vector(vec![1.0, 0.0].into()))
+                .unwrap();
+            source
+                .create_index(CreateIndexRequest {
+                    graph: GraphPath::root(),
+                    name: Some("vector_owner".into()),
+                    label: Some("Doc".into()),
+                    property: "embedding".into(),
+                    kind: IndexCreateKind::Vector {
+                        dimensions: Some(2),
+                        metric: Some("cosine".into()),
+                        m: None,
+                        ef_construction: None,
+                        ef: None,
+                        quantization: None,
+                    },
+                })
+                .unwrap();
+        }
+        let expected_snapshot = source.export_snapshot().unwrap();
+        let expected_cut = source.world_cut().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["saved", "saved.grafeo"] {
+            let path = temp.path().join(name);
+            source.save(&path).unwrap();
+            assert!(path.is_file());
+            assert!(
+                !sidecar(&path).exists(),
+                "save itself must not synthesize a WAL"
+            );
+            let reopened = GrafeoDB::open(&path).unwrap();
+            assert_eq!(reopened.export_snapshot().unwrap(), expected_snapshot);
+            assert_eq!(reopened.world_cut().unwrap(), expected_cut);
+            assert_eq!(reopened.store_id(), source.store_id());
+            assert_eq!(
+                reopened.get_node_property_at_epoch(first, "state", historical_epoch),
+                Some(Value::from("before"))
+            );
+            assert_eq!(reopened.get_edge(edge).unwrap().dst, second);
+            assert!(reopened.has_property_index("state"));
+            let saved_bytes = std::fs::read(&path).unwrap();
+            assert!(source.save(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+
+            reopened
+                .set_node_property(first, "state", Value::from("tail"))
+                .unwrap();
+            let tail_node = reopened.create_node(&["Later"]);
+            assert!(tail_node.as_u64() > burned.as_u64());
+            let tail_edge = reopened.create_edge(second, tail_node, "LATER");
+            let later_owner = reopened
+                .create_index(CreateIndexRequest {
+                    graph: GraphPath::root(),
+                    name: Some("later_owner".into()),
+                    label: None,
+                    property: "later".into(),
+                    kind: IndexCreateKind::Property,
+                })
+                .unwrap();
+            assert!(later_owner.as_u32() > owner.as_u32());
+            reopened.wal().unwrap().flush().unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                saved_bytes,
+                "tail must not be checkpointed yet"
+            );
+            let expected_tail = reopened.export_snapshot().unwrap();
+            let expected_tail_cut = reopened.world_cut().unwrap();
+            let crash = temp.path().join(format!("crash-{name}"));
+            std::fs::copy(&path, &crash).unwrap();
+            copy_tree(&sidecar(&path), &sidecar(&crash));
+            reopened.close().unwrap();
+            let recovered = GrafeoDB::open(&crash).unwrap();
+            assert_eq!(recovered.export_snapshot().unwrap(), expected_tail);
+            assert_eq!(recovered.world_cut().unwrap(), expected_tail_cut);
+            assert_eq!(
+                recovered.get_node(first).unwrap().get_property("state"),
+                Some(&Value::from("tail"))
+            );
+            assert_eq!(recovered.get_edge(tail_edge).unwrap().dst, tail_node);
+            assert!(
+                recovered.drop_index(later_owner).unwrap(),
+                "tail restored exact owner ID"
+            );
+            recovered.close().unwrap();
+        }
+        assert_eq!(source.export_snapshot().unwrap(), expected_snapshot);
+        assert_eq!(source.world_cut().unwrap(), expected_cut);
+        source.close().unwrap();
+    }
 
     /// Basic roundtrip: create nodes and edges, close, reopen, verify.
     #[test]
@@ -23,9 +191,11 @@ mod wal_directory {
             let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
             let db = GrafeoDB::with_config(config).expect("open for write");
             let a = db.create_node(&["Person"]);
-            db.set_node_property(a, "name", Value::String("Alix".into()));
+            db.set_node_property(a, "name", Value::String("Alix".into()))
+                .expect("set node property");
             let b = db.create_node(&["Person"]);
-            db.set_node_property(b, "name", Value::String("Gus".into()));
+            db.set_node_property(b, "name", Value::String("Gus".into()))
+                .expect("set node property");
             db.create_edge(a, b, "KNOWS");
             db.close().expect("close");
         }
@@ -53,9 +223,11 @@ mod wal_directory {
 
             // Write nodes BEFORE rotation (these go into wal_0.log)
             let a = db.create_node(&["Person"]);
-            db.set_node_property(a, "name", Value::String("Alix".into()));
+            db.set_node_property(a, "name", Value::String("Alix".into()))
+                .expect("set node property");
             let b = db.create_node(&["Person"]);
-            db.set_node_property(b, "name", Value::String("Gus".into()));
+            db.set_node_property(b, "name", Value::String("Gus".into()))
+                .expect("set node property");
             db.create_edge(a, b, "KNOWS");
 
             // Force WAL rotation so current_sequence advances
@@ -64,7 +236,8 @@ mod wal_directory {
 
             // Write more nodes AFTER rotation (these go into wal_1.log)
             let c = db.create_node(&["Person"]);
-            db.set_node_property(c, "name", Value::String("Vincent".into()));
+            db.set_node_property(c, "name", Value::String("Vincent".into()))
+                .expect("set node property");
 
             db.close().expect("close");
         }
@@ -98,6 +271,50 @@ mod wal_directory {
 
             db.close().expect("close");
         }
+    }
+
+    /// Closing a directory-format database must never manufacture a commit
+    /// marker for the last assigned transaction. A transaction rejected by
+    /// conflict validation has mutation frames in the WAL but no durable
+    /// commit and must remain aborted after reopen.
+    #[test]
+    fn close_does_not_commit_the_last_rejected_transaction() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("rejected_last_tx");
+        let node;
+        {
+            let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
+            let db = GrafeoDB::with_config(config).expect("open for write");
+            node = db.create_node(&["Counter"]);
+            db.set_node_property(node, "value", Value::Int64(0))
+                .expect("set node property");
+
+            let mut winner = db.session();
+            let mut rejected = db.session();
+            winner.begin_transaction().unwrap();
+            rejected.begin_transaction().unwrap();
+            winner
+                .set_node_property(node, "value", Value::Int64(1))
+                .expect("buffer winner write");
+            rejected
+                .set_node_property(node, "value", Value::Int64(2))
+                .expect("buffer competing write");
+            winner.commit().expect("first writer commits");
+            assert!(
+                rejected.commit().is_err(),
+                "second writer must fail first-writer-wins validation"
+            );
+
+            db.close().expect("close after rejected transaction");
+        }
+
+        let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
+        let db = GrafeoDB::with_config(config).expect("reopen");
+        assert_eq!(
+            db.get_node(node).unwrap().get_property("value"),
+            Some(&Value::Int64(1)),
+            "close must not authenticate the rejected transaction's WAL tail"
+        );
     }
 
     /// Data accumulates correctly across multiple close/reopen cycles,
@@ -177,7 +394,8 @@ mod wal_directory {
             let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
             let db = GrafeoDB::with_config(config).expect("open");
             let n = db.create_node(&["Person"]);
-            db.set_node_property(n, "name", Value::String("Alix".into()));
+            db.set_node_property(n, "name", Value::String("Alix".into()))
+                .expect("set node property");
             // intentionally no db.close(), Drop handles it
         }
 
@@ -207,25 +425,34 @@ mod wal_directory {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("deadlock_test");
 
-        let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
+        let config = Config::persistent(&path)
+            .with_storage_format(StorageFormat::WalDirectory)
+            .with_wal_durability(DurabilityMode::Batch {
+                max_delay_ms: 100,
+                max_records: 1000,
+            });
         let db = GrafeoDB::with_config(config).expect("open");
 
         // First batch: create nodes with properties
         for i in 0..10 {
             let id = db.create_node(&["Person"]);
-            db.set_node_property(id, "name", Value::from(format!("Node{i}")));
-            db.set_node_property(id, "index", Value::Int64(i));
+            db.set_node_property(id, "name", Value::from(format!("Node{i}")))
+                .expect("set node property");
+            db.set_node_property(id, "index", Value::Int64(i))
+                .expect("set node property");
         }
 
-        // Sleep long enough to trigger Batch mode sync threshold (default 100ms)
+        // Sleep long enough to trigger the explicitly configured Batch threshold.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Second batch: this would deadlock before the fix because the first
         // write_frame triggers sync_all() while holding active_log.
         for i in 10..20 {
             let id = db.create_node(&["Person"]);
-            db.set_node_property(id, "name", Value::from(format!("Node{i}")));
-            db.set_node_property(id, "index", Value::Int64(i));
+            db.set_node_property(id, "name", Value::from(format!("Node{i}")))
+                .expect("set node property");
+            db.set_node_property(id, "index", Value::Int64(i))
+                .expect("set node property");
         }
 
         assert_eq!(db.node_count(), 20);
@@ -333,18 +560,23 @@ mod wal_directory {
             let db = GrafeoDB::with_config(config).expect("open");
 
             let a = db.create_node(&["Person"]);
-            db.set_node_property(a, "name", Value::String("Alix".into()));
-            db.set_node_property(a, "temp", Value::String("remove_me".into()));
+            db.set_node_property(a, "name", Value::String("Alix".into()))
+                .expect("set node property");
+            db.set_node_property(a, "temp", Value::String("remove_me".into()))
+                .expect("set node property");
             db.remove_node_property(a, "temp");
 
             let b = db.create_node(&["Person"]);
-            db.set_node_property(b, "name", Value::String("Gus".into()));
+            db.set_node_property(b, "name", Value::String("Gus".into()))
+                .expect("set node property");
 
             let c = db.create_node(&["Person"]);
-            db.set_node_property(c, "name", Value::String("Vincent".into()));
+            db.set_node_property(c, "name", Value::String("Vincent".into()))
+                .expect("set node property");
 
             let e1 = db.create_edge(a, b, "KNOWS");
-            db.set_edge_property(e1, "weight", Value::Float64(0.8));
+            db.set_edge_property(e1, "weight", Value::Float64(0.8))
+                .expect("set edge property");
 
             let e2 = db.create_edge(b, c, "KNOWS");
 

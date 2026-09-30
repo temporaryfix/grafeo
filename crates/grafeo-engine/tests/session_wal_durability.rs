@@ -10,7 +10,7 @@
 //!
 //! The equivalent `GrafeoDB::create_node_with_props`,
 //! `GrafeoDB::create_edge_with_props`, etc. log
-//! `WalRecord::CreateNode` / `SetNodeProperty` / `CreateEdge` /
+//! Graph-qualified `LpgMutationOp::CreateNode` / `SetNodeProperty` / `CreateEdge` /
 //! `SetEdgeProperty` correctly. See `crates/grafeo-engine/src/database/crud.rs`
 //! for the WAL-correct path and `crates/grafeo-engine/src/session/mod.rs`
 //! around `create_node_with_props` for the bug.
@@ -28,6 +28,7 @@
 //! cargo test -p grafeo-engine --features full --test session_wal_durability
 //! ```
 
+#![cfg(feature = "lpg")]
 #![allow(missing_docs)]
 
 #[cfg(feature = "wal")]
@@ -175,6 +176,7 @@ mod session_wal_durability {
     /// Cypher path is the durability oracle: the same shape of write through
     /// `db.execute_language(..., "cypher", ...)` MUST survive reopen.
     /// If this test ever fails, the bug is broader than #327.
+    #[cfg(feature = "cypher")]
     #[test]
     fn cypher_create_node_with_props_survives_reopen() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -351,6 +353,51 @@ mod session_wal_durability {
             db.node_count(),
             1,
             "rolled-back node was resurrected by a later commit (TransactionAbort missing from rollback path)"
+        );
+    }
+
+    /// Concurrent sessions: abort of tx1 must not drop tx2's tagged LPG records.
+    #[test]
+    fn concurrent_lpg_abort_does_not_drop_other_tx() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("testdb");
+
+        let (ghost, kept) = {
+            let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
+            let db = GrafeoDB::with_config(config).expect("open for write");
+
+            let mut s1 = db.session();
+            let mut s2 = db.session();
+            s1.begin_transaction().expect("begin s1");
+            s2.begin_transaction().expect("begin s2");
+            let ghost = s1
+                .create_node_with_props(&["Ghost"], [("name", Value::String("dead".into()))])
+                .expect("ghost");
+            let kept = s2
+                .create_node_with_props(&["Kept"], [("name", Value::String("live".into()))])
+                .expect("kept");
+            s1.rollback().expect("abort s1");
+            s2.commit().expect("commit s2");
+            drop(s1);
+            drop(s2);
+            db.close().expect("close");
+            (ghost, kept)
+        };
+
+        let config = Config::persistent(&path).with_storage_format(StorageFormat::WalDirectory);
+        let db = GrafeoDB::with_config(config).expect("reopen");
+        assert_eq!(
+            db.node_count(),
+            1,
+            "only the committed session's node must survive"
+        );
+        assert!(
+            db.get_node(kept).is_some(),
+            "committed Kept node must survive the other session's abort"
+        );
+        assert!(
+            db.get_node(ghost).is_none(),
+            "aborted Ghost must not survive"
         );
     }
 }
