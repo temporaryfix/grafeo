@@ -17,14 +17,17 @@ pub mod cache;
 pub mod executor;
 pub mod optimizer;
 pub mod plan;
+pub mod plan_depth;
 pub mod planner;
+#[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+pub(crate) mod procedure_effect;
 pub mod processor;
 pub mod profile;
 pub mod translators;
 
 // Core exports
 pub use cache::{CacheKey, CacheStats, CachingQueryProcessor, QueryCache};
-pub use executor::Executor;
+pub use executor::{ExecutionOptions, Executor, ResultLimits};
 pub use optimizer::{CardinalityEstimator, Optimizer};
 pub use plan::{LogicalExpression, LogicalOperator, LogicalPlan};
 pub use planner::{

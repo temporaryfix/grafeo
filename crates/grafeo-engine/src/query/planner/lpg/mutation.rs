@@ -1,26 +1,125 @@
 //! Mutation planning (CREATE, DELETE, SET, MERGE, CALL, labels).
 
 use super::{
-    AddLabelOp, AddLabelOperator, AntiJoinOp, Arc, CreateEdgeOp, CreateEdgeOperator, CreateNodeOp,
-    CreateNodeOperator, DeleteEdgeOp, DeleteEdgeOperator, DeleteNodeOp, DeleteNodeOperator,
-    Direction, Error, ExpandDirection, ExpressionPredicate, FilterOperator, HashMap, LeftJoinOp,
-    LogicalExpression, LogicalOperator, LogicalType, MergeConfig, MergeOp, MergeOperator,
-    MergeRelationshipConfig, MergeRelationshipOp, MergeRelationshipOperator, Operator, ProjectExpr,
-    ProjectOperator, PropertySource, RemoveLabelOp, RemoveLabelOperator, Result, SetPropertyOp,
-    SetPropertyOperator, ShortestPathOp, ShortestPathOperator, UnaryOp, UnwindOp, UnwindOperator,
-    Value,
+    AddLabelOp, AddLabelOperator, AntiJoinOp, AntiJoinSemantics, Arc, CreateEdgeOp,
+    CreateEdgeOperator, CreateNodeOp, CreateNodeOperator, DeleteEdgeOp, DeleteEdgeOperator,
+    DeleteNodeOp, DeleteNodeOperator, Error, ExpressionPredicate, FilterOperator, HashMap,
+    JoinKeySemantics, LeftJoinOp, LogicalExpression, LogicalOperator, LogicalType, MergeConfig,
+    MergeOp, MergeOperator, MergeRelationshipConfig, MergeRelationshipOp,
+    MergeRelationshipOperator, Operator, ProjectExpr, ProjectOperator, PropertySource,
+    RemoveLabelOp, RemoveLabelOperator, Result, SetPropertyOp, SetPropertyOperator, UnaryOp,
+    UnwindOp, UnwindOperator, Value,
 };
-#[cfg(feature = "algos")]
-use super::{CallProcedureOp, StaticResultOperator};
+#[cfg(any(feature = "lpg", feature = "algos"))]
+use super::{CallProcedureOp, StaticResultOperator, TransactionId};
 
 impl super::Planner {
+    /// Plans property inputs for a CREATE operator.
+    ///
+    /// Simple property sources stay attached to the mutation operator. Runtime
+    /// expressions are evaluated in a projection over the original input
+    /// scope, then passed to the mutation as ordinary columns. The projection
+    /// columns are private to the physical CREATE and are removed by the
+    /// caller before its output is exposed downstream.
+    fn plan_create_property_sources(
+        &self,
+        input: Option<Box<dyn Operator>>,
+        input_columns: &[String],
+        create_properties: &[(String, LogicalExpression)],
+    ) -> Result<(
+        Option<Box<dyn Operator>>,
+        Vec<(String, PropertySource)>,
+        Vec<LogicalType>,
+    )> {
+        let mut properties = Vec::with_capacity(create_properties.len());
+        let mut projection_exprs: Vec<ProjectExpr> =
+            (0..input_columns.len()).map(ProjectExpr::Column).collect();
+        let mut projection_schema = self.derive_schema_from_columns(input_columns);
+        let mut needs_projection = false;
+
+        for (name, expr) in create_properties {
+            let source = match self.expression_to_property_source(expr, input_columns) {
+                Ok(source) => source,
+                Err(_) => {
+                    if let Some(value) = Self::try_fold_expression(expr) {
+                        PropertySource::Constant(value)
+                    } else {
+                        let Some(_) = input.as_ref() else {
+                            return Err(Error::Internal(format!(
+                                "Cannot resolve CREATE expression for property '{name}': \
+                                 variable not in scope or unsupported expression"
+                            )));
+                        };
+                        let filter_expr = self.convert_expression(expr)?;
+                        let col_idx = projection_schema.len();
+                        let variable_columns: HashMap<String, usize> = input_columns
+                            .iter()
+                            .enumerate()
+                            .map(|(index, column)| (column.clone(), index))
+                            .collect();
+                        projection_exprs.push(ProjectExpr::Expression {
+                            expr: filter_expr,
+                            variable_columns,
+                        });
+                        // Scratch values have no binding name or entity type.
+                        projection_schema.push(LogicalType::Any);
+                        needs_projection = true;
+                        PropertySource::Column(col_idx)
+                    }
+                }
+            };
+            properties.push((name.clone(), source));
+        }
+
+        let input = if needs_projection {
+            let input = input.ok_or_else(|| {
+                Error::Internal("CREATE expression projection has no input".to_string())
+            })?;
+            Some(Box::new(
+                ProjectOperator::with_store(
+                    input,
+                    projection_exprs,
+                    projection_schema.clone(),
+                    Arc::clone(&self.store),
+                )
+                .with_transaction_context(self.viewing_epoch, self.transaction_id)
+                .with_session_context(self.session_context.clone()),
+            ) as Box<dyn Operator>)
+        } else {
+            input
+        };
+
+        Ok((input, properties, projection_schema))
+    }
+
+    /// Removes the private expression columns added around a CREATE operator.
+    fn hide_create_projection_columns(
+        &self,
+        operator: Box<dyn Operator>,
+        input_column_count: usize,
+        created_column: Option<usize>,
+        output_schema: Vec<LogicalType>,
+        projected: bool,
+    ) -> Box<dyn Operator> {
+        if !projected {
+            return operator;
+        }
+
+        let mut projections: Vec<ProjectExpr> =
+            (0..input_column_count).map(ProjectExpr::Column).collect();
+        if let Some(created_column) = created_column {
+            projections.push(ProjectExpr::Column(created_column));
+        }
+        Box::new(ProjectOperator::new(operator, projections, output_schema))
+    }
+
     /// Plans a CREATE NODE operator.
     pub(super) fn plan_create_node(
         &self,
         create: &CreateNodeOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         // Plan input if present
-        let (input_op, mut columns) = if let Some(ref input) = create.input {
+        let (input_op, input_columns) = if let Some(ref input) = create.input {
             let (op, cols) = self.plan_operator(input)?;
             (Some(op), cols)
         } else {
@@ -30,31 +129,21 @@ impl super::Planner {
         // If the variable already exists in input columns and no labels/properties
         // are specified, this is a reference to an existing node (e.g., from MATCH).
         // Skip creating a new node and just pass through.
-        if columns.contains(&create.variable)
+        if input_columns.contains(&create.variable)
             && create.labels.is_empty()
             && create.properties.is_empty()
             && let Some(op) = input_op
         {
-            return Ok((op, columns));
+            return Ok((op, input_columns));
         }
 
-        // Output column for the created node
-        let output_column = columns.len();
-        columns.push(create.variable.clone());
-
-        // Convert properties: resolve variables/property access from input columns
-        let properties: Vec<(String, PropertySource)> = create
-            .properties
-            .iter()
-            .map(|(name, expr)| {
-                let source = self.expression_to_property_source(expr, &columns)?;
-                Ok((name.clone(), source))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let (input_op, properties, mut output_schema) =
+            self.plan_create_property_sources(input_op, &input_columns, &create.properties)?;
+        let projected = output_schema.len() != input_columns.len();
+        let output_column = output_schema.len();
 
         // Input pass-through columns use generic types (Any); the new node column
         // gets Node for compact VectorData::NodeId storage.
-        let mut output_schema = self.derive_schema_from_columns(&columns[..output_column]);
         output_schema.push(LogicalType::Node);
 
         let mut op = CreateNodeOperator::new(
@@ -74,8 +163,18 @@ impl super::Planner {
             op = op.with_validator(Arc::clone(validator));
         }
 
-        let operator = Box::new(op);
-        Ok((operator, columns))
+        let mut output_columns = input_columns.clone();
+        output_columns.push(create.variable.clone());
+        let mut public_schema = self.derive_schema_from_columns(&input_columns);
+        public_schema.push(LogicalType::Node);
+        let operator = self.hide_create_projection_columns(
+            Box::new(op),
+            input_columns.len(),
+            Some(output_column),
+            public_schema,
+            projected,
+        );
+        Ok((operator, output_columns))
     }
 
     /// Plans a CREATE EDGE operator.
@@ -83,10 +182,10 @@ impl super::Planner {
         &self,
         create: &CreateEdgeOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        let (input_op, mut columns) = self.plan_operator(&create.input)?;
+        let (input_op, input_columns) = self.plan_operator(&create.input)?;
 
         // Find source and target columns
-        let from_column = columns
+        let from_column = input_columns
             .iter()
             .position(|c| c == &create.from_variable)
             .ok_or_else(|| {
@@ -96,7 +195,7 @@ impl super::Planner {
                 ))
             })?;
 
-        let to_column = columns
+        let to_column = input_columns
             .iter()
             .position(|c| c == &create.to_variable)
             .ok_or_else(|| {
@@ -106,29 +205,21 @@ impl super::Planner {
                 ))
             })?;
 
-        // Output column for the created edge (if named)
-        let output_column = create.variable.as_ref().map(|v| {
-            let idx = columns.len();
-            columns.push(v.clone());
-            self.edge_columns.borrow_mut().insert(v.clone());
-            idx
+        let (input_op, properties, mut output_schema) =
+            self.plan_create_property_sources(Some(input_op), &input_columns, &create.properties)?;
+        let projected = output_schema.len() != input_columns.len();
+        let property_column_count = output_schema.len();
+        let output_column = create.variable.as_ref().map(|variable| {
+            self.edge_columns.borrow_mut().insert(variable.clone());
+            property_column_count
         });
-
-        // Convert properties: resolve variables/property access from input columns
-        let properties: Vec<(String, PropertySource)> = create
-            .properties
-            .iter()
-            .map(|(name, expr)| {
-                let source = self.expression_to_property_source(expr, &columns)?;
-                Ok((name.clone(), source))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let output_schema = self.derive_schema_from_columns(&columns);
+        if create.variable.is_some() {
+            output_schema.push(LogicalType::Edge);
+        }
 
         let mut operator = CreateEdgeOperator::new(
             self.write_store()?,
-            input_op,
+            input_op.ok_or_else(|| Error::Internal("CREATE EDGE has no input operator".into()))?,
             from_column,
             to_column,
             create.edge_type.clone(),
@@ -147,9 +238,21 @@ impl super::Planner {
             operator = operator.with_validator(Arc::clone(validator));
         }
 
-        let operator = Box::new(operator);
+        let mut output_columns = input_columns.clone();
+        let mut public_schema = self.derive_schema_from_columns(&input_columns);
+        if let Some(variable) = &create.variable {
+            output_columns.push(variable.clone());
+            public_schema.push(LogicalType::Edge);
+        }
+        let operator = self.hide_create_projection_columns(
+            Box::new(operator),
+            input_columns.len(),
+            output_column,
+            public_schema,
+            projected,
+        );
 
-        Ok((operator, columns))
+        Ok((operator, output_columns))
     }
 
     /// Plans a DELETE NODE operator.
@@ -200,6 +303,9 @@ impl super::Planner {
             if let Some(ref tracker) = self.write_tracker {
                 op = op.with_write_tracker(Arc::clone(tracker));
             }
+            if let Some(ref validator) = self.validator {
+                op = op.with_validator(Arc::clone(validator));
+            }
             Ok((Box::new(op), output_columns))
         }
     }
@@ -232,7 +338,6 @@ impl super::Planner {
         if let Some(ref tracker) = self.write_tracker {
             op = op.with_write_tracker(Arc::clone(tracker));
         }
-
         Ok((Box::new(op), output_columns))
     }
 
@@ -241,6 +346,16 @@ impl super::Planner {
         &self,
         left_join: &LeftJoinOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        if left_join
+            .compatibility_conditions
+            .iter()
+            .any(|condition| condition.semantics != JoinKeySemantics::Value)
+        {
+            return Err(Error::InvalidValue(
+                "RDF term-identity left-join metadata cannot be planned by the LPG engine"
+                    .to_string(),
+            ));
+        }
         // Handle Empty left input (OPTIONAL MATCH as first clause):
         // substitute a SingleRowOperator so the left side produces one row.
         let (left_op, left_columns): (Box<dyn Operator>, Vec<String>) =
@@ -255,14 +370,46 @@ impl super::Planner {
         let (right_op, right_columns) = self.plan_operator(&left_join.right)?;
         let left_types = self.derive_schema_from_columns(&left_columns);
         let right_types = self.derive_schema_from_columns(&right_columns);
-        let (join_op, join_columns, _join_types) = super::common::build_left_join(
-            left_op,
-            right_op,
-            &left_columns,
-            &right_columns,
-            &left_types,
-            &right_types,
-        );
+        let explicit_keys = if left_join.compatibility_conditions.is_empty() {
+            None
+        } else {
+            Some(
+                left_join
+                    .compatibility_conditions
+                    .iter()
+                    .map(|condition| {
+                        Ok((
+                            self.expression_to_column(&condition.left, &left_columns)?,
+                            self.expression_to_column(&condition.right, &right_columns)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .unzip::<_, _, Vec<_>, Vec<_>>(),
+            )
+        };
+        let (join_op, join_columns, _join_types) =
+            if let Some((left_keys, right_keys)) = explicit_keys {
+                super::common::build_left_join_with_keys(
+                    left_op,
+                    right_op,
+                    &left_columns,
+                    &right_columns,
+                    &left_types,
+                    &right_types,
+                    left_keys,
+                    right_keys,
+                )
+            } else {
+                super::common::build_left_join(
+                    left_op,
+                    right_op,
+                    &left_columns,
+                    &right_columns,
+                    &left_types,
+                    &right_types,
+                )
+            };
 
         // If the LeftJoin carries a cross-side condition (null-safe predicate),
         // apply it as a Filter above the join. The condition already incorporates
@@ -291,15 +438,59 @@ impl super::Planner {
         &self,
         anti_join: &AntiJoinOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        if anti_join
+            .compatibility_conditions
+            .iter()
+            .any(|condition| condition.semantics != JoinKeySemantics::Value)
+        {
+            return Err(Error::InvalidValue(
+                "RDF term-identity anti-join metadata cannot be planned by the LPG engine"
+                    .to_string(),
+            ));
+        }
         let (left_op, left_columns) = self.plan_operator(&anti_join.left)?;
         let (right_op, right_columns) = self.plan_operator(&anti_join.right)?;
         let schema = self.derive_schema_from_columns(&left_columns);
-        Ok(super::common::build_anti_join(
+        if anti_join.compatibility_conditions.is_empty() {
+            if anti_join.semantics == AntiJoinSemantics::NotExists {
+                return Ok(super::common::build_anti_join_with_keys(
+                    left_op,
+                    right_op,
+                    left_columns,
+                    schema,
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            return Ok(super::common::build_anti_join(
+                left_op,
+                right_op,
+                left_columns,
+                &right_columns,
+                schema,
+            ));
+        }
+        let (left_keys, right_keys) = anti_join
+            .compatibility_conditions
+            .iter()
+            .map(|condition| {
+                Ok((
+                    self.expression_to_column(&condition.left, &left_columns)?,
+                    self.expression_to_column(&condition.right, &right_columns)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        Ok(super::common::build_anti_join_with_keys(
             left_op,
             right_op,
             left_columns,
-            &right_columns,
             schema,
+            left_keys,
+            right_keys,
+            anti_join.semantics == AntiJoinSemantics::Minus,
         ))
     }
 
@@ -310,47 +501,46 @@ impl super::Planner {
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         // Plan the input operator first
         // Handle Empty specially - use a single-row operator
-        let (input_op, input_columns): (Box<dyn Operator>, Vec<String>) =
-            if matches!(&*unwind.input, LogicalOperator::Empty) {
-                // For UNWIND without prior MATCH, create a single-row input
-                // We need an operator that produces one row with the list to unwind
-                // For now, use EmptyScan which produces no rows - we'll handle the literal
-                // list in the unwind operator itself
-                let literal_list = self.convert_expression(&unwind.expression)?;
+        let input_was_empty = matches!(&*unwind.input, LogicalOperator::Empty);
+        let (input_op, input_columns): (Box<dyn Operator>, Vec<String>) = if input_was_empty {
+            // For UNWIND without prior MATCH, create a single-row input
+            // We need an operator that produces one row with the list to unwind
+            // For now, use EmptyScan which produces no rows - we'll handle the literal
+            // list in the unwind operator itself
+            let literal_list = self.convert_expression(&unwind.expression)?;
 
-                // Create a project operator that produces a single row with the list
-                let single_row_op: Box<dyn Operator> = Box::new(
-                    grafeo_core::execution::operators::single_row::SingleRowOperator::new(),
-                );
-                let project_op: Box<dyn Operator> = Box::new(
-                    ProjectOperator::with_store(
-                        single_row_op,
-                        vec![ProjectExpr::Expression {
-                            expr: literal_list,
-                            variable_columns: HashMap::new(),
-                        }],
-                        vec![LogicalType::Any],
-                        Arc::clone(&self.store),
-                    )
-                    .with_transaction_context(self.viewing_epoch, self.transaction_id)
-                    .with_session_context(self.session_context.clone()),
-                );
+            // Create a project operator that produces a single row with the list
+            let single_row_op: Box<dyn Operator> =
+                Box::new(grafeo_core::execution::operators::single_row::SingleRowOperator::new());
+            let project_op: Box<dyn Operator> = Box::new(
+                ProjectOperator::with_store(
+                    single_row_op,
+                    vec![ProjectExpr::Expression {
+                        expr: literal_list,
+                        variable_columns: HashMap::new(),
+                    }],
+                    vec![LogicalType::Any],
+                    Arc::clone(&self.store),
+                )
+                .with_transaction_context(self.viewing_epoch, self.transaction_id)
+                .with_session_context(self.session_context.clone()),
+            );
 
-                // The logical tree still contains Unwind(Empty), so under
-                // PROFILE, build_profile_tree will walk into Empty and expect
-                // an entry. plan_operator(&Empty) returns Err and is bypassed
-                // here, so push a synthetic entry attributed to Empty.
-                if self.profiling.get() {
-                    let (entry, _stats) = crate::query::profile::ProfileEntry::new(
-                        "Empty",
-                        LogicalOperator::Empty.display_label(),
-                    );
-                    self.profile_entries.borrow_mut().push(entry);
-                }
-                (project_op, vec!["__list__".to_string()])
-            } else {
-                self.plan_operator(&unwind.input)?
-            };
+            // The logical tree still contains Unwind(Empty), so under
+            // PROFILE, build_profile_tree will walk into Empty and expect
+            // an entry. plan_operator(&Empty) returns Err and is bypassed
+            // here, so push a synthetic entry attributed to Empty.
+            if self.records_entries() {
+                let (entry, _stats) = crate::query::profile::ProfileEntry::new(
+                    "Empty",
+                    LogicalOperator::Empty.display_label(),
+                );
+                self.profile_entries.borrow_mut().push(entry);
+            }
+            (project_op, vec!["__list__".to_string()])
+        } else {
+            self.plan_operator(&unwind.input)?
+        };
 
         // The UNWIND expression should be a list - we need to find/evaluate it
         // Handle variable references, property access, and literal lists
@@ -358,6 +548,7 @@ impl super::Planner {
         // Find if the expression references an existing column that is itself a list
         let list_col_idx = match &unwind.expression {
             LogicalExpression::Variable(var) => input_columns.iter().position(|c| c == var),
+            LogicalExpression::FunctionCall { .. } if input_was_empty => Some(0),
             LogicalExpression::List(_) | LogicalExpression::Literal(_) => {
                 // Literal list expression - needs to be added as a column
                 None
@@ -375,6 +566,7 @@ impl super::Planner {
                 | LogicalExpression::Literal(Value::List(_))
                 | LogicalExpression::Literal(Value::Vector(_))
                 | LogicalExpression::Property { .. }
+                | LogicalExpression::FunctionCall { .. }
         ) {
             // Wrap input in a ProjectOperator that adds the list as an extra column
             let literal_list = self.convert_expression(&unwind.expression)?;
@@ -653,105 +845,89 @@ impl super::Planner {
         Ok((operator, columns))
     }
 
-    /// Plans a SHORTEST PATH operator.
-    pub(super) fn plan_shortest_path(
-        &self,
-        sp: &ShortestPathOp,
-    ) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        // Plan the input operator
-        let (input_op, mut columns) = self.plan_operator(&sp.input)?;
-
-        // Find source and target node columns
-        let source_column = columns
-            .iter()
-            .position(|c| c == &sp.source_var)
-            .ok_or_else(|| {
-                Error::Internal(format!(
-                    "Source variable '{}' not found for shortestPath",
-                    sp.source_var
-                ))
-            })?;
-
-        let target_column = columns
-            .iter()
-            .position(|c| c == &sp.target_var)
-            .ok_or_else(|| {
-                Error::Internal(format!(
-                    "Target variable '{}' not found for shortestPath",
-                    sp.target_var
-                ))
-            })?;
-
-        // Convert direction
-        let direction = match sp.direction {
-            ExpandDirection::Outgoing => Direction::Outgoing,
-            ExpandDirection::Incoming => Direction::Incoming,
-            ExpandDirection::Both => Direction::Both,
-        };
-
-        // Create the shortest path operator
-        let operator: Box<dyn Operator> = Box::new(
-            ShortestPathOperator::new(
-                Arc::clone(&self.store),
-                input_op,
-                source_column,
-                target_column,
-                sp.edge_types.clone(),
-                direction,
-            )
-            .with_all_paths(sp.all_paths),
-        );
-
-        // Add path length column with the expected naming convention
-        // The translator expects _path_length_{alias} format for length(p) calls
-        let path_col_name = format!("_path_length_{}", sp.path_alias);
-        columns.push(path_col_name.clone());
-
-        // Mark path length as scalar so plan_return uses LogicalType::Any, not Node
-        self.scalar_columns.borrow_mut().insert(path_col_name);
-
-        Ok((operator, columns))
-    }
-
     /// Plans a CALL procedure operator.
-    #[cfg(feature = "algos")]
+    #[cfg(any(feature = "lpg", feature = "algos"))]
     pub(super) fn plan_call_procedure(
         &self,
         call: &CallProcedureOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        use crate::procedures::{self, BuiltinProcedures};
+        use crate::procedures::{self, builtin_registry};
 
-        static PROCEDURES: std::sync::OnceLock<BuiltinProcedures> = std::sync::OnceLock::new();
-        let registry = PROCEDURES.get_or_init(BuiltinProcedures::new);
-
-        // Special case: grafeo.procedures() lists all procedures
-        let resolved_name = call.name.join(".");
-        if resolved_name == "grafeo.procedures" || resolved_name == "procedures" {
-            let result = procedures::procedures_result(registry);
-            return self.plan_static_result(result, &call.yield_items);
-        }
-
-        // Check user-defined procedures first (requires GQL for body re-parsing)
         #[cfg(feature = "gql")]
-        if let Some(catalog) = &self.catalog {
-            let proc_name = if call.name.len() == 1 {
-                &call.name[0]
+        {
+            use crate::query::procedure_effect::{ResolvedProcedure, analyze_procedure_effects};
+
+            // Session supplies the immutable snapshot used for authorization.
+            // Direct lower-level Planner callers still get the same canonical
+            // resolution by taking a one-call snapshot here.
+            let fallback;
+            let procedures = if let Some(procedures) = &self.resolved_procedures {
+                procedures
+            } else if let Some(catalog) = &self.catalog {
+                let root = crate::query::plan::LogicalOperator::CallProcedure(call.clone());
+                fallback = analyze_procedure_effects(&root, catalog)?.procedures;
+                &fallback
             } else {
-                // For dotted names, try the last segment as procedure name
-                call.name.last().expect("name has at least one segment")
+                fallback = crate::query::procedure_effect::ResolvedProcedureCatalog::empty();
+                &fallback
             };
-            if let Some(proc_def) = catalog.get_procedure(proc_name) {
-                return self.plan_user_procedure(call, &proc_def);
+
+            match procedures.resolve(call)? {
+                ResolvedProcedure::Listing => {
+                    let result = procedures::procedures_result(builtin_registry());
+                    self.plan_static_result(result, &call.yield_items)
+                }
+                ResolvedProcedure::Catalog(procedure) => self.plan_user_procedure(call, &procedure),
+                ResolvedProcedure::Builtin(procedure) => {
+                    self.plan_builtin_procedure(call, procedure)
+                }
             }
         }
 
-        // Look up the procedure
-        let procedure = registry.get(&call.name).ok_or_else(|| {
-            Error::Internal(format!(
-                "Unknown procedure: '{}'. Use CALL grafeo.procedures() to list available procedures.",
-                call.name.join(".")
-            ))
-        })?;
+        #[cfg(not(feature = "gql"))]
+        {
+            let resolved_name = call.name.join(".");
+            if matches!(&call.name[..], [single] if single == "procedures")
+                || matches!(&call.name[..], [namespace, procedure]
+                    if namespace.eq_ignore_ascii_case("grafeo") && procedure == "procedures")
+            {
+                let result = procedures::procedures_result(builtin_registry());
+                return self.plan_static_result(result, &call.yield_items);
+            }
+            let procedure = builtin_registry()
+                .get(&call.name)
+                .ok_or_else(|| Error::Internal(format!("Unknown procedure: '{resolved_name}'")))?;
+            self.plan_builtin_procedure(call, procedure)
+        }
+    }
+
+    #[cfg(any(feature = "lpg", feature = "algos"))]
+    fn plan_builtin_procedure(
+        &self,
+        call: &CallProcedureOp,
+        procedure: Arc<dyn crate::procedures::Procedure>,
+    ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        use crate::procedures::{self, ProcedureEffect};
+
+        if procedure.effect() == ProcedureEffect::MayWrite {
+            return Err(Error::Query(grafeo_common::utils::error::QueryError::new(
+                grafeo_common::utils::error::QueryErrorKind::Unsupported,
+                format!(
+                    "write-capable builtin procedure '{}' is disabled until builtin mutation context carries Session WAL, CDC, validation, and conflict tracking",
+                    procedure.name()
+                ),
+            )));
+        }
+
+        // Per-procedure Serializable guard: procedures that cannot record reads
+        // for SSI (e.g. vector/text index searches) are rejected; procedures that
+        // are snapshot-safe (graph algorithms, catalog introspection) are allowed.
+        if self.is_serializable() && !procedure.serializable_safe() {
+            return Err(Error::Internal(format!(
+                "Serializable isolation is not yet supported with procedure '{}'; use SnapshotIsolation",
+                procedure.name()
+            )));
+        }
 
         // Evaluate arguments to Parameters
         let params = procedures::evaluate_arguments(&call.arguments, procedure.parameters());
@@ -783,6 +959,15 @@ impl super::Planner {
             yield_columns,
             canonical_columns,
         );
+        // Every CALL gets the statement's exact MVCC cut. Active transactions
+        // keep their identity for read-your-writes and SSI; autocommit reads
+        // use INVALID, which cannot see a transaction overlay and has no read
+        // tracker. Lower-level callers receive the same logical cut; retaining
+        // that cut across concurrent GC remains their responsibility.
+        op = op.with_snapshot_context(
+            self.viewing_epoch,
+            self.transaction_id.unwrap_or(TransactionId::INVALID),
+        );
         #[cfg(feature = "lpg")]
         if let Some(lpg_store) = self.lpg_store.as_ref() {
             op = op.with_lpg_store(Arc::clone(lpg_store));
@@ -798,7 +983,7 @@ impl super::Planner {
     }
 
     /// Plans a static result set (e.g., from `grafeo.procedures()`).
-    #[cfg(feature = "algos")]
+    #[cfg(any(feature = "lpg", feature = "algos"))]
     pub(super) fn plan_static_result(
         &self,
         result: grafeo_adapters::plugins::AlgorithmResult,
@@ -848,36 +1033,100 @@ impl super::Planner {
     }
 
     /// Plans a user-defined procedure call.
-    #[cfg(all(feature = "algos", feature = "gql"))]
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
     fn plan_user_procedure(
         &self,
         call: &CallProcedureOp,
-        proc_def: &crate::catalog::ProcedureDefinition,
+        procedure: &crate::query::procedure_effect::ResolvedCatalogProcedure,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        use crate::query::executor::user_procedure::{ProcedureContext, UserProcedureOperator};
+        use grafeo_common::utils::error::{QueryError, QueryErrorKind, TransactionError};
+
+        use crate::procedures::ProcedureEffect;
+        use crate::query::binder::Binder;
+        use crate::query::executor::procedure_output::{
+            EagerProcedureBoundaryOperator, ProcedureOutputContractOperator,
+            procedure_logical_type, procedure_value_matches,
+        };
+        use crate::query::optimizer::Optimizer;
+        use crate::query::processor::{QueryParams, substitute_params};
+
+        let proc_def = &procedure.definition;
 
         // Validate argument count
         if call.arguments.len() != proc_def.params.len() {
-            return Err(Error::Internal(format!(
-                "Procedure '{}' expects {} arguments, got {}",
-                proc_def.name,
-                proc_def.params.len(),
-                call.arguments.len()
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                format!(
+                    "procedure '{}' expects {} arguments, got {}",
+                    proc_def.name,
+                    proc_def.params.len(),
+                    call.arguments.len()
+                ),
             )));
         }
 
-        // Evaluate arguments to values
-        let mut arg_values = Vec::new();
-        for arg in &call.arguments {
-            let val = crate::query::planner::eval_constant_expression(arg)?;
+        // Evaluate and validate arguments as typed values. Runtime-dependent
+        // expressions are not supported at this root CALL boundary and fail as
+        // a user-facing semantic error rather than an internal engine error.
+        let mut arg_values = Vec::with_capacity(call.arguments.len());
+        for (((param_name, _), expected), arg) in proc_def
+            .params
+            .iter()
+            .zip(&procedure.parameter_types)
+            .zip(&call.arguments)
+        {
+            let val = crate::query::planner::eval_constant_expression(arg).map_err(|_| {
+                Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    format!(
+                        "procedure '{}' argument '{param_name}' must be a constant value",
+                        proc_def.name
+                    ),
+                ))
+            })?;
+            if !procedure_value_matches(expected, &val) {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    format!(
+                        "procedure '{}' argument '{param_name}' expects {expected}, found {}",
+                        proc_def.name,
+                        val.type_name()
+                    ),
+                )));
+            }
             arg_values.push(val);
         }
 
-        // Build parameter map: param_name -> value
-        let mut param_map = std::collections::HashMap::new();
+        // Build a typed parameter map. Substitution happens in the parsed
+        // logical tree; procedure arguments are never executable source text.
+        let mut param_map = QueryParams::new();
         for (param, value) in proc_def.params.iter().zip(arg_values) {
             param_map.insert(param.0.clone(), value);
         }
+
+        // A write-capable body is valid only inside the transaction that
+        // Session opened after transitive authorization. This also makes the
+        // lower-level QueryProcessor/Planner APIs fail closed when they do not
+        // own transaction framing.
+        if procedure.effect == ProcedureEffect::MayWrite
+            && (!self.procedure_write_authority || self.transaction_id.is_none())
+        {
+            return Err(Error::Transaction(TransactionError::InvalidState(format!(
+                "write-capable procedure '{}' requires a Session-owned transaction",
+                proc_def.name
+            ))));
+        }
+
+        let _frame = self.enter_procedure_frame(&proc_def.name)?;
+        let mut logical_body = procedure.logical_body.clone();
+        substitute_params(&mut logical_body, &param_map)?;
+
+        let mut binder = Binder::new();
+        let _binding_context = binder.bind(&logical_body)?;
+        let optimizer = Optimizer::from_graph_store(self.store.as_ref());
+        let optimized_body = optimizer.optimize(logical_body)?;
+        let child = self.fork_for_procedure();
+        let (body_operator, body_columns) = child.plan_operator(&optimized_body.root)?;
 
         // Determine output columns
         let return_columns: Vec<String> = proc_def.returns.iter().map(|r| r.0.clone()).collect();
@@ -895,26 +1144,80 @@ impl super::Planner {
             return_columns.clone()
         };
 
-        let yield_columns = call.yield_items.as_ref().map(|items| {
-            items
+        if body_columns.len() != return_columns.len() {
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                format!(
+                    "procedure '{}' declares {} output columns, but its body returns {} ([{}])",
+                    proc_def.name,
+                    return_columns.len(),
+                    body_columns.len(),
+                    body_columns.join(", ")
+                ),
+            )));
+        }
+        let source_columns = if let Some(yield_items) = &call.yield_items {
+            yield_items
                 .iter()
                 .map(|item| item.field_name.clone())
                 .collect::<Vec<_>>()
-        });
+        } else {
+            return_columns.clone()
+        };
+        let contract_columns = proc_def
+            .returns
+            .iter()
+            .zip(&procedure.return_types)
+            .map(|((name, _), data_type)| (name.clone(), data_type.clone()))
+            .collect();
+        let mut body_operator: Box<dyn Operator> = Box::new(ProcedureOutputContractOperator::new(
+            body_operator,
+            proc_def.name.clone(),
+            contract_columns,
+        ));
+        if procedure.effect == ProcedureEffect::MayWrite {
+            body_operator = Box::new(EagerProcedureBoundaryOperator::new(
+                body_operator,
+                proc_def.name.clone(),
+            ));
+        }
 
-        let operator = Box::new(UserProcedureOperator::new(
-            proc_def.body.clone(),
-            param_map,
-            return_columns,
-            yield_columns,
-            ProcedureContext {
-                store: Arc::clone(&self.store),
-                store_mut: self.write_store.as_ref().map(Arc::clone),
-                transaction_manager: self.transaction_manager.clone(),
-                transaction_id: self.transaction_id,
-                viewing_epoch: self.viewing_epoch,
-                catalog: self.catalog.clone(),
-            },
+        let mut seen = std::collections::HashSet::new();
+        let mut projections = Vec::with_capacity(source_columns.len());
+        let mut output_types = Vec::with_capacity(source_columns.len());
+        for source in &source_columns {
+            if !seen.insert(source) {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    format!(
+                        "procedure '{}' requests duplicate output column '{source}'",
+                        proc_def.name
+                    ),
+                )));
+            }
+            // RETURNS defines the public procedure schema. Body columns map to
+            // that schema positionally, so a body may use local aliases while
+            // YIELD consistently addresses the declared names.
+            let index = return_columns
+                .iter()
+                .position(|column| column == source)
+                .ok_or_else(|| {
+                    Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        format!(
+                            "procedure '{}' has no declared output '{source}' (available: [{}])",
+                            proc_def.name,
+                            return_columns.join(", ")
+                        ),
+                    ))
+                })?;
+            projections.push(ProjectExpr::Column(index));
+            output_types.push(procedure_logical_type(&procedure.return_types[index]));
+        }
+        let operator: Box<dyn Operator> = Box::new(ProjectOperator::new(
+            body_operator,
+            projections,
+            output_types,
         ));
 
         // Procedure outputs are scalar values, not node/edge IDs
@@ -960,6 +1263,9 @@ impl super::Planner {
         if let Some(ref tracker) = self.write_tracker {
             op = op.with_write_tracker(Arc::clone(tracker));
         }
+        if let Some(ref validator) = self.validator {
+            op = op.with_validator(Arc::clone(validator));
+        }
 
         Ok((Box::new(op), output_columns))
     }
@@ -998,6 +1304,9 @@ impl super::Planner {
         .with_transaction_context(self.viewing_epoch, self.transaction_id);
         if let Some(ref tracker) = self.write_tracker {
             op = op.with_write_tracker(Arc::clone(tracker));
+        }
+        if let Some(ref validator) = self.validator {
+            op = op.with_validator(Arc::clone(validator));
         }
 
         Ok((Box::new(op), output_columns))

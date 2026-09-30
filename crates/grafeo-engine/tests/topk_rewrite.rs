@@ -90,15 +90,20 @@ fn cypher_vector_topk_still_fires_first() {
             ))
             .unwrap();
     }
-    db.create_vector_index(
-        "Doc",
-        "embedding",
-        Some(3),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Doc".into()),
+        property: "embedding".into(),
+        kind: grafeo_engine::IndexCreateKind::Vector {
+            dimensions: Some(3),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
 
     let result = session
@@ -262,4 +267,202 @@ fn cypher_order_by_limit_uses_topk() {
     let expected_top5: Vec<Value> = all.iter().take(5).map(|&v| Value::Int64(v)).collect();
     let actual_top5: Vec<Value> = result.rows().iter().map(|row| row[0].clone()).collect();
     assert_eq!(actual_top5, expected_top5);
+}
+
+// Regression tests for the probe-state-pollution bug class.
+//
+// `try_heap_topk_rewrite` used to plan the input subtree as a speculative
+// probe, then fall through to the unfused path when sort-key resolution
+// failed. The probe mutated `Planner::scalar_columns`, so the unfused
+// re-planning saw a polluted set and chose `ProjectExpr::Column` (raw
+// passthrough) instead of `ProjectExpr::NodeResolve` for `Variable(n)`
+// Return items. Result: `RETURN n ORDER BY <key> LIMIT k` returned raw
+// `Int64` NodeIds instead of resolved maps for any sort key whose column
+// the resolver couldn't find by name — i.e. anything that isn't a bare
+// Variable or a Property already projected by Return.
+//
+// Issues #335 (Property keys) and #347 (FunctionCall keys, specifically
+// text_score) were reported separately. Both share the same root cause,
+// and the class extends to Case, Binary, and IndexAccess sort keys as
+// well. The fix replaces the probe with predictive column resolution
+// (see `try_heap_topk_rewrite`), so the canonical plan is built exactly
+// once and no shared state is mutated speculatively.
+//
+// Each test asserts that the entity-variable Return item still resolves
+// to a `Value::Map`, regardless of the sort key's shape.
+
+// Preserved from the release/0.5.43 cherry-pick of #337 — exercises the
+// Property-sort-key shape (issue #335). Kept as-is to preserve the
+// existing in-integration test history; the additional shapes below
+// extend the coverage to the rest of the bug class.
+#[test]
+fn order_by_limit_node_return_yields_map() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute("INSERT (:Article {title: 'A1', body: 'rust database internals'})")
+        .unwrap();
+
+    // Each variant must return Value::Map, not a raw integer NodeId.
+    let result = session.execute("MATCH (n:Article) RETURN n").unwrap();
+    assert!(result.rows()[0][0].as_map().is_some(), "bare RETURN n");
+
+    let result = session
+        .execute("MATCH (n:Article) RETURN n LIMIT 50")
+        .unwrap();
+    assert!(result.rows()[0][0].as_map().is_some(), "RETURN n LIMIT 50");
+
+    let result = session
+        .execute("MATCH (n:Article) RETURN n ORDER BY n.title")
+        .unwrap();
+    assert!(
+        result.rows()[0][0].as_map().is_some(),
+        "RETURN n ORDER BY n.title"
+    );
+
+    let result = session
+        .execute("MATCH (n:Article) RETURN n ORDER BY n.title LIMIT 50")
+        .unwrap();
+    assert!(
+        result.rows()[0][0].as_map().is_some(),
+        "RETURN n ORDER BY n.title LIMIT 50: col 0 = {:?}",
+        result.rows()[0][0]
+    );
+}
+
+#[cfg(feature = "text-index")]
+#[test]
+fn order_by_limit_text_score_key_yields_map() {
+    // Issue #347. text_score is a FunctionCall sort key; the previous
+    // predicate-based fix only handled Property keys.
+    use std::collections::HashMap;
+
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute("INSERT (:Article {title: 'A1', body: 'rust database internals'})")
+        .unwrap();
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: Some("Article".into()),
+        property: "body".into(),
+        kind: grafeo_engine::IndexCreateKind::Text {
+            min_token_length: None,
+        },
+    })
+    .expect("index");
+
+    let params = HashMap::from([("sub".to_string(), Value::from("database"))]);
+
+    // Without LIMIT: already worked, asserting it stays correct.
+    let result = session
+        .execute_with_params(
+            "MATCH (s:Article) RETURN s, text_score(s.body, $sub) \
+             ORDER BY text_score(s.body, $sub) DESC",
+            params.clone(),
+        )
+        .unwrap();
+    assert!(
+        result.rows()[0][0].as_map().is_some(),
+        "without LIMIT: expected Map, got {:?}",
+        result.rows()[0][0]
+    );
+
+    // With LIMIT: the failing case in #347.
+    let result = session
+        .execute_with_params(
+            "MATCH (s:Article) RETURN s, text_score(s.body, $sub) \
+             ORDER BY text_score(s.body, $sub) DESC LIMIT 50",
+            params.clone(),
+        )
+        .unwrap();
+    assert!(
+        result.rows()[0][0].as_map().is_some(),
+        "with LIMIT: expected Map, got {:?}",
+        result.rows()[0][0]
+    );
+}
+
+#[test]
+fn order_by_limit_case_key_yields_map() {
+    // Case sort key references a variable n that IS in Return as Variable(n).
+    // The previous variable-membership predicate would say "no augmenting
+    // needed" and let the probe run.
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute("INSERT (:Article {title: 'A1', tier: 1})")
+        .unwrap();
+    session
+        .execute("INSERT (:Article {title: 'A2', tier: 2})")
+        .unwrap();
+
+    let result = session
+        .execute(
+            "MATCH (n:Article) RETURN n \
+             ORDER BY CASE n.tier WHEN 1 THEN 0 ELSE 1 END LIMIT 50",
+        )
+        .unwrap();
+
+    assert_eq!(result.row_count(), 2);
+    for (i, row) in result.rows().iter().enumerate() {
+        assert!(
+            row[0].as_map().is_some(),
+            "row {i}: expected Map, got {:?}",
+            row[0]
+        );
+    }
+}
+
+#[test]
+fn order_by_limit_binary_key_yields_map() {
+    // Binary expression sort key, variable in Return.
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session.execute("INSERT (:Item {a: 3, b: 5})").unwrap();
+    session.execute("INSERT (:Item {a: 1, b: 2})").unwrap();
+
+    let result = session
+        .execute("MATCH (n:Item) RETURN n ORDER BY n.a + n.b DESC LIMIT 50")
+        .unwrap();
+
+    assert_eq!(result.row_count(), 2);
+    for (i, row) in result.rows().iter().enumerate() {
+        assert!(
+            row[0].as_map().is_some(),
+            "row {i}: expected Map, got {:?}",
+            row[0]
+        );
+    }
+}
+
+#[test]
+fn topk_alias_collision_orders_by_real_sort_key() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    // foo descends as age ascends, so a wrong-column sort is detectable.
+    for i in 0..10i64 {
+        session
+            .execute(&format!("INSERT (:P {{foo: {}, age: {}}})", 100 - i, i))
+            .unwrap();
+    }
+    // Alias "n_age" collides with resolved_column_name(n.age) = "n_age".
+    let result = session
+        .execute("MATCH (n:P) RETURN n.foo AS n_age ORDER BY n.age LIMIT 5")
+        .unwrap();
+    let got: Vec<i64> = result
+        .rows()
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int64(v) => *v,
+            other => panic!("expected Int64, got {other:?}"),
+        })
+        .collect();
+    // ORDER BY n.age ASC LIMIT 5 → ages 0..4 → their foo values 100..96.
+    assert_eq!(
+        got,
+        vec![100, 99, 98, 97, 96],
+        "rows must be ordered by n.age, not by the colliding alias column"
+    );
 }

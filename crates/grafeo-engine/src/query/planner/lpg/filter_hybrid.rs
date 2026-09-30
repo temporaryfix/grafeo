@@ -247,10 +247,10 @@ impl super::Planner {
             // Try vector-left + text-right, then vector-right + text-left.
             let result = self
                 .extract_vector_predicate(left)
-                .and_then(|v| self.extract_text_predicate(right).map(|t| (v, t)))
+                .zip(self.extract_text_predicate(right))
                 .or_else(|| {
                     self.extract_vector_predicate(right)
-                        .and_then(|v| self.extract_text_predicate(left).map(|t| (v, t)))
+                        .zip(self.extract_text_predicate(left))
                 });
             let Some((v, t)) = result else {
                 return Ok(None);
@@ -290,7 +290,10 @@ impl super::Planner {
         // Build VectorScanOp (threshold mode, return all candidates above threshold).
         let vector_scan_op = LogicalOperator::VectorScan(super::VectorScanOp {
             variable: scan.variable.clone(),
-            index_name: Some(format!("{}:{}", label, vector_pred.property)),
+            index_name: Some(grafeo_core::graph::lpg::encode_index_key(
+                label,
+                &vector_pred.property,
+            )),
             property: vector_pred.property.clone(),
             label: Some(label.clone()),
             query_vector: vector_pred.query_vector.clone(),
@@ -475,7 +478,7 @@ impl super::Planner {
 // `tests/hybrid_pushdown_coverage.rs` and `tests/hybrid_query.rs`.
 // ============================================================================
 
-#[cfg(all(test, feature = "text-index"))]
+#[cfg(all(test, feature = "lpg", feature = "text-index"))]
 mod text_extract_tests {
     use super::super::{
         Arc, BinaryOp, FilterOp, GraphStoreSearch, LogicalExpression, LogicalOperator, NodeScanOp,
@@ -854,7 +857,12 @@ mod text_extract_tests {
 // White-box tests for the compound (text AND/OR vector) hybrid planner
 // ============================================================================
 
-#[cfg(all(test, feature = "vector-index", feature = "text-index"))]
+#[cfg(all(
+    test,
+    feature = "lpg",
+    feature = "vector-index",
+    feature = "text-index"
+))]
 mod compound_hybrid_tests {
     use super::super::{
         Arc, BinaryOp, FilterOp, GraphStoreSearch, LogicalExpression, LogicalOperator, NodeScanOp,

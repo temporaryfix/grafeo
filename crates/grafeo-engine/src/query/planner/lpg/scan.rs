@@ -12,15 +12,28 @@ impl super::Planner {
         &self,
         scan: &NodeScanOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        let limit_hint = self.limit_hint.take();
         let scan_op = if let Some(label) = &scan.label {
             ScanOperator::with_label(Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>, label)
         } else {
             ScanOperator::new(Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>)
         };
 
+        // A bare label scan under transparent projections can size its chunks
+        // to LIMIT, avoiding entity resolution for rows the caller discards.
+        // Identity enumeration and visibility/SIREAD filtering remain complete.
+        let scan_op = if scan.input.is_none()
+            && scan.label.is_some()
+            && let Some(limit) = limit_hint
+        {
+            scan_op.with_chunk_capacity(limit.clamp(1, 2048))
+        } else {
+            scan_op
+        };
+
         // Apply MVCC context if available
-        let scan_operator: Box<dyn Operator> =
-            Box::new(scan_op.with_transaction_context(self.viewing_epoch, self.transaction_id));
+        let scan_op = scan_op.with_transaction_context(self.viewing_epoch, self.transaction_id);
+        let scan_operator: Box<dyn Operator> = Box::new(scan_op);
 
         // If there's an input, chain operators with a nested loop join (cross join)
         if let Some(input) = &scan.input {

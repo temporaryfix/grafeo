@@ -4,10 +4,11 @@
 //! [`ProfileNode`] tree that mirrors the physical operator tree, annotated
 //! with actual row counts, timing, and call counts.
 
-use std::fmt::Write;
 use std::sync::Arc;
 
-use grafeo_common::types::{LogicalType, Value};
+use super::executor::ResultLimits;
+use grafeo_common::utils::error::Result;
+use grafeo_core::execution::QueryResourceContext;
 use grafeo_core::execution::profile::{ProfileStats, SharedProfileStats};
 use parking_lot::Mutex;
 
@@ -25,6 +26,19 @@ pub struct ProfileNode {
     pub stats: SharedProfileStats,
     /// Child nodes.
     pub children: Vec<ProfileNode>,
+}
+
+#[cfg(all(feature = "gql", feature = "lpg"))]
+impl ProfileNode {
+    pub(crate) fn record_query_resources(
+        &self,
+        resources: grafeo_core::execution::profile::QueryProfileStats,
+    ) {
+        self.stats.lock().query_resources = Some(resources);
+        for child in &self.children {
+            child.record_query_resources(resources);
+        }
+    }
 }
 
 /// An entry collected during physical planning, used to build the profile tree.
@@ -91,45 +105,108 @@ pub fn build_profile_tree(
 
 /// Formats a `ProfileNode` tree into a human-readable text representation
 /// and wraps it in a `QueryResult` with a single "profile" column.
-pub fn profile_result(root: &ProfileNode, total_time_ms: f64) -> QueryResult {
-    let mut output = String::new();
-    format_node(&mut output, root, 0);
-    let _ = writeln!(output);
-    let _ = write!(output, "Total time: {total_time_ms:.2}ms");
-
-    QueryResult {
-        columns: vec!["profile".to_string()],
-        column_types: vec![LogicalType::String],
-        rows: vec![vec![Value::String(output.into())]],
-        execution_time_ms: Some(total_time_ms),
-        rows_scanned: None,
-        status_message: None,
-        gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
-    }
+///
+/// # Errors
+/// Returns cancellation, formatting, or output admission failure.
+pub fn profile_result(
+    root: &ProfileNode,
+    total_time_ms: f64,
+    resources: QueryResourceContext,
+    limits: ResultLimits,
+) -> Result<QueryResult> {
+    let mut result =
+        super::executor::bounded_text_result("profile", resources, limits, |output| {
+            format_node(output, root, 0)?;
+            writeln!(output)?;
+            write!(output, "Total time: {total_time_ms:.2}ms")
+        })?;
+    result.execution_time_ms = Some(total_time_ms);
+    Ok(result)
 }
 
-/// Recursively formats a profile node with indentation.
-fn format_node(out: &mut String, node: &ProfileNode, depth: usize) {
-    let indent = "  ".repeat(depth);
-
-    // Compute self-time before locking stats (self_time_ns also locks).
+/// Recursively formats a profile node without an intermediate indentation string.
+fn format_node(
+    out: &mut dyn std::fmt::Write,
+    node: &ProfileNode,
+    depth: usize,
+) -> std::fmt::Result {
     let self_time_ns = self_time_ns(node);
     let self_time_ms = self_time_ns as f64 / 1_000_000.0;
-
     let rows_out = node.stats.lock().rows_out;
-
-    let _ = writeln!(
+    for _ in 0..depth {
+        out.write_str("  ")?;
+    }
+    writeln!(
         out,
-        "{indent}{name} ({label})  rows={rows}  time={time:.2}ms",
+        "{name} ({label})  rows={rows}  time={time:.2}ms",
         name = node.name,
         label = node.label,
         rows = rows_out,
         time = self_time_ms,
-    );
-
-    for child in &node.children {
-        format_node(out, child, depth + 1);
+    )?;
+    if let Some(query) = node.stats.lock().query_resources {
+        for _ in 0..depth {
+            out.write_str("  ")?;
+        }
+        write!(
+            out,
+            "  query-wide resident_granted_bytes_at_sample={} resident_peak_bytes={} spilled_bytes_total={} spill_runs_total={} spill_partitions_total={} merge_time_ns=",
+            query.resident_granted_bytes,
+            query.resident_peak_bytes,
+            query.spilled_bytes,
+            query.spill_runs,
+            query.spill_partitions
+        )?;
+        match query.merge_time_ns {
+            Some(ns) => writeln!(out, "{ns}")?,
+            None => writeln!(out, "unavailable")?,
+        }
+        #[cfg(feature = "spill")]
+        if let Some(spill) = query.spill_physical {
+            for _ in 0..depth {
+                out.write_str("  ")?;
+            }
+            writeln!(
+                out,
+                "  query-wide spill_physical_reserved_bytes={} spill_physical_peak_bytes={} spill_observed_file_bytes_at_publication={} spill_observed_file_peak_bytes={} spill_cleanup_debt_bytes={} spill_cleanup_failed={} spill_reservation_uncertain={}",
+                spill.reserved_bytes,
+                spill.peak_reserved_bytes,
+                spill.observed_file_bytes,
+                spill.peak_observed_file_bytes,
+                spill.cleanup_debt_bytes,
+                spill.cleanup_failed,
+                spill.reservation_uncertain
+            )?;
+        }
+        #[cfg(feature = "spill")]
+        if query.spill_physical.is_none() {
+            for _ in 0..depth {
+                out.write_str("  ")?;
+            }
+            writeln!(out, "  query-wide spill_physical=unavailable")?;
+        }
+        #[cfg(feature = "spill")]
+        if let Some(recovery) = query.spill_recovery {
+            for _ in 0..depth {
+                out.write_str("  ")?;
+            }
+            writeln!(
+                out,
+                "  root-wide last_cleanup_inspected={} removed={} deferred={} foreign={} invalid={} reserved_bytes_at_pass={} truncated={}",
+                recovery.inspected,
+                recovery.removed,
+                recovery.deferred,
+                recovery.foreign,
+                recovery.invalid,
+                recovery.reserved_bytes,
+                recovery.truncated
+            )?;
+        }
     }
+    for child in &node.children {
+        format_node(out, child, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// Computes self-time: wall time minus children's wall time.
@@ -168,6 +245,39 @@ mod tests {
 
     /// Verifies the builder walks in post-order: children must be consumed
     /// before their parent. Also checks that self-time subtracts child time.
+    #[test]
+    fn query_resource_labels_distinguish_totals_from_live_grants() {
+        let (entry, stats) = ProfileEntry::new("RdfInMemorySort", String::new());
+        stats.lock().query_resources = Some(grafeo_core::execution::profile::QueryProfileStats {
+            resident_granted_bytes: 0,
+            resident_peak_bytes: 4096,
+            spilled_bytes: 8192,
+            spill_runs: 3,
+            spill_partitions: 0,
+            merge_time_ns: None,
+            #[cfg(feature = "spill")]
+            spill_physical: None,
+            #[cfg(feature = "spill")]
+            spill_recovery: None,
+        });
+        let root = ProfileNode {
+            name: entry.name,
+            label: entry.label,
+            stats,
+            children: Vec::new(),
+        };
+        let mut output = String::new();
+        format_node(&mut output, &root, 0).unwrap();
+        assert!(
+            output
+                .contains("query-wide resident_granted_bytes_at_sample=0 resident_peak_bytes=4096")
+        );
+        assert!(
+            output.contains("spilled_bytes_total=8192 spill_runs_total=3 spill_partitions_total=0")
+        );
+        assert!(output.contains("merge_time_ns=unavailable"));
+    }
+
     #[test]
     fn test_profile_tree_post_order() {
         let plan = three_level_plan();
@@ -230,7 +340,11 @@ mod tests {
         let root = build_profile_tree(&plan, &mut iter);
         assert_eq!(self_time_ns(&root), 0);
 
-        let result = profile_result(&root, 1.23);
+        let resources = QueryResourceContext::new(
+            grafeo_common::memory::buffer::BufferManager::with_budget(1_000_000),
+        )
+        .unwrap();
+        let result = profile_result(&root, 1.23, resources, ResultLimits::default()).unwrap();
         assert_eq!(result.columns, vec!["profile".to_string()]);
         let text = match &result.rows[0][0] {
             grafeo_common::types::Value::String(s) => s.to_string(),
@@ -239,5 +353,35 @@ mod tests {
         assert!(text.contains("Filter"));
         assert!(text.contains("NodeScan"));
         assert!(text.contains("Total time: 1.23ms"));
+    }
+
+    #[test]
+    fn profile_formatting_denial_releases_temporary_and_result_grants() {
+        let (entry, _) = ProfileEntry::new("NodeScan", "x".repeat(4096));
+        let root = ProfileNode {
+            name: entry.name,
+            label: entry.label,
+            stats: entry.stats,
+            children: Vec::new(),
+        };
+        let resources = QueryResourceContext::new(
+            grafeo_common::memory::buffer::BufferManager::with_budget(1_000_000),
+        )
+        .unwrap();
+        let error = profile_result(
+            &root,
+            1.0,
+            resources.clone(),
+            ResultLimits {
+                max_rows: 1,
+                max_bytes: 256,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            grafeo_common::utils::error::ErrorCode::StorageFull
+        );
+        assert_eq!(resources.query_stats().allocated_bytes, 0);
     }
 }

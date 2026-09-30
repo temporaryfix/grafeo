@@ -1323,6 +1323,7 @@ mod tests {
                     variable: "c".to_string(),
                     property: "id".to_string(),
                 },
+                semantics: crate::query::plan::JoinKeySemantics::Value,
             }],
         });
 
@@ -1664,6 +1665,9 @@ mod tests {
             })),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
 
         let cardinality = estimator.estimate(&expand);
@@ -1691,6 +1695,9 @@ mod tests {
             })),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
 
         let cardinality = estimator.estimate(&expand);
@@ -1718,6 +1725,9 @@ mod tests {
             })),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
 
         let cardinality = estimator.estimate(&expand);
@@ -1772,6 +1782,7 @@ mod tests {
             conditions: vec![JoinCondition {
                 left: LogicalExpression::Variable("p".to_string()),
                 right: LogicalExpression::Variable("c".to_string()),
+                semantics: crate::query::plan::JoinKeySemantics::Value,
             }],
         });
 
@@ -1991,6 +2002,9 @@ mod tests {
             })),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
 
         let cardinality = estimator.estimate(&expand);

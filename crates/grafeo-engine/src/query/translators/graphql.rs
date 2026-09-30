@@ -32,6 +32,10 @@ use std::collections::HashMap;
 ///
 /// Returns an error if the query cannot be parsed or translated.
 pub fn translate(query: &str) -> Result<LogicalPlan> {
+    crate::query::plan_depth::admit(translate_unchecked(query)?)
+}
+
+fn translate_unchecked(query: &str) -> Result<LogicalPlan> {
     let trimmed = query.trim_start();
     let (explain, profile, actual_query) = if trimmed
         .get(..7)
@@ -508,6 +512,7 @@ impl GraphQLTranslator {
                     function: AggregateFunction::Count,
                     expression: None,
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some(alias.clone()),
                     percentile: None,
@@ -563,6 +568,7 @@ impl GraphQLTranslator {
                             function: func,
                             expression,
                             expression2: None,
+                            distinct_key: None,
                             distinct: false,
                             alias: Some(alias.clone()),
                             percentile: None,
@@ -622,6 +628,7 @@ impl GraphQLTranslator {
                     function: func,
                     expression,
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some(alias.clone()),
                     percentile: None,
@@ -855,6 +862,9 @@ impl GraphQLTranslator {
             input: Box::new(input),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
 
         // Apply argument filters

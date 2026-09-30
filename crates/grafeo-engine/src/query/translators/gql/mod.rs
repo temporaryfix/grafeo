@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use super::common::{
     build_left_join_with_predicates, combine_with_and, flatten_and_conjuncts,
     is_aggregate_function, is_binary_set_function, join_and_conjuncts, references_any,
-    to_aggregate_function, wrap_distinct, wrap_filter, wrap_limit, wrap_return, wrap_skip,
-    wrap_sort,
+    to_aggregate_function, wrap_distinct, wrap_drain, wrap_filter, wrap_limit, wrap_return,
+    wrap_skip, wrap_sort,
 };
 use crate::query::plan::{
     self as plan, AddLabelOp, AggregateExpr, AggregateFunction, AggregateOp, ApplyOp, BinaryOp,
@@ -20,8 +20,8 @@ use crate::query::plan::{
     ExpandDirection, ExpandOp, HorizontalAggregateOp, IntersectOp, JoinCondition, JoinOp, JoinType,
     LeftJoinOp, LoadDataFormat, LoadDataOp, LogicalExpression, LogicalOperator, LogicalPlan,
     MergeOp, MergeRelationshipOp, NodeScanOp, NullsOrdering, OtherwiseOp, ParameterScanOp,
-    PathMode, ProcedureYield, ProjectOp, Projection, RemoveLabelOp, ReturnItem, SetPropertyOp,
-    ShortestPathOp, SortKey, SortOrder, UnaryOp, UnionOp, UnwindOp,
+    PathMode, PathSearch, ProcedureYield, ProjectOp, Projection, RemoveLabelOp, ReturnItem,
+    SetPropertyOp, SortKey, SortOrder, UnaryOp, UnionOp, UnwindOp,
 };
 #[cfg(test)]
 use crate::query::plan::{FilterOp, LimitOp, SkipOp};
@@ -71,7 +71,12 @@ pub fn translate(query: &str) -> Result<LogicalPlan> {
 pub fn translate_full(query: &str) -> Result<GqlTranslationResult> {
     let statement = gql::parse(query)?;
     let translator = GqlTranslator::new();
-    translator.translate_statement_full(&statement)
+    match translator.translate_statement_full(&statement)? {
+        GqlTranslationResult::Plan(plan) => {
+            crate::query::plan_depth::admit(plan).map(GqlTranslationResult::Plan)
+        }
+        other => Ok(other),
+    }
 }
 
 /// Translator from GQL AST to LogicalPlan.
@@ -79,12 +84,15 @@ struct GqlTranslator {
     /// Edge variables from variable-length expand patterns (group-list variables).
     /// Maps edge variable name to the path alias used for `_path_edges_{alias}` lookup.
     group_list_variables: std::cell::RefCell<HashMap<String, String>>,
+    /// Expression nesting while translating; see [`TranslationDepth`].
+    expression_depth: crate::query::plan_depth::TranslationDepth,
 }
 
 impl GqlTranslator {
     fn new() -> Self {
         Self {
             group_list_variables: std::cell::RefCell::new(HashMap::new()),
+            expression_depth: crate::query::plan_depth::TranslationDepth::default(),
         }
     }
 
@@ -424,6 +432,7 @@ impl GqlTranslator {
                                 left: Box::new(LogicalOperator::Empty),
                                 right: Box::new(match_plan),
                                 condition: None,
+                                compatibility_conditions: Vec::new(),
                             });
                         } else if matches!(plan, LogicalOperator::Empty) {
                             // No prior input: standard MATCH
@@ -435,6 +444,7 @@ impl GqlTranslator {
                                 left: Box::new(plan),
                                 right: Box::new(match_plan),
                                 condition: None,
+                                compatibility_conditions: Vec::new(),
                             });
                         } else {
                             // Non-optional MATCH after prior clauses (UNWIND, etc.)
@@ -566,6 +576,7 @@ impl GqlTranslator {
                         left: Box::new(LogicalOperator::Empty),
                         right: Box::new(match_plan),
                         condition: None,
+                        compatibility_conditions: Vec::new(),
                     });
                 } else if matches!(plan, LogicalOperator::Empty) {
                     plan = match_plan;
@@ -574,6 +585,7 @@ impl GqlTranslator {
                         left: Box::new(plan),
                         right: Box::new(match_plan),
                         condition: None,
+                        compatibility_conditions: Vec::new(),
                     });
                 } else {
                     plan = LogicalOperator::Join(JoinOp {
@@ -794,10 +806,9 @@ impl GqlTranslator {
             }
         }
 
-        // FINISH: consume input, return empty result (mutations already applied)
+        // FINISH: exhaust the input so mutations execute, but emit no rows.
         if query.return_clause.is_finish {
-            // Wrap in a Limit(0) to consume input but return no rows
-            plan = wrap_limit(plan, 0);
+            plan = wrap_drain(plan);
             return Ok(LogicalPlan::new(plan));
         }
 
@@ -1176,9 +1187,11 @@ impl GqlTranslator {
             let current_vars = &pattern_vars[index];
             let shared: Vec<String> = current_vars.intersection(&bound_vars).cloned().collect();
 
-            // Determine the input for this pattern: if shared variables exist,
-            // translate independently and join; otherwise chain as before.
-            let pattern_input = if shared.is_empty() { plan.take() } else { None };
+            let pattern_path_mode = match aliased_pattern.keep {
+                Some(ast::MatchMode::DifferentEdges) => PathMode::Trail,
+                Some(ast::MatchMode::RepeatableElements) => PathMode::Walk,
+                None => path_mode,
+            };
 
             // Check per-pattern search prefix (e.g., p = ANY SHORTEST (...))
             let per_pattern_shortest = matches!(
@@ -1191,38 +1204,91 @@ impl GqlTranslator {
                 )
             );
 
+            // A shortest traversal evaluates its intrinsic predicate for each
+            // fixed input row. Preserve shared node bindings in that input:
+            // NodeScan reuses the source and Expand filters a bound target.
+            // Reused edges still require the existing equality join, because
+            // chaining would overwrite their identity with the candidate edge.
+            let correlate_shared_nodes =
+                (aliased_pattern.path_function.is_some() || use_shortest || per_pattern_shortest)
+                    && matches!(&aliased_pattern.pattern, ast::Pattern::Path(path)
+                    if !path.edges.iter().any(|edge| edge.variable.as_ref()
+                        .is_some_and(|variable| shared.contains(variable))));
+            let independent_join = !shared.is_empty() && !correlate_shared_nodes;
+            let pattern_input = if independent_join { None } else { plan.take() };
+
             let pattern_plan = if let Some(path_function) = &aliased_pattern.path_function {
+                let path_search = match path_function {
+                    ast::PathFunction::ShortestPath => PathSearch::Shortest {
+                        k: 1,
+                        groups: false,
+                    },
+                    ast::PathFunction::AllShortestPaths => {
+                        PathSearch::Shortest { k: 1, groups: true }
+                    }
+                };
                 self.translate_shortest_path(
                     &aliased_pattern.pattern,
                     aliased_pattern.alias.as_deref(),
-                    *path_function,
+                    path_search,
                     pattern_input,
+                    pattern_path_mode,
                 )?
             } else if use_shortest || per_pattern_shortest {
                 let prefix = aliased_pattern
                     .search_prefix
                     .as_ref()
                     .or(match_clause.search_prefix.as_ref());
-                let pf = match prefix {
-                    Some(ast::PathSearchPrefix::AllShortest) => ast::PathFunction::AllShortestPaths,
-                    _ => ast::PathFunction::ShortestPath,
+                let path_search = match prefix {
+                    Some(ast::PathSearchPrefix::AnyShortest) => PathSearch::Shortest {
+                        k: 1,
+                        groups: false,
+                    },
+                    Some(ast::PathSearchPrefix::AllShortest) => {
+                        PathSearch::Shortest { k: 1, groups: true }
+                    }
+                    Some(ast::PathSearchPrefix::ShortestK(k)) => PathSearch::Shortest {
+                        k: u32::try_from(*k).map_err(|_| {
+                            Error::Query(QueryError::new(
+                                QueryErrorKind::Semantic,
+                                "shortest path k exceeds the supported range",
+                            ))
+                        })?,
+                        groups: false,
+                    },
+                    Some(ast::PathSearchPrefix::ShortestKGroups(k)) => PathSearch::Shortest {
+                        k: u32::try_from(*k).map_err(|_| {
+                            Error::Query(QueryError::new(
+                                QueryErrorKind::Semantic,
+                                "shortest path k exceeds the supported range",
+                            ))
+                        })?,
+                        groups: true,
+                    },
+                    _ => {
+                        return Err(Error::Query(QueryError::new(
+                            QueryErrorKind::Semantic,
+                            "shortest path search prefix is missing",
+                        )));
+                    }
                 };
                 self.translate_shortest_path(
                     &aliased_pattern.pattern,
                     aliased_pattern.alias.as_deref(),
-                    pf,
+                    path_search,
                     pattern_input,
+                    pattern_path_mode,
                 )?
             } else {
                 self.translate_pattern_with_alias(
                     &aliased_pattern.pattern,
                     pattern_input,
                     aliased_pattern.alias.as_deref(),
-                    path_mode,
+                    pattern_path_mode,
                 )?
             };
 
-            if !shared.is_empty() {
+            if independent_join {
                 // Join on shared variables
                 let left = plan
                     .take()
@@ -1232,6 +1298,7 @@ impl GqlTranslator {
                     .map(|var| JoinCondition {
                         left: LogicalExpression::Variable(var.clone()),
                         right: LogicalExpression::Variable(var.clone()),
+                        semantics: crate::query::plan::JoinKeySemantics::Value,
                     })
                     .collect();
                 plan = Some(LogicalOperator::Join(JoinOp {
@@ -1255,8 +1322,8 @@ impl GqlTranslator {
         })?;
 
         // ANY (without SHORTEST): wrap in LIMIT 1 to return a single matching path.
-        // ANY SHORTEST uses ShortestPathOperator which inherently returns one
-        // path per source/target pair, so no LIMIT 1 wrapper is needed.
+        // Shortest modes apply their per-target admission policy in Expand, so
+        // they do not need a global LIMIT wrapper.
         if use_any_limit {
             result = wrap_limit(result, 1);
         }
@@ -1330,6 +1397,7 @@ impl GqlTranslator {
                         left: Box::new(plan),
                         right: Box::new(match_plan),
                         condition: None,
+                        compatibility_conditions: Vec::new(),
                     });
                 } else {
                     let input = std::mem::replace(&mut plan, LogicalOperator::Empty);
@@ -1482,75 +1550,31 @@ impl GqlTranslator {
         &self,
         pattern: &ast::Pattern,
         alias: Option<&str>,
-        path_function: ast::PathFunction,
+        path_search: PathSearch,
         input: Option<LogicalOperator>,
+        path_mode: PathMode,
     ) -> Result<LogicalOperator> {
-        // Extract source and target from the pattern
-        let (source_node, target_node, edge_types, direction) = match pattern {
-            ast::Pattern::Path(path) => {
-                let target_node = if let Some(edge) = path.edges.last() {
-                    &edge.target
-                } else {
-                    return Err(Error::Query(QueryError::new(
-                        QueryErrorKind::Semantic,
-                        "shortestPath requires a path pattern",
-                    )));
-                };
-                let edge_types = path
-                    .edges
-                    .first()
-                    .map(|e| e.types.clone())
-                    .unwrap_or_default();
-                let direction =
-                    path.edges
-                        .first()
-                        .map_or(ExpandDirection::Both, |e| match e.direction {
-                            ast::EdgeDirection::Outgoing => ExpandDirection::Outgoing,
-                            ast::EdgeDirection::Incoming => ExpandDirection::Incoming,
-                            ast::EdgeDirection::Undirected => ExpandDirection::Both,
-                        });
-                (&path.source, target_node, edge_types, direction)
-            }
-            ast::Pattern::Node(_)
-            | ast::Pattern::Quantified { .. }
-            | ast::Pattern::Union(_)
-            | ast::Pattern::MultisetUnion(_) => {
-                return Err(Error::Query(QueryError::new(
-                    QueryErrorKind::Semantic,
-                    "shortestPath requires a simple path pattern",
-                )));
-            }
+        let ast::Pattern::Path(path) = pattern else {
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                "shortest path requires a simple path pattern",
+            )));
         };
+        if path.edges.len() != 1 {
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                "shortest path requires exactly one relationship segment",
+            )));
+        }
 
-        // Get variable names
-        let source_var = source_node
-            .variable
-            .clone()
-            .unwrap_or_else(|| format!("_anon_{}", rand_id()));
-        let target_var = target_node
-            .variable
-            .clone()
-            .unwrap_or_else(|| format!("_anon_{}", rand_id()));
-
-        // For shortestPath, we need to scan source and target nodes separately
-        // (not expand between them - the ShortestPathOperator will find the path)
-
-        // Scan source node first
-        let source_plan = self.translate_node_pattern(source_node, input)?;
-
-        // Scan target node (cross-product with source)
-        let target_plan = self.translate_node_pattern(target_node, Some(source_plan))?;
-
-        // Wrap with ShortestPath operator
-        Ok(LogicalOperator::ShortestPath(ShortestPathOp {
-            input: Box::new(target_plan),
-            source_var,
-            target_var,
-            edge_types,
-            direction,
-            path_alias: alias.unwrap_or("_path").to_string(),
-            all_paths: matches!(path_function, ast::PathFunction::AllShortestPaths),
-        }))
+        let plan = self.translate_path_pattern_with_alias_search(
+            path,
+            input,
+            alias,
+            path_mode,
+            path_search,
+        )?;
+        super::common::stamp_path_search(plan, path_search)
     }
 
     fn translate_pattern_with_alias(
@@ -2684,6 +2708,57 @@ mod tests {
     // === ShortestPath Tests ===
 
     #[test]
+    fn test_shortest_correlated_comma_and_separate_matches_keep_fixed_input() {
+        for query in [
+            "MATCH (a:S), (b:T), p = ANY SHORTEST (a)-[r:R*1..3 WHERE r.cost <= b.budget]->(b) RETURN p",
+            "MATCH (a:S), (b:T) MATCH p = ANY SHORTEST (a)-[r:R*1..3 WHERE r.cost <= b.budget]->(b) RETURN p",
+        ] {
+            let plan = translate(query).unwrap();
+            let LogicalOperator::Return(ret) = &plan.root else {
+                panic!("expected RETURN: {plan:?}");
+            };
+            let LogicalOperator::Expand(expand) = ret.input.as_ref() else {
+                panic!("shortest must receive correlated input: {plan:?}");
+            };
+            assert_eq!(expand.from_variable, "a");
+            assert_eq!(expand.to_variable, "b");
+            assert_eq!(expand.path_alias.as_deref(), Some("p"));
+            assert!(expand.edge_predicate.is_some());
+            let LogicalOperator::NodeScan(source) = expand.input.as_ref() else {
+                panic!("expected source binding: {expand:?}");
+            };
+            assert_eq!(source.variable, "a");
+            let Some(input) = &source.input else {
+                panic!("fixed b binding was discarded: {query}");
+            };
+            let LogicalOperator::NodeScan(target) = input.as_ref() else {
+                panic!("expected bound target input: {input:?}");
+            };
+            assert_eq!(target.variable, "b");
+            assert_eq!(target.label.as_deref(), Some("T"));
+            assert!(target.input.is_some(), "source binding must also survive");
+        }
+    }
+
+    #[test]
+    fn test_ordinary_shared_pattern_keeps_equality_join() {
+        let plan = translate("MATCH (a:S), (a)-[:R]->(b) RETURN b").unwrap();
+        let LogicalOperator::Return(ret) = &plan.root else {
+            panic!("expected RETURN: {plan:?}");
+        };
+        let LogicalOperator::Join(join) = ret.input.as_ref() else {
+            panic!("ordinary shared pattern must retain its join: {plan:?}");
+        };
+        assert_eq!(join.conditions.len(), 1);
+        assert!(
+            matches!(&join.conditions[0].left, LogicalExpression::Variable(name) if name == "a")
+        );
+        assert!(
+            matches!(&join.conditions[0].right, LogicalExpression::Variable(name) if name == "a")
+        );
+    }
+
+    #[test]
     fn test_translate_shortest_path() {
         let query = "MATCH p = shortestPath((a:Person)-[:KNOWS]->(b:Person)) RETURN p";
         let result = translate(query);
@@ -2694,17 +2769,23 @@ mod tests {
         );
         let plan = result.unwrap();
 
-        fn find_shortest_path(op: &LogicalOperator) -> bool {
+        fn find_expand(op: &LogicalOperator) -> Option<&ExpandOp> {
             match op {
-                LogicalOperator::ShortestPath(_) => true,
-                LogicalOperator::Return(r) => find_shortest_path(&r.input),
-                _ => false,
+                LogicalOperator::Expand(expand) => Some(expand),
+                LogicalOperator::Filter(filter) => find_expand(&filter.input),
+                LogicalOperator::Return(return_op) => find_expand(&return_op.input),
+                _ => None,
             }
         }
-        assert!(
-            find_shortest_path(&plan.root),
-            "Plan should contain ShortestPath operator"
+        let expand = find_expand(&plan.root).expect("Plan should contain Expand operator");
+        assert_eq!(
+            expand.path_search,
+            PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            }
         );
+        assert_eq!(expand.path_alias.as_deref(), Some("p"));
     }
 
     #[test]
@@ -2716,6 +2797,87 @@ mod tests {
             "allShortestPaths should translate: {:?}",
             result.err()
         );
+        let plan = result.unwrap();
+
+        fn find_expand(op: &LogicalOperator) -> Option<&ExpandOp> {
+            match op {
+                LogicalOperator::Expand(expand) => Some(expand),
+                LogicalOperator::Filter(filter) => find_expand(&filter.input),
+                LogicalOperator::Return(return_op) => find_expand(&return_op.input),
+                _ => None,
+            }
+        }
+        assert_eq!(
+            find_expand(&plan.root)
+                .expect("Plan should contain Expand operator")
+                .path_search,
+            PathSearch::Shortest { k: 1, groups: true }
+        );
+    }
+
+    #[test]
+    fn test_translate_shortest_prefix_preserves_k_groups_and_keep() {
+        for (query, expected) in [
+            (
+                "MATCH SHORTEST 3 (a)-[:ROAD*1..4]->(b) RETURN b",
+                PathSearch::Shortest {
+                    k: 3,
+                    groups: false,
+                },
+            ),
+            (
+                "MATCH SHORTEST 2 GROUPS (a)-[:ROAD*1..4]->(b) RETURN b",
+                PathSearch::Shortest { k: 2, groups: true },
+            ),
+        ] {
+            let plan = translate(query).unwrap();
+
+            fn find_expand(op: &LogicalOperator) -> Option<&ExpandOp> {
+                match op {
+                    LogicalOperator::Expand(expand) => Some(expand),
+                    LogicalOperator::Filter(filter) => find_expand(&filter.input),
+                    LogicalOperator::Return(return_op) => find_expand(&return_op.input),
+                    _ => None,
+                }
+            }
+
+            assert_eq!(
+                find_expand(&plan.root)
+                    .expect("shortest prefix should lower to Expand")
+                    .path_search,
+                expected
+            );
+        }
+
+        let plan = translate(
+            "MATCH p = ANY SHORTEST (a)-[r:ROAD*1..3 WHERE r.weight > 1]->(b) \
+             KEEP DIFFERENT EDGES RETURN p",
+        )
+        .unwrap();
+        fn find_expand(op: &LogicalOperator) -> Option<&ExpandOp> {
+            match op {
+                LogicalOperator::Expand(expand) => Some(expand),
+                LogicalOperator::Filter(filter) => find_expand(&filter.input),
+                LogicalOperator::Return(return_op) => find_expand(&return_op.input),
+                _ => None,
+            }
+        }
+        let expand = find_expand(&plan.root).expect("KEEP shortest should lower to Expand");
+        assert_eq!(expand.path_mode, PathMode::Trail);
+        assert!(expand.edge_predicate.is_some());
+    }
+
+    #[test]
+    fn test_translate_shortest_path_rejects_empty_or_multi_edge_chains() {
+        for query in [
+            "MATCH p = shortestPath((a)) RETURN p",
+            "MATCH p = shortestPath((a)-[:R]->(m)-[:R]->(b)) RETURN p",
+        ] {
+            assert!(
+                translate(query).is_err(),
+                "shortest path must require exactly one relationship segment: {query}"
+            );
+        }
     }
 
     // === CASE expression ===
@@ -2966,11 +3128,15 @@ mod tests {
         );
 
         let plan = result.unwrap();
-        // FINISH is translated as Limit(0)
-        if let LogicalOperator::Limit(limit) = &plan.root {
-            assert_eq!(limit.count, 0, "FINISH should produce Limit(0)");
+        // The logical drain sentinel lowers to a DrainOperator during planning.
+        if let LogicalOperator::Skip(skip) = &plan.root {
+            assert_eq!(
+                skip.count,
+                CountExpr::Literal(usize::MAX),
+                "FINISH should consume every input row"
+            );
         } else {
-            panic!("Expected Limit operator for FINISH, got {:?}", plan.root);
+            panic!("Expected drain sentinel for FINISH, got {:?}", plan.root);
         }
     }
 

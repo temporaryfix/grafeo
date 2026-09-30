@@ -10,12 +10,16 @@
 //! 2. Zone-map short-circuit fires before any index lookup so we can
 //!    skip opening an index file at all when summary statistics prove
 //!    emptiness.
-//! 3. Property-index and range-index attempts come before hybrid
+//! 3. The internal-id fetch (`try_plan_filter_with_internal_id`) runs
+//!    ahead of every index attempt: an internal id *is* the store's
+//!    lookup key, so a direct fetch is strictly cheaper than any index
+//!    probe and can never be less selective.
+//! 4. Property-index and range-index attempts come before hybrid
 //!    pushdown because they are cheaper and strictly more specific.
-//! 4. Compound hybrid (`try_plan_filter_compound_hybrid`) is tried
+//! 5. Compound hybrid (`try_plan_filter_compound_hybrid`) is tried
 //!    before single-sided vector/text pushdown so an `AND` over both
 //!    kinds doesn't get torn apart into a scan + filter.
-//! 5. The generic `FilterOperator` is the last resort; whatever fell
+//! 6. The generic `FilterOperator` is the last resort; whatever fell
 //!    through still runs correctly, just without an index.
 //!
 //! Changing this order needs a correctness argument, not just a
@@ -24,25 +28,173 @@
 //! [pf]: super::Planner::plan_filter
 
 use grafeo_common::collections::GrafeoSet;
+use grafeo_common::types::PropertyKey;
+use grafeo_core::graph::{PropertyIndexPredicate, PropertyIndexRequest};
 
 use super::{
-    ApplyOperator, Arc, BinaryOp, DistinctOperator, EmptyOperator, ExpressionPredicate,
-    FilterExpression, FilterOp, FilterOperator, GraphStoreSearch, HashAggregateOperator,
-    HashJoinOperator, HashMap, LogicalExpression, LogicalOperator, NodeListOperator, Operator,
-    PhysicalAggregateExpr, PhysicalJoinType, RangeBounds, RangeScanOperator, Result, TransactionId,
-    UnaryOp, UnionOperator, Value, convert_binary_op, convert_filter_expression,
+    ApplyOperator, Arc, BinaryOp, DistinctOperator, EmptyOperator, ExpandOp, ExpressionPredicate,
+    FactorizedCompareOp, FactorizedFilterOperator, FilterExpression, FilterOp, FilterOperator,
+    GraphStoreSearch, HashAggregateOperator, HashJoinOperator, HashMap, LogicalExpression,
+    LogicalOperator, NodeListOperator, Operator, PhysicalAggregateExpr, PhysicalJoinType,
+    PropertyPredicate, RangeBounds, RangeScanOperator, Result, SipTarget, TransactionId, UnaryOp,
+    UnionOperator, Value, convert_binary_op, convert_filter_expression,
 };
 
-/// Cross-type equality comparison with Int64/Float64 coercion.
-fn values_equal_coerced(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int64(a), Value::Float64(b)) => (*a as f64 - b).abs() < f64::EPSILON,
-        (Value::Float64(a), Value::Int64(b)) => (a - *b as f64).abs() < f64::EPSILON,
-        _ => a == b,
+/// Recognises `id(<variable>)` as it reaches the planner.
+///
+/// Cypher lowers the call to a `FunctionCall` and does not case-normalise the
+/// name (`cypher.rs`), so the comparison is case-insensitive, matching the
+/// runtime dispatch in `eval_graph_element_fn`.
+fn is_internal_id_call(expr: &LogicalExpression, variable: &str) -> bool {
+    match expr {
+        LogicalExpression::FunctionCall {
+            name,
+            args,
+            distinct: false,
+        } if name.eq_ignore_ascii_case("id") && args.len() == 1 => {
+            matches!(&args[0], LogicalExpression::Variable(v) if v == variable)
+        }
+        _ => false,
     }
 }
 
+/// Converts the literal operands of an internal-id predicate into node ids.
+///
+/// `None` means the predicate is not enumerable as a set of internal ids at
+/// plan time and must be left to the generic filter. An element that cannot
+/// equal any internal id is dropped rather than bailing, because dropping it
+/// gives the same answer the per-row comparison would:
+///
+/// - `Null`: `id(n) = NULL` and a NULL list element are UNKNOWN, never true.
+/// - a negative integer: internal ids are `u64`, so no node carries one.
+fn collect_internal_ids<'a>(
+    values: impl Iterator<Item = &'a Value>,
+) -> Option<Vec<grafeo_common::types::NodeId>> {
+    let mut ids = Vec::new();
+    for value in values {
+        match value {
+            Value::Null => {}
+            Value::Int64(raw) => {
+                if let Ok(raw) = u64::try_from(*raw) {
+                    ids.push(grafeo_common::types::NodeId::new(raw));
+                }
+            }
+            // A non-integer operand (float, string, nested list) is not an
+            // internal id. Rather than decide its comparison semantics here,
+            // hand the whole predicate back to the generic filter.
+            _ => return None,
+        }
+    }
+    Some(ids)
+}
+
 impl super::Planner {
+    /// Moves an index-served conjunct to the bottom of a filter stack over a
+    /// bare node scan, where the lookup rungs look for it.
+    ///
+    /// Filter pushdown stacks each conjunct separately and the last one ends
+    /// up innermost, so `p.id IN $ids AND p.version > $t` put the unindexed
+    /// range beneath the indexed `IN` and never used the index. Filters over
+    /// one scan with no input see only that scan's variable, so their order
+    /// cannot change the result. Returns `None` when the innermost conjunct
+    /// is already index-served or no other one is.
+    pub(super) fn index_lookup_filter_innermost(
+        &self,
+        filter: &FilterOp,
+    ) -> Option<LogicalOperator> {
+        let mut stack = vec![filter];
+        let mut input = filter.input.as_ref();
+        while let LogicalOperator::Filter(inner) = input {
+            stack.push(inner);
+            input = inner.input.as_ref();
+        }
+        let LogicalOperator::NodeScan(scan) = input else {
+            return None;
+        };
+        if scan.input.is_some() || stack.len() < 2 {
+            return None;
+        }
+        let served = |filter: &FilterOp| self.is_index_served(&filter.predicate, &scan.variable);
+        let innermost = stack.len() - 1;
+        if served(stack[innermost]) {
+            return None;
+        }
+        let chosen = (0..innermost).rev().find(|&i| served(stack[i]))?;
+        let moved = stack.remove(chosen);
+        stack.push(moved);
+        Some(
+            stack
+                .into_iter()
+                .rev()
+                .fold(input.clone(), |input, filter| {
+                    LogicalOperator::Filter(FilterOp {
+                        predicate: filter.predicate.clone(),
+                        input: Box::new(input),
+                        pushdown_hint: filter.pushdown_hint.clone(),
+                    })
+                }),
+        )
+    }
+
+    /// Reunites a split lower/upper bound immediately above a bare scan.
+    /// Residual filters stay outside this pair and consume any LIMIT hint first.
+    pub(super) fn paired_range_filter(&self, filter: &FilterOp) -> Option<LogicalOperator> {
+        // PROFILE walks the original logical tree, so retain its two entries.
+        if self.profiling.get() {
+            return None;
+        }
+        let LogicalOperator::Filter(inner) = filter.input.as_ref() else {
+            return None;
+        };
+        let LogicalOperator::NodeScan(scan) = inner.input.as_ref() else {
+            return None;
+        };
+        if scan.input.is_some() {
+            return None;
+        }
+        let predicate = LogicalExpression::Binary {
+            left: Box::new(filter.predicate.clone()),
+            op: BinaryOp::And,
+            right: Box::new(inner.predicate.clone()),
+        };
+        let (variable, _, _, _, _, _) = self.extract_between_predicate(&predicate)?;
+        if variable != scan.variable {
+            return None;
+        }
+        Some(LogicalOperator::Filter(FilterOp {
+            predicate,
+            input: inner.input.clone(),
+            pushdown_hint: filter.pushdown_hint.clone(),
+        }))
+    }
+
+    /// Whether a lookup rung answers `predicate` over `variable` from an index
+    /// or by internal id.
+    fn is_index_served(&self, predicate: &LogicalExpression, variable: &str) -> bool {
+        if let LogicalExpression::Binary {
+            left,
+            op: BinaryOp::Eq | BinaryOp::In,
+            ..
+        } = predicate
+        {
+            if is_internal_id_call(left, variable) {
+                return true;
+            }
+            if let LogicalExpression::Property {
+                variable: owner,
+                property,
+            } = left.as_ref()
+                && owner == variable
+                && self.store.has_property_index(property)
+            {
+                return true;
+            }
+        }
+        self.extract_equality_conditions(predicate, variable)
+            .iter()
+            .any(|(property, _)| self.store.has_property_index(property))
+    }
+
     /// Plans a filter operator.
     ///
     /// Uses zone map pre-filtering to potentially skip scans when predicates
@@ -53,6 +205,10 @@ impl super::Planner {
         &self,
         filter: &FilterOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        // An outer LIMIT's hint belongs to this filter alone, and only where a
+        // range scan answers the whole predicate. Planning the input with it
+        // would truncate a scan beneath this filter before the filter runs.
+        let limit_hint = self.limit_hint.take();
         // Check for complex EXISTS/NOT EXISTS patterns and rewrite as semi/anti join.
         // Simple single-hop EXISTS patterns are handled by the fast path in
         // convert_expression() -> extract_exists_pattern().
@@ -79,14 +235,33 @@ impl super::Planner {
             return self.plan_count_as_apply(&filter.input, subquery, op, threshold, remaining);
         }
 
-        // Check zone maps for simple property predicates before scanning
-        // If zone map says "definitely no matches", we can short-circuit
-        if let Some(false) = self.check_zone_map_for_predicate(&filter.predicate) {
+        // Check zone maps for simple property predicates before scanning.
+        // Zone maps reflect only the latest committed store; buffered writes and
+        // retained historical versions are invisible to them. Skip this
+        // optimisation for either view so the generic predicate sees its full
+        // epoch/transaction context.
+        if self.transaction_id.is_none()
+            && self.viewing_epoch == self.store.current_epoch()
+            && let Some(false) = self.check_zone_map_for_predicate(&filter.predicate)
+        {
             // Zone map says no matches possible - return empty result
             let (_, columns) = self.plan_operator(&filter.input)?;
             let schema = self.derive_schema_from_columns(&columns);
             let empty_op = Box::new(EmptyOperator::new(schema));
             return Ok((empty_op, columns));
+        }
+
+        // Bound input values need a snapshot-aware statement-local lookup;
+        // the committed-latest property registry is not complete for a writer.
+        if let Some(result) = self.try_plan_correlated_property_lookup(filter)? {
+            return Ok(result);
+        }
+
+        // A predicate on a node's internal id names the store's own lookup key:
+        // fetch those nodes directly instead of probing an index or scanning.
+        // Ahead of the property index deliberately — a direct fetch wins.
+        if let Some(result) = self.try_plan_filter_with_internal_id(filter)? {
+            return Ok(result);
         }
 
         // Try to use property index for equality predicates on indexed properties
@@ -104,7 +279,10 @@ impl super::Planner {
         }
 
         // Try to use range optimization for range predicates (>, <, >=, <=)
-        if let Some(result) = self.try_plan_filter_with_range_index(filter)? {
+        self.limit_hint.set(limit_hint);
+        let range = self.try_plan_filter_with_range_index(filter);
+        self.limit_hint.set(None);
+        if let Some(result) = range? {
             return Ok(result);
         }
 
@@ -124,6 +302,13 @@ impl super::Planner {
         #[cfg(feature = "text-index")]
         if let Some(result) = self.try_plan_filter_with_text_index(filter)? {
             return Ok(result);
+        }
+
+        if self.factorized_execution
+            && !self.profiling.get()
+            && let Some(planned) = self.try_plan_factorized_filter(filter)?
+        {
+            return Ok(planned);
         }
 
         // Plan the input operator first
@@ -148,10 +333,510 @@ impl super::Planner {
         .with_transaction_context(self.viewing_epoch, self.transaction_id)
         .with_session_context(self.session_context.clone());
 
-        // Create the filter operator
-        let operator = Box::new(FilterOperator::new(input_op, Box::new(predicate)));
+        // Create the filter operator. `mut` is needed under `text-index` (the
+        // block below reassigns `operator` via `with_text_index_reads`); without
+        // that feature the reassignment is cfg'd out, so suppress the otherwise-
+        // spurious unused-mut warning there rather than dropping `mut` (which
+        // breaks the `text-index`/`--all-features` build).
+        #[cfg_attr(not(feature = "text-index"), allow(unused_mut))]
+        let mut operator = FilterOperator::new(input_op, Box::new(predicate));
 
-        Ok((operator, columns))
+        // Serializable anti-phantom: carry the (label, property) pairs as data
+        // on the operator so they are recorded at EXECUTION TIME (first poll),
+        // not plan time.  This is robust to logical-plan caching (the operator
+        // is freshly polled every execution) and covers the 0-row case (where
+        // the per-row `eval_text_fn` path is never reached).
+        //
+        // The complete predicate walk (`collect_text_predicate_pairs`) finds
+        // text_match/text_score calls nested inside CASE, coalesce, list
+        // comprehensions, and other expression forms that the old incomplete
+        // walk missed.
+        //
+        // MULTI-LABEL FIX: record by PROPERTY, not by scan label.
+        //
+        // The old recorder gated recording on `has_text_index(scan_label, prop)`.
+        // That missed the case where the scan label (`Tagged`) has no text index
+        // on `prop`, but a concurrent writer inserts a multi-label node
+        // (`:Article:Tagged`) whose `Article:prop` index IS written.
+        //
+        // The fix: for each text predicate property, enumerate EVERY label that
+        // has a text index on that property via `text_index_labels_for_property`.
+        // Record (label, property) for each such label, independent of the scan
+        // label.  This is sound: the read set is a HashSet, so the per-row
+        // `eval_text_fn` path (which records the matching node's actual label)
+        // is idempotent and harmless when it overlaps.
+        #[cfg(feature = "text-index")]
+        {
+            let mut raw_pairs: Vec<(String, Option<String>)> = Vec::new();
+            Self::collect_text_predicate_pairs(&filter.predicate, &mut raw_pairs);
+
+            // For each predicate property, record every (label, property) pair
+            // for which a text index exists — independent of the scan label.
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for (property, _query) in raw_pairs {
+                for label in self.store.text_index_labels_for_property(&property) {
+                    pairs.push((label, property.clone()));
+                }
+            }
+            // Deduplicate (same (label, property) from multiple predicates).
+            pairs.sort_unstable();
+            pairs.dedup();
+
+            if !pairs.is_empty() {
+                operator = operator.with_text_index_reads(
+                    pairs,
+                    Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+                    self.viewing_epoch,
+                    self.transaction_id,
+                );
+            }
+        }
+
+        Ok((Box::new(operator), columns))
+    }
+
+    /// `MATCH (a)-[]->(b)-[]->(c) WHERE c.prop = $v` without flattening.
+    fn try_plan_factorized_filter(
+        &self,
+        filter: &FilterOp,
+    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        let (chain_len, _) = Self::count_expand_chain(&filter.input);
+        if chain_len < 2 {
+            return Ok(None);
+        }
+        let Some((var, property, cmp, value)) =
+            Self::extract_factorized_property_cmp(&filter.predicate)
+        else {
+            return Ok(None);
+        };
+        let expands = Self::collect_expand_chain(&filter.input);
+        let Some((level, column)) = Self::factorized_level_for_var(&expands, &var) else {
+            return Ok(None);
+        };
+        let (mut lazy, columns) = self.plan_expand_chain_lazy(&filter.input)?;
+        // Current-topology only: find_nodes_by_property is not as-of.
+        if cmp == FactorizedCompareOp::Eq
+            && (self.viewing_epoch == grafeo_common::types::EpochId::PENDING
+                || self.viewing_epoch == self.store.current_epoch())
+        {
+            let allow: grafeo_common::utils::hash::FxHashSet<_> = self
+                .store
+                .find_nodes_by_property(&property, &value)
+                .into_iter()
+                .collect();
+            let sip = if level == 0 {
+                SipTarget::NodeScan { allow }
+            } else {
+                SipTarget::ExpandHop {
+                    hop: level - 1,
+                    allow,
+                }
+            };
+            lazy = lazy.with_sip(sip);
+        }
+        let pred = PropertyPredicate::new(
+            level,
+            column,
+            property,
+            cmp,
+            value,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+        )
+        .with_transaction_context(self.viewing_epoch, self.transaction_id);
+        let op = FactorizedFilterOperator::new(lazy, Box::new(pred));
+        Ok(Some((Box::new(op), columns)))
+    }
+
+    fn extract_factorized_property_cmp(
+        expr: &LogicalExpression,
+    ) -> Option<(String, String, FactorizedCompareOp, Value)> {
+        let LogicalExpression::Binary { left, op, right } = expr else {
+            return None;
+        };
+        let cmp = match op {
+            BinaryOp::Eq => FactorizedCompareOp::Eq,
+            BinaryOp::Ne => FactorizedCompareOp::Ne,
+            BinaryOp::Lt => FactorizedCompareOp::Lt,
+            BinaryOp::Le => FactorizedCompareOp::Le,
+            BinaryOp::Gt => FactorizedCompareOp::Gt,
+            BinaryOp::Ge => FactorizedCompareOp::Ge,
+            _ => return None,
+        };
+        match (left.as_ref(), right.as_ref()) {
+            (
+                LogicalExpression::Property { variable, property },
+                LogicalExpression::Literal(value),
+            ) => Some((variable.clone(), property.clone(), cmp, value.clone())),
+            (
+                LogicalExpression::Literal(value),
+                LogicalExpression::Property { variable, property },
+            ) => {
+                let flipped = match cmp {
+                    FactorizedCompareOp::Eq | FactorizedCompareOp::Ne => cmp,
+                    FactorizedCompareOp::Lt => FactorizedCompareOp::Gt,
+                    FactorizedCompareOp::Le => FactorizedCompareOp::Ge,
+                    FactorizedCompareOp::Gt => FactorizedCompareOp::Lt,
+                    FactorizedCompareOp::Ge => FactorizedCompareOp::Le,
+                    _ => cmp,
+                };
+                Some((variable.clone(), property.clone(), flipped, value.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn factorized_level_for_var(
+        expands: &[&ExpandOp],
+        var: &str,
+    ) -> Option<(usize, usize)> {
+        if let Some(first) = expands.first()
+            && let LogicalOperator::NodeScan(scan) = first.input.as_ref()
+            && scan.variable == var
+        {
+            return Some((0, 0));
+        }
+        for (hop, exp) in expands.iter().enumerate() {
+            if exp.to_variable == var {
+                let dest_only = hop + 1 == expands.len() && exp.edge_variable.is_none();
+                return Some((hop + 1, usize::from(!dest_only)));
+            }
+            if exp.edge_variable.as_deref() == Some(var) {
+                return Some((hop + 1, 0));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(all(test, feature = "lpg"))]
+mod factorized_filter_plan_tests {
+    use super::super::{
+        BinaryOp, ExpandDirection, ExpandOp, FilterOp, GraphStoreSearch, LogicalExpression,
+        LogicalOperator, LogicalPlan, NodeScanOp, PathMode, Planner,
+    };
+    use grafeo_common::types::Value;
+    use grafeo_core::graph::lpg::LpgStore;
+    use std::sync::Arc;
+
+    #[test]
+    fn plans_factorized_filter_on_two_hop() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&["V"]);
+        let b = store.create_node(&["V"]);
+        let c = store.create_node(&["V"]);
+        store.create_edge(a, b, "R");
+        store.create_edge(b, c, "R");
+        store.set_node_property(c, "age", Value::Int64(40));
+        let planner = Planner::new(store as Arc<dyn GraphStoreSearch>);
+        let hop2 = LogicalOperator::Expand(ExpandOp {
+            from_variable: "b".to_string(),
+            to_variable: "c".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["R".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(LogicalOperator::Expand(ExpandOp {
+                from_variable: "a".to_string(),
+                to_variable: "b".to_string(),
+                edge_variable: None,
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec!["R".to_string()],
+                min_hops: 1,
+                max_hops: Some(1),
+                input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".to_string(),
+                    label: Some("V".to_string()),
+                    input: None,
+                })),
+                path_alias: None,
+                path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
+            })),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
+        });
+        let filter = LogicalOperator::Filter(FilterOp {
+            predicate: LogicalExpression::Binary {
+                left: Box::new(LogicalExpression::Property {
+                    variable: "c".to_string(),
+                    property: "age".to_string(),
+                }),
+                op: BinaryOp::Gt,
+                right: Box::new(LogicalExpression::Literal(Value::Int64(30))),
+            },
+            input: Box::new(hop2),
+            pushdown_hint: None,
+        });
+        let planned = planner.plan(&LogicalPlan::new(filter)).unwrap();
+        assert_eq!(planned.operator.name(), "FactorizedFilter");
+    }
+
+    #[test]
+    fn sip_equality_prunes_last_hop() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&["Src"]);
+        let b = store.create_node(&["V"]);
+        let c_keep = store.create_node(&["V"]);
+        let c_drop = store.create_node(&["V"]);
+        store.create_edge(a, b, "R");
+        store.create_edge(b, c_keep, "R");
+        store.create_edge(b, c_drop, "R");
+        store.set_node_property(c_keep, "name", Value::String("keep".into()));
+        store.set_node_property(c_drop, "name", Value::String("drop".into()));
+        let hits = store.find_nodes_by_property("name", &Value::String("keep".into()));
+        assert_eq!(hits, vec![c_keep], "SIP seed must be exact");
+        let planner = Planner::new(store as Arc<dyn GraphStoreSearch>);
+        let hop2 = LogicalOperator::Expand(ExpandOp {
+            from_variable: "b".to_string(),
+            to_variable: "c".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["R".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(LogicalOperator::Expand(ExpandOp {
+                from_variable: "a".to_string(),
+                to_variable: "b".to_string(),
+                edge_variable: None,
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec!["R".to_string()],
+                min_hops: 1,
+                max_hops: Some(1),
+                input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".to_string(),
+                    label: Some("Src".to_string()),
+                    input: None,
+                })),
+                path_alias: None,
+                path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
+            })),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
+        });
+        let filter = LogicalOperator::Filter(FilterOp {
+            predicate: LogicalExpression::Binary {
+                left: Box::new(LogicalExpression::Property {
+                    variable: "c".to_string(),
+                    property: "name".to_string(),
+                }),
+                op: BinaryOp::Eq,
+                right: Box::new(LogicalExpression::Literal(Value::String("keep".into()))),
+            },
+            input: Box::new(hop2),
+            pushdown_hint: None,
+        });
+        let planned = planner.plan(&LogicalPlan::new(filter)).unwrap();
+        assert_eq!(planned.operator.name(), "FactorizedFilter");
+        let mut op = planned.into_operator();
+        let mut rows = 0usize;
+        while let Some(chunk) = op.next().unwrap() {
+            rows += chunk.row_count();
+        }
+        assert!(rows >= 1, "keep path must survive SIP + filter");
+    }
+}
+
+impl super::Planner {
+    /// Recursively collects `(label, property)` pairs from every
+    /// `text_match` and `text_score` call reachable from `expr`.
+    ///
+    /// The walk covers **every** expression variant that can syntactically
+    /// contain a sub-expression:
+    ///
+    /// - `Binary` (any op, including `AND`/`OR`) — left and right
+    /// - `Unary` (including `NOT`) — operand
+    /// - `FunctionCall` args — handles `coalesce(text_match(…), …)` and
+    ///   every other function whose argument list may contain a text call
+    /// - `Case` — operand, all when-conditions, all when-results, else-clause
+    /// - `List` items
+    /// - `ListComprehension` — list_expr, filter_expr, map_expr
+    /// - `ListPredicate` — list_expr, predicate
+    /// - `Reduce` — initial, list, expression
+    /// - `IndexAccess` / `SliceAccess` — base (and start/end for slices)
+    /// - `MapProjection` literal entries
+    ///
+    /// Variants that cannot contain a sub-expression (`Literal`, `Variable`,
+    /// `Property`, `Parameter`, `Labels`, `Type`, `Id`) and subquery nodes
+    /// (`ExistsSubquery`, `CountSubquery`, `ValueSubquery`,
+    /// `PatternComprehension`) are left as-is (the subquery interior is a
+    /// separate logical plan, not walked here).
+    ///
+    /// The (label, property) pairs fed into `with_text_index_reads` use the
+    /// property name only; the label is resolved at recording time by
+    /// `score_text_visible`, which checks `has_text_index(label, property)`.
+    /// Because the predicate walk does not know which label the scan variable
+    /// is bound to (that information is in the `NodeScan` input, not the
+    /// predicate itself), we record the property and let the operator's
+    /// recording loop iterate over every registered index that matches.
+    ///
+    /// In practice the planner always knows the label when `input` is a bare
+    /// `NodeScan`; the `(label, property)` representation in the returned
+    /// `Vec` carries the label threaded in from the call site, not from the
+    /// expression itself.
+    #[cfg(feature = "text-index")]
+    fn collect_text_predicate_pairs(
+        expr: &LogicalExpression,
+        out: &mut Vec<(String, Option<String>)>,
+    ) {
+        match expr {
+            // ── Base case: a text function call ──────────────────────────
+            LogicalExpression::FunctionCall { name, args, .. }
+                if name == "text_match" || name == "text_score" =>
+            {
+                // args[0] should be a Property access; args[1] is the query string.
+                if let Some(LogicalExpression::Property { property, .. }) = args.first() {
+                    let query = args.get(1).and_then(|q| {
+                        if let LogicalExpression::Literal(Value::String(s)) = q {
+                            Some(s.to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    out.push((property.clone(), query));
+                }
+                // Also recurse into args in case the text fn is itself an
+                // argument to another function (unusual but possible).
+                for arg in args {
+                    Self::collect_text_predicate_pairs(arg, out);
+                }
+            }
+
+            // ── Generic FunctionCall: recurse into all arguments ─────────
+            // Handles coalesce(text_match(…), false), any user-defined fn, etc.
+            LogicalExpression::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_text_predicate_pairs(arg, out);
+                }
+            }
+
+            // ── Binary (AND / OR / comparisons / …) ─────────────────────
+            LogicalExpression::Binary { left, right, .. } => {
+                Self::collect_text_predicate_pairs(left, out);
+                Self::collect_text_predicate_pairs(right, out);
+            }
+
+            // ── Unary (NOT and others) ────────────────────────────────────
+            LogicalExpression::Unary { operand, .. } => {
+                Self::collect_text_predicate_pairs(operand, out);
+            }
+
+            // ── CASE expression ───────────────────────────────────────────
+            LogicalExpression::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    Self::collect_text_predicate_pairs(op, out);
+                }
+                for (cond, result) in when_clauses {
+                    Self::collect_text_predicate_pairs(cond, out);
+                    Self::collect_text_predicate_pairs(result, out);
+                }
+                if let Some(el) = else_clause {
+                    Self::collect_text_predicate_pairs(el, out);
+                }
+            }
+
+            // ── List literal ─────────────────────────────────────────────
+            LogicalExpression::List(items) => {
+                for item in items {
+                    Self::collect_text_predicate_pairs(item, out);
+                }
+            }
+
+            // ── Map literal ──────────────────────────────────────────────
+            LogicalExpression::Map(entries) => {
+                for (_, v) in entries {
+                    Self::collect_text_predicate_pairs(v, out);
+                }
+            }
+
+            // ── Index / slice access ─────────────────────────────────────
+            LogicalExpression::IndexAccess { base, index } => {
+                Self::collect_text_predicate_pairs(base, out);
+                Self::collect_text_predicate_pairs(index, out);
+            }
+            LogicalExpression::SliceAccess { base, start, end } => {
+                Self::collect_text_predicate_pairs(base, out);
+                if let Some(s) = start {
+                    Self::collect_text_predicate_pairs(s, out);
+                }
+                if let Some(e) = end {
+                    Self::collect_text_predicate_pairs(e, out);
+                }
+            }
+
+            // ── List comprehension ────────────────────────────────────────
+            LogicalExpression::ListComprehension {
+                list_expr,
+                filter_expr,
+                map_expr,
+                ..
+            } => {
+                Self::collect_text_predicate_pairs(list_expr, out);
+                if let Some(f) = filter_expr {
+                    Self::collect_text_predicate_pairs(f, out);
+                }
+                Self::collect_text_predicate_pairs(map_expr, out);
+            }
+
+            // ── List predicate (all/any/none/single) ─────────────────────
+            LogicalExpression::ListPredicate {
+                list_expr,
+                predicate,
+                ..
+            } => {
+                Self::collect_text_predicate_pairs(list_expr, out);
+                Self::collect_text_predicate_pairs(predicate, out);
+            }
+
+            // ── reduce() ─────────────────────────────────────────────────
+            LogicalExpression::Reduce {
+                initial,
+                list,
+                expression,
+                ..
+            } => {
+                Self::collect_text_predicate_pairs(initial, out);
+                Self::collect_text_predicate_pairs(list, out);
+                Self::collect_text_predicate_pairs(expression, out);
+            }
+
+            // ── MapProjection literal entries ─────────────────────────────
+            LogicalExpression::MapProjection { entries, .. } => {
+                for entry in entries {
+                    if let crate::query::plan::MapProjectionEntry::LiteralEntry(_, expr) = entry {
+                        Self::collect_text_predicate_pairs(expr, out);
+                    }
+                }
+            }
+
+            // Leaf nodes and subquery containers — nothing to recurse into.
+            LogicalExpression::Literal(_)
+            | LogicalExpression::Variable(_)
+            | LogicalExpression::Property { .. }
+            | LogicalExpression::Parameter(_)
+            | LogicalExpression::Labels(_)
+            | LogicalExpression::Type(_)
+            | LogicalExpression::Id(_)
+            | LogicalExpression::ExistsSubquery(_)
+            | LogicalExpression::CountSubquery(_)
+            | LogicalExpression::ValueSubquery(_)
+            | LogicalExpression::PatternComprehension { .. } => {}
+        }
     }
 
     /// Extracts an EXISTS or NOT EXISTS subquery from a filter predicate for
@@ -860,6 +1545,134 @@ impl super::Planner {
         }
     }
 
+    /// Tries to answer a predicate over a node's internal id by fetching those
+    /// nodes directly.
+    ///
+    /// `MATCH (n) WHERE id(n) IN $ids` had no plan-time representation at all:
+    /// `id(n)` lowers to a `FunctionCall` and every extractor in this ladder
+    /// requires a `Property`, so the predicate fell through to a per-row
+    /// `FilterOperator` over a full `NodeScan` — 32.8 ms at 100,000 nodes, paid
+    /// once per call by every native algorithm that maps internal ids back to
+    /// application ids (`pagerank`, `wcc`, `sssp`, `bfs_levels`,
+    /// `shortest_path`, `vector_search`).
+    ///
+    /// An internal id *is* the store's lookup key, so the ids named in the
+    /// predicate are already the complete candidate set: confirm each one's
+    /// visibility and the scan's label, and emit it.
+    ///
+    /// Unlike the property-index attempts below, this stays enabled inside a
+    /// write transaction. Those bail because the committed property index and
+    /// property store cannot see buffered writes; `get_node_versioned` is
+    /// delta-aware, so the writer sees its own uncommitted inserts and deletes
+    /// through this path.
+    ///
+    /// Returns `Ok(Some((operator, columns)))` when the rewrite applied,
+    /// `Ok(None)` when the predicate is not a plan-time-enumerable internal-id
+    /// predicate over a simple `NodeScan`.
+    pub(super) fn try_plan_filter_with_internal_id(
+        &self,
+        filter: &FilterOp,
+    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // Only a bare NodeScan: a nested input carries columns this rewrite
+        // would drop.
+        let (scan_variable, scan_label) = match filter.input.as_ref() {
+            LogicalOperator::NodeScan(scan) if scan.input.is_none() => {
+                (scan.variable.clone(), scan.label.clone())
+            }
+            _ => return Ok(None),
+        };
+
+        let LogicalExpression::Binary { left, op, right } = &filter.predicate else {
+            return Ok(None);
+        };
+        if !matches!(op, BinaryOp::Eq | BinaryOp::In) || !is_internal_id_call(left, &scan_variable)
+        {
+            return Ok(None);
+        }
+
+        // Right side: one integer for `=`, a list of integer literals for `IN`.
+        // Anything else (an unsubstituted parameter, an expression, a list
+        // holding either) cannot be enumerated at plan time.
+        let candidates = match (op, right.as_ref()) {
+            (BinaryOp::Eq, LogicalExpression::Literal(value)) => {
+                collect_internal_ids(std::iter::once(value))
+            }
+            (BinaryOp::In, LogicalExpression::Literal(Value::List(items))) => {
+                collect_internal_ids(items.iter())
+            }
+            (BinaryOp::In, LogicalExpression::List(items)) => {
+                let mut literals = Vec::with_capacity(items.len());
+                for item in items {
+                    let LogicalExpression::Literal(value) = item else {
+                        return Ok(None);
+                    };
+                    literals.push(value);
+                }
+                collect_internal_ids(literals.into_iter())
+            }
+            _ => return Ok(None),
+        };
+        let Some(candidates) = candidates else {
+            return Ok(None);
+        };
+
+        // Predicate SIREAD for the complete predicate, recorded before the ids
+        // are probed. `ScanOperator` records exactly this before enumerating
+        // (`core/.../operators/scan.rs`), and absorbing the scan must not drop
+        // it: a Serializable writer that probes an id and misses still has to
+        // conflict with a concurrent insert that creates it. Recording here is
+        // per-execution because physical plans are only cached when no
+        // transaction is open (`PhysicalCacheKey::new` returns `None` for a tx),
+        // and this arm is the only one that records.
+        if let Some(tx) = self.transaction_id {
+            if let Some(label) = &scan_label {
+                self.store.record_label_predicate_read(tx, label);
+            } else {
+                self.store.record_lpg_dataset_read(tx);
+            }
+        }
+
+        // Check existence without materializing a nontransactional node's
+        // properties. Keep the transactional fetch's label-aware SIREAD path.
+        // Ask the store for label membership at the same snapshot: projections
+        // still decide which labels they expose, including historical reads.
+        let epoch = self.viewing_epoch;
+        let scan_label = scan_label.as_deref();
+        let mut seen: GrafeoSet<_> = GrafeoSet::default();
+        let mut matching_nodes = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            // A duplicate id in the list must not emit the node twice.
+            if !seen.insert(id) {
+                continue;
+            }
+            let visible = if let Some(tx) = self.transaction_id {
+                self.store.get_node_versioned(id, epoch, tx).is_some()
+            } else {
+                self.store.is_node_visible_at_epoch(id, epoch)
+            };
+            if visible
+                && scan_label.is_none_or(|label| {
+                    self.store.node_has_label_at_epoch(
+                        id,
+                        label,
+                        epoch,
+                        self.transaction_id.unwrap_or(TransactionId::SYSTEM),
+                    )
+                })
+            {
+                matching_nodes.push(id);
+            }
+        }
+
+        // Absorbed-scan PROFILE entry: see `record_absorbed_scan_entry`.
+        self.record_absorbed_scan_entry("NodeScan", &filter.input);
+        self.record_access_path(|| super::AccessPath::InternalId);
+
+        let columns = vec![scan_variable];
+        let node_list_op: Box<dyn Operator> = Box::new(NodeListOperator::new(matching_nodes, 2048));
+        Ok(Some((node_list_op, columns)))
+    }
+
     /// Tries to use a property index for filter optimization.
     ///
     /// When a filter predicate is an equality check on an indexed property,
@@ -900,61 +1713,133 @@ impl super::Planner {
         }
 
         let mut matching_nodes = if has_indexed_condition {
-            // Use index-based batch lookup
-            let conditions_ref: Vec<(&str, Value)> = conditions
+            // Drive the lookup with one admitted index and evaluate all other
+            // equalities against the same historical/transactional view.
+            let Some((driver_property, driver_value)) = conditions
                 .iter()
-                .map(|(p, v)| (p.as_str(), v.clone()))
-                .collect();
-            let mut nodes = self.store.find_nodes_by_properties(&conditions_ref);
-
-            // Intersect with label if present
-            if let Some(label) = &scan_label {
-                let label_nodes: std::collections::HashSet<_> =
-                    self.store.nodes_by_label(label).into_iter().collect();
-                nodes.retain(|n| label_nodes.contains(n));
+                .find(|(property, _)| self.store.has_property_index(property))
+            else {
+                return Ok(None);
+            };
+            if let Some(tx) = self.transaction_id {
+                if let Some(label) = &scan_label {
+                    self.store.record_label_predicate_read(tx, label);
+                } else {
+                    self.store.record_lpg_dataset_read(tx);
+                }
             }
+            let Some(mut nodes) = self.store.lookup_nodes_indexed(PropertyIndexRequest {
+                property: driver_property,
+                predicate: PropertyIndexPredicate::Equal(driver_value),
+                epoch: self.viewing_epoch,
+                transaction_id: self.transaction_id,
+            })?
+            else {
+                self.record_decline(super::Decline::StoreDeclined);
+                return Ok(None);
+            };
+            let epoch = self.viewing_epoch;
+            nodes.retain(|id| {
+                conditions.iter().all(|(property, expected)| {
+                    self.store
+                        .read_node_property_visible(
+                            *id,
+                            &PropertyKey::new(property.as_str()),
+                            epoch,
+                            self.transaction_id,
+                        )
+                        .is_some_and(|actual| {
+                            ExpressionPredicate::matches_property_index_predicate(
+                                &actual,
+                                PropertyIndexPredicate::Equal(expected),
+                            )
+                        })
+                })
+            });
             nodes
         } else {
             // No index but we have a label: scan label first, then check properties.
             // This is more efficient than ScanOperator → DataChunk → FilterOperator
             // because it avoids DataChunk materialization and expression evaluation.
-            let label = scan_label.as_ref().expect("label checked above");
-            let label_nodes = self.store.nodes_by_label(label);
+            let Some(label) = scan_label.as_ref() else {
+                return Ok(None);
+            };
+            let label_nodes = self
+                .store
+                .nodes_by_label_visible(label, self.transaction_id);
             let epoch = self.viewing_epoch;
             let tx_id = self.transaction_id;
             label_nodes
                 .into_iter()
                 .filter(|&node_id| {
-                    // Use versioned/epoch-aware node access for correct properties
-                    let node = if let Some(tx) = tx_id {
+                    (if let Some(tx) = tx_id {
                         self.store.get_node_versioned(node_id, epoch, tx)
                     } else {
                         self.store.get_node_at_epoch(node_id, epoch)
-                    };
-                    node.is_some_and(|n| {
-                        conditions.iter().all(|(prop, val)| {
-                            n.get_property(prop)
-                                .is_some_and(|v| values_equal_coerced(v, val))
-                        })
                     })
+                    .is_some()
+                        && conditions.iter().all(|(prop, val)| {
+                            self.store
+                                .read_node_property_visible(
+                                    node_id,
+                                    &PropertyKey::new(prop.as_str()),
+                                    epoch,
+                                    tx_id,
+                                )
+                                .is_some_and(|actual| {
+                                    ExpressionPredicate::matches_property_index_predicate(
+                                        &actual,
+                                        PropertyIndexPredicate::Equal(val),
+                                    )
+                                })
+                        })
                 })
                 .collect()
         };
 
         // MVCC visibility: filter out nodes not visible at the current epoch/tx.
         // Without this, rolled-back or uncommitted nodes could leak through.
+        //
+        // The label constraint is a per-candidate membership test. Intersecting
+        // the label's full id set instead made an indexed point lookup cost the
+        // label's cardinality — 30.6 ms at a million labelled nodes against
+        // 12.8 µs unlabelled in the original labelled-lookup reproduction.
+        // The index has already narrowed the candidates, so the label only has to
+        // be confirmed on each one. The store is asked for historical label
+        // membership, so a store that scopes labels — a projection that hides
+        // one — keeps deciding its own label membership.
         let epoch = self.viewing_epoch;
-        if let Some(tx) = self.transaction_id {
-            matching_nodes.retain(|id| self.store.get_node_versioned(*id, epoch, tx).is_some());
-        } else {
-            matching_nodes.retain(|id| self.store.get_node_at_epoch(*id, epoch).is_some());
-        }
+        let scan_label = scan_label.as_deref();
+        matching_nodes.retain(|id| {
+            let visible = if let Some(tx) = self.transaction_id {
+                self.store.get_node_versioned(*id, epoch, tx).is_some()
+            } else {
+                self.store.get_node_at_epoch(*id, epoch).is_some()
+            };
+            visible
+                && scan_label.is_none_or(|label| {
+                    self.store.node_has_label_at_epoch(
+                        *id,
+                        label,
+                        epoch,
+                        self.transaction_id.unwrap_or(TransactionId::SYSTEM),
+                    )
+                })
+        });
 
         let columns = vec![scan_variable.clone()];
         let node_list_op: Box<dyn Operator> = Box::new(NodeListOperator::new(matching_nodes, 2048));
 
         // Absorbed-scan PROFILE entry: see `record_absorbed_scan_entry`.
         self.record_absorbed_scan_entry("NodeScan", &filter.input);
+        // The indexed branch returned early unless the index answered.
+        self.record_access_path(|| {
+            if has_indexed_condition {
+                super::AccessPath::PropertyIndex
+            } else {
+                super::AccessPath::LabelFirst
+            }
+        });
 
         // Check for remaining predicate parts that weren't pushed down
         // (e.g., range conditions in a compound predicate like `n.name = 'Alix' AND n.age > 30`)
@@ -1039,44 +1924,60 @@ impl super::Planner {
             }
             _ => return Ok(None),
         };
-        if values.is_empty() {
-            // `prop IN []` is always false: return an empty result without
-            // touching the store.
-            self.record_absorbed_scan_entry("NodeScan", &filter.input);
-            let columns = vec![scan_variable];
-            let empty = Box::new(NodeListOperator::new(Vec::new(), 2048));
-            return Ok(Some((empty, columns)));
-        }
-
-        // Per-value index lookup, deduplicate (the same node could match
-        // duplicate values, and we don't want to emit it twice).
-        let mut seen: GrafeoSet<_> = GrafeoSet::default();
-        let mut matching_nodes = Vec::new();
-        for value in &values {
-            for node_id in self.store.find_nodes_by_property(property, value) {
-                if seen.insert(node_id) {
-                    matching_nodes.push(node_id);
-                }
+        if let Some(tx) = self.transaction_id {
+            if let Some(label) = &scan_label {
+                self.store.record_label_predicate_read(tx, label);
+            } else {
+                self.store.record_lpg_dataset_read(tx);
             }
         }
 
-        // Intersect with the label constraint, if any.
-        if let Some(label) = &scan_label {
-            let label_nodes: GrafeoSet<_> = self.store.nodes_by_label(label).into_iter().collect();
-            matching_nodes.retain(|n| label_nodes.contains(n));
-        }
+        // One index request owns the complete IN candidate set, including an
+        // empty result. The store reconciles historical values and this tx's
+        // buffered property delta before returning candidates.
+        let Some(mut matching_nodes) = self.store.lookup_nodes_indexed(PropertyIndexRequest {
+            property,
+            predicate: PropertyIndexPredicate::In(&values),
+            epoch: self.viewing_epoch,
+            transaction_id: self.transaction_id,
+        })?
+        else {
+            self.record_decline(super::Decline::StoreDeclined);
+            return Ok(None);
+        };
 
-        // MVCC visibility: drop nodes that aren't visible at the current
-        // epoch/tx, matching the equality fast path's semantics.
         let epoch = self.viewing_epoch;
-        if let Some(tx) = self.transaction_id {
-            matching_nodes.retain(|id| self.store.get_node_versioned(*id, epoch, tx).is_some());
-        } else {
-            matching_nodes.retain(|id| self.store.get_node_at_epoch(*id, epoch).is_some());
-        }
+        let key = PropertyKey::new(property.as_str());
+        let scan_label = scan_label.as_deref();
+        matching_nodes.retain(|id| {
+            let visible = if let Some(tx) = self.transaction_id {
+                self.store.get_node_versioned(*id, epoch, tx).is_some()
+            } else {
+                self.store.get_node_at_epoch(*id, epoch).is_some()
+            };
+            visible
+                && scan_label.is_none_or(|label| {
+                    self.store.node_has_label_at_epoch(
+                        *id,
+                        label,
+                        epoch,
+                        self.transaction_id.unwrap_or(TransactionId::SYSTEM),
+                    )
+                })
+                && self
+                    .store
+                    .read_node_property_visible(*id, &key, epoch, self.transaction_id)
+                    .is_some_and(|actual| {
+                        ExpressionPredicate::matches_property_index_predicate(
+                            &actual,
+                            PropertyIndexPredicate::In(&values),
+                        )
+                    })
+        });
 
         // Absorbed-scan PROFILE entry: see `record_absorbed_scan_entry`.
         self.record_absorbed_scan_entry("NodeScan", &filter.input);
+        self.record_access_path(|| super::AccessPath::PropertyIndex);
 
         let columns = vec![scan_variable];
         let node_list_op: Box<dyn Operator> = Box::new(NodeListOperator::new(matching_nodes, 2048));
@@ -1221,7 +2122,7 @@ impl super::Planner {
     /// Pass the source operator's `name()` (e.g. `"NodeScan"`, `"EdgeScan"`)
     /// so future absorbers don't get mislabeled.
     pub(super) fn record_absorbed_scan_entry(&self, op_name: &str, absorbed: &LogicalOperator) {
-        if !self.profiling.get() {
+        if !self.records_entries() {
             return;
         }
         let label = absorbed.display_label();
@@ -1257,6 +2158,15 @@ impl super::Planner {
             self.extract_between_predicate(&filter.predicate)
             && variable == scan_variable
         {
+            // Keep the generic delta-aware filter for an unindexed writer.
+            // RangeScan can absorb the transaction only when the historical
+            // index contract is admitted for this property.
+            if (self.transaction_id.is_some() || self.viewing_epoch < self.store.current_epoch())
+                && !self.store.has_property_index(&property)
+            {
+                self.record_decline(super::Decline::UnindexedRangeView);
+                return Ok(None);
+            }
             self.record_absorbed_scan_entry("NodeScan", &filter.input);
             return self.plan_range_filter(
                 &scan_variable,
@@ -1283,6 +2193,12 @@ impl super::Planner {
                 BinaryOp::Ge => (Some(value), None, true, false),
                 _ => return Ok(None),
             };
+            if (self.transaction_id.is_some() || self.viewing_epoch < self.store.current_epoch())
+                && !self.store.has_property_index(&property)
+            {
+                self.record_decline(super::Decline::UnindexedRangeView);
+                return Ok(None);
+            }
             self.record_absorbed_scan_entry("NodeScan", &filter.input);
             return self.plan_range_filter(
                 &scan_variable,
@@ -1577,7 +2493,10 @@ impl super::Planner {
         // Build VectorScanOp
         let vector_scan = super::VectorScanOp {
             variable: scan.variable.clone(),
-            index_name: Some(format!("{}:{}", label, extracted.property)),
+            index_name: Some(grafeo_core::graph::lpg::encode_index_key(
+                label,
+                &extracted.property,
+            )),
             property: extracted.property.clone(),
             label: Some(label.clone()),
             query_vector: extracted.query_vector.clone(),

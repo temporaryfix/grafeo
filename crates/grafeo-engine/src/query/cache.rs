@@ -31,11 +31,17 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use crate::query::plan::LogicalPlan;
+use crate::query::planner::PhysicalPlan;
 use crate::query::processor::QueryLanguage;
+use grafeo_common::types::GraphPath;
+#[cfg(any(feature = "gql", feature = "cypher"))]
+use grafeo_common::types::{EpochId, TransactionId};
 
 /// Cache key combining query text, language, and active graph.
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -44,8 +50,8 @@ pub struct CacheKey {
     query: String,
     /// The query language.
     language: QueryLanguage,
-    /// Active graph name (`None` = default graph).
-    graph: Option<String>,
+    /// Exact root-relative LPG graph identity.
+    graph: GraphPath,
 }
 
 impl CacheKey {
@@ -55,17 +61,13 @@ impl CacheKey {
         Self {
             query: normalize_query(&query.into()),
             language,
-            graph: None,
+            graph: GraphPath::root(),
         }
     }
 
     /// Creates a cache key scoped to a specific graph.
     #[must_use]
-    pub fn with_graph(
-        query: impl Into<String>,
-        language: QueryLanguage,
-        graph: Option<String>,
-    ) -> Self {
+    pub fn with_graph(query: impl Into<String>, language: QueryLanguage, graph: GraphPath) -> Self {
         Self {
             query: normalize_query(&query.into()),
             language,
@@ -434,6 +436,105 @@ impl CacheStats {
     }
 }
 
+/// Key for a reusable physical operator tree.
+///
+/// Shared across sessions on one [`crate::GrafeoDB`]. Includes viewing
+/// epoch. Transactional plans are not cached (see [`PhysicalPlanCache`]).
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub(crate) struct PhysicalCacheKey {
+    query: String,
+    language: QueryLanguage,
+    storage_key: GraphPath,
+    schema: Option<String>,
+    graph: Option<String>,
+    epoch: u64,
+}
+
+impl PhysicalCacheKey {
+    #[cfg(any(feature = "gql", feature = "cypher"))]
+    pub(crate) fn new(
+        query: &str,
+        language: QueryLanguage,
+        storage_key: GraphPath,
+        schema: Option<String>,
+        graph: Option<String>,
+        epoch: EpochId,
+        tx: Option<TransactionId>,
+    ) -> Option<Self> {
+        if tx.is_some() {
+            return None;
+        }
+        Some(Self {
+            query: normalize_query(query),
+            language,
+            storage_key,
+            schema,
+            graph,
+            epoch: epoch.as_u64(),
+        })
+    }
+}
+
+/// LRU of physical plans. Values are not cloned — [`Self::take`] moves them
+/// out for execute + reset, then [`Self::insert`] puts them back.
+pub(crate) struct PhysicalPlanCache {
+    entries: HashMap<PhysicalCacheKey, PhysicalPlan>,
+    access_order: Vec<PhysicalCacheKey>,
+    /// Used by [`Self::insert`] when a query language is compiled in.
+    #[allow(dead_code)]
+    capacity: usize,
+}
+
+impl PhysicalPlanCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            access_order: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Mutex-wrapped cache shared by every session on a database.
+    pub(crate) fn shared(capacity: usize) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self::new(capacity)))
+    }
+
+    #[cfg(any(feature = "gql", feature = "cypher"))]
+    pub(crate) fn take(&mut self, key: &PhysicalCacheKey) -> Option<PhysicalPlan> {
+        let plan = self.entries.remove(key)?;
+        if let Some(pos) = self.access_order.iter().position(|k| k == key) {
+            self.access_order.remove(pos);
+        }
+        Some(plan)
+    }
+
+    #[cfg(any(feature = "gql", feature = "cypher"))]
+    pub(crate) fn insert(&mut self, key: PhysicalCacheKey, plan: PhysicalPlan) {
+        if self.entries.len() >= self.capacity
+            && !self.entries.contains_key(&key)
+            && let Some(old) = self.access_order.first().cloned()
+        {
+            self.access_order.remove(0);
+            self.entries.remove(&old);
+        }
+        if let Some(pos) = self.access_order.iter().position(|k| k == &key) {
+            self.access_order.remove(pos);
+        }
+        self.access_order.push(key.clone());
+        self.entries.insert(key, plan);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.access_order.clear();
+    }
+
+    #[cfg(all(test, feature = "lpg", feature = "gql"))]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// A caching wrapper for the query processor.
 ///
 /// This type wraps a query processor and adds caching capabilities.
@@ -480,7 +581,7 @@ impl<P> CachingQueryProcessor<P> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "gql", feature = "cypher", feature = "sparql")))]
 mod tests {
     use super::*;
 
@@ -505,6 +606,71 @@ mod tests {
 
         // Both should normalize to the same key
         assert_eq!(key1.query(), key2.query());
+    }
+
+    #[test]
+    fn cache_keys_keep_exact_graph_paths() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::query::plan::{LogicalOperator, LogicalPlan};
+
+        let paths = [
+            GraphPath::root(),
+            GraphPath::from_components(&["default"])?,
+            GraphPath::from_components(&[""])?,
+            GraphPath::from_components(&["a/b"])?,
+            GraphPath::from_components(&["a", "b"])?,
+        ];
+        let cache = QueryCache::new(32);
+        let query = "MATCH (n) RETURN n";
+        let root = CacheKey::new(query, test_language());
+        assert!(root == CacheKey::with_graph(query, test_language(), GraphPath::root()));
+        for path in &paths {
+            let key = CacheKey::with_graph(query, test_language(), path.clone());
+            assert!(cache.get_parsed(&key).is_none());
+            cache.put_parsed(key.clone(), LogicalPlan::new(LogicalOperator::Empty));
+            assert!(cache.get_parsed(&key).is_some());
+        }
+        assert_eq!(cache.stats().parsed_size, paths.len());
+        Ok(())
+    }
+
+    #[cfg(any(feature = "gql", feature = "cypher"))]
+    #[test]
+    fn physical_cache_keys_keep_exact_graph_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let paths = [
+            GraphPath::root(),
+            GraphPath::from_components(&["default"])?,
+            GraphPath::from_components(&[""])?,
+            GraphPath::from_components(&["a/b"])?,
+            GraphPath::from_components(&["a", "b"])?,
+        ];
+        let mut keys = std::collections::HashSet::new();
+        for path in &paths {
+            let key = PhysicalCacheKey::new(
+                "MATCH (n) RETURN n",
+                test_language(),
+                path.clone(),
+                Some("schema".to_owned()),
+                Some("graph".to_owned()),
+                EpochId::new(7),
+                None,
+            )
+            .ok_or("nontransactional key missing")?;
+            assert!(keys.insert(key));
+        }
+        assert_eq!(keys.len(), paths.len());
+        assert!(
+            PhysicalCacheKey::new(
+                "MATCH (n) RETURN n",
+                test_language(),
+                GraphPath::root(),
+                None,
+                None,
+                EpochId::new(7),
+                Some(TransactionId::new(1)),
+            )
+            .is_none()
+        );
+        Ok(())
     }
 
     #[test]

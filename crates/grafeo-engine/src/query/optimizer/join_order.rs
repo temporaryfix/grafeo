@@ -12,7 +12,9 @@
 
 use super::cardinality::CardinalityEstimator;
 use super::cost::{Cost, CostModel};
-use crate::query::plan::{JoinCondition, JoinOp, JoinType, LogicalExpression, LogicalOperator};
+use crate::query::plan::{
+    JoinCondition, JoinKeySemantics, JoinOp, JoinType, LogicalExpression, LogicalOperator,
+};
 use std::collections::{HashMap, HashSet};
 
 /// A node in the join graph.
@@ -133,8 +135,19 @@ impl JoinGraph {
             let to_in_right = right.contains(edge.to);
 
             // Edge crosses between left and right
-            if (from_in_left && to_in_right) || (from_in_right && to_in_left) {
+            if from_in_left && to_in_right {
                 conditions.extend(edge.conditions.clone());
+            } else if from_in_right && to_in_left {
+                conditions.extend(
+                    edge.conditions
+                        .iter()
+                        .cloned()
+                        .map(|condition| JoinCondition {
+                            left: condition.right,
+                            right: condition.left,
+                            semantics: condition.semantics,
+                        }),
+                );
             }
         }
         conditions
@@ -536,6 +549,24 @@ impl JoinGraphBuilder {
         left_expr: LogicalExpression,
         right_expr: LogicalExpression,
     ) {
+        self.add_join_condition_with_semantics(
+            left_var,
+            right_var,
+            left_expr,
+            right_expr,
+            JoinKeySemantics::Value,
+        );
+    }
+
+    /// Adds a join condition between two variables with explicit key semantics.
+    pub fn add_join_condition_with_semantics(
+        &mut self,
+        left_var: &str,
+        right_var: &str,
+        left_expr: LogicalExpression,
+        right_expr: LogicalExpression,
+        semantics: JoinKeySemantics,
+    ) {
         if let (Some(&left_id), Some(&right_id)) = (
             self.variable_to_node.get(left_var),
             self.variable_to_node.get(right_var),
@@ -546,9 +577,34 @@ impl JoinGraphBuilder {
                 vec![JoinCondition {
                     left: left_expr,
                     right: right_expr,
+                    semantics,
                 }],
             );
         }
+    }
+
+    /// Adds a join condition between concrete relation nodes.
+    ///
+    /// This is the ownership-preserving API used by optimizer extraction.
+    /// Variable names cannot identify SPARQL relations because a shared
+    /// variable has the same name in multiple triple patterns.
+    pub fn add_join_condition_between_nodes(
+        &mut self,
+        left_id: usize,
+        right_id: usize,
+        left_expr: LogicalExpression,
+        right_expr: LogicalExpression,
+        semantics: JoinKeySemantics,
+    ) {
+        self.graph.add_edge(
+            left_id,
+            right_id,
+            vec![JoinCondition {
+                left: left_expr,
+                right: right_expr,
+                semantics,
+            }],
+        );
     }
 
     /// Builds the join graph.

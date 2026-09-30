@@ -24,13 +24,21 @@ impl GqlTranslator {
         let mut agg_counter: u32 = 0;
 
         for item in items {
-            if let Some(agg_expr) = self.try_extract_aggregate(&item.expression, &item.alias)? {
+            // Name an un-aliased aggregate with a synthetic alias and pass it INTO
+            // `try_extract_aggregate`, so the `AggregateExpr` carries the same name
+            // the post-return projection references below. Otherwise the planner
+            // names the column "sum(...)" while the post-return looks for "_agg_N",
+            // yielding `Undefined variable '_agg_N'` whenever aliased and un-aliased
+            // aggregates appear in one RETURN (e.g. `count(n) AS c, sum(n.age)`).
+            let agg_alias = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| format!("_agg_{agg_counter}"));
+            if let Some(agg_expr) =
+                self.try_extract_aggregate(&item.expression, &Some(agg_alias.clone()))?
+            {
                 // Direct aggregate (e.g. `count(n) AS cnt`)
                 aggregates.push(agg_expr);
-                let agg_alias = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| format!("_agg_{agg_counter}"));
                 post_return_items.push(ReturnItem {
                     expression: LogicalExpression::Variable(agg_alias),
                     alias: item.alias.clone(),
@@ -212,6 +220,7 @@ impl GqlTranslator {
                             function: func,
                             expression: None,
                             expression2: None,
+                            distinct_key: None,
                             distinct: *distinct,
                             alias: alias.clone(),
                             percentile: None,
@@ -276,6 +285,7 @@ impl GqlTranslator {
                             function: actual_func,
                             expression: Some(self.translate_expression(&args[0])?),
                             expression2,
+                            distinct_key: None,
                             distinct: *distinct,
                             alias: alias.clone(),
                             percentile,

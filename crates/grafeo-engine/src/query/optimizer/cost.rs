@@ -737,22 +737,15 @@ impl CostModel {
             return 1.0; // No benefit for single hop or low fanout
         }
 
-        // Factorized representation compresses repeated prefixes
-        // Compression ratio improves with higher fanout and more hops
-        // Full materialization: fanout^hops
-        // Factorized: sum(fanout^i for i in 1..=hops) ≈ fanout^(hops+1) / (fanout - 1)
-
+        // Flat rows duplicate every prefix column: last_level * (hops + 1) cells.
+        // Factorized stores one column per level: sum_{i=0}^{hops} fanout^i cells.
         // reason: hop count is always small (< 100)
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let hops_i32 = num_hops as i32;
-        let full_size = avg_fanout.powi(hops_i32);
-        let factorized_size = if avg_fanout > 1.0 {
-            (avg_fanout.powi(hops_i32 + 1) - 1.0) / (avg_fanout - 1.0)
-        } else {
-            num_hops as f64
-        };
-
-        (factorized_size / full_size).min(1.0)
+        let last_level = avg_fanout.powi(hops_i32);
+        let flat_cells = last_level * (num_hops + 1) as f64;
+        let factorized_cells = (avg_fanout.powi(hops_i32 + 1) - 1.0) / (avg_fanout - 1.0);
+        (factorized_cells / flat_cells).clamp(0.0, 1.0)
     }
 }
 
@@ -895,6 +888,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let cost = model.expand_cost(&expand, 1000.0);
 
@@ -922,6 +918,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let cost_knows = model.expand_cost(&knows_out, 1000.0);
 
@@ -937,6 +936,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let cost_works = model.expand_cost(&works_out, 1000.0);
 
@@ -958,6 +960,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let cost_works_in = model.expand_cost(&works_in, 1000.0);
 
@@ -982,6 +987,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let cost_unknown = model.expand_cost(&expand, 1000.0);
 
@@ -997,6 +1005,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let cost_no_type = model.expand_cost(&expand_no_type, 1000.0);
 
@@ -1017,6 +1028,7 @@ mod tests {
             conditions: vec![JoinCondition {
                 left: LogicalExpression::Variable("a".to_string()),
                 right: LogicalExpression::Variable("b".to_string()),
+                semantics: crate::query::plan::JoinKeySemantics::Value,
             }],
         };
         let cost = model.join_cost(&join, 10000.0);
@@ -1075,6 +1087,7 @@ mod tests {
                     function: AggregateFunction::Count,
                     expression: None,
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("cnt".to_string()),
                     percentile: None,
@@ -1084,6 +1097,7 @@ mod tests {
                     function: AggregateFunction::Sum,
                     expression: Some(LogicalExpression::Variable("x".to_string())),
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("total".to_string()),
                     percentile: None,
@@ -1313,11 +1327,9 @@ mod tests {
         // Multi-hop with high fanout
         let benefit = model.factorized_benefit(10.0, 3);
 
-        // The factorized_benefit returns a ratio capped at 1.0
-        // For high fanout, factorized size / full size approaches 1/fanout
-        // which is beneficial but the formula gives a value <= 1.0
-        assert!(benefit <= 1.0, "Benefit should be <= 1.0");
-        assert!(benefit > 0.0, "Benefit should be positive");
+        // Flat cells = 10^3 * 4 = 4000; factorized = (10^4-1)/9 = 1111.
+        assert!(benefit < 0.4, "3-hop fanout 10 must compress well");
+        assert!(benefit > 0.2, "Benefit should be positive");
     }
 
     #[test]
@@ -1395,6 +1407,7 @@ mod tests {
             conditions: vec![JoinCondition {
                 left: LogicalExpression::Variable("a".to_string()),
                 right: LogicalExpression::Variable("b".to_string()),
+                semantics: crate::query::plan::JoinKeySemantics::Value,
             }],
         };
 
@@ -1435,6 +1448,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let multi_cost = model.expand_cost(&multi_expand, 100.0);
 
@@ -1450,6 +1466,9 @@ mod tests {
             input: Box::new(LogicalOperator::Empty),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         };
         let single_cost = model.expand_cost(&single_expand, 100.0);
 

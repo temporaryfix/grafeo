@@ -228,11 +228,16 @@ impl GqlTranslator {
                         .map(|(k, v)| Ok((k.clone(), self.translate_expression(v)?)))
                         .collect::<Result<_>>()?;
 
+                    let input = if matches!(&plan, LogicalOperator::Empty) {
+                        None
+                    } else {
+                        Some(Box::new(plan))
+                    };
                     plan = LogicalOperator::CreateNode(CreateNodeOp {
                         variable,
                         labels: node.labels.clone(),
                         properties,
-                        input: Some(Box::new(plan)),
+                        input,
                     });
                 }
                 ast::Pattern::Path(path) => {
@@ -252,11 +257,16 @@ impl GqlTranslator {
                             .map(|(k, v)| Ok((k.clone(), self.translate_expression(v)?)))
                             .collect::<Result<_>>()?;
 
+                        let input = if matches!(&plan, LogicalOperator::Empty) {
+                            None
+                        } else {
+                            Some(Box::new(plan))
+                        };
                         plan = LogicalOperator::CreateNode(CreateNodeOp {
                             variable: source_var.clone(),
                             labels: path.source.labels.clone(),
                             properties: source_props,
-                            input: Some(Box::new(plan)),
+                            input,
                         });
                     }
 
@@ -503,6 +513,23 @@ impl GqlTranslator {
         path_alias: Option<&str>,
         path_mode: PathMode,
     ) -> Result<LogicalOperator> {
+        self.translate_path_pattern_with_alias_search(
+            path,
+            input,
+            path_alias,
+            path_mode,
+            PathSearch::All,
+        )
+    }
+
+    pub(super) fn translate_path_pattern_with_alias_search(
+        &self,
+        path: &ast::PathPattern,
+        input: Option<LogicalOperator>,
+        path_alias: Option<&str>,
+        path_mode: PathMode,
+        path_search: PathSearch,
+    ) -> Result<LogicalOperator> {
         // Start with the source node
         let source_var = path
             .source
@@ -536,7 +563,9 @@ impl GqlTranslator {
         }
 
         // Process each edge in the chain
-        let mut current_source = source_var;
+        let mut current_source = source_var.clone();
+        let mut bound_nodes = std::collections::HashSet::new();
+        bound_nodes.insert(source_var);
         let edge_count = path.edges.len();
 
         for (idx, edge) in path.edges.iter().enumerate() {
@@ -549,13 +578,16 @@ impl GqlTranslator {
             let edge_var = edge.variable.clone();
             let edge_types = edge.types.clone();
 
+            let has_edge_predicate = !edge.properties.is_empty() || edge.where_clause.is_some();
+            let edge_var_for_filter = edge_var
+                .clone()
+                .or_else(|| has_edge_predicate.then(|| format!("_edge_pred_{}", rand_id())));
+
             let direction = match edge.direction {
                 ast::EdgeDirection::Outgoing => ExpandDirection::Outgoing,
                 ast::EdgeDirection::Incoming => ExpandDirection::Incoming,
                 ast::EdgeDirection::Undirected => ExpandDirection::Both,
             };
-
-            let edge_var_for_filter = edge_var.clone();
 
             // Set path_alias on the last edge of a named path
             let expand_path_alias = if idx == edge_count - 1 {
@@ -586,9 +618,7 @@ impl GqlTranslator {
             };
 
             // Track group-list variables for horizontal aggregation detection
-            if is_variable_length
-                && let (Some(ev), Some(pa)) = (&edge_var_for_filter, &expand_path_alias)
-            {
+            if is_variable_length && let (Some(ev), Some(pa)) = (&edge_var, &expand_path_alias) {
                 self.group_list_variables
                     .borrow_mut()
                     .insert(ev.clone(), pa.clone());
@@ -602,30 +632,52 @@ impl GqlTranslator {
                 None
             };
 
-            // Detect cycle pattern: (s)-[*]->(s) where source == target variable.
-            // The expand must use a temporary target, then filter for equality.
-            let is_cycle = target_var == current_source;
-            let expand_target = if is_cycle {
+            // Self-loop (s)-[]->(s): temp target + id filter (cannot reuse `s`
+            // as both from and to in one expand). Back-edge to an earlier
+            // bound node (a)->(b)->(c)->(a): keep `to_variable = a` so the
+            // planner sees a directed cycle, not a rebind.
+            let is_self_loop = target_var == current_source;
+            let expand_target = if is_self_loop {
                 format!("_cycle_{}", rand_id())
             } else {
                 target_var.clone()
             };
 
+            let mut edge_predicates = Vec::new();
+            if !edge.properties.is_empty()
+                && let Some(edge_binding) = edge_var_for_filter.as_deref()
+            {
+                edge_predicates
+                    .push(self.build_property_predicate(edge_binding, &edge.properties)?);
+            }
+            if let Some(ref where_expr) = edge.where_clause {
+                edge_predicates.push(self.translate_expression(where_expr)?);
+            }
+            let searched_edge = is_variable_length || path_search != PathSearch::All;
+            let edge_predicate = if searched_edge && !edge_predicates.is_empty() {
+                Some(combine_with_and(edge_predicates.clone())?)
+            } else {
+                None
+            };
+
             plan = LogicalOperator::Expand(ExpandOp {
                 from_variable: current_source,
                 to_variable: expand_target.clone(),
-                edge_variable: edge_var,
+                edge_variable: edge_var_for_filter.clone(),
                 direction,
                 edge_types,
+                edge_predicate,
+                path_predicate: None,
                 min_hops,
                 max_hops,
                 input: Box::new(plan),
                 path_alias: expand_path_alias,
                 path_mode,
+                path_search,
             });
 
-            // For cycle patterns, enforce that expanded target == original source
-            if is_cycle {
+            // For self-loops, enforce that expanded target == original source
+            if is_self_loop {
                 plan = wrap_filter(
                     plan,
                     LogicalExpression::Binary {
@@ -644,18 +696,13 @@ impl GqlTranslator {
                 );
             }
 
-            // Add filter for edge properties
-            if !edge.properties.is_empty()
-                && let Some(ref ev) = edge_var_for_filter
-            {
-                let predicate = self.build_property_predicate(ev, &edge.properties)?;
-                plan = wrap_filter(plan, predicate);
-            }
-
-            // Add element WHERE clause for edge
-            if let Some(ref where_expr) = edge.where_clause {
-                let predicate = self.translate_expression(where_expr)?;
-                plan = wrap_filter(plan, predicate);
+            // Ordinary one-hop ALL keeps its existing post-expand filters;
+            // variable-length and searched paths evaluate edge predicates on
+            // every transition through Expand.
+            if !searched_edge {
+                for predicate in edge_predicates {
+                    plan = wrap_filter(plan, predicate);
+                }
             }
 
             // Add filter for target node properties
@@ -704,9 +751,11 @@ impl GqlTranslator {
                     left: Box::new(left),
                     right: Box::new(plan),
                     condition: None,
+                    compatibility_conditions: Vec::new(),
                 });
             }
 
+            bound_nodes.insert(target_var.clone());
             current_source = target_var;
         }
 

@@ -381,19 +381,22 @@ pub fn convert_filter_expression(expr: &LogicalExpression) -> Result<FilterExpre
 pub(crate) fn value_to_logical_type(value: &grafeo_common::types::Value) -> LogicalType {
     use grafeo_common::types::Value;
     match value {
-        Value::Null => LogicalType::String,
+        Value::Null => LogicalType::Null,
         Value::Bool(_) => LogicalType::Bool,
         Value::Int64(_) => LogicalType::Int64,
         Value::Float64(_) => LogicalType::Float64,
         Value::String(_) => LogicalType::String,
-        Value::Bytes(_) => LogicalType::String,
+        Value::Bytes(_) => LogicalType::Bytes,
         Value::Timestamp(_) => LogicalType::Timestamp,
         Value::Date(_) => LogicalType::Date,
         Value::Time(_) => LogicalType::Time,
         Value::Duration(_) => LogicalType::Duration,
         Value::ZonedDatetime(_) => LogicalType::ZonedDatetime,
-        Value::List(_) => LogicalType::String,
-        Value::Map(_) => LogicalType::String,
+        Value::List(_) => LogicalType::List(Box::new(LogicalType::Any)),
+        Value::Map(_) => LogicalType::Map {
+            key: Box::new(LogicalType::String),
+            value: Box::new(LogicalType::Any),
+        },
         Value::Vector(v) => LogicalType::Vector(v.len()),
         Value::Path { .. } => LogicalType::Any,
         Value::GCounter(_) | Value::OnCounter { .. } => LogicalType::Any,
@@ -405,7 +408,7 @@ pub(crate) fn value_to_logical_type(value: &grafeo_common::types::Value) -> Logi
 ///
 /// Only handles literals, unary minus on numeric literals, and simple expressions.
 /// Returns an error for runtime-dependent expressions (variables, property accesses, etc.).
-#[cfg(feature = "algos")]
+#[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
 pub(crate) fn eval_constant_expression(
     expr: &crate::query::plan::LogicalExpression,
 ) -> Result<grafeo_common::types::Value> {
@@ -428,5 +431,59 @@ pub(crate) fn eval_constant_expression(
         _ => Err(Error::Internal(
             "Procedure argument must be a constant value".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod literal_type_tests {
+    use super::value_to_logical_type;
+    use grafeo_common::types::{LogicalType, PropertyKey, Value};
+    use grafeo_core::execution::vector::ValueVector;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    #[test]
+    fn inferred_literal_storage_preserves_nested_and_generic_values() {
+        let nested = Value::List(vec![Value::from("x".repeat(8192)), Value::Null].into());
+        let map = Value::Map(Arc::new(BTreeMap::from([(
+            PropertyKey::new("payload"),
+            nested.clone(),
+        )])));
+        let values = [
+            Value::Null,
+            Value::Bytes(Arc::from([0_u8, 255, 3])),
+            nested.clone(),
+            map.clone(),
+            Value::List(vec![Value::Int64(7), map].into()),
+            Value::Path {
+                nodes: vec![Value::Int64(1), Value::Int64(2)].into(),
+                edges: vec![Value::Int64(9)].into(),
+            },
+            Value::GCounter(Arc::new(HashMap::from([("replica".into(), 7)]))),
+            Value::OnCounter {
+                pos: Arc::new(HashMap::from([("replica".into(), 9)])),
+                neg: Arc::new(HashMap::from([("replica".into(), 2)])),
+            },
+            Value::RdfLiteral {
+                lexical: "01".into(),
+                language: None,
+                datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+            },
+            Value::from("ordinary string"),
+        ];
+        for value in values {
+            let ty = value_to_logical_type(&value);
+            let mut column = ValueVector::with_capacity(ty.clone(), 1);
+            column.push_value(value.clone());
+            assert_eq!(
+                column.get_value(0),
+                Some(value),
+                "literal storage must preserve {ty:?}"
+            );
+        }
+        assert_eq!(
+            value_to_logical_type(&nested),
+            LogicalType::List(Box::new(LogicalType::Any))
+        );
     }
 }

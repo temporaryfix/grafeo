@@ -3,10 +3,10 @@
 use grafeo_common::collections::GrafeoSet;
 
 use super::{
-    Arc, Error, FilterExpression, GraphStoreSearch, HashMap, LimitOp, LogicalExpression,
-    LogicalOperator, LogicalType, NullOrder, Operator, PhysicalSortKey, ProjectExpr,
-    ProjectOperator, Result, ReturnOp, SkipOp, SortDirection, SortOp, SortOperator, SortOrder,
-    common, expression_to_string, value_to_logical_type,
+    Arc, Error, FilterExpression, FlattenMode, FlattenOperator, GraphStoreSearch, HashMap, LimitOp,
+    LogicalExpression, LogicalOperator, LogicalType, NullOrder, Operator, PhysicalSortKey,
+    ProjectExpr, ProjectOperator, Result, ReturnOp, SkipOp, SortDirection, SortOp, SortOperator,
+    SortOrder, common, output_column_name, resolved_column_name, value_to_logical_type,
 };
 
 impl super::Planner {
@@ -18,7 +18,7 @@ impl super::Planner {
                 let single_row_op: Box<dyn Operator> = Box::new(
                     grafeo_core::execution::operators::single_row::SingleRowOperator::new(),
                 );
-                (single_row_op, Vec::new())
+                self.maybe_profile(Ok((single_row_op, Vec::new())), ret.input.as_ref())?
             } else {
                 self.plan_operator(&ret.input)?
             };
@@ -49,7 +49,7 @@ impl super::Planner {
     fn plan_return_projection(
         &self,
         ret: &ReturnOp,
-        input_op: Box<dyn Operator>,
+        mut input_op: Box<dyn Operator>,
         input_columns: Vec<String>,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         // Expand RETURN * wildcard: replace with all user-visible input columns
@@ -80,13 +80,41 @@ impl super::Planner {
         // Extract column names from return items
         let columns: Vec<String> = items
             .iter()
-            .map(|item| {
-                item.alias.clone().unwrap_or_else(|| {
-                    // Generate a default name from the expression
-                    expression_to_string(&item.expression)
-                })
-            })
+            .map(|item| output_column_name(item.alias.as_deref(), &item.expression))
             .collect();
+
+        // 2+ hop chain: stay unflat through hops. Last-hop-only RETURN
+        // (id(c) / c / c.prop) flattens the deepest level; mixed hops
+        // still full-flatten then pick / resolve.
+        if let Some((proj, names, types, deepest_only)) =
+            self.factorized_chain_return_project(items, &ret.input)
+        {
+            match grafeo_core::execution::operators::take_factorized(input_op) {
+                Ok(fact) => {
+                    for col in &names {
+                        self.scalar_columns.borrow_mut().insert(col.clone());
+                    }
+                    let mode = if deepest_only {
+                        FlattenMode::DeepestLevel
+                    } else {
+                        FlattenMode::Full
+                    };
+                    let flat = Box::new(FlattenOperator::new(fact, mode));
+                    let operator = Box::new(
+                        ProjectOperator::with_store(
+                            flat,
+                            proj,
+                            types,
+                            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+                        )
+                        .with_transaction_context(self.viewing_epoch, self.transaction_id)
+                        .with_session_context(self.session_context.clone()),
+                    );
+                    return Ok((operator, names));
+                }
+                Err(op) => input_op = op,
+            }
+        }
 
         // Check if we need a project operator (for property access or expression evaluation)
         let needs_project = items
@@ -128,7 +156,6 @@ impl super::Planner {
                             column: col_idx,
                             property: property.clone(),
                         });
-                        // Property could be any type - use Any/Generic to preserve type
                         output_types.push(LogicalType::Any);
                     }
                     LogicalExpression::Literal(value) => {
@@ -138,6 +165,28 @@ impl super::Planner {
                     LogicalExpression::FunctionCall { name, args, .. } => {
                         // Handle built-in functions
                         match name.to_lowercase().as_str() {
+                            "id" => {
+                                if args.len() != 1 {
+                                    return Err(Error::Internal(
+                                        "id() requires exactly one argument".to_string(),
+                                    ));
+                                }
+                                if let LogicalExpression::Variable(var_name) = &args[0] {
+                                    let col_idx =
+                                        *variable_columns.get(var_name).ok_or_else(|| {
+                                            Error::Internal(format!(
+                                                "Variable '{}' not found in input",
+                                                var_name
+                                            ))
+                                        })?;
+                                    projections.push(ProjectExpr::Column(col_idx));
+                                    output_types.push(LogicalType::Int64);
+                                } else {
+                                    return Err(Error::Internal(
+                                        "id() argument must be a variable".to_string(),
+                                    ));
+                                }
+                            }
                             "type" => {
                                 // type(r) returns the edge type string
                                 if args.len() != 1 {
@@ -170,23 +219,19 @@ impl super::Planner {
                                         "length() requires exactly one argument".to_string(),
                                     ));
                                 }
-                                if let LogicalExpression::Variable(var_name) = &args[0] {
-                                    // Try direct column first, then path detail column
-                                    let path_col = format!("_path_length_{var_name}");
-                                    let col_idx = variable_columns
-                                        .get(&path_col)
-                                        .or_else(|| variable_columns.get(var_name))
-                                        .ok_or_else(|| {
-                                            Error::Internal(format!(
-                                                "Variable '{}' not found in input",
-                                                var_name
-                                            ))
-                                        })?;
-                                    projections.push(ProjectExpr::Column(*col_idx));
+                                let native_length = match &args[0] {
+                                    LogicalExpression::Variable(name) => {
+                                        variable_columns.get(&format!("_path_length_{name}"))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(&column) = native_length {
+                                    projections.push(ProjectExpr::Column(column));
                                     output_types.push(LogicalType::Int64);
                                 } else {
-                                    // Non-variable argument (e.g. property access):
-                                    // fall through to expression evaluation
+                                    // WITH may retain the first-class path without its
+                                    // hidden length column. Evaluate the same function
+                                    // on that value instead of copying it into an Int64 lane.
                                     let filter_expr = self.convert_expression(&item.expression)?;
                                     projections.push(ProjectExpr::Expression {
                                         expr: filter_expr,
@@ -212,6 +257,8 @@ impl super::Planner {
                                         "edges"
                                     };
                                     let path_col = format!("_path_{suffix}_{var_name}");
+                                    let has_edge_path_column = suffix == "edges"
+                                        && variable_columns.contains_key(&path_col);
                                     let col_idx = variable_columns
                                         .get(&path_col)
                                         .or_else(|| variable_columns.get(var_name))
@@ -221,7 +268,12 @@ impl super::Planner {
                                             ))
                                         })?;
                                     projections.push(ProjectExpr::Column(*col_idx));
-                                    output_types.push(LogicalType::Any);
+                                    if has_edge_path_column {
+                                        output_types
+                                            .push(LogicalType::List(Box::new(LogicalType::Edge)));
+                                    } else {
+                                        output_types.push(LogicalType::Any);
+                                    }
                                 } else {
                                     return Err(Error::Internal(format!(
                                         "{}() argument must be a variable",
@@ -373,6 +425,111 @@ impl super::Planner {
         }
     }
 
+    /// Projections after a full flatten of a 2+ hop factorized chain.
+    ///
+    /// Hops stay unflat. Flatten once at RETURN, then either pass id columns
+    /// through or resolve nodes/edges/properties from those ids.
+    fn factorized_chain_return_project(
+        &self,
+        items: &[crate::query::plan::ReturnItem],
+        logical_input: &LogicalOperator,
+    ) -> Option<(Vec<ProjectExpr>, Vec<String>, Vec<LogicalType>, bool)> {
+        if !self.factorized_execution || self.profiling.get() {
+            return None;
+        }
+        let mut expand_root = logical_input;
+        while let LogicalOperator::Filter(filter) = expand_root {
+            expand_root = filter.input.as_ref();
+        }
+        let (hops, _) = Self::count_expand_chain(expand_root);
+        if hops < 2 {
+            return None;
+        }
+        let expands = Self::collect_expand_chain(expand_root);
+        let last_level = expands.len();
+        let mut parsed = Vec::with_capacity(items.len());
+        enum Kind {
+            Id,
+            Node,
+            Edge,
+            Property(String),
+        }
+        for item in items {
+            let (var, out_name, kind) = match &item.expression {
+                LogicalExpression::FunctionCall { name, args, .. }
+                    if name.eq_ignore_ascii_case("id") =>
+                {
+                    let LogicalExpression::Variable(v) = args.first()? else {
+                        return None;
+                    };
+                    (
+                        v.as_str(),
+                        output_column_name(item.alias.as_deref(), &item.expression),
+                        Kind::Id,
+                    )
+                }
+                LogicalExpression::Property { variable, property } => (
+                    variable.as_str(),
+                    output_column_name(item.alias.as_deref(), &item.expression),
+                    Kind::Property(property.clone()),
+                ),
+                LogicalExpression::Variable(v) if self.scalar_columns.borrow().contains(v) => (
+                    v.as_str(),
+                    output_column_name(item.alias.as_deref(), &item.expression),
+                    Kind::Id,
+                ),
+                LogicalExpression::Variable(v) if self.edge_columns.borrow().contains(v) => (
+                    v.as_str(),
+                    output_column_name(item.alias.as_deref(), &item.expression),
+                    Kind::Edge,
+                ),
+                LogicalExpression::Variable(v) => (
+                    v.as_str(),
+                    output_column_name(item.alias.as_deref(), &item.expression),
+                    Kind::Node,
+                ),
+                _ => return None,
+            };
+            let (level, col) = Self::factorized_level_for_var(&expands, var)?;
+            parsed.push((out_name, kind, level, col));
+        }
+        let deepest_only =
+            last_level >= 2 && parsed.iter().all(|(_, _, level, _)| *level == last_level);
+        let mut proj = Vec::with_capacity(parsed.len());
+        let mut names = Vec::with_capacity(parsed.len());
+        let mut types = Vec::with_capacity(parsed.len());
+        for (out_name, kind, level, col) in parsed {
+            let flat_col = if deepest_only || level == 0 {
+                col
+            } else {
+                1 + (level - 1) * 2 + col
+            };
+            match kind {
+                Kind::Id => {
+                    proj.push(ProjectExpr::Column(flat_col));
+                    types.push(LogicalType::Int64);
+                }
+                Kind::Node => {
+                    proj.push(ProjectExpr::NodeResolve { column: flat_col });
+                    types.push(LogicalType::Any);
+                }
+                Kind::Edge => {
+                    proj.push(ProjectExpr::EdgeResolve { column: flat_col });
+                    types.push(LogicalType::Any);
+                }
+                Kind::Property(property) => {
+                    proj.push(ProjectExpr::PropertyAccess {
+                        column: flat_col,
+                        property,
+                    });
+                    types.push(LogicalType::Any);
+                }
+            }
+            names.push(out_name);
+        }
+        Some((proj, names, types, deepest_only))
+    }
+
     /// Plans a project operator (for WITH clause).
     pub(super) fn plan_project(
         &self,
@@ -385,7 +542,7 @@ impl super::Planner {
                 let single_row_op: Box<dyn Operator> = Box::new(
                     grafeo_core::execution::operators::single_row::SingleRowOperator::new(),
                 );
-                (single_row_op, Vec::new())
+                self.maybe_profile(Ok((single_row_op, Vec::new())), project.input.as_ref())?
             } else {
                 self.plan_operator(&project.input)?
             };
@@ -419,11 +576,7 @@ impl super::Planner {
         }
 
         for projection in &project.projections {
-            // Determine the output column name (alias or expression string)
-            let col_name = projection
-                .alias
-                .clone()
-                .unwrap_or_else(|| expression_to_string(&projection.expression));
+            let col_name = output_column_name(projection.alias.as_deref(), &projection.expression);
 
             match &projection.expression {
                 LogicalExpression::Variable(name) => {
@@ -460,6 +613,39 @@ impl super::Planner {
                     output_types.push(value_to_logical_type(value));
                     // Literals are scalar values
                     self.scalar_columns.borrow_mut().insert(col_name.clone());
+                }
+                LogicalExpression::FunctionCall { name, args, .. } => {
+                    let path_col_idx = if (name.eq_ignore_ascii_case("edges")
+                        || name.eq_ignore_ascii_case("relationships"))
+                        && args.len() == 1
+                    {
+                        args.first().and_then(|arg| match arg {
+                            LogicalExpression::Variable(path_name) => {
+                                let path_col = format!("_path_edges_{path_name}");
+                                variable_columns.get(&path_col).copied()
+                            }
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(col_idx) = path_col_idx {
+                        // The path edge column is a generic Value list at
+                        // runtime, but its elements are edge IDs. Keeping
+                        // that schema lets ProjectOperator preserve the type
+                        // through subsequent aliases/pass-through columns.
+                        projections.push(ProjectExpr::Column(col_idx));
+                        output_types.push(LogicalType::List(Box::new(LogicalType::Edge)));
+                        self.scalar_columns.borrow_mut().insert(col_name.clone());
+                    } else {
+                        let filter_expr = self.convert_expression(&projection.expression)?;
+                        projections.push(ProjectExpr::Expression {
+                            expr: filter_expr,
+                            variable_columns: variable_columns.clone(),
+                        });
+                        output_types.push(LogicalType::Any);
+                        self.scalar_columns.borrow_mut().insert(col_name.clone());
+                    }
                 }
                 _ => {
                     // For complex expressions, use full expression evaluation
@@ -516,7 +702,10 @@ impl super::Planner {
     ///
     /// Changing this order needs a correctness argument, not just a benchmark.
     pub(super) fn plan_limit(&self, limit: &LimitOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
-        if !self.profiling.get()
+        let requires_exhaustion = self.limit_input_requires_exhaustion(&limit.input)?;
+
+        if !requires_exhaustion
+            && !self.profiling.get()
             && let LogicalOperator::Sort(sort) = limit.input.as_ref()
         {
             if let Some(result) = self.try_topk_rewrite(sort, &limit.count)? {
@@ -527,18 +716,38 @@ impl super::Planner {
             }
         }
 
-        // Phase 4e LIMIT pushdown: when this LIMIT sits directly above a
-        // Filter, push the count as a hint into leaf scan operators
-        // (currently `RangeScanOperator`). The outer `LimitOperator`
-        // wrapper still enforces correctness; the hint is purely an
-        // optimization that bounds the inner materialization step.
-        //
-        // Only fires when the input is `Filter` directly: any
-        // intermediate operator (Sort, Skip, Project, Distinct) needs
-        // full materialization and would produce wrong results if its
-        // child were truncated. Save-and-restore via `Cell::replace` so
-        // nested LIMITs don't leak hints across scopes.
-        let saved_hint = if matches!(limit.input.as_ref(), LogicalOperator::Filter(_)) {
+        // Only transparent scalar projection columns may carry the hint to
+        // a leaf scan or filter. Operators that change cardinality, order, or evaluation
+        // effects remain barriers. The filter itself admits the hint only when
+        // its range scan answers the entire predicate.
+        let mut input = limit.input.as_ref();
+        let simple = |expr: &LogicalExpression| {
+            matches!(
+                expr,
+                LogicalExpression::Variable(_)
+                    | LogicalExpression::Property { .. }
+                    | LogicalExpression::Literal(_)
+            )
+        };
+        loop {
+            input = match input {
+                LogicalOperator::Project(project)
+                    if project.projections.iter().all(|p| simple(&p.expression)) =>
+                {
+                    &project.input
+                }
+                LogicalOperator::Return(ret)
+                    if !ret.distinct && ret.items.iter().all(|p| simple(&p.expression)) =>
+                {
+                    &ret.input
+                }
+                _ => break,
+            };
+        }
+        let admits_hint = matches!(input, LogicalOperator::Filter(_))
+            || matches!(input, LogicalOperator::NodeScan(scan)
+                if scan.input.is_none() && scan.label.is_some());
+        let saved_hint = if !requires_exhaustion && admits_hint {
             Some(self.limit_hint.replace(Some(limit.count.value())))
         } else {
             None
@@ -552,23 +761,41 @@ impl super::Planner {
 
         let (input_op, columns) = plan_result?;
         let schema = self.derive_schema_from_columns(&columns);
-        Ok(crate::query::planner::common::build_limit(
-            input_op,
-            columns,
-            limit.count.value(),
-            schema,
-        ))
+        if requires_exhaustion {
+            Ok(crate::query::planner::common::build_exhaustive_limit(
+                input_op,
+                columns,
+                limit.count.value(),
+                schema,
+            ))
+        } else {
+            Ok(crate::query::planner::common::build_limit(
+                input_op,
+                columns,
+                limit.count.value(),
+                schema,
+            ))
+        }
     }
 
     /// Plans a SKIP operator.
     pub(super) fn plan_skip(&self, skip: &SkipOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        let count = skip.count.value();
         let (input_op, columns) = self.plan_operator(&skip.input)?;
+        if count == usize::MAX {
+            // FINISH is represented in the shared logical IR as SKIP usize::MAX.
+            // A dedicated drain must pull the mutation pipeline to exhaustion;
+            // Limit(0) would short-circuit before any side effect executes.
+            return Ok((
+                Box::new(grafeo_core::execution::operators::DrainOperator::new(
+                    input_op,
+                )),
+                Vec::new(),
+            ));
+        }
         let schema = self.derive_schema_from_columns(&columns);
         Ok(crate::query::planner::common::build_skip(
-            input_op,
-            columns,
-            skip.count.value(),
-            schema,
+            input_op, columns, count, schema,
         ))
     }
 
@@ -579,6 +806,19 @@ impl super::Planner {
     /// that case we inject a property projection BEFORE the Return so the sort
     /// key is available in the output columns.
     pub(super) fn plan_sort(&self, sort: &SortOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        let parts = self.plan_sort_input(sort)?;
+        let mut operator: Box<dyn Operator> =
+            Box::new(SortOperator::new(parts.input, parts.keys, parts.schema));
+        if parts.full_width > parts.columns.len() {
+            let projections = (0..parts.columns.len()).map(ProjectExpr::Column).collect();
+            let types = vec![LogicalType::Any; parts.columns.len()];
+            operator = Box::new(ProjectOperator::new(operator, projections, types));
+        }
+        Ok((operator, parts.columns))
+    }
+
+    /// Shared ORDER BY planning before either synchronous or scheduled execution.
+    pub(crate) fn plan_sort_input(&self, sort: &SortOp) -> Result<super::PlannedSortInput> {
         // Top-K rewrite is wired from plan_limit (the actual plan shape is
         // Limit-above-Sort), so plan_sort only handles the standard path.
 
@@ -659,7 +899,7 @@ impl super::Planner {
                         if already_in_return {
                             continue;
                         }
-                        let col_name = format!("{}_{}", variable, property);
+                        let col_name = resolved_column_name(&key.expression);
                         if seen.insert(col_name.clone()) {
                             augmented_items.push(crate::query::plan::ReturnItem {
                                 expression: key.expression.clone(),
@@ -669,7 +909,7 @@ impl super::Planner {
                         }
                     }
                     expr => {
-                        let col_name = format!("__expr_{expr:?}");
+                        let col_name = resolved_column_name(expr);
                         if seen.insert(col_name.clone()) {
                             augmented_items.push(crate::query::plan::ReturnItem {
                                 expression: expr.clone(),
@@ -710,29 +950,7 @@ impl super::Planner {
             .map(|(i, name)| (name.clone(), i))
             .collect();
 
-        // When the sort input is a Return, some sort key expressions may
-        // already be computed by the Return under an alias. For example,
-        // RETURN caller.name AS caller ORDER BY caller.name: the property
-        // access is already materialized in column "caller". Register the
-        // sort-style name ("caller_name") so the loop below resolves to the
-        // existing column instead of adding a broken extra PropertyAccess
-        // on a non-entity column.
-        if let LogicalOperator::Return(ret) = sort.input.as_ref() {
-            for item in &ret.items {
-                if let LogicalExpression::Property { variable, property } = &item.expression {
-                    let sort_col_name = format!("{variable}_{property}");
-                    if !variable_columns.contains_key(&sort_col_name) {
-                        let output_name = item
-                            .alias
-                            .clone()
-                            .unwrap_or_else(|| expression_to_string(&item.expression));
-                        if let Some(&col_idx) = variable_columns.get(&output_name) {
-                            variable_columns.insert(sort_col_name, col_idx);
-                        }
-                    }
-                }
-            }
-        }
+        register_return_sort_aliases(sort.input.as_ref(), &mut variable_columns);
 
         // Collect extra projections in a single ordered list so that column
         // index assignment matches the order they are added to the ProjectOperator.
@@ -754,7 +972,7 @@ impl super::Planner {
         for key in &sort.keys {
             match &key.expression {
                 LogicalExpression::Property { variable, property } => {
-                    let col_name = format!("{}_{}", variable, property);
+                    let col_name = resolved_column_name(&key.expression);
                     if !variable_columns.contains_key(&col_name) {
                         extra_projections.push(SortExtraProjection::Property {
                             variable: variable.clone(),
@@ -773,27 +991,24 @@ impl super::Planner {
                     // If this is a vector/text score function and the scan already projected
                     // a score column, register a direct alias so resolve_sort_expression
                     // picks it up without injecting a new projection.
+                    let col_name = resolved_column_name(&key.expression);
                     if let Some(score_col) =
                         self.find_projected_score(&key.expression, &input_columns)
                     {
-                        let col_name = format!("__expr_{:?}", key.expression);
                         if !variable_columns.contains_key(&col_name)
                             && let Some(&existing_idx) = variable_columns.get(&score_col)
                         {
                             variable_columns.insert(col_name, existing_idx);
                         }
-                    } else {
-                        let col_name = format!("__expr_{:?}", key.expression);
-                        if !variable_columns.contains_key(&col_name) {
-                            let filter_expr = self.convert_expression(&key.expression)?;
-                            extra_projections.push(SortExtraProjection::Expression {
-                                filter_expr,
-                                col_name: col_name.clone(),
-                            });
-                            variable_columns.insert(col_name, next_col_idx);
-                            next_col_idx += 1;
-                            expr_extra_count += 1;
-                        }
+                    } else if !variable_columns.contains_key(&col_name) {
+                        let filter_expr = self.convert_expression(&key.expression)?;
+                        extra_projections.push(SortExtraProjection::Expression {
+                            filter_expr,
+                            col_name: col_name.clone(),
+                        });
+                        variable_columns.insert(col_name, next_col_idx);
+                        next_col_idx += 1;
+                        expr_extra_count += 1;
                     }
                 }
             }
@@ -886,28 +1101,18 @@ impl super::Planner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let output_schema = self.derive_schema_from_columns(&output_columns);
-        let mut operator: Box<dyn Operator> =
-            Box::new(SortOperator::new(input_op, physical_keys, output_schema));
-
-        // Strip extra columns injected for ORDER BY resolution: both pre-Return
-        // property projections (sort_extra_count) and synthetic __expr_ columns
-        // for complex expressions like labels(n)[0] or type(r).
-        let total_extra = sort_extra_count + expr_extra_count;
-        if total_extra > 0 {
-            let keep_count = output_columns.len() - total_extra;
-            let strip_projections: Vec<ProjectExpr> =
-                (0..keep_count).map(ProjectExpr::Column).collect();
-            let strip_types: Vec<LogicalType> = (0..keep_count).map(|_| LogicalType::Any).collect();
-            operator = Box::new(ProjectOperator::new(
-                operator,
-                strip_projections,
-                strip_types,
-            ));
-            output_columns.truncate(keep_count);
-        }
-
-        Ok((operator, output_columns))
+        let schema = self.derive_schema_from_columns(&output_columns);
+        let full_width = output_columns.len();
+        // Hidden keys remain in the physical input and are stripped only after
+        // sorting, including materialized volatile expressions.
+        output_columns.truncate(full_width - sort_extra_count - expr_extra_count);
+        Ok(super::PlannedSortInput {
+            input: input_op,
+            keys: physical_keys,
+            schema,
+            columns: output_columns,
+            full_width,
+        })
     }
 
     /// Resolves a sort expression to a column index, using projected property columns.
@@ -926,16 +1131,18 @@ impl super::Planner {
     /// Derives a schema from column names using the planner's type tracking.
     ///
     /// Defaults to `Any` (safe for all value types: scalars, maps, property
-    /// projections, etc.). Columns explicitly tracked in `edge_columns` get
-    /// `Edge` for compact `Vec<EdgeId>` storage. Mutation operators that add
+    /// projections, etc.). Unresolved columns tracked in `edge_columns` get
+    /// `Edge` for compact `Vec<EdgeId>` storage. Scalar or materialized outputs
+    /// take precedence over stale edge tracking. Mutation operators that add
     /// new entity-ID columns (CREATE, MERGE) should append `Node`/`Edge`
     /// explicitly after calling this for pass-through columns.
     pub(super) fn derive_schema_from_columns(&self, columns: &[String]) -> Vec<LogicalType> {
         let edges = self.edge_columns.borrow();
+        let scalars = self.scalar_columns.borrow();
         columns
             .iter()
             .map(|name| {
-                if edges.contains(name) {
+                if edges.contains(name) && !scalars.contains(name) {
                     LogicalType::Edge
                 } else {
                     LogicalType::Any
@@ -1085,7 +1292,7 @@ impl super::Planner {
 
         let vector_scan = super::VectorScanOp {
             variable: scan_var.to_string(),
-            index_name: Some(format!("{}:{}", label, property)),
+            index_name: Some(grafeo_core::graph::lpg::encode_index_key(label, &property)),
             property,
             label: Some(label.to_string()),
             query_vector,
@@ -1235,10 +1442,10 @@ impl super::Planner {
     /// Attempts to rewrite `Limit` over `Sort` into a single [`TopKOperator`].
     ///
     /// Phase 1: heap-based, O(k) memory, accepts any input shape but bails
-    /// on the augmenting-projection case (see
-    /// [`sort_needs_augmenting_projection`]). Called from
-    /// [`Self::plan_limit`] when the input is a `Sort`, after the more
-    /// specific vector/text rewrite ([`Self::try_topk_rewrite`]).
+    /// when the sort keys cannot be resolved against the columns the input
+    /// subtree will produce. Called from [`Self::plan_limit`] when the input
+    /// is a `Sort`, after the more specific vector/text rewrite
+    /// ([`Self::try_topk_rewrite`]).
     ///
     /// PROFILE-mode plans skip this rewrite via the gate in `plan_limit`:
     /// `build_profile_tree` walks the logical tree expecting one entry per
@@ -1250,13 +1457,36 @@ impl super::Planner {
     ///
     /// 1. `count` is not a literal (parameter `LIMIT $k` falls through).
     /// 2. `count` is zero (no rewrite needed).
-    /// 3. Sort needs an augmenting projection (`plan_sort` handles it).
-    /// 4. Any sort key fails to resolve against the planned input columns.
+    /// 3. The input subtree's output columns can't be predicted (current scope:
+    ///    only Return is supported; anything else falls through).
+    /// 4. Any sort key fails to resolve against the predicted columns.
     ///
-    /// Otherwise plans the inner subtree as-is (reusing filter pushdown,
-    /// expand-chain fusion, NodeList absorption) and wraps it in a
-    /// `TopKOperator`. `derive_schema_from_columns` is the same helper
-    /// `plan_limit`'s unfused path uses.
+    /// ## Why predict first, plan second
+    ///
+    /// Earlier shapes of this function ran `plan_operator(&sort.input)` first
+    /// and only resolved sort keys against the result. That call has side
+    /// effects on `Planner::scalar_columns` and `Planner::edge_columns` —
+    /// `plan_return_projection` registers each output column as scalar so an
+    /// enclosing Apply doesn't try to re-resolve it as a NodeId. When the
+    /// resolve step then failed and we returned `Ok(None)`, the caller fell
+    /// through to `plan_sort`'s unfused path and *re-planned the same Return*,
+    /// but now with the polluted state — and `plan_return_projection`'s
+    /// `Variable(name)` arm flips from `NodeResolve` to a raw `Column`
+    /// passthrough when it sees the name already in `scalar_columns`. Result:
+    /// `MATCH (n) RETURN n ORDER BY <complex> LIMIT k` returned raw `Int64`
+    /// NodeIds instead of resolved maps (issues #335 and #347).
+    ///
+    /// We now resolve sort keys against *predicted* columns derived from
+    /// `ret.items` alone — `output_column_name` is the single source of truth
+    /// — without touching the planner. Only when resolution succeeds do we
+    /// plan for real, so the canonical plan is built exactly once and no
+    /// shared planner state is mutated speculatively.
+    ///
+    /// `sort_needs_augmenting_projection` is no longer a gate here: the
+    /// predictive resolve subsumes it (a sort key that needs augmenting will
+    /// never be in the predicted column set, so resolution fails and we bail).
+    /// `plan_sort` still uses that function to choose between pre-Return and
+    /// post-Return augmenting, which is a separate concern.
     fn try_heap_topk_rewrite(
         &self,
         sort: &SortOp,
@@ -1269,15 +1499,49 @@ impl super::Planner {
         if k == 0 {
             return Ok(None);
         }
-        if sort_needs_augmenting_projection(sort) {
+
+        // Only a bare Return is predicted/fused. Other shapes (Filter/Project/
+        // Skip wrapping Return, etc.) fall through, which is always safe.
+        let LogicalOperator::Return(ret) = sort.input.as_ref() else {
+            return Ok(None);
+        };
+        // RETURN * expands from input columns inside plan_return_projection;
+        // its output count is unknown without planning the input — skip.
+        if ret.items.len() == 1
+            && matches!(&ret.items[0].expression, LogicalExpression::Variable(n) if n == "*")
+        {
             return Ok(None);
         }
 
-        let (input_op, columns) = self.plan_operator(&sort.input)?;
-
-        let Ok(physical_keys) = resolve_logical_to_physical_keys(&sort.keys, &columns) else {
+        // Match each sort key to a projected column by EXPRESSION identity, not
+        // formatted name — a user alias must never satisfy a sort key it does
+        // not actually project. If any key is absent, fall through with NO
+        // planner state mutated, to the (correct) unfused sort.
+        let projected: Vec<(LogicalExpression, usize)> = ret
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (item.expression.clone(), i))
+            .collect();
+        let Some(physical_keys) = resolve_sort_keys_structurally(&sort.keys, &projected) else {
             return Ok(None);
         };
+
+        // Predicted output column names (for the operator schema + the
+        // post-plan drift check below).
+        let predicted_columns: Vec<String> = ret
+            .items
+            .iter()
+            .map(|item| output_column_name(item.alias.as_deref(), &item.expression))
+            .collect();
+
+        // Commit: plan the input for real. State mutations now happen exactly
+        // once, as part of the canonical plan we are about to return.
+        let (input_op, columns) = self.plan_operator(&sort.input)?;
+        debug_assert_eq!(
+            columns, predicted_columns,
+            "predict_subtree_columns drifted from plan_operator's output columns"
+        );
 
         let schema = self.derive_schema_from_columns(&columns);
         let op: Box<dyn Operator> = Box::new(grafeo_core::execution::operators::TopKOperator::new(
@@ -1290,56 +1554,89 @@ impl super::Planner {
     }
 }
 
-/// Resolves logical sort keys to physical sort keys for `TopKOperator`.
-///
-/// For each logical key:
-///   - Looks up the column index via `common::resolve_expression_to_column`.
-///   - Maps `SortOrder` → physical `SortDirection`.
-///   - Maps `Option<NullsOrdering>` → physical `NullOrder` (default `NullsLast`,
-///     matching `SortKey::ascending`'s default).
-///
-/// Returns `Err` if any key references a column not present in `columns`.
-/// Callers translate that to `Ok(None)` to fall through to the unfused path.
-fn resolve_logical_to_physical_keys(
+/// Registers retained variable/property expressions under the names ORDER BY
+/// resolves, even when RETURN renamed their output columns. For example,
+/// `RETURN i AS value ORDER BY -i` still evaluates `i` from the value column;
+/// `RETURN v.p AS value ORDER BY v.p` resolves the projected property directly.
+/// An existing output name takes precedence over an original expression name.
+fn register_return_sort_aliases(
+    sort_input: &LogicalOperator,
+    variable_columns: &mut HashMap<String, usize>,
+) {
+    let LogicalOperator::Return(ret) = sort_input else {
+        return;
+    };
+    for item in &ret.items {
+        if matches!(
+            &item.expression,
+            LogicalExpression::Variable(_) | LogicalExpression::Property { .. }
+        ) {
+            let sort_col_name = resolved_column_name(&item.expression);
+            if variable_columns.contains_key(&sort_col_name) {
+                continue;
+            }
+            let output_name = output_column_name(item.alias.as_deref(), &item.expression);
+            if let Some(&col_idx) = variable_columns.get(&output_name) {
+                variable_columns.insert(sort_col_name, col_idx);
+            }
+        }
+    }
+}
+
+/// Conservative structural equality for the two expression shapes the TopK
+/// rewrite can fuse on. Anything else returns false → the rewrite bails to the
+/// (correct) unfused sort. Deliberately does NOT compare aliases or formatted
+/// names, which is what let a user alias collide with a synthetic
+/// `{var}_{prop}` column name and fuse a sort on the wrong column.
+fn sort_key_matches_projection(key: &LogicalExpression, projected: &LogicalExpression) -> bool {
+    match (key, projected) {
+        (LogicalExpression::Variable(a), LogicalExpression::Variable(b)) => a == b,
+        (
+            LogicalExpression::Property {
+                variable: kv,
+                property: kp,
+            },
+            LogicalExpression::Property {
+                variable: pv,
+                property: pp,
+            },
+        ) => kv == pv && kp == pp,
+        _ => false,
+    }
+}
+
+/// Resolves sort keys to physical column indices by structural match against
+/// the projected expressions. Returns `None` (→ skip the rewrite, fall through
+/// to the correct unfused sort) if any key is not structurally present among
+/// the projected columns.
+fn resolve_sort_keys_structurally(
     keys: &[crate::query::plan::SortKey],
-    columns: &[String],
-) -> Result<Vec<grafeo_core::execution::operators::SortKey>> {
+    projected: &[(LogicalExpression, usize)],
+) -> Option<Vec<grafeo_core::execution::operators::SortKey>> {
     use crate::query::plan::{NullsOrdering, SortOrder};
     use grafeo_core::execution::operators::{NullOrder, SortDirection, SortKey as PhysSortKey};
-    use std::collections::HashMap;
-
-    let variable_columns: HashMap<String, usize> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.clone(), i))
-        .collect();
 
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        let col = crate::query::planner::common::resolve_expression_to_column(
-            &key.expression,
-            &variable_columns,
-            " for ORDER BY",
-        )?;
-
+        let column = projected
+            .iter()
+            .find(|(expr, _)| sort_key_matches_projection(&key.expression, expr))
+            .map(|(_, idx)| *idx)?;
         let direction = match key.order {
             SortOrder::Ascending => SortDirection::Ascending,
             SortOrder::Descending => SortDirection::Descending,
         };
-
         let null_order = match key.nulls {
             Some(NullsOrdering::First) => NullOrder::NullsFirst,
-            Some(NullsOrdering::Last) => NullOrder::NullsLast,
-            None => NullOrder::NullsLast, // default, matches plan_sort
+            Some(NullsOrdering::Last) | None => NullOrder::NullsLast,
         };
-
         out.push(PhysSortKey {
-            column: col,
+            column,
             direction,
             null_order,
         });
     }
-    Ok(out)
+    Some(out)
 }
 
 /// Collects variable references from an expression tree.
@@ -1366,6 +1663,22 @@ fn collect_vars(expr: &LogicalExpression, out: &mut Vec<String>) {
             collect_vars(right, out);
         }
         LogicalExpression::Unary { operand, .. } => collect_vars(operand, out),
+        LogicalExpression::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand {
+                collect_vars(o, out);
+            }
+            for (when, then) in when_clauses {
+                collect_vars(when, out);
+                collect_vars(then, out);
+            }
+            if let Some(e) = else_clause {
+                collect_vars(e, out);
+            }
+        }
         _ => {}
     }
 }
@@ -1373,9 +1686,16 @@ fn collect_vars(expr: &LogicalExpression, out: &mut Vec<String>) {
 /// True if `sort` requires injecting extra projection columns before sorting.
 ///
 /// Mirrors the logic at the top of `plan_sort`: when the sort input is a
-/// `Return` and any sort key references a variable that the RETURN clause has
-/// projected away, the planner must augment the Return with extra columns so
-/// the sort key is available at compare time.
+/// `Return` and any sort key is not fully materialised by that Return, the
+/// planner must augment the Return with extra columns so the sort key is
+/// available at compare time.
+///
+/// Two cases trigger augmenting:
+/// - Sort key `Property { v, p }` where Return does not explicitly project
+///   that property (e.g. `RETURN n ORDER BY n.title`: "n" is in Return but
+///   "n_title" is not a column, returning a full node is not enough).
+/// - Sort key whose expression references a variable `v` that is absent
+///   from Return entirely (covers wrapped references like `CASE n.tier ...`).
 ///
 /// Used by both `plan_sort` (which knows how to inject the augmenting
 /// projection) and `try_heap_topk_rewrite` (which doesn't, and bails out so
@@ -1384,18 +1704,33 @@ pub(super) fn sort_needs_augmenting_projection(sort: &SortOp) -> bool {
     let LogicalOperator::Return(ret) = sort.input.as_ref() else {
         return false;
     };
-    sort.keys.iter().any(|key| {
-        let mut vars = Vec::new();
-        collect_vars(&key.expression, &mut vars);
-        vars.iter().any(|variable| {
+    sort.keys.iter().any(|key| match &key.expression {
+        LogicalExpression::Property { variable, property } => {
+            // Sort key is v.p. Return satisfies it only if it explicitly
+            // projects Property{v,p}. Returning Variable(v) as a full node
+            // is not sufficient: the sort column "v_p" does not exist in
+            // the output, so augmenting is needed.
             !ret.items.iter().any(|item| {
-                item.alias.as_deref() == Some(variable)
-                    || matches!(
-                        &item.expression,
-                        LogicalExpression::Variable(v) if v == variable
-                    )
+                matches!(
+                    &item.expression,
+                    LogicalExpression::Property { variable: v, property: p }
+                    if v == variable && p == property
+                )
             })
-        })
+        }
+        _ => {
+            let mut vars = Vec::new();
+            collect_vars(&key.expression, &mut vars);
+            vars.iter().any(|variable| {
+                !ret.items.iter().any(|item| {
+                    item.alias.as_deref() == Some(variable)
+                        || matches!(
+                            &item.expression,
+                            LogicalExpression::Variable(v) if v == variable
+                        )
+                })
+            })
+        }
     })
 }
 
@@ -1441,4 +1776,37 @@ pub(super) fn text_score_column_name(
         variable,
         score_query_hash(query)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use grafeo_core::graph::NullGraphStore;
+
+    use super::{Arc, LogicalType};
+
+    #[test]
+    fn materialized_edge_schema_overrides_stale_entity_tracking() {
+        let planner = super::super::Planner::new(Arc::new(NullGraphStore));
+        planner
+            .edge_columns
+            .borrow_mut()
+            .extend(["raw".into(), "resolved".into()]);
+        planner
+            .scalar_columns
+            .borrow_mut()
+            .extend(["resolved".into(), "scalar".into()]);
+        let columns = ["raw", "resolved", "scalar", "unknown"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            planner.derive_schema_from_columns(&columns),
+            vec![
+                LogicalType::Edge,
+                LogicalType::Any,
+                LogicalType::Any,
+                LogicalType::Any
+            ],
+        );
+    }
 }

@@ -7,6 +7,8 @@
 //! - Compound predicates with remaining non-equality parts
 //! - Non-pushable expressions (kept as generic FilterOperator)
 
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
 
@@ -67,7 +69,14 @@ fn compound_equality_pushdown_without_index() {
 #[test]
 fn equality_filter_pushdown_with_index() {
     let db = setup();
-    db.create_property_index("name");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "name".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
     let session = db.session();
 
     let result = session
@@ -324,7 +333,14 @@ fn reversed_range_ge_literal_on_left() {
 #[test]
 fn property_index_with_remaining_predicate() {
     let db = setup();
-    db.create_property_index("city");
+    db.create_index(grafeo_engine::CreateIndexRequest {
+        graph: Default::default(),
+        name: None,
+        label: None,
+        property: "city".into(),
+        kind: grafeo_engine::IndexCreateKind::Property,
+    })
+    .expect("create property index");
     let session = db.session();
 
     // Index pushes equality on city, remaining range predicate on age
@@ -469,4 +485,311 @@ fn committed_tx_nodes_visible_in_pushdown() {
         .unwrap();
     assert_eq!(result.rows().len(), 1);
     assert_eq!(result.rows()[0][0], Value::from("Frank"));
+}
+
+#[test]
+fn conjuncts_split_and_anchor_on_their_own_scans() {
+    // MATCH (a:Person),(b:City) WHERE a.name = 'Ann' AND b.name = 'Rome'
+    // The conjunction must be split so each predicate anchors on its own scan,
+    // instead of one combined AND filter sitting above a cartesian product.
+    let db = GrafeoDB::new_in_memory();
+    let s = db.session();
+    s.execute("CREATE (:Person {name: 'Ann'})").unwrap();
+    s.execute("CREATE (:Person {name: 'Bob'})").unwrap();
+    s.execute("CREATE (:City {name: 'Rome'})").unwrap();
+    s.execute("CREATE (:City {name: 'Oslo'})").unwrap();
+
+    // Correctness is unchanged: exactly one (Ann, Rome) row.
+    let r = s
+        .execute("MATCH (a:Person),(b:City) WHERE a.name = 'Ann' AND b.name = 'Rome' RETURN a.name, b.name")
+        .unwrap();
+    assert_eq!(r.row_count(), 1);
+
+    // Structure: the combined "And" filter is gone; conjuncts are split.
+    let plan = s
+        .execute("EXPLAIN MATCH (a:Person),(b:City) WHERE a.name = 'Ann' AND b.name = 'Rome' RETURN a.name, b.name")
+        .unwrap();
+    let text = format!("{:?}", plan.rows());
+    assert!(
+        !text.contains(" And "),
+        "conjuncts should be split into per-scan filters, not kept as one AND; plan:\n{text}"
+    );
+}
+
+/// A LIMIT directly over a filter stack pushed its count into the range scan
+/// under a residual filter, so the scan stopped before the residual found a
+/// match: this query returned no row.
+#[cfg(feature = "cypher")]
+#[test]
+fn limit_is_not_pushed_into_a_range_scan_under_a_residual_filter() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute(
+            "CREATE (:Node {id: 'n_0', age: 0, tag: 'early'}), \
+                    (:Node {id: 'n_1', age: 1, tag: 'late'})",
+        )
+        .unwrap();
+
+    for query in [
+        "MATCH (n:Node) WHERE n.tag = 'late' AND n.age >= 0 WITH * LIMIT 1 RETURN n.id",
+        "MATCH (n:Node) WHERE n.age >= 0 AND n.tag = 'late' WITH * LIMIT 1 RETURN n.id",
+    ] {
+        let result = session.execute_cypher(query).unwrap();
+        assert_eq!(
+            result.rows(),
+            [[Value::from("n_1")]],
+            "{query} must find the late node"
+        );
+    }
+    // The pushdown still applies where the range scan answers the whole filter.
+    let result = session
+        .execute_cypher("MATCH (n:Node) WHERE n.age >= 0 WITH * LIMIT 1 RETURN n.id")
+        .unwrap();
+    assert_eq!(result.rows().len(), 1);
+}
+
+// ── GQL range/LIMIT contracts ──
+
+#[test]
+fn gql_range_bounds_preserve_order_and_inclusivity() {
+    let db = setup();
+    let session = db.session();
+
+    let cases = [
+        (
+            "MATCH (n:Person) WHERE n.age >= 25 AND n.age <= 35 \
+             RETURN n.name ORDER BY n.name",
+            vec![
+                vec![Value::from("Alix")],
+                vec![Value::from("Eve")],
+                vec![Value::from("Gus")],
+                vec![Value::from("Harm")],
+            ],
+        ),
+        (
+            "MATCH (n:Person) WHERE n.age <= 35 AND n.age >= 25 \
+             RETURN n.name ORDER BY n.name",
+            vec![
+                vec![Value::from("Alix")],
+                vec![Value::from("Eve")],
+                vec![Value::from("Gus")],
+                vec![Value::from("Harm")],
+            ],
+        ),
+        (
+            "MATCH (n:Person) WHERE n.age > 25 AND n.age < 35 \
+             RETURN n.name ORDER BY n.name",
+            vec![vec![Value::from("Alix")], vec![Value::from("Eve")]],
+        ),
+        (
+            "MATCH (n:Person) WHERE n.age < 35 AND n.age > 25 \
+             RETURN n.name ORDER BY n.name",
+            vec![vec![Value::from("Alix")], vec![Value::from("Eve")]],
+        ),
+    ];
+
+    for (query, expected) in cases {
+        assert_eq!(session.execute(query).unwrap().rows(), expected, "{query}");
+    }
+}
+
+#[test]
+fn gql_return_limit_keeps_late_residual_match() {
+    let db = GrafeoDB::new_in_memory();
+    let session = db.session();
+    session
+        .execute(
+            "CREATE (:Node {id: 'n_0', age: 0, tag: 'early'}), \
+                    (:Node {id: 'n_1', age: 1, tag: 'late'})",
+        )
+        .unwrap();
+
+    let result = session
+        .execute(
+            "MATCH (n:Node) WHERE n.tag = 'late' AND n.age >= 0 \
+             RETURN n.id LIMIT 1",
+        )
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::from("n_1")]]);
+}
+
+#[test]
+fn gql_order_by_blocks_range_limit_pushdown() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute(
+            "MATCH (n:Person) WHERE n.age >= 25 \
+             RETURN n.name ORDER BY n.name LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows(),
+        [[Value::from("Alix")], [Value::from("Dave")]]
+    );
+}
+
+#[test]
+fn gql_distinct_blocks_range_limit_pushdown() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute(
+            "MATCH (n:Person) WHERE n.age >= 25 \
+             RETURN DISTINCT n.city LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows(),
+        [[Value::from("NYC")], [Value::from("London")]]
+    );
+}
+
+#[test]
+fn gql_skip_blocks_range_limit_pushdown() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute(
+            "MATCH (n:Person) WHERE n.age >= 25 \
+             RETURN n.name SKIP 1 LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::from("Gus")], [Value::from("Harm")]]);
+}
+
+#[test]
+fn gql_transaction_own_property_update_is_visible_to_range_filter() {
+    let db = setup();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    session
+        .execute("MATCH (n:Person {name: 'Gus'}) SET n.age = 50")
+        .unwrap();
+
+    let result = session
+        .execute("MATCH (n:Person) WHERE n.age >= 50 RETURN n.name")
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::from("Gus")]]);
+    session.rollback().unwrap();
+}
+
+// ── GQL label-scan LIMIT contracts ──
+
+#[test]
+fn gql_label_limit_does_not_truncate_count() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute("MATCH (n:Person) RETURN count(n) LIMIT 1")
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::Int64(5)]]);
+}
+
+#[test]
+fn gql_label_limit_preserves_order_by() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute("MATCH (n:Person) RETURN n.name ORDER BY n.name LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        result.rows(),
+        [[Value::from("Alix")], [Value::from("Dave")]]
+    );
+}
+
+#[test]
+fn gql_label_limit_preserves_distinct() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute("MATCH (n:Person) RETURN DISTINCT n.city LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        result.rows(),
+        [[Value::from("NYC")], [Value::from("London")]]
+    );
+}
+
+#[test]
+fn gql_label_limit_preserves_skip() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute("MATCH (n:Person) RETURN n.name SKIP 1 LIMIT 2")
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::from("Gus")], [Value::from("Harm")]]);
+}
+
+#[test]
+fn gql_label_limit_keeps_late_residual_match() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute("MATCH (n:Person) WHERE n.city = 'Paris' RETURN n.name LIMIT 1")
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::from("Eve")]]);
+}
+
+#[test]
+fn gql_label_scan_sees_own_create_and_delete() {
+    let db = setup();
+    let mut session = db.session();
+    session.begin_transaction().unwrap();
+    session
+        .execute("CREATE (:Person {name: 'Frank', city: 'Berlin', age: 50})")
+        .unwrap();
+
+    let result = session
+        .execute("MATCH (n:Person) RETURN n.name LIMIT 6")
+        .unwrap();
+    assert_eq!(
+        result.rows(),
+        [
+            [Value::from("Alix")],
+            [Value::from("Gus")],
+            [Value::from("Harm")],
+            [Value::from("Dave")],
+            [Value::from("Eve")],
+            [Value::from("Frank")],
+        ]
+    );
+    let result = session
+        .execute("MATCH (n:Person) RETURN count(n) LIMIT 1")
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::Int64(6)]]);
+
+    session
+        .execute("MATCH (n:Person) WHERE n.name = 'Frank' DELETE n")
+        .unwrap();
+    let result = session
+        .execute("MATCH (n:Person) RETURN n.name LIMIT 6")
+        .unwrap();
+    assert_eq!(
+        result.rows(),
+        [
+            [Value::from("Alix")],
+            [Value::from("Gus")],
+            [Value::from("Harm")],
+            [Value::from("Dave")],
+            [Value::from("Eve")],
+        ]
+    );
+    let result = session
+        .execute("MATCH (n:Person) RETURN count(n) LIMIT 1")
+        .unwrap();
+    assert_eq!(result.rows(), [[Value::Int64(5)]]);
+    session.rollback().unwrap();
+}
+
+#[test]
+fn gql_bare_label_limit_zero_is_empty() {
+    let db = setup();
+    let result = db
+        .session()
+        .execute("MATCH (n:Person) RETURN n.name LIMIT 0")
+        .unwrap();
+    assert!(result.rows().is_empty());
 }

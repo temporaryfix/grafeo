@@ -100,6 +100,8 @@ pub type QueryParams = HashMap<String, Value>;
 /// # }
 /// ```
 pub struct QueryProcessor {
+    result_buffer: Arc<grafeo_common::memory::buffer::BufferManager>,
+    result_limits: super::ResultLimits,
     /// LPG store for property graph queries.
     #[cfg(feature = "lpg")]
     lpg_store: Arc<LpgStore>,
@@ -114,7 +116,10 @@ pub struct QueryProcessor {
     /// Query optimizer.
     optimizer: Optimizer,
     /// Current transaction context (if any).
-    transaction_context: Option<(EpochId, TransactionId)>,
+    /// Explicit MVCC cut plus an optional active transaction. `Some((epoch,
+    /// None))` is a historical read outside a transaction and must not be
+    /// collapsed to the current epoch.
+    transaction_context: Option<(EpochId, Option<TransactionId>)>,
     /// RDF store for triple pattern queries (optional).
     #[cfg(feature = "triple-store")]
     rdf_store: Option<Arc<grafeo_core::graph::rdf::RdfStore>>,
@@ -136,6 +141,10 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            result_buffer: grafeo_common::memory::buffer::BufferManager::with_budget(
+                64 * 1024 * 1024,
+            ),
+            result_limits: super::ResultLimits::default(),
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         }
@@ -159,6 +168,10 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            result_buffer: grafeo_common::memory::buffer::BufferManager::with_budget(
+                64 * 1024 * 1024,
+            ),
+            result_limits: super::ResultLimits::default(),
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         }
@@ -184,6 +197,10 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            result_buffer: grafeo_common::memory::buffer::BufferManager::with_budget(
+                64 * 1024 * 1024,
+            ),
+            result_limits: super::ResultLimits::default(),
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         })
@@ -209,9 +226,29 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            result_buffer: grafeo_common::memory::buffer::BufferManager::with_budget(
+                64 * 1024 * 1024,
+            ),
+            result_limits: super::ResultLimits::default(),
             #[cfg(feature = "triple-store")]
             rdf_store: None,
         })
+    }
+
+    /// Sets row/byte output limits, further constrained by this processor's grant.
+    #[must_use]
+    pub fn with_result_limits(mut self, limits: super::ResultLimits) -> Self {
+        self.result_limits = limits;
+        self
+    }
+
+    fn result_resources(&self) -> Result<grafeo_core::execution::QueryResourceContext> {
+        grafeo_core::execution::QueryResourceContext::new(Arc::clone(&self.result_buffer)).map_err(
+            |error| {
+                Error::Storage(grafeo_common::utils::error::StorageError::Full)
+                    .with_context(error.to_string())
+            },
+        )
     }
 
     /// Sets the transaction context for MVCC visibility.
@@ -223,7 +260,7 @@ impl QueryProcessor {
         viewing_epoch: EpochId,
         transaction_id: TransactionId,
     ) -> Self {
-        self.transaction_context = Some((viewing_epoch, transaction_id));
+        self.transaction_context = Some((viewing_epoch, Some(transaction_id)));
         self
     }
 
@@ -289,6 +326,14 @@ impl QueryProcessor {
         language: QueryLanguage,
         params: Option<&QueryParams>,
     ) -> Result<QueryResult> {
+        let resources = self.result_resources()?;
+        // Keep the selected MVCC cut alive from qualification through the
+        // final pull. When this processor shares a TransactionManager with a
+        // database, commits and GC take the matching write side. A detached
+        // raw-store processor has no external publication owner, so callers
+        // remain responsible for coordinating direct store mutation/GC.
+        let _publication = self.transaction_manager.publication().read();
+
         #[cfg(not(target_arch = "wasm32"))]
         let start_time = std::time::Instant::now();
 
@@ -317,44 +362,83 @@ impl QueryProcessor {
         // 4. Optimize the plan
         let optimized_plan = self.optimizer.optimize(logical_plan)?;
 
+        #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+        let procedure_effects = crate::query::procedure_effect::analyze_procedure_effects(
+            &optimized_plan.root,
+            self.catalog.as_ref(),
+        )?;
+        #[cfg(all(any(feature = "lpg", feature = "algos"), not(feature = "gql")))]
+        let procedure_effects =
+            crate::procedures::analyze_builtin_procedure_effects(&optimized_plan.root)?;
+        #[cfg(any(feature = "lpg", feature = "algos"))]
+        if procedure_effects.contains_mutating_call {
+            return Err(Error::Transaction(
+                grafeo_common::utils::error::TransactionError::InvalidState(
+                    "write-capable procedures require a Session-owned transaction and authorization framing"
+                        .to_string(),
+                ),
+            ));
+        }
+
+        #[cfg(any(feature = "lpg", feature = "algos"))]
+        let effective_mutations = procedure_effects.mutates;
+        #[cfg(not(any(feature = "lpg", feature = "algos")))]
+        let effective_mutations = optimized_plan.root.has_mutations();
+
         // 4a. EXPLAIN: annotate pushdown hints and return the plan tree
         if optimized_plan.explain {
             let mut plan = optimized_plan;
             annotate_pushdown_hints(&mut plan.root, self.graph_store.as_ref());
-            return Ok(explain_result(&plan));
+            return explain_result(&plan, resources, self.result_limits);
         }
 
         // 5. Convert to physical plan with transaction context
         // Read-only fast path: safe when no mutations AND no active transaction
         // (an active transaction may have prior uncommitted writes from earlier statements)
-        let is_read_only =
-            !optimized_plan.root.has_mutations() && self.transaction_context.is_none();
+        let is_read_only = !effective_mutations
+            && self
+                .transaction_context
+                .is_none_or(|(_, transaction_id)| transaction_id.is_none());
         let planner = if let Some((epoch, transaction_id)) = self.transaction_context {
             Planner::with_context(
                 Arc::clone(&self.graph_store),
                 self.write_store.as_ref().map(Arc::clone),
                 Arc::clone(&self.transaction_manager),
-                Some(transaction_id),
+                transaction_id,
                 epoch,
             )
         } else {
+            // A detached processor may wrap a store that has already advanced
+            // independently of its newly-created TransactionManager. The
+            // store is the authoritative committed cut in that configuration.
             Planner::with_context(
                 Arc::clone(&self.graph_store),
                 self.write_store.as_ref().map(Arc::clone),
                 Arc::clone(&self.transaction_manager),
                 None,
-                self.transaction_manager.current_epoch(),
+                self.graph_store.current_epoch(),
             )
         }
-        .with_read_only(is_read_only);
+        .with_read_only(is_read_only)
+        .with_catalog(Arc::clone(&self.catalog));
+        #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+        let planner = planner.with_resolved_procedures(procedure_effects.procedures);
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         // 6. Execute and collect results
-        let executor = Executor::with_columns(physical_plan.columns.clone());
+        physical_plan
+            .operator
+            .install_resource_context(&resources)
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        let executor = Executor::with_bounded_columns(
+            &physical_plan.columns,
+            resources.clone(),
+            self.result_limits,
+        )?;
         let mut result = executor.execute(physical_plan.operator.as_mut())?;
 
         // Add execution metrics
-        let rows_scanned = result.rows.len() as u64; // Approximate: rows returned
+        let rows_scanned = result.row_count() as u64; // Approximate: rows returned
         #[cfg(not(target_arch = "wasm32"))]
         {
             let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -367,6 +451,14 @@ impl QueryProcessor {
 
     /// Translates an LPG query to a logical plan.
     fn translate_lpg(&self, query: &str, language: QueryLanguage) -> Result<LogicalPlan> {
+        #[cfg(not(any(
+            feature = "gql",
+            feature = "cypher",
+            feature = "gremlin",
+            feature = "graphql",
+            feature = "sql-pgq"
+        )))]
+        let _ = query;
         let _span = grafeo_debug_span!("grafeo::query::parse", ?language);
         match language {
             #[cfg(feature = "gql")]
@@ -454,6 +546,10 @@ impl QueryProcessor {
             catalog: Arc::new(Catalog::new()),
             optimizer,
             transaction_context: None,
+            result_buffer: grafeo_common::memory::buffer::BufferManager::with_budget(
+                64 * 1024 * 1024,
+            ),
+            result_limits: super::ResultLimits::default(),
             rdf_store: Some(rdf_store),
         }
     }
@@ -471,6 +567,7 @@ impl QueryProcessor {
         language: QueryLanguage,
         params: Option<&QueryParams>,
     ) -> Result<QueryResult> {
+        let resources = self.result_resources()?;
         use crate::query::planner::rdf::RdfPlanner;
 
         let rdf_store = self.rdf_store.as_ref().ok_or_else(|| {
@@ -511,7 +608,12 @@ impl QueryProcessor {
         if optimized_plan.explain {
             let planner = RdfPlanner::new(Arc::clone(rdf_store));
             let (_, entries) = planner.plan_profiled(&optimized_plan)?;
-            return Ok(physical_explain_result(&optimized_plan, entries));
+            return physical_explain_result(
+                &optimized_plan,
+                entries,
+                resources,
+                self.result_limits,
+            );
         }
 
         // 3b. EXPLAIN ANALYZE (PROFILE): execute with instrumentation, report stats.
@@ -520,7 +622,15 @@ impl QueryProcessor {
             let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
 
             let start = std::time::Instant::now();
-            let executor = Executor::with_columns(physical_plan.columns.clone());
+            physical_plan
+                .operator
+                .install_resource_context(&resources)
+                .map_err(|error| Error::Internal(error.to_string()))?;
+            let executor = Executor::with_bounded_columns(
+                &physical_plan.columns,
+                resources.clone(),
+                self.result_limits,
+            )?;
             let _result = executor.execute(physical_plan.operator.as_mut())?;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -528,7 +638,12 @@ impl QueryProcessor {
                 &optimized_plan.root,
                 &mut entries.into_iter(),
             );
-            return Ok(crate::query::profile::profile_result(&tree, elapsed_ms));
+            return crate::query::profile::profile_result(
+                &tree,
+                elapsed_ms,
+                resources,
+                self.result_limits,
+            );
         }
 
         // 4. Convert to physical plan (using RDF planner)
@@ -536,12 +651,22 @@ impl QueryProcessor {
         let mut physical_plan = planner.plan(&optimized_plan)?;
 
         // 5. Execute and collect results
-        let executor = Executor::with_columns(physical_plan.columns.clone());
+        physical_plan
+            .operator
+            .install_resource_context(&resources)
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        let executor = Executor::with_bounded_columns(
+            &physical_plan.columns,
+            resources.clone(),
+            self.result_limits,
+        )?;
         executor.execute(physical_plan.operator.as_mut())
     }
 
     /// Translates an RDF query to a logical plan.
     fn translate_rdf(&self, query: &str, language: QueryLanguage) -> Result<LogicalPlan> {
+        #[cfg(not(any(feature = "sparql", feature = "graphql")))]
+        let _ = query;
         match language {
             #[cfg(feature = "sparql")]
             QueryLanguage::Sparql => {
@@ -554,6 +679,7 @@ impl QueryProcessor {
                 // Default namespace for GraphQL-RDF queries
                 graphql_rdf::translate(query, "http://example.org/")
             }
+            #[allow(unreachable_patterns)]
             _ => Err(Error::Internal(format!(
                 "Language {:?} is not an RDF language",
                 language
@@ -694,51 +820,44 @@ fn extract_property_name(expr: &LogicalExpression, scan_var: &str) -> Option<Str
 }
 
 /// Builds a `QueryResult` containing the EXPLAIN plan tree text.
-pub(crate) fn explain_result(plan: &LogicalPlan) -> QueryResult {
-    let tree_text = plan.root.explain_tree();
-    QueryResult {
-        columns: vec!["plan".to_string()],
-        column_types: vec![grafeo_common::types::LogicalType::String],
-        rows: vec![vec![Value::String(tree_text.into())]],
-        execution_time_ms: None,
-        rows_scanned: None,
-        status_message: None,
-        gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
-    }
+pub(crate) fn explain_result(
+    plan: &LogicalPlan,
+    resources: grafeo_core::execution::QueryResourceContext,
+    limits: crate::query::executor::ResultLimits,
+) -> Result<QueryResult> {
+    crate::query::executor::bounded_text_result("plan", resources, limits, |output| {
+        plan.root.write_explain(output)
+    })
 }
 
-/// Formats a physical EXPLAIN result showing both the logical plan and the
-/// physical operator names mapped to each logical operator.
+/// Formats physical EXPLAIN under the same bounded result admission.
 #[cfg(feature = "triple-store")]
 pub(crate) fn physical_explain_result(
     plan: &LogicalPlan,
     entries: Vec<crate::query::profile::ProfileEntry>,
-) -> QueryResult {
+    resources: grafeo_core::execution::QueryResourceContext,
+    limits: crate::query::executor::ResultLimits,
+) -> Result<QueryResult> {
     let tree = crate::query::profile::build_profile_tree(&plan.root, &mut entries.into_iter());
-
-    let mut output = String::new();
-    format_physical_node(&mut output, &tree, 0);
-
-    QueryResult {
-        columns: vec!["plan".to_string()],
-        column_types: vec![grafeo_common::types::LogicalType::String],
-        rows: vec![vec![Value::String(output.into())]],
-        execution_time_ms: None,
-        rows_scanned: None,
-        status_message: None,
-        gql_status: grafeo_common::utils::GqlStatus::SUCCESS,
-    }
+    crate::query::executor::bounded_text_result("plan", resources, limits, |output| {
+        format_physical_node(output, &tree, 0)
+    })
 }
 
-/// Recursively formats a physical plan node showing operator name and label.
 #[cfg(feature = "triple-store")]
-fn format_physical_node(out: &mut String, node: &crate::query::profile::ProfileNode, depth: usize) {
-    use std::fmt::Write;
-    let indent = "  ".repeat(depth);
-    let _ = writeln!(out, "{indent}{} {}", node.name, node.label);
-    for child in &node.children {
-        format_physical_node(out, child, depth + 1);
+fn format_physical_node(
+    out: &mut dyn std::fmt::Write,
+    node: &crate::query::profile::ProfileNode,
+    depth: usize,
+) -> std::fmt::Result {
+    for _ in 0..depth {
+        out.write_str("  ")?;
     }
+    writeln!(out, "{} {}", node.name, node.label)?;
+    for child in &node.children {
+        format_physical_node(out, child, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// Substitutes parameters in a logical plan with their values.
@@ -747,6 +866,8 @@ fn format_physical_node(out: &mut String, node: &crate::query::profile::ProfileN
 ///
 /// Returns an error if a referenced parameter is not found in `params`.
 pub fn substitute_params(plan: &mut LogicalPlan, params: &QueryParams) -> Result<()> {
+    // Substitution recurses per operator and expression: bound the depth first.
+    super::plan_depth::check_plan_depth(plan)?;
     substitute_in_operator(&mut plan.root, params)
 }
 
@@ -783,6 +904,12 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
             }
         }
         LogicalOperator::Expand(expand) => {
+            if let Some(predicate) = &mut expand.edge_predicate {
+                substitute_in_expression(predicate, params)?;
+            }
+            if let Some(predicate) = &mut expand.path_predicate {
+                substitute_in_expression(predicate, params)?;
+            }
             substitute_in_operator(&mut expand.input, params)?;
         }
         LogicalOperator::Join(join) => {
@@ -796,6 +923,10 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
         LogicalOperator::LeftJoin(join) => {
             substitute_in_operator(&mut join.left, params)?;
             substitute_in_operator(&mut join.right, params)?;
+            for condition in &mut join.compatibility_conditions {
+                substitute_in_expression(&mut condition.left, params)?;
+                substitute_in_expression(&mut condition.right, params)?;
+            }
             if let Some(cond) = &mut join.condition {
                 substitute_in_expression(cond, params)?;
             }
@@ -806,6 +937,12 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
             }
             for agg_expr in &mut agg.aggregates {
                 if let Some(expr) = &mut agg_expr.expression {
+                    substitute_in_expression(expr, params)?;
+                }
+                if let Some(expr) = &mut agg_expr.expression2 {
+                    substitute_in_expression(expr, params)?;
+                }
+                if let Some(expr) = &mut agg_expr.distinct_key {
                     substitute_in_expression(expr, params)?;
                 }
             }
@@ -862,6 +999,10 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
         LogicalOperator::AntiJoin(anti) => {
             substitute_in_operator(&mut anti.left, params)?;
             substitute_in_operator(&mut anti.right, params)?;
+            for condition in &mut anti.compatibility_conditions {
+                substitute_in_expression(&mut condition.left, params)?;
+                substitute_in_expression(&mut condition.right, params)?;
+            }
         }
         LogicalOperator::Bind(bind) => {
             substitute_in_expression(&mut bind.expression, params)?;
@@ -909,9 +1050,6 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
         LogicalOperator::RemoveLabel(remove_label) => {
             substitute_in_operator(&mut remove_label.input, params)?;
         }
-        LogicalOperator::ShortestPath(sp) => {
-            substitute_in_operator(&mut sp.input, params)?;
-        }
         // SPARQL Update operators
         LogicalOperator::InsertTriple(insert) => {
             if let Some(ref mut input) = insert.input {
@@ -932,7 +1070,8 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
         | LogicalOperator::LoadGraph(_)
         | LogicalOperator::CopyGraph(_)
         | LogicalOperator::MoveGraph(_)
-        | LogicalOperator::AddGraph(_) => {}
+        | LogicalOperator::AddGraph(_)
+        | LogicalOperator::PropertyPath(_) => {}
         LogicalOperator::HorizontalAggregate(op) => {
             substitute_in_operator(&mut op.input, params)?;
         }
@@ -979,8 +1118,11 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
         }
         // DDL operators have no expressions to substitute
         LogicalOperator::CreatePropertyGraph(_) => {}
-        // Procedure calls: arguments could contain parameters but we handle at execution time
-        LogicalOperator::CallProcedure(_) => {}
+        LogicalOperator::CallProcedure(call) => {
+            for argument in &mut call.arguments {
+                substitute_in_expression(argument, params)?;
+            }
+        }
         // LoadData: file path is a literal, no parameter substitution needed
         LogicalOperator::LoadData(_) => {}
         // Construct: template uses variables, substitute in the WHERE input
@@ -1146,9 +1288,19 @@ fn substitute_in_expression(expr: &mut LogicalExpression, params: &QueryParams) 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(all(
+    test,
+    any(
+        feature = "gql",
+        feature = "cypher",
+        feature = "sparql",
+        feature = "gremlin",
+        feature = "graphql",
+        feature = "sql-pgq"
+    )
+))]
+mod language_tests {
+    use super::QueryLanguage;
 
     #[test]
     fn test_query_language_is_lpg() {
@@ -1159,12 +1311,17 @@ mod tests {
         #[cfg(feature = "sparql")]
         assert!(!QueryLanguage::Sparql.is_lpg());
     }
+}
+
+#[cfg(all(test, feature = "lpg"))]
+mod tests {
+    use super::*;
 
     #[test]
     fn test_processor_creation() {
         let store = Arc::new(LpgStore::new().unwrap());
         let processor = QueryProcessor::for_lpg(store);
-        assert!(processor.lpg_store().node_count() == 0);
+        assert_eq!(processor.lpg_store().node_count(), 0);
     }
 
     #[cfg(feature = "gql")]
@@ -1181,6 +1338,23 @@ mod tests {
 
         assert_eq!(result.row_count(), 2);
         assert_eq!(result.columns[0], "n");
+    }
+
+    #[cfg(feature = "gql")]
+    #[test]
+    fn test_process_columnar_result_counts_scanned_rows() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        store.create_node(&["Person"]);
+        store.create_node(&["Person"]);
+
+        let processor = QueryProcessor::for_lpg(store);
+        let result = processor
+            .process("MATCH (n:Person) RETURN id(n)", QueryLanguage::Gql, None)
+            .unwrap();
+
+        assert!(result.is_int64_columnar());
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(result.rows_scanned(), Some(2));
     }
 
     #[cfg(feature = "cypher")]

@@ -14,8 +14,8 @@ use super::common::{
     VarGen, capitalize_first, graphql_directives_allow, wrap_filter, wrap_limit, wrap_skip,
 };
 use crate::query::plan::{
-    BinaryOp, CountExpr, JoinOp, JoinType, LogicalExpression, LogicalOperator, LogicalPlan,
-    ProjectOp, Projection, TripleComponent, TripleScanOp, UnionOp,
+    BinaryOp, CountExpr, JoinCondition, JoinKeySemantics, JoinOp, JoinType, LogicalExpression,
+    LogicalOperator, LogicalPlan, ProjectOp, Projection, TripleComponent, TripleScanOp, UnionOp,
 };
 use grafeo_adapters::query::graphql::{self, ast};
 use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
@@ -30,6 +30,10 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 ///
 /// Returns an error if the query cannot be parsed or translated.
 pub fn translate(query: &str, namespace: &str) -> Result<LogicalPlan> {
+    crate::query::plan_depth::admit(translate_unchecked(query, namespace)?)
+}
+
+fn translate_unchecked(query: &str, namespace: &str) -> Result<LogicalPlan> {
     let doc = graphql::parse(query)?;
     let translator = GraphQLRdfTranslator::new(namespace);
     translator.translate_document(&doc)
@@ -279,7 +283,7 @@ impl GraphQLRdfTranslator {
                             input: None,
                             dataset: None,
                         });
-                        plan = self.join_patterns(plan, type_check);
+                        plan = self.join_patterns(plan, type_check, subject_var);
                     }
 
                     // Process inline fragment's selection set
@@ -313,7 +317,7 @@ impl GraphQLRdfTranslator {
             dataset: None,
         });
 
-        let plan = self.join_patterns(input, triple);
+        let plan = self.join_patterns(input, triple, subject_var);
         Ok((plan, object_var))
     }
 
@@ -336,7 +340,7 @@ impl GraphQLRdfTranslator {
             dataset: None,
         });
 
-        let mut plan = self.join_patterns(input, triple);
+        let mut plan = self.join_patterns(input, triple, from_var);
 
         // Apply argument filters to the target
         if !field.arguments.is_empty() {
@@ -418,7 +422,7 @@ impl GraphQLRdfTranslator {
                 dataset: None,
             });
 
-            plan = self.join_patterns(plan, triple);
+            plan = self.join_patterns(plan, triple, subject_var);
 
             // Add filter for the value (variable refs become Parameter expressions)
             let right = match &arg.value {
@@ -454,13 +458,18 @@ impl GraphQLRdfTranslator {
             dataset: None,
         });
 
-        let plan = self.join_patterns(input, type_check);
+        let plan = self.join_patterns(input, type_check, subject_var);
 
         // Process fragment's selection set
         self.translate_selection_set(&frag.selection_set, plan, subject_var)
     }
 
-    fn join_patterns(&self, left: LogicalOperator, right: LogicalOperator) -> LogicalOperator {
+    fn join_patterns(
+        &self,
+        left: LogicalOperator,
+        right: LogicalOperator,
+        subject_var: &str,
+    ) -> LogicalOperator {
         if matches!(left, LogicalOperator::Empty) {
             return right;
         }
@@ -472,7 +481,14 @@ impl GraphQLRdfTranslator {
             left: Box::new(left),
             right: Box::new(right),
             join_type: JoinType::Inner,
-            conditions: vec![], // Shared variables are implicit join conditions
+            // Every caller adds a triple scan for an already-bound subject;
+            // its object is constant or freshly allocated by VarGen. Declare
+            // the one shared public column without rescanning the input tree.
+            conditions: vec![JoinCondition {
+                left: LogicalExpression::Variable(subject_var.to_string()),
+                right: LogicalExpression::Variable(subject_var.to_string()),
+                semantics: JoinKeySemantics::RdfTermIdentity,
+            }],
         })
     }
 

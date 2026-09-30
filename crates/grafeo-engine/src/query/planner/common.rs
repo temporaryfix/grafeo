@@ -5,7 +5,7 @@
 //! Each function takes already-planned input operators and column lists,
 //! plus a schema derivation function to handle LPG vs RDF type differences.
 
-use crate::query::plan::LogicalExpression;
+use crate::query::plan::{BinaryOp, LogicalExpression, UnaryOp};
 use grafeo_common::types::LogicalType;
 use grafeo_common::utils::error::{Error, Result};
 use grafeo_core::execution::operators::{
@@ -22,6 +22,21 @@ pub(crate) fn build_limit(
     schema: Vec<LogicalType>,
 ) -> (Box<dyn Operator>, Vec<String>) {
     let operator = Box::new(LimitOperator::new(input, count, schema));
+    (operator, columns)
+}
+
+/// Builds a LIMIT that preserves complete input execution.
+///
+/// The child remains a pull boundary and is drained after the visible row
+/// limit. This is required for mutation/effect subtrees: a push LIMIT is
+/// intentionally allowed to stop its source early.
+pub(crate) fn build_exhaustive_limit(
+    input: Box<dyn Operator>,
+    columns: Vec<String>,
+    count: usize,
+    schema: Vec<LogicalType>,
+) -> (Box<dyn Operator>, Vec<String>) {
+    let operator = Box::new(LimitOperator::new_exhaustive(input, count, schema));
     (operator, columns)
 }
 
@@ -131,6 +146,37 @@ pub(crate) fn build_inner_join(
 ) -> (Box<dyn Operator>, Vec<String>, Vec<LogicalType>) {
     let (probe_keys, build_keys) = find_shared_join_keys(left_columns, right_columns);
 
+    build_inner_join_with_keys(
+        left,
+        right,
+        left_columns,
+        right_columns,
+        left_types,
+        right_types,
+        probe_keys,
+        build_keys,
+        cardinalities,
+    )
+}
+
+/// Builds an INNER JOIN using caller-resolved left/right key columns.
+///
+/// This is used when logical key semantics select a canonical physical
+/// representation (for example, canonical RDF term identity) rather than every
+/// same-named visible column.
+#[cfg(feature = "triple-store")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_inner_join_with_keys(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    left_columns: &[String],
+    right_columns: &[String],
+    left_types: &[LogicalType],
+    right_types: &[LogicalType],
+    probe_keys: Vec<usize>,
+    build_keys: Vec<usize>,
+    cardinalities: Option<(f64, f64)>,
+) -> (Box<dyn Operator>, Vec<String>, Vec<LogicalType>) {
     let join_type = if probe_keys.is_empty() {
         PhysicalJoinType::Cross
     } else {
@@ -252,8 +298,32 @@ pub(crate) fn build_anti_join(
 ) -> (Box<dyn Operator>, Vec<String>) {
     let (probe_keys, build_keys) = find_shared_join_keys(&left_columns, right_columns);
 
+    build_anti_join_with_keys(
+        left,
+        right,
+        left_columns,
+        schema,
+        probe_keys,
+        build_keys,
+        true,
+    )
+}
+
+/// Builds an ANTI JOIN from caller-resolved key columns.
+///
+/// `keep_left_when_keyless` is true for SPARQL MINUS and false for NOT EXISTS,
+/// whose empty key tuple is compatible with every right-side solution.
+pub(crate) fn build_anti_join_with_keys(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    left_columns: Vec<String>,
+    schema: Vec<LogicalType>,
+    probe_keys: Vec<usize>,
+    build_keys: Vec<usize>,
+    keep_left_when_keyless: bool,
+) -> (Box<dyn Operator>, Vec<String>) {
     // No shared variables: MINUS is a no-op (keep all left rows).
-    if probe_keys.is_empty() {
+    if keep_left_when_keyless && probe_keys.is_empty() {
         return (left, left_columns);
     }
 
@@ -282,6 +352,19 @@ pub(crate) fn build_semi_join(
 ) -> (Box<dyn Operator>, Vec<String>) {
     let (probe_keys, build_keys) = find_shared_join_keys(&left_columns, right_columns);
 
+    build_semi_join_with_keys(left, right, left_columns, schema, probe_keys, build_keys)
+}
+
+/// Builds a SEMI JOIN from caller-resolved key columns.
+#[cfg(feature = "triple-store")]
+pub(crate) fn build_semi_join_with_keys(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    left_columns: Vec<String>,
+    schema: Vec<LogicalType>,
+    probe_keys: Vec<usize>,
+    build_keys: Vec<usize>,
+) -> (Box<dyn Operator>, Vec<String>) {
     let operator: Box<dyn Operator> = Box::new(HashJoinOperator::new(
         left,
         right,
@@ -307,6 +390,30 @@ pub(crate) fn build_left_join(
 ) -> (Box<dyn Operator>, Vec<String>, Vec<LogicalType>) {
     let (probe_keys, build_keys) = find_shared_join_keys(left_columns, right_columns);
 
+    build_left_join_with_keys(
+        left,
+        right,
+        left_columns,
+        right_columns,
+        left_types,
+        right_types,
+        probe_keys,
+        build_keys,
+    )
+}
+
+/// Builds a LEFT JOIN from caller-resolved key columns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_left_join_with_keys(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    left_columns: &[String],
+    right_columns: &[String],
+    left_types: &[LogicalType],
+    right_types: &[LogicalType],
+    probe_keys: Vec<usize>,
+    build_keys: Vec<usize>,
+) -> (Box<dyn Operator>, Vec<String>, Vec<LogicalType>) {
     // Full join outputs all left + all right columns
     let mut join_columns: Vec<String> = left_columns.to_vec();
     join_columns.extend(right_columns.iter().cloned());
@@ -366,14 +473,47 @@ fn find_shared_join_keys(left: &[String], right: &[String]) -> (Vec<usize>, Vec<
     (probe_keys, build_keys)
 }
 
+/// Column name that `resolve_expression_to_column` will look up for `expr`.
+///
+/// The naming scheme is the source of truth for synthetic columns that
+/// aggregate/sort planners inject so that downstream resolution finds them:
+///
+/// - `Variable(name)` → `"name"`
+/// - `Property { variable, property }` → `"{variable}_{property}"` (LPG projections)
+/// - Anything else → `"__expr_{expr:?}"`
+///
+/// Both the producers (Aggregate/Sort augmenting projections, the `_ =>` arm in
+/// `plan_sort`'s pre-Return loop, the equivalents in `aggregate.rs` and the RDF
+/// planner) and the consumer (`resolve_expression_to_column`) must agree on
+/// this formula. Keep them in sync by funnelling through this function — and
+/// `resolve_expression_to_column` itself — rather than re-deriving the string
+/// at each call site.
+pub(crate) fn resolved_column_name(expr: &LogicalExpression) -> String {
+    match expr {
+        LogicalExpression::Variable(name) => name.clone(),
+        LogicalExpression::Property { variable, property } => {
+            format!("{variable}_{property}")
+        }
+        _ => format!("__expr_{expr:?}"),
+    }
+}
+
+/// Output column name for a Return/Project item or sort-key projection.
+///
+/// Returns `alias` when set, otherwise falls back to `expression_to_string(expr)`.
+/// `plan_return_projection`, `plan_project`, and the RDF planner all label
+/// their output columns with this rule — extracting it here keeps the rule in
+/// one place so predictive callers (e.g. the heap top-K rewrite) cannot drift
+/// from the actual planner.
+pub(crate) fn output_column_name(alias: Option<&str>, expr: &LogicalExpression) -> String {
+    alias.map_or_else(|| expression_to_string(expr), str::to_string)
+}
+
 /// Resolves a logical expression to a column index in the given variable-column map.
 ///
-/// Handles three expression kinds:
-/// - `Variable(name)`: direct lookup in `variable_columns`
-/// - `Property { variable, property }`: lookup of `"{variable}_{property}"` (LPG projections)
-/// - Complex expressions: lookup of `"__expr_{expr:?}"` (synthetic columns)
-///
-/// `context` is appended to error messages (e.g. `" for ORDER BY"`, or `""` for aggregations).
+/// Mirrors [`resolved_column_name`]: the column name looked up is whatever that
+/// function returns for `expr`. `context` is appended to error messages
+/// (e.g. `" for ORDER BY"`, or `""` for aggregations).
 ///
 /// NOTE: The expression *collection* loops (which build the synthetic columns that this
 /// function resolves) are intentionally NOT shared, because the LPG and RDF planners use
@@ -383,31 +523,39 @@ pub(crate) fn resolve_expression_to_column(
     variable_columns: &std::collections::HashMap<String, usize>,
     context: &str,
 ) -> Result<usize> {
-    match expr {
-        LogicalExpression::Variable(name) => variable_columns
-            .get(name)
-            .copied()
-            .ok_or_else(|| Error::Internal(format!("Variable '{name}' not found{context}"))),
-        LogicalExpression::Property { variable, property } => {
-            let col_name = format!("{variable}_{property}");
-            variable_columns.get(&col_name).copied().ok_or_else(|| {
-                Error::Internal(format!(
-                    "Property column '{col_name}' not found{context} (from {variable}.{property})"
-                ))
-            })
-        }
-        _ => {
-            let col_name = format!("__expr_{expr:?}");
-            variable_columns.get(&col_name).copied().ok_or_else(|| {
-                Error::Internal(format!(
-                    "Cannot resolve expression to column{context}: {expr:?}"
-                ))
-            })
-        }
-    }
+    let col_name = resolved_column_name(expr);
+    variable_columns
+        .get(&col_name)
+        .copied()
+        .ok_or_else(|| match expr {
+            LogicalExpression::Variable(name) => {
+                Error::Internal(format!("Variable '{name}' not found{context}"))
+            }
+            LogicalExpression::Property { variable, property } => Error::Internal(format!(
+                "Property column '{col_name}' not found{context} (from {variable}.{property})"
+            )),
+            _ => Error::Internal(format!(
+                "Cannot resolve expression to column{context}: {expr:?}"
+            )),
+        })
 }
 
 /// Converts a logical expression to a human-readable string for column naming.
+///
+/// Used by `output_column_name` as the fallback when a Return/Project item
+/// has no explicit alias. The goal is two-fold:
+///
+/// 1. The string should look like the source expression (users see it as a
+///    column header).
+/// 2. Two structurally distinct expressions should produce distinct strings,
+///    so `RETURN n.a + n.b, n.c + n.d` doesn't yield two columns named the
+///    same thing — downstream lookups by name would silently shadow.
+///
+/// We can't fully meet (2) without sacrificing (1); heavy expressions
+/// (CASE / subqueries / comprehensions) collapse to a short generic label.
+/// Two such expressions in one Return without aliases will still collide —
+/// the right answer there is to alias them. This function covers every
+/// arithmetic/logical/scalar shape users commonly write inline.
 pub(crate) fn expression_to_string(expr: &LogicalExpression) -> String {
     match expr {
         LogicalExpression::Variable(name) => name.clone(),
@@ -415,7 +563,17 @@ pub(crate) fn expression_to_string(expr: &LogicalExpression) -> String {
             format!("{variable}.{property}")
         }
         LogicalExpression::Literal(value) => format!("{value:?}"),
-        LogicalExpression::FunctionCall { name, .. } => format!("{name}(...)"),
+        LogicalExpression::Parameter(name) => format!("${name}"),
+        LogicalExpression::FunctionCall { name, args, .. } => {
+            // Include argument signatures so `count(n)` and `count(m)` don't
+            // collapse to the same column. Empty arg lists keep the "()" form.
+            let inner = args
+                .iter()
+                .map(expression_to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name}({inner})")
+        }
         LogicalExpression::IndexAccess { base, index } => {
             format!(
                 "{}[{}]",
@@ -423,7 +581,87 @@ pub(crate) fn expression_to_string(expr: &LogicalExpression) -> String {
                 expression_to_string(index)
             )
         }
-        _ => "expr".to_string(),
+        LogicalExpression::SliceAccess { base, start, end } => {
+            let s = start
+                .as_deref()
+                .map(expression_to_string)
+                .unwrap_or_default();
+            let e = end.as_deref().map(expression_to_string).unwrap_or_default();
+            format!("{}[{s}..{e}]", expression_to_string(base))
+        }
+        LogicalExpression::Binary { op, left, right } => {
+            format!(
+                "({} {} {})",
+                expression_to_string(left),
+                binary_op_symbol(*op),
+                expression_to_string(right)
+            )
+        }
+        LogicalExpression::Unary { op, operand } => match op {
+            UnaryOp::IsNull => format!("({} IS NULL)", expression_to_string(operand)),
+            UnaryOp::IsNotNull => format!("({} IS NOT NULL)", expression_to_string(operand)),
+            UnaryOp::Not => format!("(NOT {})", expression_to_string(operand)),
+            UnaryOp::Neg => format!("(-{})", expression_to_string(operand)),
+        },
+        LogicalExpression::Labels(v) => format!("labels({v})"),
+        LogicalExpression::Type(v) => format!("type({v})"),
+        LogicalExpression::Id(v) => format!("id({v})"),
+        LogicalExpression::List(items) => {
+            let inner = items
+                .iter()
+                .map(expression_to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{inner}]")
+        }
+        LogicalExpression::Map(entries) => {
+            let inner = entries
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", expression_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{inner}}}")
+        }
+        LogicalExpression::MapProjection { base, .. } => format!("{base}{{...}}"),
+        // Heavy expressions — short generic labels. Two unaliased instances
+        // in the same Return still collide; the user should alias them.
+        LogicalExpression::Case { .. } => "case".to_string(),
+        LogicalExpression::ExistsSubquery(_) => "exists".to_string(),
+        LogicalExpression::CountSubquery(_) => "count".to_string(),
+        LogicalExpression::ValueSubquery(_) => "subquery".to_string(),
+        LogicalExpression::Reduce { .. } => "reduce".to_string(),
+        LogicalExpression::ListComprehension { .. } => "list_comprehension".to_string(),
+        LogicalExpression::ListPredicate { kind, .. } => format!("{kind:?}").to_lowercase(),
+        LogicalExpression::PatternComprehension { .. } => "pattern_comprehension".to_string(),
+    }
+}
+
+/// Cypher-style symbol for a `BinaryOp`. Used by `expression_to_string` so
+/// auto-generated column names read like the source expression.
+fn binary_op_symbol(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::Ne => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::Le => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Ge => ">=",
+        BinaryOp::And => "AND",
+        BinaryOp::Or => "OR",
+        BinaryOp::Xor => "XOR",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::Concat => "||",
+        BinaryOp::StartsWith => "STARTS WITH",
+        BinaryOp::EndsWith => "ENDS WITH",
+        BinaryOp::Contains => "CONTAINS",
+        BinaryOp::In => "IN",
+        BinaryOp::Like => "LIKE",
+        BinaryOp::Regex => "=~",
+        BinaryOp::Pow => "^",
     }
 }
 

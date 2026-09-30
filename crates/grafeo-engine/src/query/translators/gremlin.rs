@@ -23,6 +23,10 @@ use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
 ///
 /// Returns an error if the query cannot be parsed or translated.
 pub fn translate(query: &str) -> Result<LogicalPlan> {
+    crate::query::plan_depth::admit(translate_unchecked(query)?)
+}
+
+fn translate_unchecked(query: &str) -> Result<LogicalPlan> {
     let trimmed = query.trim_start();
     let (explain, profile, actual_query) = if trimmed
         .get(..7)
@@ -167,15 +171,14 @@ impl GremlinTranslator {
                     }
                     _ => {
                         // Non-edge step encountered, finalize edge if possible
-                        if edge.from_var.is_some() && edge.to_var.is_some() {
+                        if let (Some(from_var), Some(to_var)) =
+                            (&mut edge.from_var, &mut edge.to_var)
+                        {
                             let edge_var = self.var_gen.next();
                             plan = LogicalOperator::CreateEdge(CreateEdgeOp {
                                 variable: Some(edge_var.clone()),
-                                from_variable: edge
-                                    .from_var
-                                    .take()
-                                    .expect("from_var checked above"),
-                                to_variable: edge.to_var.take().expect("to_var checked above"),
+                                from_variable: std::mem::take(from_var),
+                                to_variable: std::mem::take(to_var),
                                 edge_type: edge.edge_type.clone(),
                                 properties: std::mem::take(&mut edge.properties),
                                 input: Box::new(plan),
@@ -606,6 +609,9 @@ impl GremlinTranslator {
                     input: Box::new(plan),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
 
                 // Filter by edge IDs if specified
@@ -660,6 +666,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
                 Ok((plan, Some(target_var)))
             }
@@ -677,6 +686,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
                 Ok((plan, Some(target_var)))
             }
@@ -694,6 +706,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
                 Ok((plan, Some(target_var)))
             }
@@ -712,6 +727,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
                 Ok((plan, Some(edge_var)))
             }
@@ -730,6 +748,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
                 Ok((plan, Some(edge_var)))
             }
@@ -748,6 +769,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
                 Ok((plan, Some(edge_var)))
             }
@@ -803,9 +827,12 @@ impl GremlinTranslator {
                                 right: Box::new(LogicalExpression::Labels(current_var.to_string())),
                             })
                             .collect();
-                        let mut result = conditions
-                            .pop()
-                            .expect("conditions non-empty for multi-label");
+                        let mut result = conditions.pop().ok_or_else(|| {
+                            Error::Query(QueryError::new(
+                                QueryErrorKind::Semantic,
+                                "hasLabel requires at least one label",
+                            ))
+                        })?;
                         for cond in conditions {
                             result = LogicalExpression::Binary {
                                 left: Box::new(cond),
@@ -992,6 +1019,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Count,
                         expression: None,
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1011,6 +1039,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Sum,
                         expression: Some(LogicalExpression::Variable(current_var.to_string())),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1029,6 +1058,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Avg,
                         expression: Some(LogicalExpression::Variable(current_var.to_string())),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1047,6 +1077,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Min,
                         expression: Some(LogicalExpression::Variable(current_var.to_string())),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1065,6 +1096,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Max,
                         expression: Some(LogicalExpression::Variable(current_var.to_string())),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1083,6 +1115,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Collect,
                         expression: Some(LogicalExpression::Variable(current_var.to_string())),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1345,6 +1378,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Collect,
                         expression: Some(LogicalExpression::Variable(current_var.to_string())),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -1365,6 +1399,7 @@ impl GremlinTranslator {
                         function: AggregateFunction::Count,
                         expression: None,
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some("count".to_string()),
                         percentile: None,
@@ -1422,12 +1457,9 @@ impl GremlinTranslator {
                         predicates.push(pred);
                     }
                 }
-                if predicates.is_empty() {
+                let Some(mut combined) = predicates.pop() else {
                     return Ok((input, None));
-                }
-                let mut combined = predicates
-                    .pop()
-                    .expect("predicates non-empty after is_empty check");
+                };
                 for pred in predicates {
                     combined = LogicalExpression::Binary {
                         left: Box::new(pred),
@@ -1447,12 +1479,9 @@ impl GremlinTranslator {
                         predicates.push(pred);
                     }
                 }
-                if predicates.is_empty() {
+                let Some(mut combined) = predicates.pop() else {
                     return Ok((input, None));
-                }
-                let mut combined = predicates
-                    .pop()
-                    .expect("predicates non-empty after is_empty check");
+                };
                 for pred in predicates {
                     combined = LogicalExpression::Binary {
                         left: Box::new(pred),
@@ -1635,6 +1664,7 @@ impl GremlinTranslator {
                         left: Box::new(input),
                         right: Box::new(inner_plan),
                         condition: None,
+                        compatibility_conditions: Vec::new(),
                     });
 
                     // CASE WHEN inner_var IS NOT NULL
@@ -1863,6 +1893,9 @@ impl GremlinTranslator {
                     input: Box::new(input),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 });
 
                 Ok((plan, Some(target_var)))
@@ -2211,9 +2244,12 @@ impl GremlinTranslator {
                                 right: Box::new(LogicalExpression::Labels(current_var.to_string())),
                             })
                             .collect();
-                        let mut result = conditions
-                            .pop()
-                            .expect("conditions non-empty for multi-label");
+                        let mut result = conditions.pop().ok_or_else(|| {
+                            Error::Query(QueryError::new(
+                                QueryErrorKind::Semantic,
+                                "hasLabel requires at least one label",
+                            ))
+                        })?;
                         for cond in conditions {
                             result = LogicalExpression::Binary {
                                 left: Box::new(cond),
@@ -2263,18 +2299,18 @@ impl GremlinTranslator {
                         })),
                         path_alias: None,
                         path_mode: PathMode::Walk,
+                        edge_predicate: None,
+                        path_predicate: None,
+                        path_search: crate::query::plan::PathSearch::All,
                     });
                     predicates.push(LogicalExpression::ExistsSubquery(Box::new(expand)));
                 }
                 _ => {}
             }
         }
-        if predicates.is_empty() {
+        let Some(mut result) = predicates.pop() else {
             return Ok(None);
-        }
-        let mut result = predicates
-            .pop()
-            .expect("predicates non-empty after is_empty check");
+        };
         for pred in predicates {
             result = LogicalExpression::Binary {
                 left: Box::new(pred),
@@ -2355,6 +2391,173 @@ mod tests {
     fn test_translate_with_filter() {
         let result = translate("g.V().hasLabel('Person')");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_totality_empty_node_labels_return_semantic_errors() {
+        for query in [
+            "g.V().hasLabel()",
+            "g.V().where(hasLabel())",
+            "g.V().and(hasLabel())",
+            "g.V().or(hasLabel())",
+            "g.V().not(hasLabel())",
+        ] {
+            let error = translate(query).expect_err(query);
+            let Error::Query(error) = error else {
+                panic!("expected a query error for {query}: {error:?}");
+            };
+            assert_eq!(error.kind, QueryErrorKind::Semantic, "{query}");
+            assert_eq!(error.message, "hasLabel requires at least one label");
+        }
+    }
+
+    fn label_predicate_shape(expression: &LogicalExpression) -> String {
+        match expression {
+            LogicalExpression::Binary {
+                left,
+                op: BinaryOp::In,
+                right,
+            } => {
+                let LogicalExpression::Literal(Value::String(label)) = left.as_ref() else {
+                    panic!("expected a literal label: {left:?}");
+                };
+                assert!(matches!(right.as_ref(), LogicalExpression::Labels(var) if var == "v"));
+                label.to_string()
+            }
+            LogicalExpression::Binary { left, op, right }
+                if matches!(op, BinaryOp::And | BinaryOp::Or) =>
+            {
+                format!(
+                    "({} {op:?} {})",
+                    label_predicate_shape(left),
+                    label_predicate_shape(right)
+                )
+            }
+            other => panic!("unexpected label predicate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_totality_label_predicates_preserve_labels_and_association() {
+        let translator = GremlinTranslator::new();
+        for (labels, expected) in [(vec!["A"], "A"), (vec!["A", "B", "C"], "(B Or (A Or C))")] {
+            let step = ast::Step::HasLabel(labels.into_iter().map(str::to_string).collect());
+            let (plan, current_var) = translator
+                .translate_step(&step, LogicalOperator::Empty, "v", false)
+                .unwrap();
+            assert!(current_var.is_none());
+            let LogicalOperator::Filter(filter) = plan else {
+                panic!("expected the direct label filter");
+            };
+            assert_eq!(label_predicate_shape(&filter.predicate), expected);
+            let predicate = translator
+                .steps_to_predicate(&[step], "v")
+                .unwrap()
+                .expect("nested label filter");
+            assert_eq!(label_predicate_shape(&predicate), expected);
+        }
+
+        // Edge label membership already supports an empty list without a panic.
+        let (plan, _) = translator
+            .translate_step(
+                &ast::Step::HasLabel(Vec::new()),
+                LogicalOperator::Empty,
+                "e",
+                true,
+            )
+            .unwrap();
+        let LogicalOperator::Filter(filter) = plan else {
+            panic!("expected the edge label filter");
+        };
+        let LogicalExpression::Binary { left, op, right } = filter.predicate else {
+            panic!("expected edge label membership");
+        };
+        assert!(matches!(*left, LogicalExpression::Type(ref var) if var == "e"));
+        assert_eq!(op, BinaryOp::In);
+        assert!(
+            matches!(*right, LogicalExpression::Literal(Value::List(ref labels)) if labels.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_totality_predicate_combinations_preserve_order_and_empty_inputs() {
+        let translator = GremlinTranslator::new();
+        let steps: Vec<_> = ["A", "B", "C"]
+            .into_iter()
+            .map(|label| ast::Step::HasLabel(vec![label.to_string()]))
+            .collect();
+        let traversals: Vec<_> = steps.iter().cloned().map(|step| vec![step]).collect();
+        for (step, expected) in [
+            (ast::Step::And(traversals.clone()), "(B And (A And C))"),
+            (ast::Step::Or(traversals), "(B Or (A Or C))"),
+        ] {
+            let (plan, current_var) = translator
+                .translate_step(&step, LogicalOperator::Empty, "v", false)
+                .unwrap();
+            assert!(current_var.is_none());
+            let LogicalOperator::Filter(filter) = plan else {
+                panic!("expected combined traversal filter");
+            };
+            assert_eq!(label_predicate_shape(&filter.predicate), expected);
+        }
+        let predicate = translator
+            .steps_to_predicate(&steps, "v")
+            .unwrap()
+            .expect("combined nested predicates");
+        assert_eq!(label_predicate_shape(&predicate), "(B And (A And C))");
+        assert!(translator.steps_to_predicate(&[], "v").unwrap().is_none());
+        for step in [
+            ast::Step::And(Vec::new()),
+            ast::Step::Or(Vec::new()),
+            ast::Step::And(vec![Vec::new()]),
+            ast::Step::Or(vec![Vec::new()]),
+        ] {
+            let (plan, current_var) = translator
+                .translate_step(&step, LogicalOperator::Empty, "v", false)
+                .unwrap();
+            assert!(matches!(plan, LogicalOperator::Empty));
+            assert!(current_var.is_none());
+        }
+    }
+
+    #[test]
+    fn test_totality_pending_edge_endpoints_survive_non_edge_steps() {
+        let plan = translate(
+            "g.V().as('a').addE('knows').to('a').property('since', 2020).has('since', 2020)",
+        )
+        .unwrap();
+        let LogicalOperator::Return(ret) = plan.root else {
+            panic!("expected returned edge");
+        };
+        let LogicalOperator::Filter(filter) = *ret.input else {
+            panic!("expected filter after edge completion");
+        };
+        let LogicalOperator::CreateEdge(edge) = *filter.input else {
+            panic!("expected edge completion before the filter");
+        };
+        let LogicalOperator::NodeScan(scan) = *edge.input else {
+            panic!("expected the original vertex scan");
+        };
+        assert_eq!(edge.from_variable, scan.variable);
+        assert_eq!(edge.to_variable, scan.variable);
+        assert_eq!(edge.edge_type, "knows");
+        assert!(
+            matches!(edge.properties.as_slice(), [(key, LogicalExpression::Literal(Value::Int64(2020)))] if key == "since")
+        );
+
+        // A non-edge step before to() must preserve the source endpoint.
+        let plan = translate("g.V().as('a').addE('knows').has('active', true).to('a')").unwrap();
+        let edge = find_create_edge(&plan.root).expect("completed pending edge");
+        let LogicalOperator::Filter(filter) = edge.input.as_ref() else {
+            panic!("expected the pre-completion filter");
+        };
+        let LogicalOperator::NodeScan(scan) = filter.input.as_ref() else {
+            panic!("expected the original vertex scan");
+        };
+        assert_eq!(edge.from_variable, scan.variable);
+        assert_eq!(edge.to_variable, scan.variable);
+        assert_eq!(edge.edge_type, "knows");
+        assert!(edge.properties.is_empty());
     }
 
     // === Navigation Tests ===

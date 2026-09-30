@@ -3,17 +3,32 @@
 //! Functions here are used by multiple translator modules (GQL, Cypher, etc.)
 //! to avoid duplication of identical logic.
 
+#[cfg(any(test, feature = "gql", feature = "cypher"))]
 use std::collections::HashSet;
 #[cfg(any(feature = "graphql", feature = "gremlin", test))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(any(test, feature = "gql", feature = "cypher", feature = "sql-pgq"))]
+use crate::query::plan::{AggregateFunction, BinaryOp};
 use crate::query::plan::{
-    AggregateFunction, BinaryOp, CountExpr, DistinctOp, FilterOp, LeftJoinOp, LimitOp,
-    LogicalExpression, LogicalOperator, ReturnItem, ReturnOp, SkipOp, SortKey, SortOp, UnaryOp,
+    CountExpr, DistinctOp, FilterOp, LimitOp, LogicalExpression, LogicalOperator, SkipOp, SortKey,
+    SortOp,
 };
+#[cfg(any(feature = "gql", feature = "cypher"))]
+use crate::query::plan::{LeftJoinOp, UnaryOp};
+#[cfg(any(
+    feature = "gql",
+    feature = "cypher",
+    feature = "gremlin",
+    feature = "graphql",
+    feature = "sql-pgq"
+))]
+use crate::query::plan::{ReturnItem, ReturnOp};
+#[cfg(any(test, feature = "gql", feature = "cypher", feature = "sql-pgq"))]
 use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
 
 /// Returns true if the function name is a recognized aggregate function.
+#[cfg(any(test, feature = "gql", feature = "cypher", feature = "sql-pgq"))]
 pub(crate) fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name.to_uppercase().as_str(),
@@ -56,6 +71,7 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
 }
 
 /// Converts a function name to an `AggregateFunction` enum variant.
+#[cfg(any(test, feature = "gql", feature = "cypher", feature = "sql-pgq"))]
 pub(crate) fn to_aggregate_function(name: &str) -> Option<AggregateFunction> {
     match name.to_uppercase().as_str() {
         "COUNT" => Some(AggregateFunction::Count),
@@ -89,6 +105,7 @@ pub(crate) fn to_aggregate_function(name: &str) -> Option<AggregateFunction> {
 }
 
 /// Returns true if the aggregate function is a binary set function (requires two arguments).
+#[cfg(any(test, feature = "gql"))]
 pub(crate) fn is_binary_set_function(func: AggregateFunction) -> bool {
     matches!(
         func,
@@ -192,6 +209,7 @@ impl VarGen {
     }
 
     /// Returns the current counter value without incrementing.
+    #[cfg(any(test, feature = "gremlin"))]
     pub fn current(&self) -> u32 {
         self.counter.load(Ordering::Relaxed)
     }
@@ -201,6 +219,7 @@ impl VarGen {
 ///
 /// Returns an error if the input is empty. Used by `build_property_predicate`
 /// in multiple translators.
+#[cfg(any(test, feature = "gql", feature = "cypher", feature = "sql-pgq"))]
 pub(crate) fn combine_with_and(predicates: Vec<LogicalExpression>) -> Result<LogicalExpression> {
     predicates
         .into_iter()
@@ -222,6 +241,7 @@ pub(crate) fn combine_with_and(predicates: Vec<LogicalExpression>) -> Result<Log
 // ---------------------------------------------------------------------------
 
 /// Collects all variable names referenced by a logical expression.
+#[cfg(any(test, feature = "gql", feature = "cypher"))]
 pub(crate) fn collect_expression_variables(expr: &LogicalExpression, vars: &mut HashSet<String>) {
     match expr {
         LogicalExpression::Variable(name) => {
@@ -338,12 +358,14 @@ pub(crate) fn collect_expression_variables(expr: &LogicalExpression, vars: &mut 
 // ---------------------------------------------------------------------------
 
 /// Splits a conjunctive predicate (AND-chain) into individual conjuncts.
+#[cfg(any(test, feature = "gql", feature = "cypher"))]
 pub(crate) fn split_conjuncts(expr: LogicalExpression) -> Vec<LogicalExpression> {
     let mut result = Vec::new();
     split_conjuncts_recursive(expr, &mut result);
     result
 }
 
+#[cfg(any(test, feature = "gql", feature = "cypher"))]
 fn split_conjuncts_recursive(expr: LogicalExpression, out: &mut Vec<LogicalExpression>) {
     if let LogicalExpression::Binary {
         left,
@@ -362,6 +384,7 @@ fn split_conjuncts_recursive(expr: LogicalExpression, out: &mut Vec<LogicalExpre
 ///
 /// Predicates are split based on which side of the LeftJoin their variables
 /// belong to, ensuring correct NULL-preservation semantics.
+#[cfg(any(test, feature = "gql", feature = "cypher"))]
 pub(crate) struct ClassifiedPredicates {
     /// Predicates referencing only left-side variables (or constants): placed
     /// as a Filter above the LeftJoin (they filter the required side).
@@ -384,6 +407,7 @@ pub(crate) struct ClassifiedPredicates {
 /// - **right_filters**: reference only right-side variables, can be pushed as a
 ///   pre-filter on the right input (semantically equivalent to a join condition)
 /// - **cross_filters**: reference both sides, must be applied as a join condition
+#[cfg(any(test, feature = "gql", feature = "cypher"))]
 pub(crate) fn classify_optional_predicates(
     predicate: LogicalExpression,
     left_vars: &HashSet<String>,
@@ -436,6 +460,7 @@ pub(crate) fn classify_optional_predicates(
 }
 
 /// Collects all variables produced by a logical operator's subtree.
+#[cfg(any(feature = "gql", feature = "cypher"))]
 pub(crate) fn collect_operator_variables(op: &LogicalOperator, vars: &mut HashSet<String>) {
     match op {
         LogicalOperator::NodeScan(scan) => {
@@ -523,6 +548,7 @@ pub(crate) fn collect_operator_variables(op: &LogicalOperator, vars: &mut HashSe
 /// 3. Pushes right-only predicates as a Filter on the right input
 /// 4. Stores cross-side predicates in `LeftJoinOp.condition`
 /// 5. Returns the LeftJoin and any remaining post-filters to apply above
+#[cfg(any(feature = "gql", feature = "cypher"))]
 pub(crate) fn build_left_join_with_predicates(
     left: LogicalOperator,
     right: LogicalOperator,
@@ -533,6 +559,7 @@ pub(crate) fn build_left_join_with_predicates(
             left: Box::new(left),
             right: Box::new(right),
             condition: None,
+            compatibility_conditions: Vec::new(),
         });
         return (join, None);
     };
@@ -622,6 +649,7 @@ pub(crate) fn build_left_join_with_predicates(
         left: Box::new(left),
         right: Box::new(filtered_right),
         condition: cross_condition,
+        compatibility_conditions: Vec::new(),
     });
 
     // Combine remaining post-filters
@@ -648,6 +676,31 @@ pub(crate) fn build_left_join_with_predicates(
 // Plan node builder helpers
 // ---------------------------------------------------------------------------
 
+/// Selects the search policy on a single path expansion while retaining its
+/// intrinsic and endpoint filters. Source scans remain below that expansion.
+#[cfg(any(feature = "gql", feature = "cypher"))]
+pub(crate) fn stamp_path_search(
+    mut plan: LogicalOperator,
+    search: crate::query::plan::PathSearch,
+) -> Result<LogicalOperator> {
+    let mut current = &mut plan;
+    loop {
+        match current {
+            LogicalOperator::Filter(filter) => current = filter.input.as_mut(),
+            LogicalOperator::Expand(expand) => {
+                expand.path_search = search;
+                return Ok(plan);
+            }
+            _ => {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    "shortest path requires a single relationship expansion",
+                )));
+            }
+        }
+    }
+}
+
 /// Wraps an operator with a filter predicate.
 pub(crate) fn wrap_filter(input: LogicalOperator, predicate: LogicalExpression) -> LogicalOperator {
     LogicalOperator::Filter(FilterOp {
@@ -673,6 +726,17 @@ pub(crate) fn wrap_skip(input: LogicalOperator, count: impl Into<CountExpr>) -> 
     })
 }
 
+/// Wraps an operator in a terminal drain.
+///
+/// The shared logical IR represents this as the maximum possible SKIP count,
+/// which is observationally a full drain for any materializable query. The LPG
+/// planner recognizes this sentinel and lowers it to `DrainOperator`, ensuring
+/// side-effecting children run to exhaustion while producing no result rows.
+#[cfg(feature = "gql")]
+pub(crate) fn wrap_drain(input: LogicalOperator) -> LogicalOperator {
+    wrap_skip(input, usize::MAX)
+}
+
 /// Wraps an operator with LIMIT.
 pub(crate) fn wrap_limit(input: LogicalOperator, count: impl Into<CountExpr>) -> LogicalOperator {
     LogicalOperator::Limit(LimitOp {
@@ -690,6 +754,7 @@ pub(crate) fn wrap_distinct(input: LogicalOperator) -> LogicalOperator {
 }
 
 /// Checks if a logical expression references any variable in the given set.
+#[cfg(feature = "gql")]
 pub(crate) fn references_any(expr: &LogicalExpression, names: &[String]) -> bool {
     match expr {
         LogicalExpression::Literal(_) | LogicalExpression::Parameter(_) => false,
@@ -767,6 +832,7 @@ pub(crate) fn references_any(expr: &LogicalExpression, names: &[String]) -> bool
 }
 
 /// Flattens a tree of AND-joined expressions into a list of conjuncts.
+#[cfg(feature = "gql")]
 pub(crate) fn flatten_and_conjuncts(expr: &LogicalExpression) -> Vec<&LogicalExpression> {
     match expr {
         LogicalExpression::Binary {
@@ -783,6 +849,7 @@ pub(crate) fn flatten_and_conjuncts(expr: &LogicalExpression) -> Vec<&LogicalExp
 }
 
 /// Joins a list of expressions with AND. Returns `None` for an empty list.
+#[cfg(feature = "gql")]
 pub(crate) fn join_and_conjuncts(parts: Vec<LogicalExpression>) -> Option<LogicalExpression> {
     parts
         .into_iter()
@@ -794,6 +861,13 @@ pub(crate) fn join_and_conjuncts(parts: Vec<LogicalExpression>) -> Option<Logica
 }
 
 /// Wraps an operator with RETURN.
+#[cfg(any(
+    feature = "gql",
+    feature = "cypher",
+    feature = "gremlin",
+    feature = "graphql",
+    feature = "sql-pgq"
+))]
 pub(crate) fn wrap_return(
     input: LogicalOperator,
     items: Vec<ReturnItem>,
@@ -1256,6 +1330,23 @@ mod tests {
             1,
             "right-only should be right-filter"
         );
+        assert!(result.cross_filters.is_empty());
+    }
+
+    #[test]
+    fn classify_cross_side_predicate() {
+        let left_vars: HashSet<String> = ["n".into()].into_iter().collect();
+        let right_vars: HashSet<String> = ["m".into()].into_iter().collect();
+        let pred = LogicalExpression::Binary {
+            left: Box::new(LogicalExpression::Variable("n".into())),
+            op: BinaryOp::Eq,
+            right: Box::new(LogicalExpression::Variable("m".into())),
+        };
+
+        let result = classify_optional_predicates(pred, &left_vars, &right_vars);
+        assert!(result.post_filters.is_empty());
+        assert!(result.right_filters.is_empty());
+        assert_eq!(result.cross_filters.len(), 1);
     }
 
     #[test]

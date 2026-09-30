@@ -220,9 +220,6 @@ pub enum LogicalOperator {
     /// Merge a relationship pattern (match or create).
     MergeRelationship(MergeRelationshipOp),
 
-    /// Find shortest path between nodes.
-    ShortestPath(ShortestPathOp),
-
     // ==================== SPARQL Update Operators ====================
     /// Insert RDF triples.
     InsertTriple(InsertTripleOp),
@@ -254,6 +251,9 @@ pub enum LogicalOperator {
 
     /// Add (merge) triples from one graph to another.
     AddGraph(AddGraphOp),
+
+    /// Native SPARQL property path (`pred*` / `pred+` on a simple IRI).
+    PropertyPath(PropertyPathOp),
 
     /// Per-row aggregation over a list-valued column (horizontal aggregation, GE09).
     HorizontalAggregate(HorizontalAggregateOp),
@@ -370,13 +370,28 @@ impl LogicalOperator {
             | Self::EdgeScan(_)
             | Self::Expand(_)
             | Self::TripleScan(_)
-            | Self::ShortestPath(_)
+            | Self::PropertyPath(_)
             | Self::Empty
             | Self::ParameterScan(_)
             | Self::CallProcedure(_)
             | Self::LoadData(_) => false,
             Self::Construct(op) => op.input.has_mutations(),
         }
+    }
+
+    /// Returns `true` when this tree contains a procedure whose transitive
+    /// effects are not represented by [`Self::has_mutations`].
+    ///
+    /// Until catalog-procedure effects are classified and inherited planning
+    /// context is sealed, historical execution must fail closed on every
+    /// procedure call rather than treating an unknown body as read-only.
+    #[must_use]
+    pub fn contains_procedure_call(&self) -> bool {
+        matches!(self, Self::CallProcedure(_))
+            || self
+                .children()
+                .into_iter()
+                .any(Self::contains_procedure_call)
     }
 
     /// Returns references to the child operators.
@@ -409,7 +424,6 @@ impl LogicalOperator {
             Self::Bind(op) => vec![&*op.input],
             Self::Construct(op) => vec![&*op.input],
             Self::MapCollect(op) => vec![&*op.input],
-            Self::ShortestPath(op) => vec![&*op.input],
             Self::Merge(op) => vec![&*op.input],
             Self::MergeRelationship(op) => vec![&*op.input],
             Self::CreateEdge(op) => vec![&*op.input],
@@ -448,6 +462,7 @@ impl LogicalOperator {
             | Self::CopyGraph(_)
             | Self::MoveGraph(_)
             | Self::AddGraph(_)
+            | Self::PropertyPath(_)
             | Self::CreatePropertyGraph(_)
             | Self::LoadData(_)
             | Self::TextScan(_) => vec![],
@@ -546,10 +561,6 @@ impl LogicalOperator {
             Self::MapCollect(mut op) => {
                 op.input = Box::new(f(*op.input));
                 Self::MapCollect(op)
-            }
-            Self::ShortestPath(mut op) => {
-                op.input = Box::new(f(*op.input));
-                Self::ShortestPath(op)
             }
             Self::Merge(mut op) => {
                 op.input = Box::new(f(*op.input));
@@ -656,6 +667,7 @@ impl LogicalOperator {
             | Self::CopyGraph(_)
             | Self::MoveGraph(_)
             | Self::AddGraph(_)
+            | Self::PropertyPath(_)
             | Self::CreatePropertyGraph(_)
             | Self::LoadData(_)
             | Self::TextScan(_)) => leaf,
@@ -761,9 +773,6 @@ impl LogicalOperator {
             Self::Unwind(op) => op.variable.clone(),
             Self::Bind(op) => op.variable.clone(),
             Self::MapCollect(op) => op.alias.clone(),
-            Self::ShortestPath(op) => {
-                format!("{} -> {}", op.source_var, op.target_var)
-            }
             Self::Merge(op) => op.variable.clone(),
             Self::MergeRelationship(op) => op.variable.clone(),
             Self::CreateNode(op) => {
@@ -803,312 +812,294 @@ impl LogicalOperator {
     /// Formats this operator tree as a human-readable plan for EXPLAIN output.
     pub fn explain_tree(&self) -> String {
         let mut output = String::new();
-        self.fmt_tree(&mut output, 0);
+        let _ = self.write_explain(&mut output);
         output
     }
 
-    fn fmt_tree(&self, out: &mut String, depth: usize) {
+    /// Writes EXPLAIN directly into a fallible, caller-owned formatting target.
+    ///
+    /// # Errors
+    /// Propagates the target's formatting or output-admission failure.
+    pub fn write_explain(&self, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        self.fmt_tree(out, 0)
+    }
+
+    fn fmt_tree(&self, out: &mut dyn std::fmt::Write, depth: usize) -> std::fmt::Result {
         use std::fmt::Write;
 
-        let indent = "  ".repeat(depth);
+        let indent = ExplainIndent(depth);
         match self {
             Self::NodeScan(op) => {
                 let label = op.label.as_deref().unwrap_or("*");
-                let _ = writeln!(out, "{indent}NodeScan ({var}:{label})", var = op.variable);
+                writeln!(out, "{indent}NodeScan ({var}:{label})", var = op.variable)?;
                 if let Some(input) = &op.input {
-                    input.fmt_tree(out, depth + 1);
+                    input.fmt_tree(out, depth + 1)?;
                 }
             }
             Self::EdgeScan(op) => {
-                let types = if op.edge_types.is_empty() {
-                    "*".to_string()
-                } else {
-                    op.edge_types.join("|")
-                };
-                let _ = writeln!(out, "{indent}EdgeScan ({var}:{types})", var = op.variable);
+                let types = ExplainJoined(&op.edge_types, "|", "*");
+                writeln!(out, "{indent}EdgeScan ({var}:{types})", var = op.variable)?;
             }
             Self::Expand(op) => {
-                let types = if op.edge_types.is_empty() {
-                    "*".to_string()
-                } else {
-                    op.edge_types.join("|")
-                };
+                let types = ExplainJoined(&op.edge_types, "|", "*");
                 let dir = match op.direction {
                     ExpandDirection::Outgoing => "->",
                     ExpandDirection::Incoming => "<-",
                     ExpandDirection::Both => "--",
                 };
-                let hops = match (op.min_hops, op.max_hops) {
-                    (1, Some(1)) => String::new(),
-                    (min, Some(max)) if min == max => format!("*{min}"),
-                    (min, Some(max)) => format!("*{min}..{max}"),
-                    (min, None) => format!("*{min}.."),
-                };
-                let _ = writeln!(
+                let hops = explain_display(|f| match (op.min_hops, op.max_hops) {
+                    (1, Some(1)) => Ok(()),
+                    (min, Some(max)) if min == max => write!(f, "*{min}"),
+                    (min, Some(max)) => write!(f, "*{min}..{max}"),
+                    (min, None) => write!(f, "*{min}.."),
+                });
+                writeln!(
                     out,
                     "{indent}Expand ({from}){dir}[:{types}{hops}]{dir}({to})",
                     from = op.from_variable,
                     to = op.to_variable,
-                );
-                op.input.fmt_tree(out, depth + 1);
+                )?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Filter(op) => {
-                let hint = match &op.pushdown_hint {
+                let hint = explain_display(|f| match &op.pushdown_hint {
                     Some(PushdownHint::IndexLookup { property }) => {
-                        format!(" [index: {property}]")
+                        write!(f, " [index: {property}]")
                     }
-                    Some(PushdownHint::RangeScan { property }) => {
-                        format!(" [range: {property}]")
-                    }
-                    Some(PushdownHint::LabelFirst) => " [label-first]".to_string(),
-                    None => String::new(),
-                };
-                let _ = writeln!(
+                    Some(PushdownHint::RangeScan { property }) => write!(f, " [range: {property}]"),
+                    Some(PushdownHint::LabelFirst) => f.write_str(" [label-first]"),
+                    None => Ok(()),
+                });
+                writeln!(
                     out,
                     "{indent}Filter ({expr}){hint}",
-                    expr = fmt_expr(&op.predicate)
-                );
-                op.input.fmt_tree(out, depth + 1);
+                    expr = fmt_expr_display(&op.predicate)
+                )?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Project(op) => {
-                let cols: Vec<String> = op
-                    .projections
-                    .iter()
-                    .map(|p| {
-                        let expr = fmt_expr(&p.expression);
-                        match &p.alias {
-                            Some(alias) => format!("{expr} AS {alias}"),
-                            None => expr,
-                        }
-                    })
-                    .collect();
-                let _ = writeln!(out, "{indent}Project ({cols})", cols = cols.join(", "));
-                op.input.fmt_tree(out, depth + 1);
+                write!(out, "{indent}Project (")?;
+                for (index, projection) in op.projections.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(", ")?;
+                    }
+                    write!(out, "{}", fmt_expr_display(&projection.expression))?;
+                    if let Some(alias) = &projection.alias {
+                        write!(out, " AS {alias}")?;
+                    }
+                }
+                writeln!(out, ")")?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Join(op) => {
-                let _ = writeln!(out, "{indent}Join ({ty:?})", ty = op.join_type);
-                op.left.fmt_tree(out, depth + 1);
-                op.right.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Join ({ty:?})", ty = op.join_type)?;
+                op.left.fmt_tree(out, depth + 1)?;
+                op.right.fmt_tree(out, depth + 1)?;
             }
             Self::Aggregate(op) => {
-                let groups: Vec<String> = op.group_by.iter().map(fmt_expr).collect();
-                let aggs: Vec<String> = op
-                    .aggregates
-                    .iter()
-                    .map(|a| {
-                        let func = format!("{:?}", a.function).to_lowercase();
-                        match &a.alias {
-                            Some(alias) => format!("{func}(...) AS {alias}"),
-                            None => format!("{func}(...)"),
-                        }
-                    })
-                    .collect();
-                let _ = writeln!(
-                    out,
-                    "{indent}Aggregate (group: [{groups}], aggs: [{aggs}])",
-                    groups = groups.join(", "),
-                    aggs = aggs.join(", "),
-                );
-                op.input.fmt_tree(out, depth + 1);
+                write!(out, "{indent}Aggregate (group: [")?;
+                for (index, group) in op.group_by.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(", ")?;
+                    }
+                    write!(out, "{}", fmt_expr_display(group))?;
+                }
+                out.write_str("], aggs: [")?;
+                for (index, aggregate) in op.aggregates.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(", ")?;
+                    }
+                    write!(&mut ExplainLowercase(out), "{:?}", aggregate.function)?;
+                    out.write_str("(...)")?;
+                    if let Some(alias) = &aggregate.alias {
+                        write!(out, " AS {alias}")?;
+                    }
+                }
+                writeln!(out, "])")?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Limit(op) => {
-                let _ = writeln!(out, "{indent}Limit ({})", op.count);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Limit ({})", op.count)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Skip(op) => {
-                let _ = writeln!(out, "{indent}Skip ({})", op.count);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Skip ({})", op.count)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Sort(op) => {
-                let keys: Vec<String> = op
-                    .keys
-                    .iter()
-                    .map(|k| {
-                        let dir = match k.order {
-                            SortOrder::Ascending => "ASC",
-                            SortOrder::Descending => "DESC",
-                        };
-                        format!("{} {dir}", fmt_expr(&k.expression))
-                    })
-                    .collect();
-                let _ = writeln!(out, "{indent}Sort ({keys})", keys = keys.join(", "));
-                op.input.fmt_tree(out, depth + 1);
+                write!(out, "{indent}Sort (")?;
+                for (index, key) in op.keys.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(", ")?;
+                    }
+                    let direction = match key.order {
+                        SortOrder::Ascending => "ASC",
+                        SortOrder::Descending => "DESC",
+                    };
+                    write!(out, "{} {direction}", fmt_expr_display(&key.expression))?;
+                }
+                writeln!(out, ")")?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Distinct(op) => {
-                let _ = writeln!(out, "{indent}Distinct");
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Distinct")?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Return(op) => {
-                let items: Vec<String> = op
-                    .items
-                    .iter()
-                    .map(|item| {
-                        let expr = fmt_expr(&item.expression);
-                        match &item.alias {
-                            Some(alias) => format!("{expr} AS {alias}"),
-                            None => expr,
-                        }
-                    })
-                    .collect();
                 let distinct = if op.distinct { " DISTINCT" } else { "" };
-                let _ = writeln!(
-                    out,
-                    "{indent}Return{distinct} ({items})",
-                    items = items.join(", ")
-                );
-                op.input.fmt_tree(out, depth + 1);
+                write!(out, "{indent}Return{distinct} (")?;
+                for (index, item) in op.items.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(", ")?;
+                    }
+                    write!(out, "{}", fmt_expr_display(&item.expression))?;
+                    if let Some(alias) = &item.alias {
+                        write!(out, " AS {alias}")?;
+                    }
+                }
+                writeln!(out, ")")?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Union(op) => {
-                let _ = writeln!(out, "{indent}Union ({n} branches)", n = op.inputs.len());
+                writeln!(out, "{indent}Union ({n} branches)", n = op.inputs.len())?;
                 for input in &op.inputs {
-                    input.fmt_tree(out, depth + 1);
+                    input.fmt_tree(out, depth + 1)?;
                 }
             }
             Self::MultiWayJoin(op) => {
-                let vars = op.shared_variables.join(", ");
-                let _ = writeln!(
+                let vars = ExplainJoined(&op.shared_variables, ", ", "");
+                writeln!(
                     out,
                     "{indent}MultiWayJoin ({n} inputs, shared: [{vars}])",
                     n = op.inputs.len()
-                );
+                )?;
                 for input in &op.inputs {
-                    input.fmt_tree(out, depth + 1);
+                    input.fmt_tree(out, depth + 1)?;
                 }
             }
             Self::LeftJoin(op) => {
                 if let Some(cond) = &op.condition {
-                    let _ = writeln!(out, "{indent}LeftJoin (condition: {cond:?})");
+                    writeln!(out, "{indent}LeftJoin (condition: {cond:?})")?;
                 } else {
-                    let _ = writeln!(out, "{indent}LeftJoin");
+                    writeln!(out, "{indent}LeftJoin")?;
                 }
-                op.left.fmt_tree(out, depth + 1);
-                op.right.fmt_tree(out, depth + 1);
+                op.left.fmt_tree(out, depth + 1)?;
+                op.right.fmt_tree(out, depth + 1)?;
             }
             Self::AntiJoin(op) => {
-                let _ = writeln!(out, "{indent}AntiJoin");
-                op.left.fmt_tree(out, depth + 1);
-                op.right.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}AntiJoin")?;
+                op.left.fmt_tree(out, depth + 1)?;
+                op.right.fmt_tree(out, depth + 1)?;
             }
             Self::Unwind(op) => {
-                let _ = writeln!(out, "{indent}Unwind ({var})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Unwind ({var})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Bind(op) => {
-                let _ = writeln!(out, "{indent}Bind ({var})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Bind ({var})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::MapCollect(op) => {
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{indent}MapCollect ({key} -> {val} AS {alias})",
                     key = op.key_var,
                     val = op.value_var,
                     alias = op.alias
-                );
-                op.input.fmt_tree(out, depth + 1);
+                )?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::Apply(op) => {
-                let _ = writeln!(out, "{indent}Apply");
-                op.input.fmt_tree(out, depth + 1);
-                op.subplan.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Apply")?;
+                op.input.fmt_tree(out, depth + 1)?;
+                op.subplan.fmt_tree(out, depth + 1)?;
             }
             Self::Except(op) => {
                 let all = if op.all { " ALL" } else { "" };
-                let _ = writeln!(out, "{indent}Except{all}");
-                op.left.fmt_tree(out, depth + 1);
-                op.right.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Except{all}")?;
+                op.left.fmt_tree(out, depth + 1)?;
+                op.right.fmt_tree(out, depth + 1)?;
             }
             Self::Intersect(op) => {
                 let all = if op.all { " ALL" } else { "" };
-                let _ = writeln!(out, "{indent}Intersect{all}");
-                op.left.fmt_tree(out, depth + 1);
-                op.right.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Intersect{all}")?;
+                op.left.fmt_tree(out, depth + 1)?;
+                op.right.fmt_tree(out, depth + 1)?;
             }
             Self::Otherwise(op) => {
-                let _ = writeln!(out, "{indent}Otherwise");
-                op.left.fmt_tree(out, depth + 1);
-                op.right.fmt_tree(out, depth + 1);
-            }
-            Self::ShortestPath(op) => {
-                let _ = writeln!(
-                    out,
-                    "{indent}ShortestPath ({from} -> {to})",
-                    from = op.source_var,
-                    to = op.target_var
-                );
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Otherwise")?;
+                op.left.fmt_tree(out, depth + 1)?;
+                op.right.fmt_tree(out, depth + 1)?;
             }
             Self::Merge(op) => {
-                let _ = writeln!(out, "{indent}Merge ({var})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}Merge ({var})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::MergeRelationship(op) => {
-                let _ = writeln!(out, "{indent}MergeRelationship ({var})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}MergeRelationship ({var})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::CreateNode(op) => {
-                let labels = op.labels.join(":");
-                let _ = writeln!(
+                let labels = ExplainJoined(&op.labels, ":", "");
+                writeln!(
                     out,
                     "{indent}CreateNode ({var}:{labels})",
                     var = op.variable
-                );
+                )?;
                 if let Some(input) = &op.input {
-                    input.fmt_tree(out, depth + 1);
+                    input.fmt_tree(out, depth + 1)?;
                 }
             }
             Self::CreateEdge(op) => {
                 let var = op.variable.as_deref().unwrap_or("?");
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{indent}CreateEdge ({from})-[{var}:{ty}]->({to})",
                     from = op.from_variable,
                     ty = op.edge_type,
                     to = op.to_variable
-                );
-                op.input.fmt_tree(out, depth + 1);
+                )?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::DeleteNode(op) => {
-                let _ = writeln!(out, "{indent}DeleteNode ({var})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}DeleteNode ({var})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::DeleteEdge(op) => {
-                let _ = writeln!(out, "{indent}DeleteEdge ({var})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                writeln!(out, "{indent}DeleteEdge ({var})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::SetProperty(op) => {
-                let props: Vec<String> = op
-                    .properties
-                    .iter()
-                    .map(|(k, _)| format!("{}.{k}", op.variable))
-                    .collect();
-                let _ = writeln!(
-                    out,
-                    "{indent}SetProperty ({props})",
-                    props = props.join(", ")
-                );
-                op.input.fmt_tree(out, depth + 1);
+                write!(out, "{indent}SetProperty (")?;
+                for (index, (key, _)) in op.properties.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(", ")?;
+                    }
+                    write!(out, "{}.{key}", op.variable)?;
+                }
+                writeln!(out, ")")?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::AddLabel(op) => {
-                let labels = op.labels.join(":");
-                let _ = writeln!(out, "{indent}AddLabel ({var}:{labels})", var = op.variable);
-                op.input.fmt_tree(out, depth + 1);
+                let labels = ExplainJoined(&op.labels, ":", "");
+                writeln!(out, "{indent}AddLabel ({var}:{labels})", var = op.variable)?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::RemoveLabel(op) => {
-                let labels = op.labels.join(":");
-                let _ = writeln!(
+                let labels = ExplainJoined(&op.labels, ":", "");
+                writeln!(
                     out,
                     "{indent}RemoveLabel ({var}:{labels})",
                     var = op.variable
-                );
-                op.input.fmt_tree(out, depth + 1);
+                )?;
+                op.input.fmt_tree(out, depth + 1)?;
             }
             Self::CallProcedure(op) => {
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{indent}CallProcedure ({name})",
-                    name = op.name.join(".")
-                );
+                    name = ExplainJoined(&op.name, ".", "")
+                )?;
             }
             Self::LoadData(op) => {
                 let format_name = match op.format {
@@ -1122,23 +1113,23 @@ impl LogicalOperator {
                 } else {
                     ""
                 };
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{indent}{format_name}{headers} ('{path}' AS {var})",
                     path = op.path,
                     var = op.variable,
-                );
+                )?;
             }
             Self::TripleScan(op) => {
-                let _ = writeln!(
+                writeln!(
                     out,
                     "{indent}TripleScan ({s} {p} {o})",
-                    s = fmt_triple_component(&op.subject),
-                    p = fmt_triple_component(&op.predicate),
-                    o = fmt_triple_component(&op.object)
-                );
+                    s = fmt_triple_component_display(&op.subject),
+                    p = fmt_triple_component_display(&op.predicate),
+                    o = fmt_triple_component_display(&op.object)
+                )?;
                 if let Some(input) = &op.input {
-                    input.fmt_tree(out, depth + 1);
+                    input.fmt_tree(out, depth + 1)?;
                 }
             }
             Self::VectorScan(op) => {
@@ -1148,75 +1139,171 @@ impl LogicalOperator {
                     VectorMetric::DotProduct => "dot_product",
                     VectorMetric::Manhattan => "manhattan",
                 });
-                let mode = match op.k {
-                    Some(k) => format!("top-{k}"),
-                    None => "threshold".to_string(),
-                };
-                let _ = writeln!(
+                let mode = explain_display(|f| match op.k {
+                    Some(k) => write!(f, "top-{k}"),
+                    None => f.write_str("threshold"),
+                });
+                writeln!(
                     out,
                     "{indent}VectorScan ({var}:{label}.{prop}, {metric}, {mode})",
                     var = op.variable,
                     label = op.label.as_deref().unwrap_or("*"),
                     prop = op.property,
-                );
+                )?;
                 if let Some(input) = &op.input {
-                    input.fmt_tree(out, depth + 1);
+                    input.fmt_tree(out, depth + 1)?;
                 }
             }
             Self::TextScan(op) => {
-                let mode = match (op.k, op.threshold) {
-                    (Some(k), _) => format!("top-{k}"),
-                    (None, Some(t)) => format!("threshold>={t}"),
-                    (None, None) => "default-top-100".to_string(),
-                };
-                let query = fmt_expr(&op.query);
-                let _ = writeln!(
+                let mode = explain_display(|f| match (op.k, op.threshold) {
+                    (Some(k), _) => write!(f, "top-{k}"),
+                    (None, Some(t)) => write!(f, "threshold>={t}"),
+                    (None, None) => f.write_str("default-top-100"),
+                });
+                let query = fmt_expr_display(&op.query);
+                writeln!(
                     out,
                     "{indent}TextScan ({var}:{label}.{prop}, query={query}, {mode})",
                     var = op.variable,
                     label = op.label,
                     prop = op.property,
-                );
+                )?;
             }
             Self::Empty => {
-                let _ = writeln!(out, "{indent}Empty");
+                writeln!(out, "{indent}Empty")?;
             }
             // Remaining operators: show a simple name
             _ => {
-                let _ = writeln!(out, "{indent}{:?}", std::mem::discriminant(self));
+                writeln!(out, "{indent}{:?}", std::mem::discriminant(self))?;
             }
         }
+        Ok(())
     }
 }
 
-/// Format a logical expression compactly for EXPLAIN output.
-fn fmt_expr(expr: &LogicalExpression) -> String {
-    match expr {
-        LogicalExpression::Variable(name) => name.clone(),
-        LogicalExpression::Property { variable, property } => format!("{variable}.{property}"),
-        LogicalExpression::Literal(val) => format!("{val}"),
+struct ExplainIndent(usize);
+impl std::fmt::Display for ExplainIndent {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for _ in 0..self.0 {
+            out.write_str("  ")?;
+        }
+        Ok(())
+    }
+}
+
+struct ExplainJoined<'a>(&'a [String], &'a str, &'a str);
+impl std::fmt::Display for ExplainJoined<'_> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return out.write_str(self.2);
+        }
+        for (index, item) in self.0.iter().enumerate() {
+            if index != 0 {
+                out.write_str(self.1)?;
+            }
+            out.write_str(item)?;
+        }
+        Ok(())
+    }
+}
+
+struct ExplainDisplay<F>(F);
+fn explain_display(
+    function: impl Fn(&mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+) -> impl std::fmt::Display {
+    ExplainDisplay(function)
+}
+impl<F: Fn(&mut std::fmt::Formatter<'_>) -> std::fmt::Result> std::fmt::Display
+    for ExplainDisplay<F>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (self.0)(formatter)
+    }
+}
+
+struct ExplainLowercase<'a>(&'a mut dyn std::fmt::Write);
+impl std::fmt::Write for ExplainLowercase<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        for character in value.chars().flat_map(char::to_lowercase) {
+            self.0.write_char(character)?;
+        }
+        Ok(())
+    }
+}
+
+/// Formats an expression without intermediate strings or argument vectors.
+fn fmt_expr_display(expr: &LogicalExpression) -> impl std::fmt::Display + '_ {
+    explain_display(move |out| match expr {
+        LogicalExpression::Variable(name) => out.write_str(name),
+        LogicalExpression::Property { variable, property } => write!(out, "{variable}.{property}"),
+        LogicalExpression::Literal(value) => write!(out, "{value}"),
         LogicalExpression::Binary { left, op, right } => {
-            format!("{} {op:?} {}", fmt_expr(left), fmt_expr(right))
+            write!(
+                out,
+                "{} {op:?} {}",
+                fmt_expr_display(left),
+                fmt_expr_display(right)
+            )
         }
         LogicalExpression::Unary { op, operand } => {
-            format!("{op:?} {}", fmt_expr(operand))
+            write!(out, "{op:?} {}", fmt_expr_display(operand))
         }
         LogicalExpression::FunctionCall { name, args, .. } => {
-            let arg_strs: Vec<String> = args.iter().map(fmt_expr).collect();
-            format!("{name}({})", arg_strs.join(", "))
+            write!(out, "{name}(")?;
+            for (index, argument) in args.iter().enumerate() {
+                if index != 0 {
+                    out.write_str(", ")?;
+                }
+                write!(out, "{}", fmt_expr_display(argument))?;
+            }
+            out.write_str(")")
         }
-        _ => format!("{expr:?}"),
-    }
+        _ => write!(out, "{expr:?}"),
+    })
 }
 
-/// Format a triple component for EXPLAIN output.
-fn fmt_triple_component(comp: &TripleComponent) -> String {
-    match comp {
-        TripleComponent::Variable(name) => format!("?{name}"),
-        TripleComponent::Iri(iri) => format!("<{iri}>"),
-        TripleComponent::Literal(val) => format!("{val}"),
-        TripleComponent::LangLiteral { value, lang } => format!("\"{value}\"@{lang}"),
-        TripleComponent::BlankNode(label) => format!("_:{label}"),
+fn fmt_triple_component_display(component: &TripleComponent) -> impl std::fmt::Display + '_ {
+    explain_display(move |out| match component {
+        TripleComponent::Variable(name) => write!(out, "?{name}"),
+        TripleComponent::Iri(iri) => write!(out, "<{iri}>"),
+        TripleComponent::Literal(value) => write!(out, "{value}"),
+        TripleComponent::LangLiteral { value, lang } => write!(out, "\"{value}\"@{lang}"),
+        TripleComponent::BlankNode(label) => write!(out, "_:{label}"),
+    })
+}
+
+// Physical profile labels are existing owned planning metadata. Their callers
+// still request Strings; bounded EXPLAIN writes the Display adapters directly.
+fn fmt_expr(expression: &LogicalExpression) -> String {
+    fmt_expr_display(expression).to_string()
+}
+
+#[cfg(test)]
+fn fmt_triple_component(component: &TripleComponent) -> String {
+    fmt_triple_component_display(component).to_string()
+}
+
+#[cfg(test)]
+mod bounded_explain_tests {
+    use super::*;
+
+    #[test]
+    fn explain_writer_stops_at_first_output_failure() {
+        struct RejectWriter(usize);
+        impl std::fmt::Write for RejectWriter {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                self.0 += 1;
+                Err(std::fmt::Error)
+            }
+        }
+        let plan = LogicalOperator::NodeScan(NodeScanOp {
+            variable: "n".into(),
+            label: Some("Person".into()),
+            input: None,
+        });
+        let mut writer = RejectWriter(0);
+        assert!(plan.write_explain(&mut writer).is_err());
+        assert_eq!(writer.0, 1);
     }
 }
 
@@ -1257,6 +1344,30 @@ pub enum PathMode {
     Acyclic,
 }
 
+/// Which of the walks matching a variable-length pattern survive to the output.
+///
+/// [`PathMode`] decides whether a walk is *legal*; `PathSearch` decides how many
+/// of the legal walks are kept. Maps one-to-one onto
+/// `grafeo_core::execution::operators::ExecutionPathSearch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum PathSearch {
+    /// Every legal walk within the hop bounds (default).
+    #[default]
+    All,
+    /// Exactly one row per distinct target node.
+    DistinctTargets,
+    /// Only the shortest legal walks to each target.
+    Shortest {
+        /// How many walks (`groups: false`) or distinct lengths (`groups: true`)
+        /// to keep per target.
+        k: u32,
+        /// When true, keep every walk whose length is among the `k` smallest
+        /// distinct lengths (`ALL SHORTEST`, `SHORTEST k GROUPS`).
+        groups: bool,
+    },
+}
+
 /// Expand from nodes to their neighbors.
 #[derive(Debug, Clone)]
 pub struct ExpandOp {
@@ -1281,6 +1392,14 @@ pub struct ExpandOp {
     pub path_alias: Option<String>,
     /// Path traversal mode (WALK, TRAIL, SIMPLE, ACYCLIC).
     pub path_mode: PathMode,
+    /// Which of the legal walks survive (ALL, DISTINCT targets, SHORTEST k).
+    pub path_search: PathSearch,
+    /// Intrinsic per-edge eligibility, bound to `edge_variable` and fixed input
+    /// variables. Evaluated before traversal admission, not on the final edge.
+    pub edge_predicate: Option<LogicalExpression>,
+    /// Full candidate path eligibility before shortest output quotas.
+    /// Validated with the target/path bindings; traversal-prefix pruning is disabled.
+    pub path_predicate: Option<LogicalExpression>,
 }
 
 /// Direction for edge expansion.
@@ -1335,6 +1454,23 @@ pub struct JoinCondition {
     pub left: LogicalExpression,
     /// Right expression.
     pub right: LogicalExpression,
+    /// Equality semantics required by this key.
+    pub semantics: JoinKeySemantics,
+}
+
+/// Equality semantics for a logical join key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKeySemantics {
+    /// Compare the visible logical values.
+    Value,
+    /// Compare canonical RDF term identity, including term kind and datatype.
+    RdfTermIdentity,
+    /// Requires full SPARQL solution-mapping compatibility (unbound wildcard).
+    ///
+    /// RDF planning routes this through its compatibility operator, which
+    /// compares bound RDF identity, treats an unbound side as a wildcard, and
+    /// coalesces shared output bindings. Non-RDF planners must reject it.
+    SparqlCompatibility,
 }
 
 /// Multi-way join for worst-case optimal joins (leapfrog).
@@ -1404,6 +1540,9 @@ pub struct AggregateExpr {
     pub expression: Option<LogicalExpression>,
     /// Second expression for binary set functions (x for COVAR, CORR, REGR_*).
     pub expression2: Option<LogicalExpression>,
+    /// Optional identity expression used only to key DISTINCT independently
+    /// from the value consumed by the aggregate function.
+    pub distinct_key: Option<LogicalExpression>,
     /// Whether to use DISTINCT.
     pub distinct: bool,
     /// Alias for the result.
@@ -1826,6 +1965,8 @@ pub struct LeftJoinOp {
     pub right: Box<LogicalOperator>,
     /// Optional filter condition.
     pub condition: Option<LogicalExpression>,
+    /// Shared-variable compatibility keys with explicit equality semantics.
+    pub compatibility_conditions: Vec<JoinCondition>,
 }
 
 /// Anti-join for MINUS patterns.
@@ -1835,6 +1976,19 @@ pub struct AntiJoinOp {
     pub left: Box<LogicalOperator>,
     /// Right input (patterns to exclude).
     pub right: Box<LogicalOperator>,
+    /// Shared-variable compatibility keys with explicit equality semantics.
+    pub compatibility_conditions: Vec<JoinCondition>,
+    /// SPARQL operation whose semantics this anti join represents.
+    pub semantics: AntiJoinSemantics,
+}
+
+/// Semantic origin of an RDF anti join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiJoinSemantics {
+    /// SPARQL MINUS, which is a no-op when there are no shared variables.
+    Minus,
+    /// FILTER NOT EXISTS, which rejects on any non-empty uncorrelated right side.
+    NotExists,
 }
 
 /// Bind a variable to an expression.
@@ -1927,28 +2081,6 @@ pub struct MergeRelationshipOp {
     pub input: Box<LogicalOperator>,
 }
 
-/// Find shortest path between two nodes.
-///
-/// This operator uses Dijkstra's algorithm to find the shortest path(s)
-/// between a source node and a target node, optionally filtered by edge type.
-#[derive(Debug, Clone)]
-pub struct ShortestPathOp {
-    /// Input operator providing source/target nodes.
-    pub input: Box<LogicalOperator>,
-    /// Variable name for the source node.
-    pub source_var: String,
-    /// Variable name for the target node.
-    pub target_var: String,
-    /// Edge type filter (empty = match all types, multiple = match any).
-    pub edge_types: Vec<String>,
-    /// Direction of edge traversal.
-    pub direction: ExpandDirection,
-    /// Variable name to bind the path result.
-    pub path_alias: String,
-    /// Whether to find all shortest paths (vs. just one).
-    pub all_paths: bool,
-}
-
 // ==================== SPARQL Update Operators ====================
 
 /// Insert RDF triples.
@@ -2012,6 +2144,183 @@ pub struct TripleTemplate {
     pub object: TripleComponent,
     /// Named graph (optional).
     pub graph: Option<String>,
+}
+
+/// Internal, parser-inexpressible prefix for lossless RDF term columns.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_EXACT_TERM_COLUMN_PREFIX: &str = "\0grafeo:rdf-term:";
+
+/// Internal, parser-inexpressible prefix for canonical RDF identity keys.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_IDENTITY_KEY_COLUMN_PREFIX: &str = "\0grafeo:rdf-identity-key:";
+
+/// Internal, parser-inexpressible prefix for discriminated RDF/native GROUP keys.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_GROUP_KEY_COLUMN_PREFIX: &str = "\0grafeo:rdf-group-key:";
+
+/// Internal, parser-inexpressible prefix for tagged RDF expression columns.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAGGED_TERM_COLUMN_PREFIX: &str = "\0grafeo:rdf-tagged-term:";
+
+/// Internal column marking a translator-produced MODIFY plan whose bindings
+/// require sealed RDF identities instead of public legacy coercions.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_SEALED_MODIFY_COLUMN: &str = "\0grafeo:rdf-sealed-modify";
+
+/// Internal marker for a GRAPH template variable on the stable public
+/// `TripleTemplate { graph: Option<String> }` shape.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_GRAPH_VARIABLE_TEMPLATE_PREFIX: &str = "\0grafeo:rdf-graph-variable:";
+
+/// Internal dataset entry distinguishing explicit absence from the public
+/// empty-list convention (which means unrestricted named graphs).
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_EXPLICIT_EMPTY_NAMED_DATASET: &str = "\0grafeo:rdf-no-named-graphs";
+
+/// Internal dataset entry distinguishing explicit absence from the public
+/// empty-list convention (which means the actual default graph).
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_EXPLICIT_EMPTY_DEFAULT_DATASET: &str = "\0grafeo:rdf-no-default-graph";
+
+/// Internal expression function that evaluates and tags an RDF IRI.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_IRI_TERM: &str = "\0grafeo:rdf-tag-iri";
+
+/// Internal expression function that evaluates and tags an RDF blank node.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_BLANK_TERM: &str = "\0grafeo:rdf-tag-blank";
+
+/// Internal expression function that evaluates and tags an RDF literal.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_LITERAL_TERM: &str = "\0grafeo:rdf-tag-literal";
+
+/// Internal expression function that evaluates and tags a language literal.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_LANG_LITERAL_TERM: &str = "\0grafeo:rdf-tag-lang-literal";
+
+/// Internal expression function that evaluates and tags a typed literal.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_TYPED_LITERAL_TERM: &str = "\0grafeo:rdf-tag-typed-literal";
+
+/// Internal expression function that pairs a visible value with its exact term.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_BOUND_TERM: &str = "\0grafeo:rdf-tag-bound";
+
+/// Internal selector wrapper that keeps an exact tagged term when available
+/// and otherwise exposes the already-evaluated native value.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TERM_OR_NATIVE_VALUE: &str = "\0grafeo:rdf-term-or-native-value";
+
+/// Extracts the public value from an RDF-or-native selector result without
+/// mistaking an arbitrary native list for Grafeo's sealed tagged-term shape.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TERM_OR_NATIVE_VISIBLE: &str = "\0grafeo:rdf-term-or-native-visible";
+
+/// Extracts lossless N-Triples from an RDF-or-native selector result, or null
+/// when the stored value is a native extension value rather than an RDF term.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TERM_OR_NATIVE_EXACT: &str = "\0grafeo:rdf-term-or-native-exact";
+
+/// Internal DISTINCT-key wrapper that keeps canonical RDF term identity when
+/// the input is tagged and otherwise preserves the native value's identity.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_DISTINCT_TERM_OR_VALUE_KEY: &str = "\0grafeo:rdf-distinct-term-or-value-key";
+
+/// Builds one rowwise discriminated comparison key from a public value, an
+/// optional existing discriminated helper, and an optional canonical RDF
+/// identity. RDF keys and native extension values can therefore share
+/// GROUP/DISTINCT/compatibility machinery without collisions.
+#[cfg(feature = "triple-store")]
+pub(crate) const RDF_IDENTITY_OR_NATIVE_KEY: &str = "\0grafeo:rdf-identity-or-native-key";
+
+/// Internal expression function that extracts a tagged term's visible value.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_VALUE: &str = "\0grafeo:rdf-tag-value";
+
+/// Internal expression function that extracts a tagged term's N-Triples value.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TAG_EXACT: &str = "\0grafeo:rdf-tag-exact";
+
+/// Internal expression function that canonicalizes a tagged RDF term for
+/// same-term DISTINCT identity.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TERM_IDENTITY_KEY: &str = "\0grafeo:rdf-term-identity-key";
+
+/// Internal value-equality operation over sealed RDF term pairs.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TERM_EQUAL: &str = "\0grafeo:rdf-term-equal";
+
+/// Internal SPARQL value-membership operation over sealed RDF terms.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_TERM_IN: &str = "\0grafeo:rdf-term-in";
+
+/// Internal identity-equality operation over sealed RDF term pairs.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_SAME_TERM: &str = "\0grafeo:rdf-same-term";
+
+/// Internal IRI-kind predicate over a sealed RDF term pair.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_IS_IRI: &str = "\0grafeo:rdf-is-iri";
+
+/// Internal blank-node-kind predicate over a sealed RDF term pair.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_IS_BLANK: &str = "\0grafeo:rdf-is-blank";
+
+/// Internal literal-kind predicate over a sealed RDF term pair.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_IS_LITERAL: &str = "\0grafeo:rdf-is-literal";
+
+/// Internal numeric-value predicate over a sealed RDF term.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_IS_NUMERIC: &str = "\0grafeo:rdf-is-numeric";
+
+/// Internal expression function that validates and exposes an RDF numeric value.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) const RDF_NUMERIC_VALUE: &str = "\0grafeo:rdf-numeric-value";
+
+/// Returns the sealed internal column name carrying one variable's N-Triples term.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) fn rdf_exact_term_column(variable: &str) -> String {
+    format!("{RDF_EXACT_TERM_COLUMN_PREFIX}{variable}")
+}
+
+/// Returns the internal column carrying one variable's canonical identity key.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) fn rdf_identity_key_column(variable: &str) -> String {
+    format!("{RDF_IDENTITY_KEY_COLUMN_PREFIX}{variable}")
+}
+
+/// Returns the internal column carrying a GROUP-only RDF/native identity key.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) fn rdf_group_key_column(variable: &str) -> String {
+    format!("{RDF_GROUP_KEY_COLUMN_PREFIX}{variable}")
+}
+
+/// Returns the sealed internal column holding one evaluated tagged RDF term.
+#[cfg(feature = "sparql")]
+pub(crate) fn rdf_tagged_term_column(variable: &str) -> String {
+    format!("{RDF_TAGGED_TERM_COLUMN_PREFIX}{variable}")
+}
+
+/// Encodes a GRAPH template variable without consuming any public graph-name value.
+#[cfg(feature = "sparql")]
+pub(crate) fn rdf_graph_variable_template(variable: &str) -> String {
+    format!("{RDF_GRAPH_VARIABLE_TEMPLATE_PREFIX}{variable}")
+}
+
+/// Decodes an internally marked GRAPH template variable.
+#[cfg(feature = "triple-store")]
+pub(crate) fn rdf_graph_variable_from_template(template: &str) -> Option<&str> {
+    template.strip_prefix(RDF_GRAPH_VARIABLE_TEMPLATE_PREFIX)
+}
+
+/// Whether a column contains sealed internal RDF term metadata.
+#[cfg(any(feature = "triple-store", feature = "sparql"))]
+pub(crate) fn is_rdf_internal_term_column(column: &str) -> bool {
+    column.starts_with(RDF_EXACT_TERM_COLUMN_PREFIX)
+        || column.starts_with(RDF_IDENTITY_KEY_COLUMN_PREFIX)
+        || column.starts_with(RDF_GROUP_KEY_COLUMN_PREFIX)
+        || column.starts_with(RDF_TAGGED_TERM_COLUMN_PREFIX)
 }
 
 /// SPARQL CONSTRUCT: evaluate WHERE, substitute bindings into template.
@@ -2095,6 +2404,56 @@ pub struct AddGraphOp {
     pub destination: Option<String>,
     /// Whether to silently ignore errors.
     pub silent: bool,
+}
+
+/// One hop of a SPARQL property path (`pred`, `p/q`, `p|q`, `^p`).
+#[derive(Debug, Clone)]
+pub enum PathStep {
+    /// A single predicate IRI, optionally inverse.
+    Iri {
+        /// Predicate IRI.
+        iri: String,
+        /// Walk the inverse (`^iri`).
+        inverse: bool,
+    },
+    /// Sequence `p/q`.
+    Sequence(Vec<PathStep>),
+    /// Alternative `p|q`.
+    Alternative(Vec<PathStep>),
+}
+
+impl PathStep {
+    /// Inverse of this step (`^path`).
+    #[must_use]
+    pub fn inverted(&self) -> Self {
+        match self {
+            Self::Iri { iri, inverse } => Self::Iri {
+                iri: iri.clone(),
+                inverse: !inverse,
+            },
+            Self::Sequence(steps) => {
+                Self::Sequence(steps.iter().rev().map(Self::inverted).collect())
+            }
+            Self::Alternative(steps) => {
+                Self::Alternative(steps.iter().map(Self::inverted).collect())
+            }
+        }
+    }
+}
+
+/// Native SPARQL property path (`pred*` / `pred+`, including nested `p/q` and `p|q`).
+#[derive(Debug, Clone)]
+pub struct PropertyPathOp {
+    /// Path start (variable or IRI).
+    pub subject: TripleComponent,
+    /// One hop of the inner path (repeated `min_hops..` times).
+    pub path: PathStep,
+    /// Path end (variable or IRI).
+    pub object: TripleComponent,
+    /// 0 for `*`, 1 for `+`.
+    pub min_hops: u32,
+    /// Named-graph IRI, if the path is inside `GRAPH`.
+    pub graph: Option<String>,
 }
 
 // ==================== Vector Search Operators ====================
@@ -2807,7 +3166,7 @@ mod tests {
             score_column: None,
         }));
         let mut out = String::new();
-        plan.root.fmt_tree(&mut out, 0);
+        plan.root.fmt_tree(&mut out, 0).unwrap();
         out
     }
 
@@ -2891,6 +3250,9 @@ mod tests {
                     })),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 })),
                 pushdown_hint: Some(PushdownHint::LabelFirst),
             })),
@@ -3029,7 +3391,7 @@ mod tests {
         // Display/Equality sanity
         assert_eq!(format!("{literal}"), "42");
         assert_eq!(format!("{param}"), "$limit");
-        assert!(literal == 42usize);
+        assert_eq!(literal, 42usize);
     }
 
     // ==================== CountExpr ====================
@@ -3334,12 +3696,15 @@ mod tests {
             left: Box::new(mutating()),
             right: Box::new(read()),
             condition: None,
+            compatibility_conditions: Vec::new(),
         });
         assert!(left_join.has_mutations());
 
         let anti_join = LogicalOperator::AntiJoin(AntiJoinOp {
             left: Box::new(read()),
             right: Box::new(mutating()),
+            compatibility_conditions: Vec::new(),
+            semantics: AntiJoinSemantics::Minus,
         });
         assert!(anti_join.has_mutations());
 
@@ -3569,6 +3934,9 @@ mod tests {
             input: leaf_node_scan("a"),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         assert_eq!(expand.display_label(), "(a)->[:KNOWS]->(b)");
 
@@ -3583,6 +3951,9 @@ mod tests {
             input: leaf_node_scan("a"),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         assert_eq!(expand_in.display_label(), "(a)<-[:*]<-(b)");
 
@@ -3597,6 +3968,9 @@ mod tests {
             input: leaf_node_scan("a"),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         assert_eq!(expand_both.display_label(), "(a)--[:*]--(b)");
     }
@@ -3742,12 +4116,15 @@ mod tests {
             left: leaf_empty(),
             right: leaf_empty(),
             condition: None,
+            compatibility_conditions: Vec::new(),
         });
         assert_eq!(lj.display_label(), "");
 
         let aj = LogicalOperator::AntiJoin(AntiJoinOp {
             left: leaf_empty(),
             right: leaf_empty(),
+            compatibility_conditions: Vec::new(),
+            semantics: AntiJoinSemantics::Minus,
         });
         assert_eq!(aj.display_label(), "");
 
@@ -3775,16 +4152,25 @@ mod tests {
         });
         assert_eq!(mapc.display_label(), "counts");
 
-        let sp = LogicalOperator::ShortestPath(ShortestPathOp {
+        let expand = LogicalOperator::Expand(ExpandOp {
             input: leaf_empty(),
-            source_var: "a".into(),
-            target_var: "b".into(),
+            from_variable: "a".into(),
+            to_variable: "b".into(),
+            edge_variable: None,
             edge_types: vec![],
             direction: ExpandDirection::Outgoing,
-            path_alias: "p".into(),
-            all_paths: false,
+            min_hops: 1,
+            max_hops: Some(3),
+            path_alias: Some("p".into()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
         });
-        assert_eq!(sp.display_label(), "a -> b");
+        assert_eq!(expand.display_label(), "(a)->[:*]->(b)");
 
         let merge = LogicalOperator::Merge(MergeOp {
             variable: "django".into(),
@@ -3974,6 +4360,9 @@ mod tests {
                 input: leaf_node_scan("a"),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })
             .explain_tree()
         };
@@ -4054,6 +4443,7 @@ mod tests {
                     function: AggregateFunction::Count,
                     expression: None,
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("c".into()),
                     percentile: None,
@@ -4063,6 +4453,7 @@ mod tests {
                     function: AggregateFunction::Sum,
                     expression: Some(var("x")),
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: None,
                     percentile: None,
@@ -4132,6 +4523,7 @@ mod tests {
             left: leaf_empty(),
             right: leaf_empty(),
             condition: Some(var("x")),
+            compatibility_conditions: Vec::new(),
         });
         assert!(
             left_join_cond
@@ -4143,6 +4535,7 @@ mod tests {
             left: leaf_empty(),
             right: leaf_empty(),
             condition: None,
+            compatibility_conditions: Vec::new(),
         });
         let s = left_join_none.explain_tree();
         assert!(s.contains("LeftJoin"));
@@ -4151,6 +4544,8 @@ mod tests {
         let anti = LogicalOperator::AntiJoin(AntiJoinOp {
             left: leaf_empty(),
             right: leaf_empty(),
+            compatibility_conditions: Vec::new(),
+            semantics: AntiJoinSemantics::Minus,
         });
         assert!(anti.explain_tree().contains("AntiJoin"));
 
@@ -4237,16 +4632,26 @@ mod tests {
         });
         assert!(apply.explain_tree().contains("Apply"));
 
-        let sp = LogicalOperator::ShortestPath(ShortestPathOp {
+        let expand = LogicalOperator::Expand(ExpandOp {
             input: leaf_empty(),
-            source_var: "a".into(),
-            target_var: "b".into(),
+            from_variable: "a".into(),
+            to_variable: "b".into(),
+            edge_variable: None,
             edge_types: vec![],
             direction: ExpandDirection::Outgoing,
-            path_alias: "p".into(),
-            all_paths: false,
+            min_hops: 1,
+            max_hops: Some(3),
+            path_alias: Some("p".into()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
         });
-        assert!(sp.explain_tree().contains("ShortestPath (a -> b)"));
+        let tree = expand.explain_tree();
+        assert!(tree.contains("Expand (a)->[:**1..3]->(b)"), "{tree}");
     }
 
     #[test]

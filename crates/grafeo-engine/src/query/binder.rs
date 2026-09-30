@@ -119,6 +119,16 @@ impl BindingContext {
     }
 }
 
+/// Physical columns required by a named path binding, shared with the planner contract.
+pub(crate) fn path_binding_names(alias: &str) -> [String; 4] {
+    [
+        alias.to_owned(),
+        format!("_path_length_{alias}"),
+        format!("_path_nodes_{alias}"),
+        format!("_path_edges_{alias}"),
+    ]
+}
+
 /// Semantic binder for query plans.
 ///
 /// The binder walks the logical plan and:
@@ -146,6 +156,8 @@ impl Binder {
     ///
     /// Returns an error if semantic validation fails.
     pub fn bind(&mut self, plan: &LogicalPlan) -> Result<BindingContext> {
+        // Binding recurses per operator and expression: bound the depth first.
+        super::plan_depth::check_plan_depth(plan)?;
         self.bind_operator(&plan.root)?;
         Ok(self.context.clone())
     }
@@ -350,6 +362,7 @@ impl Binder {
 
             // RDF/SPARQL operators
             LogicalOperator::TripleScan(scan) => self.bind_triple_scan(scan),
+            LogicalOperator::PropertyPath(path) => self.bind_property_path(path),
             LogicalOperator::Union(union) => {
                 for input in &union.inputs {
                     self.bind_operator(input)?;
@@ -359,6 +372,10 @@ impl Binder {
             LogicalOperator::LeftJoin(lj) => {
                 self.bind_operator(&lj.left)?;
                 self.bind_operator(&lj.right)?;
+                for condition in &lj.compatibility_conditions {
+                    self.validate_expression(&condition.left)?;
+                    self.validate_expression(&condition.right)?;
+                }
                 if let Some(ref cond) = lj.condition {
                     self.validate_expression(cond)?;
                 }
@@ -367,6 +384,10 @@ impl Binder {
             LogicalOperator::AntiJoin(aj) => {
                 self.bind_operator(&aj.left)?;
                 self.bind_operator(&aj.right)?;
+                for condition in &aj.compatibility_conditions {
+                    self.validate_expression(&condition.left)?;
+                    self.validate_expression(&condition.right)?;
+                }
                 Ok(())
             }
             LogicalOperator::Bind(bind) => {
@@ -472,47 +493,6 @@ impl Binder {
                         " in REMOVE labels",
                     ));
                 }
-                Ok(())
-            }
-            LogicalOperator::ShortestPath(sp) => {
-                // First bind the input
-                self.bind_operator(&sp.input)?;
-                // Validate that source and target variables are defined
-                if !self.context.contains(&sp.source_var) {
-                    return Err(undefined_variable_error(
-                        &sp.source_var,
-                        &self.context,
-                        " (source in shortestPath)",
-                    ));
-                }
-                if !self.context.contains(&sp.target_var) {
-                    return Err(undefined_variable_error(
-                        &sp.target_var,
-                        &self.context,
-                        " (target in shortestPath)",
-                    ));
-                }
-                // Add the path alias variable to the context
-                self.context.add_variable(
-                    sp.path_alias.clone(),
-                    VariableInfo {
-                        name: sp.path_alias.clone(),
-                        data_type: LogicalType::Any, // Path is a complex type
-                        is_node: false,
-                        is_edge: false,
-                    },
-                );
-                // Also add the path length variable for length(p) calls
-                let path_length_var = format!("_path_length_{}", sp.path_alias);
-                self.context.add_variable(
-                    path_length_var.clone(),
-                    VariableInfo {
-                        name: path_length_var,
-                        data_type: LogicalType::Int64,
-                        is_node: false,
-                        is_edge: false,
-                    },
-                );
                 Ok(())
             }
             // SPARQL Update operators - these don't require variable binding
@@ -836,6 +816,26 @@ impl Binder {
         Ok(())
     }
 
+    fn bind_property_path(&mut self, path: &crate::query::plan::PropertyPathOp) -> Result<()> {
+        use crate::query::plan::TripleComponent;
+        for component in [&path.subject, &path.object] {
+            if let TripleComponent::Variable(name) = component
+                && !self.context.contains(name)
+            {
+                self.context.add_variable(
+                    name.clone(),
+                    VariableInfo {
+                        name: name.clone(),
+                        data_type: LogicalType::Any,
+                        is_node: false,
+                        is_edge: false,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Binds a node scan operator.
     fn bind_node_scan(&mut self, scan: &NodeScanOp) -> Result<()> {
         // First bind the input if present
@@ -894,6 +894,12 @@ impl Binder {
             );
         }
 
+        // Intrinsic edge predicates see the candidate edge and fixed input
+        // bindings, before this expansion introduces its target or path.
+        if let Some(predicate) = &expand.edge_predicate {
+            self.validate_expression(predicate)?;
+        }
+
         // Add target variable
         self.context.add_variable(
             expand.to_variable.clone(),
@@ -907,49 +913,30 @@ impl Binder {
 
         // Add path variables for variable-length paths
         if let Some(ref path_alias) = expand.path_alias {
-            // Register the path variable itself (e.g. p in MATCH p=...)
-            self.context.add_variable(
-                path_alias.clone(),
-                VariableInfo {
-                    name: path_alias.clone(),
-                    data_type: LogicalType::Any,
-                    is_node: false,
-                    is_edge: false,
-                },
-            );
-            // length(p) → _path_length_p
-            let path_length_var = format!("_path_length_{}", path_alias);
-            self.context.add_variable(
-                path_length_var.clone(),
-                VariableInfo {
-                    name: path_length_var,
-                    data_type: LogicalType::Int64,
-                    is_node: false,
-                    is_edge: false,
-                },
-            );
-            // nodes(p) → _path_nodes_p
-            let path_nodes_var = format!("_path_nodes_{}", path_alias);
-            self.context.add_variable(
-                path_nodes_var.clone(),
-                VariableInfo {
-                    name: path_nodes_var,
-                    data_type: LogicalType::Any,
-                    is_node: false,
-                    is_edge: false,
-                },
-            );
-            // edges(p) → _path_edges_p
-            let path_edges_var = format!("_path_edges_{}", path_alias);
-            self.context.add_variable(
-                path_edges_var.clone(),
-                VariableInfo {
-                    name: path_edges_var,
-                    data_type: LogicalType::Any,
-                    is_node: false,
-                    is_edge: false,
-                },
-            );
+            for (name, data_type) in path_binding_names(path_alias).into_iter().zip([
+                LogicalType::Any,
+                LogicalType::Int64,
+                LogicalType::Any,
+                LogicalType::Any,
+            ]) {
+                self.context.add_variable(
+                    name.clone(),
+                    VariableInfo {
+                        name,
+                        data_type,
+                        is_node: false,
+                        is_edge: false,
+                    },
+                );
+            }
+        }
+
+        // A full-path predicate is evaluated after the candidate target and
+        // path columns have been materialized.  Validate it only after all
+        // those bindings are in scope; unlike an edge predicate it may refer
+        // to the target, path alias, and synthetic `_path_*` columns.
+        if let Some(predicate) = &expand.path_predicate {
+            self.validate_expression(predicate)?;
         }
 
         Ok(())
@@ -1345,6 +1332,12 @@ impl Binder {
             if let Some(ref expr) = agg_expr.expression {
                 self.validate_expression(expr)?;
             }
+            if let Some(ref expr) = agg_expr.expression2 {
+                self.validate_expression(expr)?;
+            }
+            if let Some(ref expr) = agg_expr.distinct_key {
+                self.validate_expression(expr)?;
+            }
             // Add the alias as a new variable if present
             if let Some(ref alias) = agg_expr.alias {
                 self.context.add_variable(
@@ -1529,6 +1522,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -1543,6 +1539,45 @@ mod tests {
         assert!(ctx.get("a").unwrap().is_node);
         assert!(ctx.get("b").unwrap().is_node);
         assert!(ctx.get("e").unwrap().is_edge);
+    }
+
+    #[test]
+    fn test_bind_expand_path_predicate_sees_path_bindings() {
+        use crate::query::plan::{ExpandDirection, ExpandOp, PathMode, PathSearch};
+
+        let plan = LogicalPlan::new(LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::Variable("p".into()),
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(LogicalOperator::Expand(ExpandOp {
+                from_variable: "a".into(),
+                to_variable: "b".into(),
+                edge_variable: Some("e".into()),
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec!["R".into()],
+                min_hops: 1,
+                max_hops: Some(3),
+                input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".into(),
+                    label: None,
+                    input: None,
+                })),
+                path_alias: Some("p".into()),
+                path_mode: PathMode::Walk,
+                path_search: PathSearch::All,
+                edge_predicate: None,
+                path_predicate: Some(LogicalExpression::FunctionCall {
+                    name: "length".into(),
+                    args: vec![LogicalExpression::Variable("p".into())],
+                    distinct: false,
+                }),
+            })),
+        }));
+
+        let mut binder = Binder::new();
+        assert!(binder.bind(&plan).is_ok());
     }
 
     #[test]
@@ -1571,6 +1606,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2161,39 +2199,50 @@ mod tests {
         );
     }
 
-    // --- ShortestPath ---
+    // --- Expand path search ---
 
     #[test]
-    fn test_shortest_path_rejects_undefined_source() {
-        use crate::query::plan::{ExpandDirection, ShortestPathOp};
+    fn test_expand_path_search_rejects_undefined_source() {
+        use crate::query::plan::{ExpandDirection, ExpandOp, PathMode, PathSearch};
 
-        let plan = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
+        let plan = LogicalPlan::new(LogicalOperator::Expand(ExpandOp {
             input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
                 variable: "b".to_string(),
                 label: None,
                 input: None,
             })),
-            source_var: "missing".to_string(), // not defined
-            target_var: "b".to_string(),
+            from_variable: "missing".to_string(), // not defined
+            to_variable: "b".to_string(),
+            edge_variable: None,
             edge_types: vec![],
             direction: ExpandDirection::Both,
-            path_alias: "p".to_string(),
-            all_paths: false,
+            min_hops: 1,
+            max_hops: Some(3),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
         }));
 
         let mut binder = Binder::new();
         let err = binder.bind(&plan).unwrap_err();
         assert!(
-            err.to_string().contains("source in shortestPath"),
-            "Error should mention shortestPath source context, got: {err}"
+            err.to_string().contains("in EXPAND"),
+            "Error should mention EXPAND source context, got: {err}"
         );
     }
 
     #[test]
-    fn test_shortest_path_adds_path_and_length_variables() {
-        use crate::query::plan::{ExpandDirection, JoinOp, JoinType, ShortestPathOp};
+    fn test_expand_path_search_adds_path_and_length_variables() {
+        use crate::query::plan::{
+            ExpandDirection, ExpandOp, JoinOp, JoinType, PathMode, PathSearch,
+        };
 
-        let plan = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
+        let plan = LogicalPlan::new(LogicalOperator::Expand(ExpandOp {
             input: Box::new(LogicalOperator::Join(JoinOp {
                 left: Box::new(LogicalOperator::NodeScan(NodeScanOp {
                     variable: "a".to_string(),
@@ -2208,12 +2257,21 @@ mod tests {
                 join_type: JoinType::Cross,
                 conditions: vec![],
             })),
-            source_var: "a".to_string(),
-            target_var: "b".to_string(),
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: None,
             edge_types: vec!["ROAD".to_string()],
             direction: ExpandDirection::Outgoing,
-            path_alias: "p".to_string(),
-            all_paths: false,
+            min_hops: 1,
+            max_hops: Some(3),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
         }));
 
         let mut binder = Binder::new();
@@ -2449,6 +2507,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2806,6 +2867,7 @@ mod tests {
                     function: AggregateFunction::Count,
                     expression: None,
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("cnt".to_string()),
                     percentile: None,
@@ -3259,6 +3321,7 @@ mod tests {
                 input: None,
             })),
             condition: Some(LogicalExpression::Variable("paris".to_string())),
+            compatibility_conditions: Vec::new(),
         }));
         let mut binder = Binder::new();
         assert!(binder.bind(&ok_plan).is_ok());
@@ -3276,6 +3339,7 @@ mod tests {
                 input: None,
             })),
             condition: None,
+            compatibility_conditions: Vec::new(),
         }));
         assert!(Binder::new().bind(&plan_no_cond).is_ok());
 
@@ -3292,6 +3356,7 @@ mod tests {
                 input: None,
             })),
             condition: Some(LogicalExpression::Variable("missing".to_string())),
+            compatibility_conditions: Vec::new(),
         }));
         assert!(Binder::new().bind(&bad_plan).is_err());
     }
@@ -3311,6 +3376,8 @@ mod tests {
                 label: None,
                 input: None,
             })),
+            compatibility_conditions: Vec::new(),
+            semantics: crate::query::plan::AntiJoinSemantics::NotExists,
         }));
         let mut binder = Binder::new();
         let ctx = binder.bind(&plan).unwrap();
@@ -3417,6 +3484,7 @@ mod tests {
             conditions: vec![JoinCondition {
                 left: LogicalExpression::Variable("a".to_string()),
                 right: LogicalExpression::Variable("b".to_string()),
+                semantics: crate::query::plan::JoinKeySemantics::Value,
             }],
             shared_variables: vec![],
         }));
@@ -3433,6 +3501,7 @@ mod tests {
             conditions: vec![JoinCondition {
                 left: LogicalExpression::Variable("a".to_string()),
                 right: LogicalExpression::Variable("nope".to_string()),
+                semantics: crate::query::plan::JoinKeySemantics::Value,
             }],
             shared_variables: vec![],
         }));
@@ -4261,6 +4330,7 @@ mod tests {
                 function: AggregateFunction::Count,
                 expression: Some(LogicalExpression::Variable("n".to_string())),
                 expression2: None,
+                distinct_key: None,
                 distinct: false,
                 alias: Some("c".to_string()),
                 percentile: None,
@@ -4294,6 +4364,7 @@ mod tests {
                     function: AggregateFunction::Count,
                     expression: None,
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("total".to_string()),
                     percentile: None,
@@ -4424,6 +4495,9 @@ mod tests {
             })),
             path_alias: Some("p".to_string()),
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         }));
         let mut binder = Binder::new();
         let ctx = binder.bind(&plan).unwrap();

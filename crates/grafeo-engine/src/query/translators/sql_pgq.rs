@@ -18,6 +18,8 @@ use crate::query::plan::{
 use grafeo_adapters::query::sql_pgq::{self, ast};
 use grafeo_common::types::Value;
 use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
+use hashbrown::HashSet;
+use std::cell::{Cell, RefCell};
 
 /// Translates a SQL/PGQ query string to a logical plan.
 ///
@@ -28,6 +30,10 @@ use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
 ///
 /// Returns an error if parsing fails or the AST contains unsupported constructs.
 pub fn translate(query: &str) -> Result<LogicalPlan> {
+    crate::query::plan_depth::admit(translate_unchecked(query)?)
+}
+
+fn translate_unchecked(query: &str) -> Result<LogicalPlan> {
     let trimmed = query.trim_start();
     let (explain, profile, actual_query) = if trimmed
         .get(..7)
@@ -60,11 +66,53 @@ pub fn translate(query: &str) -> Result<LogicalPlan> {
 }
 
 /// SQL/PGQ AST to logical plan translator.
-struct SqlPgqTranslator;
+struct SqlPgqTranslator {
+    /// Expression nesting while translating; see
+    /// [`TranslationDepth`](crate::query::plan_depth::TranslationDepth).
+    expression_depth: crate::query::plan_depth::TranslationDepth,
+    anonymous_counter: Cell<usize>,
+    occupied_variables: RefCell<HashSet<String>>,
+}
 
 impl SqlPgqTranslator {
     fn new() -> Self {
-        Self
+        Self {
+            expression_depth: crate::query::plan_depth::TranslationDepth::default(),
+            anonymous_counter: Cell::new(0),
+            occupied_variables: RefCell::new(HashSet::new()),
+        }
+    }
+
+    fn next_anonymous_variable(&self) -> String {
+        loop {
+            let id = self.anonymous_counter.get();
+            self.anonymous_counter.set(id + 1);
+            let name = format!("_anon_{id}");
+            if self.occupied_variables.borrow_mut().insert(name.clone()) {
+                return name;
+            }
+        }
+    }
+
+    fn reserve_match_variables(&self, clause: &ast::MatchClause) {
+        let mut occupied = self.occupied_variables.borrow_mut();
+        for aliased in &clause.patterns {
+            occupied.extend(aliased.alias.iter().cloned());
+            match &aliased.pattern {
+                ast::Pattern::Node(node) => occupied.extend(node.variable.iter().cloned()),
+                ast::Pattern::Path(path) => {
+                    occupied.extend(path.source.variable.iter().cloned());
+                    for edge in &path.edges {
+                        occupied.extend(edge.variable.iter().cloned());
+                        occupied.extend(edge.target.variable.iter().cloned());
+                    }
+                }
+                // These patterns are rejected by translate_pattern.
+                ast::Pattern::Quantified { .. }
+                | ast::Pattern::Union(_)
+                | ast::Pattern::MultisetUnion(_) => {}
+            }
+        }
     }
 
     fn translate_statement(&self, stmt: &ast::Statement) -> Result<LogicalPlan> {
@@ -111,6 +159,20 @@ impl SqlPgqTranslator {
     }
 
     fn translate_select(&self, select: &ast::SelectStatement) -> Result<LogicalPlan> {
+        // Reserve later MATCH/OPTIONAL declarations before assigning any anonymous name.
+        self.reserve_match_variables(&select.graph_table.match_clause);
+        for optional in &select.graph_table.optional_matches {
+            self.reserve_match_variables(optional);
+        }
+        self.occupied_variables.borrow_mut().extend(
+            select
+                .graph_table
+                .columns
+                .items
+                .iter()
+                .map(|column| column.alias.clone()),
+        );
+
         // Build the column alias → original expression map for resolving SQL references.
         // SQL WHERE/ORDER BY reference output column aliases (e.g., `g.age`), which must
         // be resolved back to graph expressions (e.g., `a.age`) for the binder/planner.
@@ -156,6 +218,7 @@ impl SqlPgqTranslator {
                 left: Box::new(plan),
                 right: Box::new(right),
                 condition: None,
+                compatibility_conditions: Vec::new(),
             });
         }
 
@@ -289,6 +352,7 @@ impl SqlPgqTranslator {
                                 function: agg_fn,
                                 expression: expr,
                                 expression2: None,
+                                distinct_key: None,
                                 distinct: *distinct,
                                 alias,
                                 percentile: None,
@@ -569,7 +633,10 @@ impl SqlPgqTranslator {
         node: &ast::NodePattern,
         input: Option<LogicalOperator>,
     ) -> Result<LogicalOperator> {
-        let variable = node.variable.clone().unwrap_or_else(|| "_anon".to_string());
+        let variable = node
+            .variable
+            .clone()
+            .unwrap_or_else(|| self.next_anonymous_variable());
         let label = node.labels.first().cloned();
 
         let mut plan = LogicalOperator::NodeScan(NodeScanOp {
@@ -613,7 +680,7 @@ impl SqlPgqTranslator {
             .target
             .variable
             .clone()
-            .unwrap_or_else(|| "_anon".to_string());
+            .unwrap_or_else(|| self.next_anonymous_variable());
         let target_label = edge.target.labels.first().cloned();
 
         let direction = match edge.direction {
@@ -648,6 +715,9 @@ impl SqlPgqTranslator {
             input: Box::new(input),
             path_alias,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
 
         // Add label filter on the target node if present
@@ -733,6 +803,7 @@ impl SqlPgqTranslator {
                     function: agg_fn,
                     expression: agg_expr,
                     expression2: None,
+                    distinct_key: None,
                     distinct: *distinct,
                     alias: Some(alias.clone()),
                     percentile: None,
@@ -910,6 +981,15 @@ impl SqlPgqTranslator {
     ///
     /// Used for COLUMNS clause expressions (graph-level, no table alias resolution).
     fn translate_expression(
+        &self,
+        expr: &ast::Expression,
+        table_alias: Option<&str>,
+    ) -> Result<LogicalExpression> {
+        let _level = self.expression_depth.enter()?;
+        self.translate_expression_node(expr, table_alias)
+    }
+
+    fn translate_expression_node(
         &self,
         expr: &ast::Expression,
         table_alias: Option<&str>,

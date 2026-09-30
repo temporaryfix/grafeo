@@ -4,7 +4,7 @@
 //! that can be optimized and executed.
 
 use super::common::{
-    build_left_join_with_predicates, combine_with_and, is_aggregate_function,
+    build_left_join_with_predicates, combine_with_and, is_aggregate_function, stamp_path_search,
     to_aggregate_function, wrap_distinct, wrap_filter, wrap_limit, wrap_return, wrap_skip,
     wrap_sort,
 };
@@ -13,9 +13,9 @@ use crate::query::plan::{
     CountExpr, CreateEdgeOp, CreateNodeOp, DeleteEdgeOp, DeleteNodeOp, ExpandDirection, ExpandOp,
     JoinCondition, JoinOp, JoinType, LeftJoinOp, ListPredicateKind, LoadDataFormat, LoadDataOp,
     LogicalExpression, LogicalOperator, LogicalPlan, MapProjectionEntry, MergeOp,
-    MergeRelationshipOp, NodeScanOp, ParameterScanOp, PathMode, ProcedureYield, ProjectOp,
-    Projection, RemoveLabelOp, ReturnItem, SetPropertyOp, ShortestPathOp, SortKey, SortOrder,
-    UnaryOp, UnionOp, UnwindOp,
+    MergeRelationshipOp, NodeScanOp, ParameterScanOp, PathMode, PathSearch, ProcedureYield,
+    ProjectOp, Projection, RemoveLabelOp, ReturnItem, SetPropertyOp, SortKey, SortOrder, UnaryOp,
+    UnionOp, UnwindOp,
 };
 use grafeo_adapters::query::cypher::{self, ast};
 use grafeo_common::types::Value;
@@ -62,7 +62,12 @@ pub fn translate(query: &str) -> Result<LogicalPlan> {
 pub fn translate_full(query: &str) -> Result<CypherTranslationResult> {
     let statement = cypher::parse(query)?;
     let translator = CypherTranslator::new();
-    translator.translate_statement_full(&statement)
+    match translator.translate_statement_full(&statement)? {
+        CypherTranslationResult::Plan(plan) => {
+            crate::query::plan_depth::admit(plan).map(CypherTranslationResult::Plan)
+        }
+        other => Ok(other),
+    }
 }
 
 /// Cypher AST to logical plan translator.
@@ -75,11 +80,15 @@ struct CypherTranslator {
     /// Alias-to-output-column-name mapping from the most recent RETURN/WITH clause.
     /// Used by ORDER BY to resolve alias references to actual output column names.
     return_aliases: RefCell<HashMap<String, String>>,
+    /// Expression nesting while translating; see
+    /// [`TranslationDepth`](crate::query::plan_depth::TranslationDepth).
+    expression_depth: crate::query::plan_depth::TranslationDepth,
 }
 
 impl CypherTranslator {
     fn new() -> Self {
         Self {
+            expression_depth: crate::query::plan_depth::TranslationDepth::default(),
             edge_variables: RefCell::new(HashSet::new()),
             anon_counter: Cell::new(0),
             return_aliases: RefCell::new(HashMap::new()),
@@ -180,16 +189,38 @@ impl CypherTranslator {
     }
 
     fn translate_query(&self, query: &ast::Query) -> Result<LogicalPlan> {
-        let mut plan: Option<LogicalOperator> = None;
-
-        for clause in &query.clauses {
-            plan = Some(self.translate_clause(clause, plan)?);
-        }
+        let plan = self.translate_clause_sequence(&query.clauses, None)?;
 
         let root = plan.ok_or_else(|| {
             Error::Query(QueryError::new(QueryErrorKind::Semantic, "Empty query"))
         })?;
         Ok(LogicalPlan::new(root))
+    }
+
+    /// Translates clauses while recognizing the Cypher legacy shortest-path
+    /// `MATCH ... WHERE` pair.  The pair must be handled before the ordinary
+    /// filter wrapper so path-observing conjuncts can run before shortest-path
+    /// admission and quota selection.
+    fn translate_clause_sequence(
+        &self,
+        clauses: &[ast::Clause],
+        mut plan: Option<LogicalOperator>,
+    ) -> Result<Option<LogicalOperator>> {
+        let mut index = 0;
+        while index < clauses.len() {
+            if index + 1 < clauses.len()
+                && let ast::Clause::Match(match_clause) = &clauses[index]
+                && let ast::Clause::Where(where_clause) = &clauses[index + 1]
+            {
+                plan = Some(self.translate_match_where(match_clause, where_clause, plan)?);
+                index += 2;
+                continue;
+            }
+
+            plan = Some(self.translate_clause(&clauses[index], plan)?);
+            index += 1;
+        }
+        Ok(plan)
     }
 
     fn translate_clause(
@@ -279,7 +310,7 @@ impl CypherTranslator {
         // ParameterScan instead of Empty.
         let mut shared_variables = Vec::new();
         let mut inner_plan: Option<LogicalOperator> = None;
-        let mut clauses_iter = inner.clauses.iter();
+        let mut clause_start = 0;
 
         if input.is_some()
             && let Some(ast::Clause::With(with_clause)) = inner.clauses.first()
@@ -297,17 +328,17 @@ impl CypherTranslator {
             }
             if !shared_variables.is_empty() {
                 // Skip the importing WITH and start from a ParameterScan
-                clauses_iter.next();
+                clause_start = 1;
                 inner_plan = Some(LogicalOperator::ParameterScan(ParameterScanOp {
                     columns: shared_variables.clone(),
                 }));
             }
         }
 
-        // Translate the remaining inner subquery clauses
-        for clause in clauses_iter {
-            inner_plan = Some(self.translate_clause(clause, inner_plan)?);
-        }
+        // Translate the remaining inner subquery clauses, including any
+        // adjacent legacy shortest-path MATCH/WHERE pair.
+        let inner_plan =
+            self.translate_clause_sequence(&inner.clauses[clause_start..], inner_plan)?;
         let inner_plan = inner_plan.ok_or_else(|| {
             Error::Query(QueryError::new(
                 QueryErrorKind::Semantic,
@@ -401,6 +432,17 @@ impl CypherTranslator {
         patterns: &[ast::Pattern],
         input: Option<LogicalOperator>,
     ) -> Result<LogicalOperator> {
+        self.translate_comma_patterns_with_predicates(patterns, input, &[])
+    }
+
+    /// Attach current-MATCH predicates while their owning pattern is isolated,
+    /// before the existing shared-variable joins or cross products are built.
+    fn translate_comma_patterns_with_predicates(
+        &self,
+        patterns: &[ast::Pattern],
+        input: Option<LogicalOperator>,
+        predicates: &[Option<LogicalExpression>],
+    ) -> Result<LogicalOperator> {
         if patterns.is_empty() {
             return Err(Error::Query(QueryError::new(
                 QueryErrorKind::Semantic,
@@ -408,33 +450,70 @@ impl CypherTranslator {
             )));
         }
 
+        let translate = |index: usize, input: Option<LogicalOperator>| {
+            let predicate = predicates.get(index).and_then(Option::as_ref);
+            if let Some(predicate) = predicate {
+                // A sibling is not automatically a fixed input. In particular,
+                // shared-variable joins translate their right pattern alone.
+                // This conservative subtree inventory detects missing sibling
+                // bindings; the physical planner separately proves every actual
+                // candidate column (including projection and CALL boundaries).
+                let mut available = Self::pattern_variables(&patterns[index]);
+                if let Some(input) = &input {
+                    super::common::collect_operator_variables(input, &mut available);
+                }
+                let mut referenced = HashSet::new();
+                crate::query::optimizer::Optimizer::collect_variables(predicate, &mut referenced);
+                for (sibling_index, sibling) in patterns.iter().enumerate() {
+                    if sibling_index != index {
+                        let sibling_variables = Self::pattern_variables(sibling);
+                        if let Some(missing) = referenced.iter().find(|name| {
+                            sibling_variables.contains(*name) && !available.contains(*name)
+                        }) {
+                            return Err(Error::Query(QueryError::new(
+                                QueryErrorKind::Unsupported,
+                                format!(
+                                    "legacy shortest-path prefilter requires unavailable sibling binding '{missing}'"
+                                ),
+                            )));
+                        }
+                    }
+                }
+            }
+            let plan = self.translate_pattern(&patterns[index], input)?;
+            match predicate {
+                Some(predicate) => stamp_path_predicate(plan, predicate.clone()),
+                None => Ok(plan),
+            }
+        };
+
         // Single pattern: fast path, no join logic needed
         if patterns.len() == 1 {
-            return self.translate_pattern(&patterns[0], input);
+            return translate(0, input);
         }
 
         // Multiple patterns: detect shared variables and create joins
         let pattern_vars: Vec<HashSet<String>> =
             patterns.iter().map(Self::pattern_variables).collect();
 
-        let mut plan = self.translate_pattern(&patterns[0], input)?;
+        let mut plan = translate(0, input)?;
         let mut bound_vars = pattern_vars[0].clone();
 
-        for (index, pattern) in patterns.iter().enumerate().skip(1) {
-            let current_vars = &pattern_vars[index];
+        for (index, current_vars) in pattern_vars.iter().enumerate().skip(1) {
             let shared: Vec<String> = current_vars.intersection(&bound_vars).cloned().collect();
 
             if shared.is_empty() {
                 // No shared variables: chain as input (cross product)
-                plan = self.translate_pattern(pattern, Some(plan))?;
+                plan = translate(index, Some(plan))?;
             } else {
                 // Shared variables: translate independently and inner join
-                let right = self.translate_pattern(pattern, None)?;
+                let right = translate(index, None)?;
                 let conditions = shared
                     .iter()
                     .map(|var| JoinCondition {
                         left: LogicalExpression::Variable(var.clone()),
                         right: LogicalExpression::Variable(var.clone()),
+                        semantics: crate::query::plan::JoinKeySemantics::Value,
                     })
                     .collect();
                 plan = LogicalOperator::Join(JoinOp {
@@ -479,6 +558,7 @@ impl CypherTranslator {
             left: Box::new(input),
             right: Box::new(right),
             condition: None,
+            compatibility_conditions: Vec::new(),
         }))
     }
 
@@ -611,10 +691,25 @@ impl CypherTranslator {
         input: Option<LogicalOperator>,
         path_alias: Option<String>,
     ) -> Result<LogicalOperator> {
+        self.translate_path_pattern_with_alias_search(path, input, path_alias, PathSearch::All)
+    }
+
+    fn translate_path_pattern_with_alias_search(
+        &self,
+        path: &ast::PathPattern,
+        input: Option<LogicalOperator>,
+        path_alias: Option<String>,
+        path_search: PathSearch,
+    ) -> Result<LogicalOperator> {
         let mut plan = self.translate_node_pattern(&path.start, input)?;
 
         for rel in &path.chain {
-            plan = self.translate_relationship_pattern_with_alias(rel, plan, path_alias.clone())?;
+            plan = self.translate_relationship_pattern_with_alias_search(
+                rel,
+                plan,
+                path_alias.clone(),
+                path_search,
+            )?;
         }
 
         Ok(plan)
@@ -655,9 +750,8 @@ impl CypherTranslator {
         pattern: &ast::Pattern,
         input: Option<LogicalOperator>,
     ) -> Result<LogicalOperator> {
-        // Extract the path pattern from the inner pattern
         let path = match pattern {
-            ast::Pattern::Path(p) => p,
+            ast::Pattern::Path(path) => path,
             ast::Pattern::Node(_) => {
                 return Err(Error::Query(QueryError::new(
                     QueryErrorKind::Semantic,
@@ -665,9 +759,8 @@ impl CypherTranslator {
                 )));
             }
             ast::Pattern::NamedPath { pattern: inner, .. } => {
-                // Recursively get the path pattern
-                if let ast::Pattern::Path(p) = inner.as_ref() {
-                    p
+                if let ast::Pattern::Path(path) = inner.as_ref() {
+                    path
                 } else {
                     return Err(Error::Query(QueryError::new(
                         QueryErrorKind::Semantic,
@@ -677,94 +770,110 @@ impl CypherTranslator {
             }
         };
 
-        // Scan for the source node first
-        let source_var = path
-            .start
-            .variable
-            .clone()
-            .unwrap_or_else(|| "_src".to_string());
-        let source_label = path.start.labels.first().cloned();
-
-        let mut plan = LogicalOperator::NodeScan(NodeScanOp {
-            variable: source_var.clone(),
-            label: source_label,
-            input: input.map(Box::new),
-        });
-
-        // Apply property filters on the source node if any
-        for (key, value) in &path.start.properties {
-            let filter_expr = LogicalExpression::Binary {
-                left: Box::new(LogicalExpression::Property {
-                    variable: source_var.clone(),
-                    property: key.clone(),
-                }),
-                op: BinaryOp::Eq,
-                right: Box::new(self.translate_expression(value)?),
-            };
-            plan = wrap_filter(plan, filter_expr);
+        if path.chain.len() != 1 {
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                "shortestPath requires exactly one relationship segment",
+            )));
         }
 
-        // Get the target node info from the relationship chain
-        // shortestPath typically has one relationship in the chain
-        if let Some(rel) = path.chain.first() {
-            let target_var = rel
-                .target
-                .variable
-                .clone()
-                .unwrap_or_else(|| "_tgt".to_string());
-            let target_label = rel.target.labels.first().cloned();
+        let search = PathSearch::Shortest {
+            k: 1,
+            groups: matches!(path_function, ast::PathFunction::AllShortestPaths),
+        };
+        let plan = self.translate_path_pattern_with_alias_search(
+            path,
+            input,
+            Some(path_alias.to_string()),
+            search,
+        )?;
+        let plan = stamp_path_search(plan, search)?;
+        stamp_path_mode(plan, PathMode::Trail)
+    }
 
-            // Scan for target node
-            plan = LogicalOperator::NodeScan(NodeScanOp {
-                variable: target_var.clone(),
-                label: target_label,
-                input: Some(Box::new(plan)),
-            });
-
-            // Apply property filters on the target node if any
-            for (key, value) in &rel.target.properties {
-                let filter_expr = LogicalExpression::Binary {
-                    left: Box::new(LogicalExpression::Property {
-                        variable: target_var.clone(),
-                        property: key.clone(),
-                    }),
-                    op: BinaryOp::Eq,
-                    right: Box::new(self.translate_expression(value)?),
-                };
-                plan = wrap_filter(plan, filter_expr);
-            }
-
-            let direction = match rel.direction {
-                ast::Direction::Outgoing => ExpandDirection::Outgoing,
-                ast::Direction::Incoming => ExpandDirection::Incoming,
-                ast::Direction::Undirected => ExpandDirection::Both,
-            };
-
-            let edge_types = rel.types.clone();
-            let all_paths = matches!(path_function, ast::PathFunction::AllShortestPaths);
-
-            plan = LogicalOperator::ShortestPath(ShortestPathOp {
-                input: Box::new(plan),
-                source_var,
-                target_var,
-                edge_types,
-                direction,
-                path_alias: path_alias.to_string(),
-                all_paths,
-            });
+    /// A legacy MATCH-WHERE prefilter belongs to its current path pattern.
+    /// Only certified stable path-independent conjuncts commute past quotas.
+    fn translate_match_where(
+        &self,
+        match_clause: &ast::MatchClause,
+        where_clause: &ast::WhereClause,
+        input: Option<LogicalOperator>,
+    ) -> Result<LogicalOperator> {
+        let scopes: Vec<_> = match_clause
+            .patterns
+            .iter()
+            .map(Self::legacy_path_scope)
+            .collect();
+        let predicate = self.translate_expression(&where_clause.predicate)?;
+        if !scopes.iter().any(Option::is_some) {
+            return Ok(wrap_filter(
+                self.translate_match(match_clause, input)?,
+                predicate,
+            ));
         }
-
+        let (path_terms, post_terms) = split_path_predicate(predicate, &scopes)?;
+        let predicates = path_terms
+            .into_iter()
+            .map(|terms| {
+                if terms.is_empty() {
+                    Ok(None)
+                } else {
+                    combine_with_and(terms).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut plan = self.translate_comma_patterns_with_predicates(
+            &match_clause.patterns,
+            input,
+            &predicates,
+        )?;
+        if !post_terms.is_empty() {
+            plan = wrap_filter(plan, combine_with_and(post_terms)?);
+        }
         Ok(plan)
     }
 
-    fn translate_relationship_pattern_with_alias(
+    /// Names whose values can differ between routes for this legacy pattern.
+    /// Endpoints are fixed within a source/target partition.
+    fn legacy_path_scope(pattern: &ast::Pattern) -> Option<HashSet<String>> {
+        let ast::Pattern::NamedPath {
+            name,
+            path_function: Some(_),
+            pattern,
+        } = pattern
+        else {
+            return None;
+        };
+        let ast::Pattern::Path(path) = pattern.as_ref() else {
+            return None;
+        };
+        let mut scope = HashSet::from([name.clone()]);
+        if let Some(variable) = &path.chain.first()?.variable {
+            scope.insert(variable.clone());
+        }
+        Some(scope)
+    }
+
+    fn translate_relationship_pattern_with_alias_search(
         &self,
         rel: &ast::RelationshipPattern,
         input: LogicalOperator,
         path_alias: Option<String>,
+        path_search: PathSearch,
     ) -> Result<LogicalOperator> {
         let from_variable = Self::get_last_variable(&input)?;
-        let edge_variable = rel.variable.clone();
+        let (min_hops, max_hops) = if let Some(range) = &rel.length {
+            (range.min.unwrap_or(1), range.max)
+        } else {
+            (1, Some(1))
+        };
+        let is_variable_length = min_hops != 1 || max_hops != Some(1);
+        let searched_edge = is_variable_length || path_search != PathSearch::All;
+        let has_edge_predicate = !rel.properties.is_empty() || rel.where_clause.is_some();
+        let edge_variable = rel
+            .variable
+            .clone()
+            .or_else(|| (searched_edge && has_edge_predicate).then(|| self.next_anon_var()));
         if let Some(ref ev) = edge_variable {
             self.register_edge_variable(ev);
         }
@@ -774,7 +883,6 @@ impl CypherTranslator {
             .variable
             .clone()
             .unwrap_or_else(|| self.next_anon_var());
-        let target_label = rel.target.labels.first().cloned();
 
         let direction = match rel.direction {
             ast::Direction::Outgoing => ExpandDirection::Outgoing,
@@ -782,25 +890,34 @@ impl CypherTranslator {
             ast::Direction::Undirected => ExpandDirection::Both,
         };
 
-        let (min_hops, max_hops) = if let Some(range) = &rel.length {
-            (range.min.unwrap_or(1), range.max)
-        } else {
-            (1, Some(1))
-        };
-
-        // Detect cycle pattern: (s)-[*]->(s) where source == target variable.
-        // The expand must use a temporary target, then filter for equality.
-        let is_cycle = to_variable == from_variable;
-        let expand_target = if is_cycle {
+        // Self-loop (s)-[]->(s): temp target + id filter. Back-edge to an
+        // earlier bound node keeps `to_variable` so the planner sees a cycle.
+        let is_self_loop = to_variable == from_variable;
+        let expand_target = if is_self_loop {
             self.next_anon_var()
         } else {
             to_variable.clone()
         };
 
+        let mut edge_predicates = Vec::new();
+        if !rel.properties.is_empty()
+            && let Some(ref ev) = edge_variable
+        {
+            edge_predicates.push(self.build_property_predicate(ev, &rel.properties)?);
+        }
+        if let Some(where_expr) = &rel.where_clause {
+            edge_predicates.push(self.translate_expression(where_expr)?);
+        }
+        let edge_predicate = if searched_edge && !edge_predicates.is_empty() {
+            Some(combine_with_and(edge_predicates.clone())?)
+        } else {
+            None
+        };
+
         let expand = LogicalOperator::Expand(ExpandOp {
             from_variable,
             to_variable: expand_target.clone(),
-            edge_variable,
+            edge_variable: edge_variable.clone(),
             direction,
             edge_types,
             min_hops,
@@ -808,10 +925,13 @@ impl CypherTranslator {
             input: Box::new(input),
             path_alias,
             path_mode: PathMode::Walk,
+            path_search,
+            edge_predicate,
+            path_predicate: None,
         });
 
-        // For cycle patterns, enforce that expanded target == original source
-        let expand = if is_cycle {
+        // For self-loops, enforce that expanded target == original source
+        let expand = if is_self_loop {
             wrap_filter(
                 expand,
                 LogicalExpression::Binary {
@@ -832,34 +952,26 @@ impl CypherTranslator {
             expand
         };
 
-        let mut result = if let Some(label) = target_label {
-            wrap_filter(
-                expand,
+        let mut result = expand;
+        if !searched_edge {
+            for predicate in edge_predicates {
+                result = wrap_filter(result, predicate);
+            }
+        }
+
+        // Apply all target labels (AND semantics).
+        for label in &rel.target.labels {
+            result = wrap_filter(
+                result,
                 LogicalExpression::FunctionCall {
                     name: "hasLabel".into(),
                     args: vec![
                         LogicalExpression::Variable(to_variable.clone()),
-                        LogicalExpression::Literal(Value::from(label)),
+                        LogicalExpression::Literal(Value::from(label.clone())),
                     ],
                     distinct: false,
                 },
-            )
-        } else {
-            expand
-        };
-
-        // Apply property filters on the edge: -[r {since: 2020}]->
-        if !rel.properties.is_empty()
-            && let Some(ref ev) = rel.variable
-        {
-            let predicate = self.build_property_predicate(ev, &rel.properties)?;
-            result = wrap_filter(result, predicate);
-        }
-
-        // Apply inline WHERE clause from relationship pattern: -[r WHERE expr]->
-        if let Some(where_expr) = &rel.where_clause {
-            let predicate = self.translate_expression(where_expr)?;
-            result = wrap_filter(result, predicate);
+            );
         }
 
         // Apply property filters on the target node: ()-[r]->(o {id: "X"})
@@ -1680,6 +1792,7 @@ impl CypherTranslator {
                         function,
                         expression,
                         expression2: None,
+                        distinct_key: None,
                         distinct: *distinct,
                         alias: alias.clone(),
                         percentile,
@@ -2054,6 +2167,11 @@ impl CypherTranslator {
     }
 
     fn translate_expression(&self, expr: &ast::Expression) -> Result<LogicalExpression> {
+        let _level = self.expression_depth.enter()?;
+        self.translate_expression_node(expr)
+    }
+
+    fn translate_expression_node(&self, expr: &ast::Expression) -> Result<LogicalExpression> {
         match expr {
             ast::Expression::Literal(lit) => self.translate_literal(lit),
             ast::Expression::Variable(name) => Ok(LogicalExpression::Variable(name.clone())),
@@ -2122,21 +2240,12 @@ impl CypherTranslator {
                 })
             }
             ast::Expression::FunctionCall { name, args, .. } => {
-                // Special handling for length() on path variables
-                // When length(p) is called where p is a path alias, we convert it
-                // to a variable reference to the path length column
-                if name.to_lowercase() == "length"
-                    && args.len() == 1
-                    && let ast::Expression::Variable(var_name) = &args[0]
-                {
-                    // Check if this looks like a path variable
-                    // Path lengths are stored in columns named _path_length_{alias}
-                    return Ok(LogicalExpression::Variable(format!(
-                        "_path_length_{}",
-                        var_name
-                    )));
-                }
-
+                // Keep length(path) as a semantic function call. A path alias
+                // can cross a WITH projection, where its hidden length column
+                // is not part of the projected scope; resolving it here would
+                // leave a stale `_path_length_*` variable in that scope. The
+                // evaluator handles Value::Path directly, and the planner still
+                // recognizes this built-in when a native path column exists.
                 let translated_args: Vec<LogicalExpression> = args
                     .iter()
                     .map(|a| self.translate_expression(a))
@@ -2525,6 +2634,7 @@ impl CypherTranslator {
                         function: AggregateFunction::Collect,
                         expression: Some(*projection.clone()),
                         expression2: None,
+                        distinct_key: None,
                         distinct: false,
                         alias: Some(alias.clone()),
                         percentile: None,
@@ -2553,6 +2663,114 @@ impl CypherTranslator {
         }
 
         Ok((current_input, rewritten_items))
+    }
+}
+
+fn stamp_path_mode(mut plan: LogicalOperator, mode: PathMode) -> Result<LogicalOperator> {
+    let mut current = &mut plan;
+    loop {
+        match current {
+            LogicalOperator::Filter(filter) => current = filter.input.as_mut(),
+            LogicalOperator::Expand(expand) => {
+                expand.path_mode = mode;
+                return Ok(plan);
+            }
+            _ => {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    "shortest path requires a single relationship expansion",
+                )));
+            }
+        }
+    }
+}
+
+fn stamp_path_predicate(
+    mut plan: LogicalOperator,
+    predicate: LogicalExpression,
+) -> Result<LogicalOperator> {
+    let mut current = &mut plan;
+    loop {
+        match current {
+            LogicalOperator::Filter(filter) => current = filter.input.as_mut(),
+            LogicalOperator::Expand(expand) => {
+                expand.path_predicate = Some(predicate);
+                return Ok(plan);
+            }
+            _ => {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Semantic,
+                    "shortest path requires a single relationship expansion",
+                )));
+            }
+        }
+    }
+}
+
+fn split_path_predicate(
+    predicate: LogicalExpression,
+    scopes: &[Option<HashSet<String>>],
+) -> Result<(Vec<Vec<LogicalExpression>>, Vec<LogicalExpression>)> {
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+    let mut path_terms = vec![Vec::new(); scopes.len()];
+    let mut post_terms = Vec::new();
+    for term in conjuncts {
+        let mut variables = HashSet::new();
+        crate::query::optimizer::Optimizer::collect_variables(&term, &mut variables);
+        let mut owners = scopes.iter().enumerate().filter_map(|(index, scope)| {
+            scope
+                .as_ref()
+                .filter(|scope| !scope.is_disjoint(&variables))
+                .map(|_| index)
+        });
+        let owner = owners.next();
+        if owners.next().is_some() {
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Unsupported,
+                "legacy shortest-path prefilter observes multiple current paths; joint path selection is unsupported",
+            )));
+        }
+        if let Some(owner) = owner {
+            path_terms[owner].push(term);
+        } else if crate::query::optimizer::Optimizer::intrinsic_edge_predicate_is_stable(&term) {
+            post_terms.push(term);
+        } else {
+            // Unknown/volatile expressions cannot commute past path selection.
+            // With one owner they can run in the ordinary full-path evaluator;
+            // multiple simultaneous searches have no unambiguous owner.
+            let mut legacy = scopes
+                .iter()
+                .enumerate()
+                .filter(|(_, scope)| scope.is_some());
+            let Some((owner, _)) = legacy.next() else {
+                return Err(Error::Internal(
+                    "legacy prefilter lost its owning pattern".into(),
+                ));
+            };
+            if legacy.next().is_some() {
+                return Err(Error::Query(QueryError::new(
+                    QueryErrorKind::Unsupported,
+                    "uncertified path-independent prefilter requires joint legacy path selection",
+                )));
+            }
+            path_terms[owner].push(term);
+        }
+    }
+    Ok((path_terms, post_terms))
+}
+
+fn flatten_and(expr: LogicalExpression, terms: &mut Vec<LogicalExpression>) {
+    if let LogicalExpression::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = expr
+    {
+        flatten_and(*left, terms);
+        flatten_and(*right, terms);
+    } else {
+        terms.push(expr);
     }
 }
 
@@ -2708,6 +2926,306 @@ mod tests {
         let expand = find_expand(&plan.root).expect("Expected Expand");
         assert_eq!(expand.min_hops, 1);
         assert_eq!(expand.max_hops, Some(3));
+    }
+
+    fn find_expand_in_path(op: &LogicalOperator) -> Option<&ExpandOp> {
+        match op {
+            LogicalOperator::Expand(expand) => Some(expand),
+            LogicalOperator::Filter(filter) => find_expand_in_path(&filter.input),
+            LogicalOperator::Project(project) => find_expand_in_path(&project.input),
+            LogicalOperator::Return(ret) => find_expand_in_path(&ret.input),
+            LogicalOperator::NodeScan(scan) => scan.input.as_deref().and_then(find_expand_in_path),
+            LogicalOperator::EdgeScan(scan) => scan.input.as_deref().and_then(find_expand_in_path),
+            LogicalOperator::Join(join) => {
+                find_expand_in_path(&join.left).or_else(|| find_expand_in_path(&join.right))
+            }
+            LogicalOperator::Apply(apply) => {
+                find_expand_in_path(&apply.subplan).or_else(|| find_expand_in_path(&apply.input))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn shortest_path_uses_bounded_expand_and_preserves_search_shape() {
+        for (function, expected_search) in [
+            (
+                "shortestPath",
+                crate::query::plan::PathSearch::Shortest {
+                    k: 1,
+                    groups: false,
+                },
+            ),
+            (
+                "allShortestPaths",
+                crate::query::plan::PathSearch::Shortest { k: 1, groups: true },
+            ),
+        ] {
+            let query = format!(
+                "MATCH p = {function}((a:Person {{id: 1}})-[r:KNOWS*2..4 WHERE r.weight > 1]->(b:Person {{id: 2}})) RETURN p"
+            );
+            let plan = translate(&query).unwrap();
+            let expand = find_expand_in_path(&plan.root)
+                .expect("shortest path should lower to an ordinary Expand");
+            assert_eq!(expand.from_variable, "a");
+            assert_eq!(expand.to_variable, "b");
+            assert_eq!(expand.edge_variable.as_deref(), Some("r"));
+            assert_eq!(expand.edge_types, vec!["KNOWS".to_string()]);
+            assert_eq!(expand.direction, ExpandDirection::Outgoing);
+            assert_eq!(expand.min_hops, 2);
+            assert_eq!(expand.max_hops, Some(4));
+            assert_eq!(expand.path_alias.as_deref(), Some("p"));
+            assert_eq!(expand.path_search, expected_search);
+            assert!(
+                expand.edge_predicate.is_some(),
+                "intrinsic relationship WHERE must stay on the Expand"
+            );
+        }
+    }
+
+    #[test]
+    fn shortest_path_rejects_empty_or_multi_edge_chains() {
+        for query in [
+            "MATCH p = shortestPath((a)) RETURN p",
+            "MATCH p = shortestPath((a)-[:R]->(m)-[:R]->(b)) RETURN p",
+        ] {
+            assert!(
+                translate(query).is_err(),
+                "shortestPath must require exactly one relationship segment: {query}"
+            );
+        }
+    }
+
+    /// Pattern label checks remain ordinary filters regardless of WHERE
+    /// admission. Count only the separate clause-level predicate wrappers.
+    fn count_where_filters(op: &LogicalOperator) -> usize {
+        let own = usize::from(matches!(op, LogicalOperator::Filter(filter)
+            if !matches!(&filter.predicate, LogicalExpression::FunctionCall { name, .. }
+                if name.eq_ignore_ascii_case("hasLabel"))));
+        own + op
+            .children()
+            .into_iter()
+            .map(count_where_filters)
+            .sum::<usize>()
+    }
+
+    #[test]
+    fn legacy_shortest_match_where_is_a_path_predicate() {
+        let plan = translate(
+            "MATCH p = shortestPath((a:Person)-[r:KNOWS*1..3]->(b:Person)) \
+             WHERE r.weight > 1 RETURN p",
+        )
+        .unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("shortest path Expand");
+
+        assert_eq!(
+            expand.path_search,
+            PathSearch::Shortest {
+                k: 1,
+                groups: false
+            }
+        );
+        assert_eq!(expand.path_mode, PathMode::Trail);
+        assert!(
+            expand.path_predicate.is_some(),
+            "WHERE immediately after legacy MATCH must run during path admission"
+        );
+        assert_eq!(count_where_filters(&plan.root), 0);
+    }
+
+    #[test]
+    fn legacy_shortest_where_after_with_remains_a_post_filter() {
+        let plan = translate(
+            "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) \
+             WITH p WHERE p IS NOT NULL RETURN p",
+        )
+        .unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("shortest path Expand");
+
+        assert!(expand.path_predicate.is_none());
+        assert!(count_where_filters(&plan.root) > 0);
+    }
+
+    #[test]
+    fn legacy_shortest_unavailable_sibling_prefilter_is_explicitly_unsupported() {
+        for query in [
+            "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)), (x:Other) WHERE length(p) > x.limit RETURN p, x",
+            "MATCH (a:Person), (x:Other), p = shortestPath((a)-[:KNOWS*1..3]->(b:Person)) WHERE length(p) > x.limit RETURN p, x",
+        ] {
+            assert!(
+                matches!(translate(query), Err(Error::Query(error)) if error.kind == QueryErrorKind::Unsupported),
+                "{query}"
+            );
+        }
+    }
+
+    fn legacy_prefilters(plan: &LogicalOperator) -> Vec<(&str, &LogicalExpression)> {
+        let mut result = Vec::new();
+        if let LogicalOperator::Expand(expand) = plan
+            && let (Some(alias), Some(predicate)) = (&expand.path_alias, &expand.path_predicate)
+        {
+            result.push((alias.as_str(), predicate));
+        }
+        for child in plan.children() {
+            result.extend(legacy_prefilters(child));
+        }
+        result
+    }
+
+    #[test]
+    fn legacy_shortest_independent_sibling_prefilter_attaches_to_owning_pattern() {
+        for patterns in [
+            "p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)), (x:Other)",
+            "(x:Other), p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person))",
+            "(a:Person), p = shortestPath((a)-[:KNOWS*1..3]->(b:Person))",
+        ] {
+            let plan =
+                translate(&format!("MATCH {patterns} WHERE length(p) = 2 RETURN p")).unwrap();
+            let predicates = legacy_prefilters(&plan.root);
+            assert_eq!(predicates.len(), 1, "{patterns}");
+            assert_eq!(predicates[0].0, "p");
+            assert_eq!(count_where_filters(&plan.root), 0);
+        }
+    }
+
+    #[test]
+    fn legacy_shortest_multiple_independent_prefilters_preserve_join_and_scope() {
+        for second_start in ["c:Person", "a"] {
+            let plan = translate(&format!(
+                "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)), \
+                 q = allShortestPaths(({second_start})-[:KNOWS*1..3]->(d:Person)) \
+                 WHERE length(p) = 2 AND length(q) = 3 RETURN p, q"
+            ))
+            .unwrap();
+            let predicates = legacy_prefilters(&plan.root);
+            assert_eq!(predicates.len(), 2);
+            for (alias, predicate) in predicates {
+                let mut variables = HashSet::new();
+                crate::query::optimizer::Optimizer::collect_variables(predicate, &mut variables);
+                assert_eq!(variables, HashSet::from([alias.to_string()]));
+            }
+            if second_start == "a" {
+                assert!(
+                    matches!(&plan.root, LogicalOperator::Return(ret) if matches!(ret.input.as_ref(), LogicalOperator::Join(_)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_shortest_cross_path_prefilters_are_explicitly_unqualified() {
+        for predicate in ["length(p) = length(q)", "length(p) = 2 OR length(q) = 3"] {
+            let query = format!(
+                "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)), \
+                 q = shortestPath((c:Person)-[:KNOWS*1..3]->(d:Person)) \
+                 WHERE {predicate} RETURN p, q"
+            );
+            assert!(
+                matches!(translate(&query), Err(Error::Query(error)) if error.kind == QueryErrorKind::Unsupported)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_shortest_uncertified_input_term_does_not_commute_after_quota() {
+        let plan = translate("MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) WHERE coalesce(rand(), 0) < 0.5 RETURN p").unwrap();
+        assert_eq!(legacy_prefilters(&plan.root).len(), 1);
+        assert_eq!(count_where_filters(&plan.root), 0);
+        assert!(
+            matches!(translate("MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)), q = shortestPath((c:Person)-[:KNOWS*1..3]->(d:Person)) WHERE rand() < 0.5 RETURN p, q"), Err(Error::Query(error)) if error.kind == QueryErrorKind::Unsupported)
+        );
+    }
+
+    #[test]
+    fn legacy_shortest_prefilter_free_variables_respect_current_match_and_local_scope() {
+        for query in [
+            "MATCH (outer:Person) MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) WHERE length(p) > outer.limit RETURN p",
+            "MATCH (outer:Person) CALL { WITH outer MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) WHERE length(p) > outer.limit RETURN p } RETURN p",
+            "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) MATCH q = shortestPath((c:Person)-[:KNOWS*1..3]->(d:Person)) WHERE length(q) = length(p) RETURN q",
+            "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)), q = shortestPath((c:Person)-[:KNOWS*1..3]->(d:Person)) WHERE all(p IN relationships(q) WHERE p.ok) RETURN p, q",
+        ] {
+            let plan = translate(query).unwrap();
+            let predicates = legacy_prefilters(&plan.root);
+            assert_eq!(predicates.len(), 1, "{query}");
+            let alias = if query.contains("q =") { "q" } else { "p" };
+            assert_eq!(predicates[0].0, alias);
+        }
+    }
+
+    #[test]
+    fn legacy_shortest_endpoint_where_stays_after_quota() {
+        let plan = translate(
+            "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) \
+             WHERE b.id = 1 RETURN p",
+        )
+        .unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("shortest path Expand");
+
+        assert!(expand.path_predicate.is_none());
+        assert!(count_where_filters(&plan.root) > 0);
+    }
+
+    #[test]
+    fn legacy_shortest_and_splits_path_and_endpoint_terms() {
+        let plan = translate(
+            "MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person)) \
+             WHERE length(p) = 2 AND b.id = 1 RETURN p",
+        )
+        .unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("shortest path Expand");
+
+        assert!(expand.path_predicate.is_some());
+        assert!(count_where_filters(&plan.root) > 0);
+    }
+
+    #[test]
+    fn legacy_shortest_without_bound_uses_trail() {
+        let plan =
+            translate("MATCH p = shortestPath((a:Person)-[:KNOWS*]->(b:Person)) RETURN p").unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("shortest path Expand");
+
+        assert_eq!(
+            expand.path_search,
+            PathSearch::Shortest {
+                k: 1,
+                groups: false
+            }
+        );
+        assert_eq!(expand.path_mode, PathMode::Trail);
+        assert_eq!(expand.max_hops, None);
+    }
+
+    #[test]
+    fn legacy_shortest_match_where_association_also_works_in_subquery() {
+        let plan = translate(
+            "CALL { MATCH p = allShortestPaths((a:Person)-[r:KNOWS*1..3]->(b:Person)) \
+             WHERE r.weight > 1 RETURN p } RETURN p",
+        )
+        .unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("subquery shortest path Expand");
+
+        assert_eq!(
+            expand.path_search,
+            PathSearch::Shortest { k: 1, groups: true }
+        );
+        assert_eq!(expand.path_mode, PathMode::Trail);
+        assert!(expand.path_predicate.is_some());
+        assert_eq!(count_where_filters(&plan.root), 0);
+    }
+
+    #[test]
+    fn legacy_shortest_match_where_association_preserves_imported_call_scope() {
+        let plan = translate(
+            "MATCH (outer:Person) CALL { WITH outer \
+             MATCH p = shortestPath((a:Person)-[r:KNOWS*1..3]->(b:Person)) \
+             WHERE r.weight > 1 RETURN p } RETURN p",
+        )
+        .unwrap();
+        let expand = find_expand_in_path(&plan.root).expect("imported subquery Expand");
+
+        assert_eq!(expand.path_mode, PathMode::Trail);
+        assert!(expand.path_predicate.is_some());
+        assert_eq!(count_where_filters(&plan.root), 0);
     }
 
     // === Mutation Tests ===

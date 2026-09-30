@@ -5,6 +5,11 @@ use super::*;
 
 impl GqlTranslator {
     pub(super) fn translate_expression(&self, expr: &ast::Expression) -> Result<LogicalExpression> {
+        let _level = self.expression_depth.enter()?;
+        self.translate_expression_node(expr)
+    }
+
+    fn translate_expression_node(&self, expr: &ast::Expression) -> Result<LogicalExpression> {
         match expr {
             ast::Expression::Literal(lit) => Ok(self.translate_literal(lit)),
             ast::Expression::Variable(name) => Ok(LogicalExpression::Variable(name.clone())),

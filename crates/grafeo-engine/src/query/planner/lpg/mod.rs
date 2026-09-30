@@ -92,26 +92,85 @@
 //! rules.
 
 mod aggregate;
+#[cfg(any(debug_assertions, test))]
+mod column_contract;
+mod correlated_lookup;
 mod expand;
 mod expression;
 mod filter;
 mod filter_hybrid;
 mod join;
 mod mutation;
+// These workload contracts use the managed LPG root and GQL translator.
+#[cfg(all(test, feature = "lpg", feature = "gql"))]
+mod plan_contracts;
 mod project;
 mod scan;
 
-#[cfg(feature = "algos")]
+/// How a filter over a node scan found its candidate nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessPath {
+    /// Fetched by internal node id.
+    InternalId,
+    /// Candidates came from a property index lookup.
+    PropertyIndex,
+    /// No index: every node with the scan's label was checked.
+    LabelFirst,
+    /// A lookup per input row, planned to probe the property index. The store
+    /// answers each probe at execution and may decline it, so contracts pair
+    /// this with store work counters.
+    CorrelatedIndex,
+    /// A lookup per input row, planned without an index: the candidate scan
+    /// is materialised and matched against every row's key.
+    CorrelatedScan,
+}
+
+/// Why the planner did not apply an optimization it checked for. Recorded
+/// only at the gate that declines, never as a choice made in advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Decline {
+    /// A range over an unindexed property in a transaction or retained view
+    /// keeps the generic filter: only an index answers for such a view.
+    UnindexedRangeView,
+    /// A per-row lookup's key was found, but the statement's own effects on
+    /// its label or property make a lookup unsafe.
+    CorrelatedAdmission,
+    /// The store declined an index request it was offered.
+    StoreDeclined,
+}
+
+/// Physical sort input shared by the ordinary and scheduled query callers.
+pub(crate) struct PlannedSortInput {
+    pub(crate) input: Box<dyn Operator>,
+    pub(crate) keys: Vec<PhysicalSortKey>,
+    pub(crate) schema: Vec<LogicalType>,
+    pub(crate) columns: Vec<String>,
+    pub(crate) full_width: usize,
+}
+
+/// What [`Planner::plan_traced`] observed while building one plan.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanTrace {
+    /// Built operator names in post-order, including absorbed scans.
+    pub(crate) operators: Vec<String>,
+    /// Access paths in the order their operators were built.
+    pub(crate) access_paths: Vec<AccessPath>,
+    /// Declined optimizations in the order their gates ran.
+    pub(crate) declines: Vec<Decline>,
+}
+
+#[cfg(any(feature = "lpg", feature = "algos"))]
 use crate::query::plan::CallProcedureOp;
 #[cfg(feature = "text-index")]
 use crate::query::plan::TextScanOp;
 use crate::query::plan::{
-    AddLabelOp, AggregateFunction as LogicalAggregateFunction, AggregateOp, AntiJoinOp, ApplyOp,
-    BinaryOp, CreateEdgeOp, CreateNodeOp, DeleteEdgeOp, DeleteNodeOp, DistinctOp,
-    EntityKind as LogicalEntityKind, ExceptOp, ExpandDirection, ExpandOp, FilterOp,
-    HorizontalAggregateOp, IntersectOp, JoinOp, JoinType, LeftJoinOp, LimitOp, LogicalExpression,
-    LogicalOperator, LogicalPlan, MapCollectOp, MergeOp, MergeRelationshipOp, MultiWayJoinOp,
-    NodeScanOp, OtherwiseOp, PathMode, RemoveLabelOp, ReturnOp, SetPropertyOp, ShortestPathOp,
+    AddLabelOp, AggregateFunction as LogicalAggregateFunction, AggregateOp, AntiJoinOp,
+    AntiJoinSemantics, ApplyOp, BinaryOp, CreateEdgeOp, CreateNodeOp, DeleteEdgeOp, DeleteNodeOp,
+    DistinctOp, EntityKind as LogicalEntityKind, ExceptOp, ExpandDirection, ExpandOp, FilterOp,
+    HorizontalAggregateOp, IntersectOp, JoinKeySemantics, JoinOp, JoinType, LeftJoinOp, LimitOp,
+    LogicalExpression, LogicalOperator, LogicalPlan, MapCollectOp, MergeOp, MergeRelationshipOp,
+    MultiWayJoinOp, NodeScanOp, OtherwiseOp, PathMode, RemoveLabelOp, ReturnOp, SetPropertyOp,
     SkipOp, SortOp, SortOrder, UnaryOp, UnionOp, UnwindOp,
 };
 #[cfg(feature = "vector-index")]
@@ -125,22 +184,28 @@ use grafeo_core::execution::operators::{
     AddLabelOperator, AggregateExpr as PhysicalAggregateExpr, ApplyOperator, ConstraintValidator,
     CreateEdgeOperator, CreateNodeOperator, DeleteEdgeOperator, DeleteNodeOperator,
     DistinctOperator, EmptyOperator, EntityKind, ExecutionPathMode, ExpandOperator, ExpandStep,
-    ExpressionPredicate, FactorizedAggregate, FactorizedAggregateOperator, FilterExpression,
-    FilterOperator, HashAggregateOperator, HashJoinOperator, HorizontalAggregateOperator,
-    JoinType as PhysicalJoinType, LazyFactorizedChainOperator, LeapfrogJoinOperator,
-    LoadDataOperator, MapCollectOperator, MergeConfig, MergeOperator, MergeRelationshipConfig,
-    MergeRelationshipOperator, NestedLoopJoinOperator, NodeListOperator, NullOrder, Operator,
-    ParameterScanOperator, ProjectExpr, ProjectOperator, PropertySource, RangeScanOperator,
-    RemoveLabelOperator, ScanOperator, SetPropertyOperator, ShortestPathOperator,
-    SimpleAggregateOperator, SortDirection, SortKey as PhysicalSortKey, SortOperator,
-    UnionOperator, UnwindOperator, VariableLengthExpandOperator,
+    ExpressionPredicate, FactorizedAggregate, FactorizedAggregateOperator, FactorizedCompareOp,
+    FactorizedFilterOperator, FilterExpression, FilterOperator, FlattenMode, FlattenOperator,
+    HashAggregateOperator, HashJoinOperator, HorizontalAggregateOperator, JoinSipExpandOperator,
+    JoinType as PhysicalJoinType, LazyFactorizedChainOperator, LeapfrogExpandOperator,
+    LeapfrogExpandSpec, LeapfrogJoinOperator, LoadDataOperator, MapCollectOperator, MergeConfig,
+    MergeOperator, MergeRelationshipConfig, MergeRelationshipOperator, NestedLoopJoinOperator,
+    NodeListOperator, NullOrder, Operator, ParameterScanOperator, ProjectExpr, ProjectOperator,
+    PropertyPredicate, PropertySource, RangeScanOperator, RemoveLabelOperator, ScanOperator,
+    SetPropertyOperator, SimpleAggregateOperator, SipTarget, SortDirection,
+    SortKey as PhysicalSortKey, SortOperator, TriangleCountOperator, UnionOperator, UnwindOperator,
+    VariableLengthExpandOperator,
 };
 use grafeo_core::graph::{Direction, GraphStoreMut, GraphStoreSearch};
 use std::collections::HashMap;
+#[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::query::planner::common;
-use crate::query::planner::common::expression_to_string;
+use crate::query::planner::common::{
+    expression_to_string, output_column_name, resolved_column_name,
+};
 use crate::query::planner::{
     PhysicalPlan, convert_aggregate_function, convert_binary_op, convert_filter_expression,
     convert_unary_op, value_to_logical_type,
@@ -181,6 +246,20 @@ pub struct Planner {
     pub(super) validator: Option<Arc<dyn ConstraintValidator>>,
     /// Catalog for user-defined procedure lookup.
     pub(super) catalog: Option<Arc<crate::catalog::Catalog>>,
+    /// Immutable, transitively classified procedure bodies authorized for the
+    /// current statement. Physical planning must never resolve a catalog body
+    /// from live mutable state after Session authorization.
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    pub(super) resolved_procedures:
+        Option<Arc<crate::query::procedure_effect::ResolvedProcedureCatalog>>,
+    /// Shared recursion stack across eagerly nested procedure planners.
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    procedure_stack: Rc<std::cell::RefCell<Vec<String>>>,
+    /// Crate-private authority proving that Session classified and framed this
+    /// plan. A public Planner caller cannot manufacture write-procedure
+    /// authority merely by supplying a transaction ID.
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    procedure_write_authority: bool,
     /// LPG store handle for procedures that need direct index access (vector
     /// and text search reach HNSW / BM25 indexes owned by the LPG store).
     #[cfg(feature = "lpg")]
@@ -195,6 +274,17 @@ pub struct Planner {
     pub(super) group_list_variables: std::cell::RefCell<std::collections::HashSet<String>>,
     /// When true, each physical operator is wrapped in `ProfiledOperator`.
     profiling: std::cell::Cell<bool>,
+    /// When true, each built operator's name is recorded in
+    /// `profile_entries` without wrapping it and without enabling any
+    /// profiling-gated planning decision, so the names describe the plan
+    /// that normal execution runs.
+    record_shape: std::cell::Cell<bool>,
+    /// Access paths recorded alongside operator entries; see [`AccessPath`].
+    access_paths: std::cell::RefCell<Vec<AccessPath>>,
+    /// Declines recorded alongside operator entries; see [`Decline`].
+    declines: std::cell::RefCell<Vec<Decline>>,
+    /// Statement effects checked against each correlated lookup's label and key.
+    snapshot_lookup_effects: std::cell::RefCell<correlated_lookup::LookupPlanEffects>,
     /// Profile entries collected during planning (post-order).
     profile_entries: std::cell::RefCell<Vec<crate::query::profile::ProfileEntry>>,
     /// Optional write tracker for recording writes during mutations.
@@ -218,6 +308,18 @@ pub struct Planner {
     pub(super) limit_hint: std::cell::Cell<Option<usize>>,
 }
 
+#[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+struct ProcedurePlanningFrame {
+    stack: Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+#[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+impl Drop for ProcedurePlanningFrame {
+    fn drop(&mut self) {
+        self.stack.borrow_mut().pop();
+    }
+}
+
 impl Planner {
     /// Creates a new planner with the given store.
     ///
@@ -238,11 +340,23 @@ impl Planner {
             edge_columns: std::cell::RefCell::new(std::collections::HashSet::new()),
             validator: None,
             catalog: None,
+            #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+            resolved_procedures: None,
+            #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+            procedure_stack: Rc::new(std::cell::RefCell::new(Vec::new())),
+            #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+            procedure_write_authority: false,
             #[cfg(feature = "lpg")]
             lpg_store: None,
             correlated_param_state: std::cell::RefCell::new(None),
             group_list_variables: std::cell::RefCell::new(std::collections::HashSet::new()),
             profiling: std::cell::Cell::new(false),
+            record_shape: std::cell::Cell::new(false),
+            access_paths: std::cell::RefCell::new(Vec::new()),
+            declines: std::cell::RefCell::new(Vec::new()),
+            snapshot_lookup_effects: std::cell::RefCell::new(
+                correlated_lookup::LookupPlanEffects::default(),
+            ),
             profile_entries: std::cell::RefCell::new(Vec::new()),
             write_tracker: None,
             session_context: grafeo_core::execution::operators::SessionContext::default(),
@@ -284,11 +398,23 @@ impl Planner {
             edge_columns: std::cell::RefCell::new(std::collections::HashSet::new()),
             validator: None,
             catalog: None,
+            #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+            resolved_procedures: None,
+            #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+            procedure_stack: Rc::new(std::cell::RefCell::new(Vec::new())),
+            #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+            procedure_write_authority: false,
             #[cfg(feature = "lpg")]
             lpg_store: None,
             correlated_param_state: std::cell::RefCell::new(None),
             group_list_variables: std::cell::RefCell::new(std::collections::HashSet::new()),
             profiling: std::cell::Cell::new(false),
+            record_shape: std::cell::Cell::new(false),
+            access_paths: std::cell::RefCell::new(Vec::new()),
+            declines: std::cell::RefCell::new(Vec::new()),
+            snapshot_lookup_effects: std::cell::RefCell::new(
+                correlated_lookup::LookupPlanEffects::default(),
+            ),
             profile_entries: std::cell::RefCell::new(Vec::new()),
             write_tracker,
             session_context: grafeo_core::execution::operators::SessionContext::default(),
@@ -302,6 +428,51 @@ impl Planner {
     #[must_use]
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Replaces the write tracker with one that uses the given conflict granularity.
+    ///
+    /// Must be called after [`with_context`](Self::with_context) and only takes
+    /// effect when a transaction is active (i.e. when `write_tracker` is `Some`).
+    /// No-op when no transaction is active.
+    #[must_use]
+    pub fn with_conflict_granularity(
+        mut self,
+        granularity: crate::transaction::ConflictGranularity,
+    ) -> Self {
+        use crate::transaction::{ConflictGranularity, TransactionWriteTracker};
+        if granularity == ConflictGranularity::Property
+            && let Some(ref mgr) = self.transaction_manager
+        {
+            self.write_tracker = Some(Arc::new(TransactionWriteTracker::with_granularity(
+                Arc::clone(mgr),
+                granularity,
+            )));
+        }
+        self
+    }
+
+    /// Disables global entity conflict tracking while retaining the real
+    /// transaction ID and manager for MVCC visibility and lifecycle framing.
+    ///
+    /// This is valid only for a transaction-private store incarnation that no
+    /// concurrent transaction can observe. Its lifecycle compare-and-swap is
+    /// the concurrency boundary; graph-local numeric entity IDs must not enter
+    /// the currently graph-unqualified global conflict keyspace.
+    #[cfg(all(
+        feature = "lpg",
+        any(
+            feature = "gql",
+            feature = "cypher",
+            feature = "gremlin",
+            feature = "graphql",
+            feature = "sql-pgq"
+        )
+    ))]
+    #[must_use]
+    pub(crate) fn without_entity_conflict_tracking(mut self) -> Self {
+        self.write_tracker = None;
         self
     }
 
@@ -333,6 +504,55 @@ impl Planner {
         self.transaction_manager.as_ref()
     }
 
+    /// Returns `true` when the active transaction uses Serializable isolation.
+    ///
+    /// Used by `plan_operator` arms that bypass the visible-read API (shortest
+    /// path, vector scan, text scan, graph algorithms) to reject queries that
+    /// would silently miss SSI conflicts.  A planner with no transaction, or
+    /// whose transaction runs under a weaker isolation level, returns `false`.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "algos",
+        feature = "text-index",
+        feature = "vector-index"
+    ))]
+    fn is_serializable(&self) -> bool {
+        self.transaction_id.is_some_and(|tid| {
+            self.transaction_manager
+                .as_ref()
+                .and_then(|m| m.isolation_level(tid))
+                == Some(crate::transaction::IsolationLevel::Serializable)
+        })
+    }
+
+    /// Returns whether a LIMIT input must run to completion.
+    ///
+    /// Direct mutations are visible in the logical tree. Catalog procedures
+    /// require the same immutable, transitive resolution snapshot that Session
+    /// authorized; consulting only `LogicalOperator::has_mutations` would
+    /// misclassify every CALL as read-only and let `LIMIT 0` skip its body.
+    fn limit_input_requires_exhaustion(&self, input: &LogicalOperator) -> Result<bool> {
+        let required = input.has_mutations();
+
+        #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+        let required = if required {
+            true
+        } else if let Some(procedures) = &self.resolved_procedures {
+            procedures.contains_mutating_call(input)?
+        } else if let Some(catalog) = &self.catalog {
+            crate::query::procedure_effect::analyze_procedure_effects(input, catalog)?
+                .contains_mutating_call
+        } else {
+            false
+        };
+
+        #[cfg(all(any(feature = "lpg", feature = "algos"), not(feature = "gql")))]
+        let required = required
+            || crate::procedures::analyze_builtin_procedure_effects(input)?.contains_mutating_call;
+
+        Ok(required)
+    }
+
     /// Enables or disables factorized execution for multi-hop queries.
     #[must_use]
     pub fn with_factorized_execution(mut self, enabled: bool) -> Self {
@@ -352,6 +572,99 @@ impl Planner {
     pub fn with_catalog(mut self, catalog: Arc<crate::catalog::Catalog>) -> Self {
         self.catalog = Some(catalog);
         self
+    }
+
+    /// Pins the catalog procedure bodies that Session classified and
+    /// authorized for this statement.
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    #[must_use]
+    pub(crate) fn with_resolved_procedures(
+        mut self,
+        procedures: Arc<crate::query::procedure_effect::ResolvedProcedureCatalog>,
+    ) -> Self {
+        self.resolved_procedures = Some(procedures);
+        self
+    }
+
+    /// Grants write-capable procedure planning only to the Session path that
+    /// has already performed transitive effect analysis, authorization, and
+    /// transaction framing.
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    #[must_use]
+    pub(crate) fn with_session_procedure_write_authority(mut self) -> Self {
+        self.procedure_write_authority = true;
+        self
+    }
+
+    /// Creates lexical planning state for a procedure body while preserving
+    /// every transaction, validation, graph, index, and Session capability
+    /// from the authorized outer planner.
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    fn fork_for_procedure(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            write_store: self.write_store.as_ref().map(Arc::clone),
+            transaction_manager: self.transaction_manager.as_ref().map(Arc::clone),
+            transaction_id: self.transaction_id,
+            viewing_epoch: self.viewing_epoch,
+            anon_edge_counter: std::cell::Cell::new(0),
+            factorized_execution: self.factorized_execution,
+            scalar_columns: std::cell::RefCell::new(std::collections::HashSet::new()),
+            edge_columns: std::cell::RefCell::new(std::collections::HashSet::new()),
+            validator: self.validator.as_ref().map(Arc::clone),
+            catalog: self.catalog.as_ref().map(Arc::clone),
+            resolved_procedures: self.resolved_procedures.as_ref().map(Arc::clone),
+            procedure_stack: Rc::clone(&self.procedure_stack),
+            procedure_write_authority: self.procedure_write_authority,
+            #[cfg(feature = "lpg")]
+            lpg_store: self.lpg_store.as_ref().map(Arc::clone),
+            correlated_param_state: std::cell::RefCell::new(None),
+            group_list_variables: std::cell::RefCell::new(std::collections::HashSet::new()),
+            profiling: std::cell::Cell::new(false),
+            record_shape: std::cell::Cell::new(false),
+            access_paths: std::cell::RefCell::new(Vec::new()),
+            declines: std::cell::RefCell::new(Vec::new()),
+            snapshot_lookup_effects: std::cell::RefCell::new(
+                correlated_lookup::LookupPlanEffects::default(),
+            ),
+            profile_entries: std::cell::RefCell::new(Vec::new()),
+            write_tracker: self.write_tracker.as_ref().map(Arc::clone),
+            session_context: self.session_context.clone(),
+            read_only: self.read_only,
+            limit_hint: std::cell::Cell::new(None),
+        }
+    }
+
+    #[cfg(all(any(feature = "lpg", feature = "algos"), feature = "gql"))]
+    fn enter_procedure_frame(&self, name: &str) -> Result<ProcedurePlanningFrame> {
+        use grafeo_common::utils::error::{QueryError, QueryErrorKind};
+
+        let mut stack = self.procedure_stack.borrow_mut();
+        if let Some(start) = stack.iter().position(|entry| entry == name) {
+            let mut path = stack[start..].to_vec();
+            path.push(name.to_string());
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                format!("procedure call cycle detected: {}", path.join(" -> ")),
+            )));
+        }
+        if stack.len() >= crate::query::procedure_effect::MAX_PROCEDURE_CALL_DEPTH {
+            let mut path = stack.clone();
+            path.push(name.to_string());
+            return Err(Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                format!(
+                    "procedure call depth exceeded {}: {}",
+                    crate::query::procedure_effect::MAX_PROCEDURE_CALL_DEPTH,
+                    path.join(" -> ")
+                ),
+            )));
+        }
+        stack.push(name.to_string());
+        drop(stack);
+        Ok(ProcedurePlanningFrame {
+            stack: Rc::clone(&self.procedure_stack),
+        })
     }
 
     /// Attaches an LPG store handle so `CALL grafeo.search.*` procedures can
@@ -394,7 +707,11 @@ impl Planner {
     fn count_expand_chain(op: &LogicalOperator) -> (usize, &LogicalOperator) {
         match op {
             LogicalOperator::Expand(expand) => {
-                let is_single_hop = expand.min_hops == 1 && expand.max_hops == Some(1);
+                let is_single_hop = expand.min_hops == 1
+                    && expand.max_hops == Some(1)
+                    && expand.edge_predicate.is_none()
+                    && expand.path_predicate.is_none()
+                    && expand.path_search == crate::query::plan::PathSearch::All;
 
                 if is_single_hop {
                     let (inner_count, base) = Self::count_expand_chain(&expand.input);
@@ -403,6 +720,9 @@ impl Planner {
                     (0, op)
                 }
             }
+            LogicalOperator::Filter(filter) if Self::is_haslabel_only_filter(&filter.predicate) => {
+                Self::count_expand_chain(&filter.input)
+            }
             _ => (0, op),
         }
     }
@@ -410,21 +730,77 @@ impl Planner {
     /// Collects expand operations from the outermost down to the base.
     ///
     /// Returns expands in order from innermost (base) to outermost.
+    /// Label-only filters between hops are skipped so a labeled triangle
+    /// `(a:L)-[]->(b:L)-[]->(c:L)-[]->(a)` is still one chain.
     fn collect_expand_chain(op: &LogicalOperator) -> Vec<&ExpandOp> {
         let mut chain = Vec::new();
         let mut current = op;
 
-        while let LogicalOperator::Expand(expand) = current {
-            let is_single_hop = expand.min_hops == 1 && expand.max_hops == Some(1);
-            if !is_single_hop {
-                break;
+        loop {
+            match current {
+                LogicalOperator::Expand(expand)
+                    if expand.min_hops == 1
+                        && expand.max_hops == Some(1)
+                        && expand.edge_predicate.is_none()
+                        && expand.path_predicate.is_none()
+                        && expand.path_search == crate::query::plan::PathSearch::All =>
+                {
+                    chain.push(expand);
+                    current = &expand.input;
+                }
+                LogicalOperator::Filter(filter)
+                    if Self::is_haslabel_only_filter(&filter.predicate) =>
+                {
+                    current = &filter.input;
+                }
+                _ => break,
             }
-            chain.push(expand);
-            current = &expand.input;
         }
 
         chain.reverse();
         chain
+    }
+
+    fn is_haslabel_only_filter(expr: &LogicalExpression) -> bool {
+        match expr {
+            LogicalExpression::FunctionCall { name, .. }
+                if name.eq_ignore_ascii_case("haslabel") =>
+            {
+                true
+            }
+            LogicalExpression::Binary {
+                op: crate::query::plan::BinaryOp::And,
+                left,
+                right,
+            } => Self::is_haslabel_only_filter(left) && Self::is_haslabel_only_filter(right),
+            _ => false,
+        }
+    }
+
+    fn collect_haslabel_filters(op: &LogicalOperator) -> Vec<&LogicalExpression> {
+        let mut out = Vec::new();
+        let mut current = op;
+        loop {
+            match current {
+                LogicalOperator::Expand(expand)
+                    if expand.min_hops == 1
+                        && expand.max_hops == Some(1)
+                        && expand.edge_predicate.is_none()
+                        && expand.path_predicate.is_none()
+                        && expand.path_search == crate::query::plan::PathSearch::All =>
+                {
+                    current = &expand.input;
+                }
+                LogicalOperator::Filter(filter)
+                    if Self::is_haslabel_only_filter(&filter.predicate) =>
+                {
+                    out.push(&filter.predicate);
+                    current = &filter.input;
+                }
+                _ => break,
+            }
+        }
+        out
     }
 
     /// Plans a logical plan into a physical operator.
@@ -434,13 +810,74 @@ impl Planner {
     /// Returns an error if the logical plan contains unsupported operators
     /// or invalid expressions.
     pub fn plan(&self, logical_plan: &LogicalPlan) -> Result<PhysicalPlan> {
+        #[cfg(test)]
+        if plan_trace::is_capturing() {
+            let (physical, trace) = self.plan_traced(logical_plan)?;
+            plan_trace::push(trace);
+            return Ok(physical);
+        }
+        self.plan_untraced(logical_plan)
+    }
+
+    fn plan_untraced(&self, logical_plan: &LogicalPlan) -> Result<PhysicalPlan> {
         let _span = grafeo_debug_span!("grafeo::query::plan");
+        *self.snapshot_lookup_effects.borrow_mut() = Self::lookup_plan_effects(&logical_plan.root);
         let (operator, columns) = self.plan_operator(&logical_plan.root)?;
         Ok(PhysicalPlan {
             operator,
             columns,
             adaptive_context: None,
         })
+    }
+
+    /// Plans exactly as [`Self::plan`] and also returns the built operators'
+    /// names in post-order (children before parents).
+    ///
+    /// Unlike [`Self::plan_profiled`], operators are not wrapped and no
+    /// profiling-gated rewrite is disabled, so the names describe the plan
+    /// normal execution runs. Plan contracts assert on these names.
+    #[cfg(test)]
+    pub(crate) fn plan_traced(
+        &self,
+        logical_plan: &LogicalPlan,
+    ) -> Result<(PhysicalPlan, PlanTrace)> {
+        self.record_shape.set(true);
+        self.profile_entries.borrow_mut().clear();
+        self.access_paths.borrow_mut().clear();
+        self.declines.borrow_mut().clear();
+        let result = self.plan_untraced(logical_plan);
+        self.record_shape.set(false);
+        let trace = PlanTrace {
+            operators: self
+                .profile_entries
+                .borrow_mut()
+                .drain(..)
+                .map(|entry| entry.name)
+                .collect(),
+            access_paths: self.access_paths.borrow_mut().drain(..).collect(),
+            declines: self.declines.borrow_mut().drain(..).collect(),
+        };
+        Ok((result?, trace))
+    }
+
+    /// Whether planning records operator entries (profiling or shape trace).
+    pub(super) fn records_entries(&self) -> bool {
+        self.profiling.get() || self.record_shape.get()
+    }
+
+    /// Records how a filter found its candidates. Call only where the
+    /// operator using them is returned, never before the store has answered.
+    pub(super) fn record_access_path(&self, path: impl FnOnce() -> AccessPath) {
+        if self.record_shape.get() {
+            self.access_paths.borrow_mut().push(path());
+        }
+    }
+
+    /// Records a declined optimization at the gate that declines it.
+    pub(super) fn record_decline(&self, decline: Decline) {
+        if self.record_shape.get() {
+            self.declines.borrow_mut().push(decline);
+        }
     }
 
     /// Plans a logical plan with profiling: each physical operator is wrapped
@@ -459,6 +896,7 @@ impl Planner {
     ) -> Result<(PhysicalPlan, Vec<crate::query::profile::ProfileEntry>)> {
         self.profiling.set(true);
         self.profile_entries.borrow_mut().clear();
+        *self.snapshot_lookup_effects.borrow_mut() = Self::lookup_plan_effects(&logical_plan.root);
 
         let result = self.plan_operator(&logical_plan.root);
 
@@ -483,6 +921,7 @@ impl Planner {
     /// Returns an error if the logical plan contains unsupported operators
     /// or invalid expressions.
     pub fn plan_adaptive(&self, logical_plan: &LogicalPlan) -> Result<PhysicalPlan> {
+        *self.snapshot_lookup_effects.borrow_mut() = Self::lookup_plan_effects(&logical_plan.root);
         let (operator, columns) = self.plan_operator(&logical_plan.root)?;
 
         let mut adaptive_context = AdaptiveContext::new();
@@ -696,13 +1135,107 @@ impl Planner {
             let profiled = grafeo_core::execution::ProfiledOperator::new(physical, stats);
             self.profile_entries.borrow_mut().push(entry);
             Ok((Box::new(profiled), columns))
+        } else if self.record_shape.get() {
+            let (physical, columns) = result?;
+            let (entry, _stats) =
+                crate::query::profile::ProfileEntry::new(physical.name(), op.display_label());
+            self.profile_entries.borrow_mut().push(entry);
+            Ok((physical, columns))
         } else {
             result
         }
     }
 
     /// Plans a single logical operator.
+    ///
+    /// # Soundness sweep — store-access classification (Task 4)
+    ///
+    /// Every arm is classified for how it accesses the graph store:
+    ///
+    /// **records-via-store** — reads the store exclusively through the
+    /// visible-read API (`node_visible`, `edge_visible`, `neighbors_visible`,
+    /// `properties_visible`, etc.) which auto-records reads for SSI. Safe
+    /// under Serializable once the read-tracking chokepoints land.
+    ///
+    /// | Arm                | Classification        |
+    /// |--------------------|-----------------------|
+    /// | `NodeScan`         | records-via-store     |
+    /// | `Expand`           | records-via-store     |
+    /// | `Return`           | no-store-read         |
+    /// | `Filter`           | records-via-store     |
+    /// | `Project`          | no-store-read         |
+    /// | `Limit`            | no-store-read         |
+    /// | `Skip`             | no-store-read         |
+    /// | `Sort`             | no-store-read         |
+    /// | `Aggregate`        | no-store-read         |
+    /// | `Join`             | no-store-read (join over already-read rows) |
+    /// | `LeftJoin`         | no-store-read         |
+    /// | `AntiJoin`         | no-store-read         |
+    /// | `Union`            | no-store-read         |
+    /// | `Except`           | no-store-read         |
+    /// | `Intersect`        | no-store-read         |
+    /// | `Otherwise`        | no-store-read         |
+    /// | `Apply`            | no-store-read (drives inner plan_operator) |
+    /// | `Distinct`         | no-store-read         |
+    /// | `CreateNode`       | no-store-read (write, already-resolved entities) |
+    /// | `CreateEdge`       | no-store-read (write) |
+    /// | `DeleteNode`       | no-store-read (write) |
+    /// | `DeleteEdge`       | no-store-read (write) |
+    /// | `Unwind`           | no-store-read         |
+    /// | `Merge`            | records-via-store (reads through MVCC-aware search) |
+    /// | `MergeRelationship`| records-via-store     |
+    /// | `AddLabel`         | no-store-read (write) |
+    /// | `RemoveLabel`      | no-store-read (write) |
+    /// | `SetProperty`      | no-store-read (write) |
+    /// | `MapCollect`       | no-store-read         |
+    /// | `ParameterScan`    | no-store-read         |
+    /// | `MultiWayJoin`     | no-store-read         |
+    /// | `HorizontalAggregate` | records-via-store (property reads via store) |
+    /// | `LoadData`         | no-store-read (reads CSV file, not the graph store) |
+    /// | `Empty`            | unreachable-Err       |
+    /// | `VectorJoin`       | unreachable-Err (always rejected; VectorJoin not supported) |
+    ///
+    /// **guarded** — bypasses the visible-read API; rejected under Serializable
+    /// until proper MVCC integration is implemented:
+    ///
+    /// | Arm                | Reason bypassed              |
+    /// |--------------------|------------------------------|
+    /// | `VectorScan`       | raw HNSW index               |
+    /// | `TextScan`         | raw BM25 inverted index      |
+    /// | `CallProcedure`    | raw graph traversal in algos |
+    ///
+    /// The catch-all `_ =>` arm is also an `unreachable-Err` (any newly-added
+    /// variant that isn't wired up will error immediately at planning time).
     fn plan_operator(&self, op: &LogicalOperator) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        if let LogicalOperator::Filter(filter) = op
+            && let Some(planned) = self.plan_filter_stack_reordered(filter)
+        {
+            return planned;
+        }
+        let (operator, columns) = self.plan_operator_inner(op)?;
+        #[cfg(any(debug_assertions, test))]
+        self.validate_output_bindings(op, &columns)?;
+        Ok((operator, columns))
+    }
+
+    /// Plans `filter` with an index-served conjunct moved innermost, if that
+    /// changes the stack. Kept out of line: the reordered plan must not
+    /// enlarge `plan_operator`'s frame, which deep plans recurse through.
+    #[inline(never)]
+    fn plan_filter_stack_reordered(
+        &self,
+        filter: &FilterOp,
+    ) -> Option<Result<(Box<dyn Operator>, Vec<String>)>> {
+        let reordered = self
+            .index_lookup_filter_innermost(filter)
+            .or_else(|| self.paired_range_filter(filter))?;
+        Some(self.plan_operator(&reordered))
+    }
+
+    fn plan_operator_inner(
+        &self,
+        op: &LogicalOperator,
+    ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         let result = match op {
             LogicalOperator::NodeScan(scan) => self.plan_node_scan(scan),
             LogicalOperator::Expand(expand) => {
@@ -725,7 +1258,10 @@ impl Planner {
                 // its own entry.
                 if self.factorized_execution && !self.profiling.get() {
                     let (chain_len, _base) = Self::count_expand_chain(op);
-                    if chain_len >= 2 {
+                    if chain_len == 3 && self.is_directed_triangle_chain(op) {
+                        return self.maybe_profile(self.plan_leapfrog_triangle(op), op);
+                    }
+                    if chain_len >= 2 && self.factorized_benefit_for_chain(op) < 1.0 {
                         return self.maybe_profile(self.plan_expand_chain(op), op);
                     }
                 }
@@ -759,13 +1295,12 @@ impl Planner {
             LogicalOperator::AddLabel(add_label) => self.plan_add_label(add_label),
             LogicalOperator::RemoveLabel(remove_label) => self.plan_remove_label(remove_label),
             LogicalOperator::SetProperty(set_prop) => self.plan_set_property(set_prop),
-            LogicalOperator::ShortestPath(sp) => self.plan_shortest_path(sp),
             LogicalOperator::MapCollect(mc) => self.plan_map_collect(mc),
-            #[cfg(feature = "algos")]
+            #[cfg(any(feature = "lpg", feature = "algos"))]
             LogicalOperator::CallProcedure(call) => self.plan_call_procedure(call),
-            #[cfg(not(feature = "algos"))]
+            #[cfg(not(any(feature = "lpg", feature = "algos")))]
             LogicalOperator::CallProcedure(_) => Err(Error::Internal(
-                "CALL procedures require the 'algos' feature".to_string(),
+                "LPG CALL procedures require the 'lpg' feature".to_string(),
             )),
             LogicalOperator::ParameterScan(_param_scan) => {
                 let state = self
@@ -844,15 +1379,18 @@ impl Planner {
         let function = convert_aggregate_function(ha.function);
         let input_column_count = child_columns.len();
 
-        let operator: Box<dyn Operator> = Box::new(HorizontalAggregateOperator::new(
-            child_op,
-            list_col_idx,
-            entity_kind,
-            function,
-            ha.property.clone(),
-            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
-            input_column_count,
-        ));
+        let operator: Box<dyn Operator> = Box::new(
+            HorizontalAggregateOperator::new(
+                child_op,
+                list_col_idx,
+                entity_kind,
+                function,
+                ha.property.clone(),
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+                input_column_count,
+            )
+            .with_transaction_context(self.viewing_epoch, self.transaction_id),
+        );
 
         let mut columns = child_columns;
         columns.push(ha.alias.clone());
@@ -889,6 +1427,10 @@ impl Planner {
     }
 
     /// Plans a text search scan operator using BM25 inverted index.
+    ///
+    /// Every planned scan carries its viewing epoch, including historical
+    /// reads without an active transaction. A valid transaction ID additionally
+    /// enables overlay visibility and SSI recording.
     #[cfg(feature = "text-index")]
     fn plan_text_scan(&self, scan: &TextScanOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use grafeo_core::execution::operators::TextScanOperator;
@@ -908,31 +1450,36 @@ impl Planner {
             }
         };
 
-        let operator: Box<dyn Operator> = if let Some(k) = scan.k {
-            Box::new(TextScanOperator::top_k(
+        let base_op: TextScanOperator = if let Some(k) = scan.k {
+            TextScanOperator::top_k(
                 Arc::clone(&self.store),
                 &scan.label,
                 &scan.property,
                 &query_string,
                 k,
-            ))
+            )
         } else if let Some(threshold) = scan.threshold {
-            Box::new(TextScanOperator::with_threshold(
+            TextScanOperator::with_threshold(
                 Arc::clone(&self.store),
                 &scan.label,
                 &scan.property,
                 &query_string,
                 threshold,
-            ))
+            )
         } else {
-            Box::new(TextScanOperator::top_k(
+            TextScanOperator::top_k(
                 Arc::clone(&self.store),
                 &scan.label,
                 &scan.property,
                 &query_string,
                 100,
-            ))
+            )
         };
+
+        let operator: Box<dyn Operator> = Box::new(base_op.with_transaction_context(
+            self.viewing_epoch,
+            self.transaction_id.unwrap_or(TransactionId::INVALID),
+        ));
 
         let mut columns = vec![scan.variable.clone()];
         if let Some(ref score_col) = scan.score_column {
@@ -1012,6 +1559,16 @@ impl Planner {
             operator = operator.with_max_distance(dist);
         }
 
+        // Thread (epoch, tx) into the operator for Serializable transactions so
+        // the search is snapshot-pinned and the index read is recorded for SSI.
+        let operator: Box<dyn Operator> = if self.is_serializable()
+            && let Some(tx) = self.transaction_id
+        {
+            Box::new(operator.with_transaction_context(self.viewing_epoch, tx))
+        } else {
+            Box::new(operator)
+        };
+
         let mut columns = vec![scan.variable.clone()];
         // VectorScan always projects a score column keyed by the resolved
         // metric (after index-driven fallback) so downstream score reuse
@@ -1032,7 +1589,7 @@ impl Planner {
             &scan.query_vector,
         ));
 
-        Ok((Box::new(operator), columns))
+        Ok((operator, columns))
     }
 
     /// Resolves a LogicalExpression to a Vec<f32> for vector operations.
@@ -1080,14 +1637,14 @@ impl Planner {
 }
 
 /// An operator that yields a static set of rows (for `grafeo.procedures()` etc.).
-#[cfg(feature = "algos")]
+#[cfg(any(feature = "lpg", feature = "algos"))]
 struct StaticResultOperator {
     rows: Vec<Vec<Value>>,
     column_indices: Vec<usize>,
     row_index: usize,
 }
 
-#[cfg(feature = "algos")]
+#[cfg(any(feature = "lpg", feature = "algos"))]
 impl Operator for StaticResultOperator {
     fn next(&mut self) -> grafeo_core::execution::operators::OperatorResult {
         use grafeo_core::execution::DataChunk;
@@ -1131,7 +1688,7 @@ impl Operator for StaticResultOperator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lpg"))]
 mod tests {
     use super::*;
     use crate::query::plan::{
@@ -1248,6 +1805,191 @@ mod tests {
 
         let physical = planner.plan(&logical).unwrap();
         assert_eq!(physical.columns(), &["n.name"]);
+    }
+
+    #[test]
+    fn two_hop_id_return_stays_factorized() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&["Person"]);
+        let b = store.create_node(&["Person"]);
+        let c = store.create_node(&["Person"]);
+        store.create_edge(a, b, "KNOWS");
+        store.create_edge(b, c, "KNOWS");
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        let hop2 = LogicalOperator::Expand(ExpandOp {
+            from_variable: "b".to_string(),
+            to_variable: "c".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(LogicalOperator::Expand(ExpandOp {
+                from_variable: "a".to_string(),
+                to_variable: "b".to_string(),
+                edge_variable: None,
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec!["KNOWS".to_string()],
+                min_hops: 1,
+                max_hops: Some(1),
+                input: Box::new(scan_person("a")),
+                path_alias: None,
+                path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
+            })),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
+        });
+        let logical = LogicalPlan::new(LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::FunctionCall {
+                    name: "id".to_string(),
+                    args: vec![LogicalExpression::Variable("c".to_string())],
+                    distinct: false,
+                },
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(hop2),
+        }));
+        let mut physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.operator.name(), "Project");
+        assert_eq!(physical.columns(), &["id(c)"]);
+        let fact_rows = crate::query::Executor::with_columns(physical.columns.clone())
+            .execute(physical.operator.as_mut())
+            .unwrap();
+        let mut flat_plan = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .with_factorized_execution(false)
+            .plan(&logical)
+            .unwrap();
+        assert_ne!(flat_plan.operator.name(), "FactorizedProject");
+        let flat_rows = crate::query::Executor::with_columns(flat_plan.columns.clone())
+            .execute(flat_plan.operator.as_mut())
+            .unwrap();
+        assert_eq!(
+            fact_rows.rows.len(),
+            flat_rows.rows.len(),
+            "factorized id RETURN must match the flat execute path\nfact={:?}\nflat={:?}",
+            fact_rows.rows,
+            flat_rows.rows
+        );
+    }
+
+    fn two_hop_knows_expand(from_scan: LogicalOperator) -> LogicalOperator {
+        LogicalOperator::Expand(ExpandOp {
+            from_variable: "b".to_string(),
+            to_variable: "c".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(LogicalOperator::Expand(ExpandOp {
+                from_variable: "a".to_string(),
+                to_variable: "b".to_string(),
+                edge_variable: None,
+                direction: ExpandDirection::Outgoing,
+                edge_types: vec!["KNOWS".to_string()],
+                min_hops: 1,
+                max_hops: Some(1),
+                input: Box::new(from_scan),
+                path_alias: None,
+                path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
+            })),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
+        })
+    }
+
+    #[test]
+    fn two_hop_entity_return_matches_flat() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&["Person"]);
+        let b = store.create_node(&["Person"]);
+        let c = store.create_node(&["Person"]);
+        store.set_node_property(a, "name", Value::from("A"));
+        store.set_node_property(b, "name", Value::from("B"));
+        store.set_node_property(c, "name", Value::from("C"));
+        store.create_edge(a, b, "KNOWS");
+        store.create_edge(b, c, "KNOWS");
+        let logical = LogicalPlan::new(LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::Variable("c".to_string()),
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(two_hop_knows_expand(scan_person("a"))),
+        }));
+        let mut physical = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .plan(&logical)
+            .unwrap();
+        assert_eq!(physical.operator.name(), "Project");
+        let fact_rows = crate::query::Executor::with_columns(physical.columns.clone())
+            .execute(physical.operator.as_mut())
+            .unwrap();
+        let mut flat_plan = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .with_factorized_execution(false)
+            .plan(&logical)
+            .unwrap();
+        let flat_rows = crate::query::Executor::with_columns(flat_plan.columns.clone())
+            .execute(flat_plan.operator.as_mut())
+            .unwrap();
+        assert_eq!(
+            fact_rows.rows, flat_rows.rows,
+            "factorized entity RETURN must match the flat execute path"
+        );
+        assert_eq!(fact_rows.rows.len(), 1);
+    }
+
+    #[test]
+    fn two_hop_property_return_matches_flat() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let a = store.create_node(&["Person"]);
+        let b = store.create_node(&["Person"]);
+        let c = store.create_node(&["Person"]);
+        store.set_node_property(c, "name", Value::from("leaf"));
+        store.create_edge(a, b, "KNOWS");
+        store.create_edge(b, c, "KNOWS");
+        let logical = LogicalPlan::new(LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::Property {
+                    variable: "c".to_string(),
+                    property: "name".to_string(),
+                },
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(two_hop_knows_expand(scan_person("a"))),
+        }));
+        let mut physical = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .plan(&logical)
+            .unwrap();
+        let fact_rows = crate::query::Executor::with_columns(physical.columns.clone())
+            .execute(physical.operator.as_mut())
+            .unwrap();
+        let mut flat_plan = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .with_factorized_execution(false)
+            .plan(&logical)
+            .unwrap();
+        let flat_rows = crate::query::Executor::with_columns(flat_plan.columns.clone())
+            .execute(flat_plan.operator.as_mut())
+            .unwrap();
+        assert_eq!(
+            fact_rows.rows, flat_rows.rows,
+            "factorized property RETURN must match the flat execute path"
+        );
+        assert_eq!(fact_rows.rows[0][0], Value::from("leaf"));
     }
 
     #[test]
@@ -1493,6 +2235,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -1539,6 +2284,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -1941,6 +2689,7 @@ mod tests {
                     function: LogicalAggregateFunction::Count,
                     expression: Some(LogicalExpression::Variable("n".to_string())),
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("cnt".to_string()),
                     percentile: None,
@@ -1960,6 +2709,37 @@ mod tests {
     }
 
     #[test]
+    fn factorized_aggregate_rejects_distinct_identity_semantics() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let aggregate = |distinct, distinct_key| AggregateOp {
+            group_by: vec![],
+            aggregates: vec![LogicalAggregateExpr {
+                function: LogicalAggregateFunction::CountNonNull,
+                expression: Some(LogicalExpression::Variable("n".to_string())),
+                expression2: None,
+                distinct_key,
+                distinct,
+                alias: Some("cnt".to_string()),
+                percentile: None,
+                separator: None,
+            }],
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "n".to_string(),
+                label: None,
+                input: None,
+            })),
+            having: None,
+        };
+
+        assert!(!planner.is_simple_aggregate(&aggregate(true, None)));
+        assert!(!planner.is_simple_aggregate(&aggregate(
+            false,
+            Some(LogicalExpression::Variable("rdf_identity".to_string())),
+        )));
+    }
+
+    #[test]
     fn test_plan_aggregate_with_group_by() {
         let store = create_test_store();
         let planner = Planner::new(store);
@@ -1974,6 +2754,7 @@ mod tests {
                 function: LogicalAggregateFunction::Count,
                 expression: Some(LogicalExpression::Variable("n".to_string())),
                 expression2: None,
+                distinct_key: None,
                 distinct: false,
                 alias: Some("cnt".to_string()),
                 percentile: None,
@@ -2006,6 +2787,7 @@ mod tests {
                     property: "value".to_string(),
                 }),
                 expression2: None,
+                distinct_key: None,
                 distinct: false,
                 alias: Some("total".to_string()),
                 percentile: None,
@@ -2038,6 +2820,7 @@ mod tests {
                     property: "score".to_string(),
                 }),
                 expression2: None,
+                distinct_key: None,
                 distinct: false,
                 alias: Some("average".to_string()),
                 percentile: None,
@@ -2071,6 +2854,7 @@ mod tests {
                         property: "age".to_string(),
                     }),
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("youngest".to_string()),
                     percentile: None,
@@ -2083,6 +2867,7 @@ mod tests {
                         property: "age".to_string(),
                     }),
                     expression2: None,
+                    distinct_key: None,
                     distinct: false,
                     alias: Some("oldest".to_string()),
                     percentile: None,
@@ -2137,6 +2922,7 @@ mod tests {
                 conditions: vec![JoinCondition {
                     left: LogicalExpression::Variable("a".to_string()),
                     right: LogicalExpression::Variable("b".to_string()),
+                    semantics: crate::query::plan::JoinKeySemantics::Value,
                 }],
             })),
         }));
@@ -2483,6 +3269,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2538,6 +3327,7 @@ mod tests {
                 function: LogicalAggregateFunction::Count,
                 expression: Some(LogicalExpression::Variable("n".to_string())),
                 expression2: None,
+                distinct_key: None,
                 distinct: false,
                 alias: Some("cnt".to_string()),
                 percentile: None,
@@ -2725,6 +3515,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2766,6 +3559,9 @@ mod tests {
                 })),
                 path_alias: Some("p".to_string()),
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2809,6 +3605,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2851,6 +3650,9 @@ mod tests {
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -2925,9 +3727,15 @@ mod tests {
                     })),
                     path_alias: None,
                     path_mode: PathMode::Walk,
+                    edge_predicate: None,
+                    path_predicate: None,
+                    path_search: crate::query::plan::PathSearch::All,
                 })),
                 path_alias: None,
                 path_mode: PathMode::Walk,
+                edge_predicate: None,
+                path_predicate: None,
+                path_search: crate::query::plan::PathSearch::All,
             })),
         }));
 
@@ -3020,9 +3828,9 @@ mod tests {
         AddLabelOp, AntiJoinOp, ApplyOp, BindOp, DeleteEdgeOp, EdgeScanOp, ExceptOp,
         HorizontalAggregateOp, IntersectOp, LeftJoinOp, LoadDataFormat, LoadDataOp, MapCollectOp,
         MergeOp, MergeRelationshipOp, MultiWayJoinOp, OtherwiseOp, ParameterScanOp, RemoveLabelOp,
-        SetPropertyOp, ShortestPathOp, TripleComponent, TripleScanOp, UnionOp, UnwindOp,
+        SetPropertyOp, TripleComponent, TripleScanOp, UnionOp, UnwindOp,
     };
-    use grafeo_core::execution::operators::{Operator, SessionContext};
+    use grafeo_core::execution::operators::SessionContext;
 
     fn full_store() -> Arc<LpgStore> {
         // Richer store so expand and shortest path tests have real data.
@@ -3050,6 +3858,20 @@ mod tests {
             label: None,
             input: None,
         })
+    }
+
+    fn assert_named_path_columns(columns: &[String], alias: &str) {
+        for name in [
+            format!("_path_length_{alias}"),
+            format!("_path_nodes_{alias}"),
+            format!("_path_edges_{alias}"),
+            alias.to_string(),
+        ] {
+            assert!(
+                columns.iter().any(|column| column == &name),
+                "missing {name}"
+            );
+        }
     }
 
     // ==================== Builder Methods ====================
@@ -3289,6 +4111,7 @@ mod tests {
             left: Box::new(scan_any("a")),
             right: Box::new(scan_any("b")),
             condition: None,
+            compatibility_conditions: Vec::new(),
         }));
         let physical = planner.plan(&logical).unwrap();
         assert!(physical.columns().contains(&"a".to_string()));
@@ -3302,6 +4125,8 @@ mod tests {
         let logical = LogicalPlan::new(LogicalOperator::AntiJoin(AntiJoinOp {
             left: Box::new(scan_any("a")),
             right: Box::new(scan_any("b")),
+            compatibility_conditions: Vec::new(),
+            semantics: crate::query::plan::AntiJoinSemantics::Minus,
         }));
         let physical = planner.plan(&logical).unwrap();
         assert!(physical.columns().contains(&"a".to_string()));
@@ -3447,6 +4272,9 @@ mod tests {
             input: Box::new(scan_person("a")),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         let logical = LogicalPlan::new(LogicalOperator::DeleteEdge(DeleteEdgeOp {
             variable: "r".to_string(),
@@ -3457,49 +4285,136 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_shortest_path_dispatch() {
-        let store = full_store();
+    fn test_plan_unified_shortest_path_dispatch() {
+        let store = Arc::new(LpgStore::new().unwrap());
+        let source = store.create_node(&["Source"]);
+        let target = store.create_node(&["Target"]);
+        store.create_edge(source, target, "KNOWS");
         let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
 
-        // SHORTEST PATH (a)-(b)
-        let logical = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
-            input: Box::new(LogicalOperator::Join(JoinOp {
-                left: Box::new(scan_person("a")),
-                right: Box::new(scan_person("b")),
-                join_type: JoinType::Cross,
-                conditions: vec![],
-            })),
-            source_var: "a".to_string(),
-            target_var: "b".to_string(),
-            edge_types: vec!["KNOWS".to_string()],
+        // A bound target is represented by the ordinary Expand input. The
+        // unified operator must retain all named path detail columns.
+        let logical = LogicalPlan::new(LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: None,
             direction: ExpandDirection::Outgoing,
-            path_alias: "p".to_string(),
-            all_paths: false,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(2),
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "b".to_string(),
+                label: Some("Target".to_string()),
+                input: Some(Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".to_string(),
+                    label: Some("Source".to_string()),
+                    input: None,
+                }))),
+            })),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
         }));
-        let physical = planner.plan(&logical).unwrap();
-        assert!(
-            physical
-                .columns()
-                .iter()
-                .any(|c| c.contains("_path_length_p"))
+        let mut physical = planner.plan(&logical).unwrap();
+        assert_named_path_columns(physical.columns(), "p");
+        let source_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "a")
+            .unwrap();
+        let bound_target_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "b")
+            .unwrap();
+        let close_target_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "_close_b")
+            .unwrap();
+        let length_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "_path_length_p")
+            .unwrap();
+        let nodes_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "_path_nodes_p")
+            .unwrap();
+        let edges_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "_path_edges_p")
+            .unwrap();
+        let path_column = physical
+            .columns()
+            .iter()
+            .position(|column| column == "p")
+            .unwrap();
+        let chunk = physical.operator.next().unwrap().expect("bound path");
+        assert_eq!(chunk.row_count(), 1);
+        assert_eq!(
+            chunk.column(source_column).unwrap().get_node_id(0),
+            Some(source)
         );
+        assert_eq!(
+            chunk.column(bound_target_column).unwrap().get_node_id(0),
+            Some(target)
+        );
+        assert_eq!(
+            chunk.column(close_target_column).unwrap().get_node_id(0),
+            Some(target)
+        );
+        assert_eq!(
+            chunk.column(length_column).unwrap().get_value(0),
+            Some(grafeo_common::types::Value::Int64(1))
+        );
+        assert!(matches!(
+            chunk.column(nodes_column).unwrap().get_value(0),
+            Some(grafeo_common::types::Value::List(nodes)) if nodes.len() == 2
+        ));
+        assert!(matches!(
+            chunk.column(edges_column).unwrap().get_value(0),
+            Some(grafeo_common::types::Value::List(edges)) if edges.len() == 1
+        ));
+        assert!(matches!(
+            chunk.column(path_column).unwrap().get_value(0),
+            Some(grafeo_common::types::Value::Path { nodes, edges })
+                if nodes.len() == 2 && edges.len() == 1
+        ));
+        assert!(physical.operator.next().unwrap().is_none());
     }
 
     #[test]
-    fn test_plan_shortest_path_missing_source_errors() {
+    fn test_plan_unified_shortest_path_missing_source_errors() {
         let store = full_store();
         let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
-        let logical = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
-            input: Box::new(scan_person("a")),
-            source_var: "missing".to_string(),
-            target_var: "a".to_string(),
-            edge_types: vec![],
+        let logical = LogicalPlan::new(LogicalOperator::Expand(ExpandOp {
+            from_variable: "missing".to_string(),
+            to_variable: "a".to_string(),
+            edge_variable: None,
             direction: ExpandDirection::Both,
-            path_alias: "p".to_string(),
-            all_paths: false,
+            edge_types: vec![],
+            min_hops: 1,
+            max_hops: Some(2),
+            input: Box::new(scan_person("a")),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
         }));
         let err = planner.plan(&logical).err().expect("plan should fail");
-        assert!(format!("{err}").contains("Source variable"));
+        assert!(format!("{err}").contains("Source variable 'missing'"));
     }
 
     #[test]
@@ -3613,6 +4528,9 @@ mod tests {
             input: Box::new(scan_person("a")),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         let bc = LogicalOperator::Expand(ExpandOp {
             from_variable: "b".to_string(),
@@ -3625,6 +4543,9 @@ mod tests {
             input: Box::new(scan_person("b")),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         let ca = LogicalOperator::Expand(ExpandOp {
             from_variable: "c".to_string(),
@@ -3637,6 +4558,9 @@ mod tests {
             input: Box::new(scan_person("c")),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         let logical = LogicalPlan::new(LogicalOperator::MultiWayJoin(MultiWayJoinOp {
             inputs: vec![ab, bc, ca],
@@ -3663,6 +4587,9 @@ mod tests {
             input: Box::new(scan_person("a")),
             path_alias: Some("p".to_string()),
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         // Variable-length expand emits a column named _path_edges_p.
         let logical = LogicalPlan::new(LogicalOperator::HorizontalAggregate(
@@ -3735,6 +4662,9 @@ mod tests {
             input: Box::new(scan_person("a")),
             path_alias: None,
             path_mode: PathMode::Walk,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::All,
         });
         let (count, _) = Planner::count_expand_chain(&var_expand);
         assert_eq!(count, 0);
@@ -3822,5 +4752,497 @@ mod tests {
                 .unwrap_or_else(|e| panic!("plan_vector_scan failed for {label:?}: {e:?}"));
             assert_eq!(cols[0], "n", "variable column must be first for {label:?}");
         }
+    }
+
+    // ==================== is_serializable + guard tests (Task 4) ====================
+
+    /// Helper: build a Planner with the given isolation level.
+    fn make_planner_with_isolation(
+        isolation: crate::transaction::IsolationLevel,
+    ) -> (Planner, Arc<crate::transaction::TransactionManager>) {
+        use crate::transaction::TransactionManager;
+
+        let store = create_test_store();
+        let tm = Arc::new(TransactionManager::new());
+        let tid = tm.begin_with_isolation(isolation);
+        let epoch = tm.current_epoch();
+        let planner = Planner::with_context(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
+            Arc::clone(&tm),
+            Some(tid),
+            epoch,
+        );
+        (planner, tm)
+    }
+
+    /// A planner with no transaction context must not be Serializable.
+    #[test]
+    fn test_is_serializable_no_context() {
+        let store = create_test_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        assert!(
+            !planner.is_serializable(),
+            "no-context planner is not Serializable"
+        );
+    }
+
+    /// A planner with a SnapshotIsolation transaction must not be Serializable.
+    #[test]
+    fn test_is_serializable_snapshot_isolation() {
+        use crate::transaction::IsolationLevel;
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+        assert!(
+            !planner.is_serializable(),
+            "SnapshotIsolation planner must not report Serializable"
+        );
+    }
+
+    /// A planner with a Serializable transaction must be Serializable.
+    #[test]
+    fn test_is_serializable_serializable_level() {
+        use crate::transaction::IsolationLevel;
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        assert!(
+            planner.is_serializable(),
+            "Serializable planner must report is_serializable() == true"
+        );
+    }
+
+    /// Unified shortest expansion carries the serializable snapshot and retains
+    /// a bound target plus all named path detail columns.
+    #[test]
+    fn test_plan_unified_shortest_path_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let logical = LogicalPlan::new(LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Both,
+            edge_types: vec![],
+            min_hops: 1,
+            max_hops: Some(2),
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "b".to_string(),
+                label: None,
+                input: Some(Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".to_string(),
+                    label: None,
+                    input: None,
+                }))),
+            })),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_named_path_columns(physical.columns(), "p");
+    }
+
+    /// Snapshot isolation follows the same unified path lowering, with the
+    /// target bound in the input so the close-target path is exercised.
+    #[test]
+    fn test_plan_unified_shortest_path_under_snapshot_isolation() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+
+        let logical = LogicalPlan::new(LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Both,
+            edge_types: vec![],
+            min_hops: 1,
+            max_hops: Some(2),
+            input: Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                variable: "b".to_string(),
+                label: None,
+                input: Some(Box::new(LogicalOperator::NodeScan(NodeScanOp {
+                    variable: "a".to_string(),
+                    label: None,
+                    input: None,
+                }))),
+            })),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Trail,
+            edge_predicate: None,
+            path_predicate: None,
+            path_search: crate::query::plan::PathSearch::Shortest {
+                k: 1,
+                groups: false,
+            },
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_named_path_columns(physical.columns(), "p");
+    }
+
+    /// plan_vector_scan must SUCCEED under Serializable isolation (VI7: guard removed).
+    ///
+    /// The guard has been replaced with snapshot-aware execution: `plan_vector_scan`
+    /// threads `(epoch, tx)` into `VectorScanOperator` so `execute_search` routes
+    /// through `vector_search_visible`, recording the index read for SSI.
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn test_plan_vector_scan_rejected_under_serializable() {
+        use crate::query::plan::VectorScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = VectorScanOp {
+            variable: "n".to_string(),
+            index_name: None,
+            property: "emb".to_string(),
+            label: None,
+            query_vector: LogicalExpression::Literal(Value::List(
+                vec![Value::Float64(1.0), Value::Float64(0.0)].into(),
+            )),
+            k: Some(5),
+            metric: None,
+            min_similarity: None,
+            max_distance: None,
+            input: None,
+        };
+        // Guard has been removed: planning MUST succeed.
+        let result = planner.plan_vector_scan(&op);
+        assert!(
+            result.is_ok(),
+            "plan_vector_scan must succeed under Serializable (VI7: guard removed), got: {:?}",
+            result.err()
+        );
+    }
+
+    /// plan_vector_scan must NOT be rejected under SnapshotIsolation.
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn test_plan_vector_scan_allowed_under_snapshot_isolation() {
+        use crate::query::plan::VectorScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+        let op = VectorScanOp {
+            variable: "n".to_string(),
+            index_name: None,
+            property: "emb".to_string(),
+            label: None,
+            query_vector: LogicalExpression::Literal(Value::List(
+                vec![Value::Float64(1.0), Value::Float64(0.0)].into(),
+            )),
+            k: Some(5),
+            metric: None,
+            min_similarity: None,
+            max_distance: None,
+            input: None,
+        };
+        // Guard must not fire for SnapshotIsolation.
+        let result = planner.plan_vector_scan(&op);
+        assert!(
+            result.is_ok(),
+            "plan_vector_scan must succeed under SnapshotIsolation, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// plan_text_scan must SUCCEED under Serializable isolation (TI8: guard removed).
+    ///
+    /// The old blanket rejection has been replaced with snapshot-aware execution:
+    /// `plan_text_scan` threads `(epoch, tx)` into `TextScanOperator` so that
+    /// `execute_search` calls `text_search_visible`, records the index read for
+    /// SSI, and merges the per-transaction write delta.  Vector scan also
+    /// succeeds under Serializable after VI7 (guard removed).
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn test_plan_text_scan_allowed_under_serializable() {
+        use crate::query::plan::TextScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = TextScanOp {
+            variable: "n".to_string(),
+            label: "Doc".to_string(),
+            property: "body".to_string(),
+            query: LogicalExpression::Literal(Value::String("hello".into())),
+            k: Some(10),
+            threshold: None,
+            score_column: None,
+        };
+        let result = planner.plan_text_scan(&op);
+        assert!(
+            result.is_ok(),
+            "plan_text_scan must succeed under Serializable after TI8 guard removal, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// plan_text_scan must NOT be rejected under SnapshotIsolation.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn test_plan_text_scan_allowed_under_snapshot_isolation() {
+        use crate::query::plan::TextScanOp;
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::SnapshotIsolation);
+        let op = TextScanOp {
+            variable: "n".to_string(),
+            label: "Doc".to_string(),
+            property: "body".to_string(),
+            query: LogicalExpression::Literal(Value::String("hello".into())),
+            k: Some(10),
+            threshold: None,
+            score_column: None,
+        };
+        let result = planner.plan_text_scan(&op);
+        assert!(
+            result.is_ok(),
+            "plan_text_scan must succeed under SnapshotIsolation, got: {:?}",
+            result.err()
+        );
+    }
+
+    // ==================== per-procedure Serializable guard (Task 2) ====================
+
+    /// Build a `CallProcedureOp` for a procedure by its bare name (no namespace).
+    #[cfg(feature = "algos")]
+    fn make_call_op(name: &str) -> crate::query::plan::CallProcedureOp {
+        crate::query::plan::CallProcedureOp {
+            name: vec![name.to_string()],
+            arguments: vec![],
+            yield_items: None,
+        }
+    }
+
+    /// A graph algorithm CALL must succeed under Serializable isolation.
+    ///
+    /// The blanket `is_serializable()` guard has been replaced with a
+    /// per-procedure check: `GraphAlgorithmProcedure::serializable_safe()` is
+    /// `true`, so planning must return `Ok`, not `Err`.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_pagerank_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = make_call_op("pagerank");
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL pagerank must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `connected_components` (another graph algorithm) must also succeed.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_connected_components_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = make_call_op("connected_components");
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL connected_components must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `CALL db.labels()` (introspection) must succeed under Serializable.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_labels_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = crate::query::plan::CallProcedureOp {
+            name: vec!["db".to_string(), "labels".to_string()],
+            arguments: vec![],
+            yield_items: None,
+        };
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL db.labels must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// A no-transaction CALL is planned at one committed cut even if the
+    /// operator is pulled after the store advances. INVALID is intentional:
+    /// SYSTEM would treat future SYSTEM-created versions as the reader's own.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_autocommit_builtin_call_is_pinned_before_first_pull() {
+        use crate::transaction::TransactionManager;
+        use grafeo_common::types::EpochId;
+
+        let store = create_test_store();
+        store.sync_epoch(EpochId::new(1));
+        let manager = Arc::new(TransactionManager::new());
+        let planner = Planner::with_context(
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
+            Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
+            manager,
+            None,
+            EpochId::new(1),
+        );
+        let call = crate::query::plan::CallProcedureOp {
+            name: vec!["grafeo".to_string(), "labels".to_string()],
+            arguments: vec![],
+            yield_items: None,
+        };
+        let (mut operator, _) = planner
+            .plan_call_procedure(&call)
+            .expect("plan metadata CALL at epoch 1");
+
+        store.sync_epoch(EpochId::new(2));
+        store.create_node(&["Future"]);
+
+        let chunk = operator
+            .next()
+            .expect("execute metadata CALL")
+            .expect("metadata CALL returns rows");
+        let labels = chunk
+            .selected_indices()
+            .filter_map(|row| chunk.column(0)?.get_value(row))
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label == "Person"));
+        assert!(labels.iter().any(|label| label == "Company"));
+        assert!(
+            labels.iter().all(|label| label != "Future"),
+            "CALL drifted beyond its epoch-1 plan cut: {labels:?}"
+        );
+    }
+
+    /// `CALL grafeo.propertyKeys()` must succeed under Serializable.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_property_keys_succeeds_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = crate::query::plan::CallProcedureOp {
+            name: vec!["grafeo".to_string(), "propertyKeys".to_string()],
+            arguments: vec![],
+            yield_items: None,
+        };
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL grafeo.propertyKeys must succeed under Serializable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `CALL grafeo.search.vector` must SUCCEED under Serializable isolation
+    /// (VI7: guard removed; `SearchVectorProcedure::serializable_safe()` is now `true`).
+    ///
+    /// The procedure routes through `search_vector_visible` which records the
+    /// index read for SSI conflict detection.
+    #[cfg(all(feature = "algos", feature = "lpg", feature = "vector-index"))]
+    #[test]
+    fn test_plan_call_search_vector_rejected_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = crate::query::plan::CallProcedureOp {
+            name: vec![
+                "grafeo".to_string(),
+                "search".to_string(),
+                "vector".to_string(),
+            ],
+            arguments: vec![],
+            yield_items: None,
+        };
+        // Guard has been removed: CALL must succeed under Serializable.
+        let result = planner.plan_call_procedure(&op);
+        assert!(
+            result.is_ok(),
+            "CALL grafeo.search.vector must succeed under Serializable (VI7: guard removed); \
+             got: {:?}",
+            result.err()
+        );
+    }
+
+    /// The old blanket test: CALL to a graph algorithm under Serializable must
+    /// now succeed (blanket guard removed).  This replaces any prior test that
+    /// expected a blanket rejection of ALL graph algorithms under Serializable.
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_plan_call_graph_algorithm_no_longer_blanket_rejected_under_serializable() {
+        use crate::transaction::IsolationLevel;
+
+        let (planner, _tm) = make_planner_with_isolation(IsolationLevel::Serializable);
+        let op = make_call_op("pagerank");
+        // Must NOT return an error referencing the old blanket guard message.
+        match planner.plan_call_procedure(&op) {
+            Ok(_) => { /* ideal */ }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("graph algorithms") || !msg.contains("not yet supported"),
+                    "old blanket guard must be gone; per-procedure check applies. Got: {msg}"
+                );
+            }
+        }
+    }
+}
+
+/// Test-only capture of the trace of every `Planner::plan` call made
+/// on this thread, so plan contracts can observe the real `Session` path.
+#[cfg(test)]
+pub(crate) mod plan_trace {
+    use super::PlanTrace;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CAPTURED: RefCell<Option<Vec<PlanTrace>>> = const { RefCell::new(None) };
+    }
+
+    /// Ends a capture even if the captured closure panics.
+    #[cfg(feature = "lpg")]
+    struct Capturing;
+
+    #[cfg(feature = "lpg")]
+    impl Drop for Capturing {
+        fn drop(&mut self) {
+            CAPTURED.with(|captured| captured.borrow_mut().take());
+        }
+    }
+
+    /// Runs `f` and returns the trace of each plan built during it, in
+    /// planning order. Captures do not nest.
+    #[cfg(feature = "lpg")]
+    pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<PlanTrace>) {
+        CAPTURED.with(|captured| {
+            let mut captured = captured.borrow_mut();
+            assert!(captured.is_none(), "plan_trace::capture does not nest");
+            *captured = Some(Vec::new());
+        });
+        let capturing = Capturing;
+        let output = f();
+        let plans = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+        drop(capturing);
+        (output, plans)
+    }
+
+    pub(super) fn is_capturing() -> bool {
+        CAPTURED.with(|captured| captured.borrow().is_some())
+    }
+
+    pub(super) fn push(trace: PlanTrace) {
+        CAPTURED.with(|captured| {
+            if let Some(plans) = captured.borrow_mut().as_mut() {
+                plans.push(trace);
+            }
+        });
     }
 }
