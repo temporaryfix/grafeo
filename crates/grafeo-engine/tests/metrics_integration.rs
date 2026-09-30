@@ -106,20 +106,35 @@ fn test_query_error_metric() {
 #[test]
 fn test_cache_metrics_in_snapshot() {
     let db = db_with_metrics();
-    let session = db.session();
+    let mut session = db.session();
 
-    // Execute same query twice: first is a miss, second should be a hit
     session.execute("INSERT (:Animal {name: 'Dog'})").unwrap();
-    session.execute("MATCH (a:Animal) RETURN a.name").unwrap();
-    session.execute("MATCH (a:Animal) RETURN a.name").unwrap();
-
-    let m = db.metrics();
-    // Cache hits should be > 0 after the second identical query
-    assert!(
-        m.cache_hits > 0,
-        "expected cache hits after repeated query, got {}",
-        m.cache_hits
+    // Snapshot cache counters cover parsed/optimized plans. An explicit
+    // transaction exercises those lookups without the physical-plan fast path.
+    session.begin_transaction().unwrap();
+    let before = db.metrics();
+    assert_eq!(
+        session
+            .execute("MATCH (a:Animal) RETURN a.name")
+            .unwrap()
+            .row_count(),
+        1
     );
+    let first = db.metrics();
+    assert_eq!(first.cache_misses, before.cache_misses + 1);
+    assert_eq!(first.cache_hits, before.cache_hits);
+
+    assert_eq!(
+        session
+            .execute("MATCH (a:Animal) RETURN a.name")
+            .unwrap()
+            .row_count(),
+        1
+    );
+    let second = db.metrics();
+    assert_eq!(second.cache_hits, first.cache_hits + 1);
+    assert_eq!(second.cache_misses, first.cache_misses);
+    session.rollback().unwrap();
 }
 
 #[test]

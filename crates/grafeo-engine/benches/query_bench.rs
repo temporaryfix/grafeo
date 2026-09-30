@@ -59,10 +59,12 @@ fn setup_social_graph(node_count: usize, edge_multiplier: usize) -> GrafeoDB {
 }
 
 fn bench_node_lookup(c: &mut Criterion) {
-    let db = setup_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("query_node_lookup_by_property", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_social_graph(1_000, 5)).session());
         b.iter(|| {
             let result = session
                 .execute("MATCH (n:Person {id: 42}) RETURN n.name")
@@ -73,10 +75,12 @@ fn bench_node_lookup(c: &mut Criterion) {
 }
 
 fn bench_pattern_match(c: &mut Criterion) {
-    let db = setup_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("query_1hop_pattern", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_social_graph(1_000, 5)).session());
         b.iter(|| {
             let result = session
                 .execute("MATCH (a:Person {id: 0})-[:KNOWS]->(b) RETURN b.name")
@@ -87,10 +91,12 @@ fn bench_pattern_match(c: &mut Criterion) {
 }
 
 fn bench_two_hop_pattern(c: &mut Criterion) {
-    let db = setup_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("query_2hop_pattern", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_social_graph(1_000, 5)).session());
         b.iter(|| {
             let result = session
                 .execute(
@@ -103,10 +109,12 @@ fn bench_two_hop_pattern(c: &mut Criterion) {
 }
 
 fn bench_aggregation_count(c: &mut Criterion) {
-    let db = setup_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("query_count_all", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_social_graph(1_000, 5)).session());
         b.iter(|| {
             let result = session.execute("MATCH (n:Person) RETURN COUNT(n)").unwrap();
             black_box(result)
@@ -115,10 +123,12 @@ fn bench_aggregation_count(c: &mut Criterion) {
 }
 
 fn bench_filter_range(c: &mut Criterion) {
-    let db = setup_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("query_filter_range", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_social_graph(1_000, 5)).session());
         b.iter(|| {
             let result = session
                 .execute("MATCH (n:Person) WHERE n.age > 50 RETURN n.id")
@@ -129,11 +139,13 @@ fn bench_filter_range(c: &mut Criterion) {
 }
 
 fn bench_fan_out_expand_1k(c: &mut Criterion) {
-    let db = setup_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     // Expands from ALL Person nodes, testing scatter performance.
     c.bench_function("query_fan_out_expand_1k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_social_graph(1_000, 5)).session());
         b.iter(|| {
             let result = session
                 .execute("MATCH (a:Person)-[:KNOWS]->(b) RETURN COUNT(b)")
@@ -211,10 +223,14 @@ fn setup_rdf_social_graph(person_count: usize, edge_multiplier: usize) -> Grafeo
 /// Single triple pattern lookup with subject bound.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_single_pattern(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_single_pattern_lookup", |b| {
+        let session = session.get_or_init(|| {
+            db.get_or_init(|| setup_rdf_social_graph(1_000, 5))
+                .session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -231,10 +247,14 @@ fn bench_rdf_single_pattern(c: &mut Criterion) {
 /// Two-pattern star join (shared subject variable).
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_star_join(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_star_join_2pattern", |b| {
+        let session = session.get_or_init(|| {
+            db.get_or_init(|| setup_rdf_social_graph(1_000, 5))
+                .session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -252,10 +272,14 @@ fn bench_rdf_star_join(c: &mut Criterion) {
 /// Three-pattern star join (shared subject, three predicates).
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_star_join_3(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_star_join_3pattern", |b| {
+        let session = session.get_or_init(|| {
+            db.get_or_init(|| setup_rdf_social_graph(1_000, 5))
+                .session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -274,10 +298,14 @@ fn bench_rdf_star_join_3(c: &mut Criterion) {
 /// Chain join: ?a knows ?b, ?b has name.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_chain_join(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_chain_join", |b| {
+        let session = session.get_or_init(|| {
+            db.get_or_init(|| setup_rdf_social_graph(1_000, 5))
+                .session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -295,21 +323,28 @@ fn bench_rdf_chain_join(c: &mut Criterion) {
 /// OPTIONAL pattern: name required, email optional.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_optional(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
-
-    // Add email for ~half the persons
-    let mut triples = String::from("INSERT DATA {\n");
-    for i in (0..1_000).step_by(2) {
-        let _ = writeln!(
-            triples,
-            "  <http://ex.org/p{i}> <http://ex.org/email> \"user{i}@example.org\" ."
-        );
-    }
-    triples.push('}');
-    session.execute_sparql(&triples).unwrap();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_optional_pattern", |b| {
+        let session = session.get_or_init(|| {
+            let db = db.get_or_init(|| {
+                let db = setup_rdf_social_graph(1_000, 5);
+                let session = db.session();
+                // Add email for ~half the persons
+                let mut triples = String::from("INSERT DATA {\n");
+                for i in (0..1_000).step_by(2) {
+                    let _ = writeln!(
+                        triples,
+                        "  <http://ex.org/p{i}> <http://ex.org/email> \"user{i}@example.org\" ."
+                    );
+                }
+                triples.push('}');
+                session.execute_sparql(&triples).unwrap();
+                db
+            });
+            db.session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -327,10 +362,14 @@ fn bench_rdf_optional(c: &mut Criterion) {
 /// COUNT aggregation over all triples.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_count(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_count_all", |b| {
+        let session = session.get_or_init(|| {
+            db.get_or_init(|| setup_rdf_social_graph(1_000, 5))
+                .session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -347,10 +386,14 @@ fn bench_rdf_count(c: &mut Criterion) {
 /// FILTER with string comparison.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_filter(c: &mut Criterion) {
-    let db = setup_rdf_social_graph(1_000, 5);
-    let session = db.session();
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_filter_string", |b| {
+        let session = session.get_or_init(|| {
+            db.get_or_init(|| setup_rdf_social_graph(1_000, 5))
+                .session()
+        });
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -380,6 +423,53 @@ fn bench_rdf_insert_single(c: &mut Criterion) {
             counter += 1;
             let result = session.execute_sparql(&query).unwrap();
             black_box(result)
+        });
+    });
+}
+
+/// 10k-quad batch insert with intra-batch duplicates (O(n) HashSet).
+#[cfg(all(feature = "sparql", feature = "triple-store"))]
+fn bench_rdf_quad_batch_dedup_10k(c: &mut Criterion) {
+    use grafeo_engine::{Quad, Term, Triple};
+    let dup = Quad::named(
+        Triple::new(
+            Term::iri("http://ex.org/s"),
+            Term::iri("http://ex.org/p"),
+            Term::literal("x"),
+        ),
+        "http://ex.org/g",
+    );
+    let quads = vec![dup; 10_000];
+    c.bench_function("rdf_quad_batch_dedup_10k", |b| {
+        b.iter(|| {
+            let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))
+                .unwrap();
+            black_box(db.insert_rdf_quads(quads.clone()).unwrap())
+        });
+    });
+}
+
+/// 10k unique quads through the batch mouth.
+#[cfg(all(feature = "sparql", feature = "triple-store"))]
+fn bench_rdf_quad_batch_unique_10k(c: &mut Criterion) {
+    use grafeo_engine::{Quad, Term, Triple};
+    let quads: Vec<Quad> = (0..10_000)
+        .map(|i| {
+            Quad::named(
+                Triple::new(
+                    Term::iri(format!("http://ex.org/s{i}")),
+                    Term::iri("http://ex.org/p"),
+                    Term::literal("v"),
+                ),
+                "http://ex.org/g",
+            )
+        })
+        .collect();
+    c.bench_function("rdf_quad_batch_unique_10k", |b| {
+        b.iter(|| {
+            let db = GrafeoDB::with_config(Config::in_memory().with_graph_model(GraphModel::Rdf))
+                .unwrap();
+            black_box(db.insert_rdf_quads(quads.clone()).unwrap())
         });
     });
 }
@@ -434,10 +524,13 @@ fn setup_rdf_join_dataset(person_count: usize) -> GrafeoDB {
 /// 2-pattern star join on 10K persons.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_join_star_2_10k(c: &mut Criterion) {
-    let db = setup_rdf_join_dataset(10_000);
-    let session = db.session();
+    // Keep the fixture across samples, but construct it only if selected.
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_join_star_2_10k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_rdf_join_dataset(10_000)).session());
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -455,10 +548,13 @@ fn bench_rdf_join_star_2_10k(c: &mut Criterion) {
 /// 3-pattern star join on 10K persons.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_join_star_3_10k(c: &mut Criterion) {
-    let db = setup_rdf_join_dataset(10_000);
-    let session = db.session();
+    // Keep the fixture across samples, but construct it only if selected.
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_join_star_3_10k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_rdf_join_dataset(10_000)).session());
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -477,10 +573,13 @@ fn bench_rdf_join_star_3_10k(c: &mut Criterion) {
 /// 4-pattern star join (one pattern has ~50% selectivity via OPTIONAL-like density).
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_join_star_4_10k(c: &mut Criterion) {
-    let db = setup_rdf_join_dataset(10_000);
-    let session = db.session();
+    // Keep the fixture across samples, but construct it only if selected.
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_join_star_4_10k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_rdf_join_dataset(10_000)).session());
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -500,10 +599,13 @@ fn bench_rdf_join_star_4_10k(c: &mut Criterion) {
 /// Chain join: ?a knows ?b, ?b has name (traversal pattern).
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_join_chain_10k(c: &mut Criterion) {
-    let db = setup_rdf_join_dataset(10_000);
-    let session = db.session();
+    // Keep the fixture across samples, but construct it only if selected.
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_join_chain_10k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_rdf_join_dataset(10_000)).session());
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -521,10 +623,13 @@ fn bench_rdf_join_chain_10k(c: &mut Criterion) {
 /// 2-hop chain join: ?a knows ?b, ?b knows ?c, ?c has name.
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_join_chain_2hop_10k(c: &mut Criterion) {
-    let db = setup_rdf_join_dataset(10_000);
-    let session = db.session();
+    // Keep the fixture across samples, but construct it only if selected.
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_join_chain_2hop_10k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_rdf_join_dataset(10_000)).session());
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -543,10 +648,13 @@ fn bench_rdf_join_chain_2hop_10k(c: &mut Criterion) {
 /// OPTIONAL join on 10K persons (left join performance).
 #[cfg(all(feature = "sparql", feature = "triple-store"))]
 fn bench_rdf_join_optional_10k(c: &mut Criterion) {
-    let db = setup_rdf_join_dataset(10_000);
-    let session = db.session();
+    // Keep the fixture across samples, but construct it only if selected.
+    let db = std::cell::OnceCell::new();
+    let session = std::cell::OnceCell::new();
 
     c.bench_function("rdf_join_optional_10k", |b| {
+        let session =
+            session.get_or_init(|| db.get_or_init(|| setup_rdf_join_dataset(10_000)).session());
         b.iter(|| {
             let result = session
                 .execute_sparql(
@@ -572,6 +680,8 @@ criterion_group!(
     bench_rdf_count,
     bench_rdf_filter,
     bench_rdf_insert_single,
+    bench_rdf_quad_batch_dedup_10k,
+    bench_rdf_quad_batch_unique_10k,
 );
 
 #[cfg(all(feature = "sparql", feature = "triple-store"))]

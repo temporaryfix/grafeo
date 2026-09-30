@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Database mode - either LPG (Labeled Property Graph) or RDF (Triple Store).
+/// Database model exposed by the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -17,6 +17,8 @@ pub enum DatabaseMode {
     Lpg,
     /// RDF mode (subject-predicate-object triples).
     Rdf,
+    /// Native LPG and RDF models in the same database.
+    Both,
 }
 
 impl std::fmt::Display for DatabaseMode {
@@ -24,6 +26,7 @@ impl std::fmt::Display for DatabaseMode {
         match self {
             DatabaseMode::Lpg => write!(f, "lpg"),
             DatabaseMode::Rdf => write!(f, "rdf"),
+            DatabaseMode::Both => write!(f, "both"),
         }
     }
 }
@@ -31,11 +34,15 @@ impl std::fmt::Display for DatabaseMode {
 /// High-level database information returned by `db.info()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseInfo {
-    /// Database mode (LPG or RDF).
+    /// Native model exposed by the database.
     pub mode: DatabaseMode,
-    /// Number of nodes (LPG) or subjects (RDF).
+    /// Number of LPG nodes, or distinct RDF subjects in RDF-only mode.
+    ///
+    /// A dual-model database reports its LPG count here.
     pub node_count: usize,
-    /// Number of edges (LPG) or triples (RDF).
+    /// Number of LPG edges, or RDF triples/quads in RDF-only mode.
+    ///
+    /// A dual-model database reports its LPG count here.
     pub edge_count: usize,
     /// Whether the database is backed by a file.
     pub is_persistent: bool,
@@ -315,7 +322,10 @@ pub trait AdminService {
     fn validate(&self) -> ValidationResult;
 
     /// Returns WAL (Write-Ahead Log) status.
-    fn wal_status(&self) -> WalStatus;
+    ///
+    /// # Errors
+    /// Returns an error if WAL admission, filesystem access or status metadata fails.
+    fn wal_status(&self) -> grafeo_common::utils::error::Result<WalStatus>;
 
     /// Forces a WAL checkpoint, flushing pending records to storage.
     ///
@@ -335,6 +345,7 @@ mod tests {
     fn test_database_mode_display() {
         assert_eq!(DatabaseMode::Lpg.to_string(), "lpg");
         assert_eq!(DatabaseMode::Rdf.to_string(), "rdf");
+        assert_eq!(DatabaseMode::Both.to_string(), "both");
     }
 
     #[test]

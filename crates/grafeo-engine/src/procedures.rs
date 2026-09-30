@@ -4,12 +4,12 @@
 //! all supported query languages (GQL, Cypher, SQL/PGQ) to dispatch
 //! `CALL grafeo.<name>(...) [YIELD ...]` statements.
 //!
-//! # Unified dispatch (0.5.41+)
+//! # Unified dispatch
 //!
 //! Three kinds of procedures share the [`Procedure`] trait:
 //!
 //! - Graph algorithms (PageRank, BFS, Dijkstra, ...): adapted from
-//!   [`GraphAlgorithm`] via [`GraphAlgorithmProcedure`].
+//!   `GraphAlgorithm` via `GraphAlgorithmProcedure`.
 //! - Catalog introspection (`db.labels`, `db.relationshipTypes`,
 //!   `db.propertyKeys`): implemented directly.
 //! - Vector and text search (`grafeo.search.vector`, `grafeo.search.mmr`,
@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "algos")]
 use grafeo_adapters::plugins::algorithms::{
     ArticulationPointsAlgorithm, BellmanFordAlgorithm, BetweennessCentralityAlgorithm,
     BfsAlgorithm, BridgesAlgorithm, ClosenessCentralityAlgorithm, ClusteringCoefficientAlgorithm,
@@ -28,18 +29,37 @@ use grafeo_adapters::plugins::algorithms::{
     TopologicalSortAlgorithm,
 };
 use grafeo_adapters::plugins::{AlgorithmResult, ParameterDef, Parameters};
-use grafeo_common::types::Value;
+use grafeo_common::types::{EpochId, TransactionId, Value};
 use grafeo_common::utils::error::Result;
-use grafeo_core::graph::GraphStoreSearch;
+#[cfg(not(feature = "gql"))]
+use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind};
 #[cfg(feature = "lpg")]
 use grafeo_core::graph::lpg::LpgStore;
+#[cfg(all(feature = "lpg", any(feature = "text-index", feature = "vector-index")))]
+use grafeo_core::graph::lpg::encode_index_key;
+use grafeo_core::graph::{Direction, GraphStoreSearch};
 use hashbrown::HashMap;
 
 use crate::query::plan::LogicalExpression;
+#[cfg(not(feature = "gql"))]
+use crate::query::plan::LogicalOperator;
+
+/// The externally observable effect of a procedure invocation.
+///
+/// The default is deliberately fail-closed: a newly added procedure must opt
+/// in to [`ReadOnly`](Self::ReadOnly) before the Session may execute it with
+/// read authority or outside a write transaction.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ProcedureEffect {
+    /// The procedure only observes graph or catalog state.
+    ReadOnly,
+    /// The procedure may mutate state, including through another procedure.
+    MayWrite,
+}
 
 /// Unified interface for built-in procedures callable via `CALL`.
 ///
-/// Subsumes graph algorithms (through [`GraphAlgorithmProcedure`]), catalog
+/// Subsumes graph algorithms (through `GraphAlgorithmProcedure`), catalog
 /// introspection, and vector/text search procedures. The planner dispatches
 /// every `CALL grafeo.<name>(...)` through this trait, so adding a new
 /// procedure reduces to implementing [`Procedure`] and registering it in
@@ -57,6 +77,39 @@ pub trait Procedure: Send + Sync {
     /// Returns the canonical output column names in order.
     fn output_columns(&self) -> Vec<String>;
 
+    /// Classifies the procedure's externally visible effect.
+    ///
+    /// Implementations are write-capable until explicitly audited and marked
+    /// read-only. This prevents a future builtin from silently bypassing
+    /// Session authorization and transaction framing.
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::MayWrite
+    }
+
+    /// Returns `true` if this procedure is safe to run under Serializable
+    /// isolation.
+    ///
+    /// A procedure is Serializable-safe when its reads can be made
+    /// snapshot-consistent and recorded into the SSI read-set so that
+    /// concurrent conflicting writes will abort it correctly.
+    ///
+    /// - Graph algorithms (`GraphAlgorithmProcedure`): `true` — the executor
+    ///   wraps the store in a [`SnapshotView`][grafeo_core::graph::SnapshotView]
+    ///   so all reads are pinned to the transaction epoch and recorded.
+    /// - Catalog introspection (`labels`, `relationshipTypes`, `propertyKeys`):
+    ///   `true` — each procedure derives metadata from snapshot-visible
+    ///   entities. The enclosing dataset scan and entity reads are recorded for
+    ///   Serializable anti-phantom/conflict detection.
+    /// - Vector/text search procedures (`search.vector`, `search.mmr`,
+    ///   `search.text`): `true` — all three route through `*_visible` APIs
+    ///   that record index reads for SSI conflict detection when
+    ///   `snapshot_epoch`/`snapshot_tx` are set. The default `false` applies
+    ///   only to hypothetical future procedures that have not yet been made
+    ///   snapshot-aware.
+    fn serializable_safe(&self) -> bool {
+        false
+    }
+
     /// Executes the procedure against the supplied context and parameters.
     ///
     /// # Errors
@@ -73,6 +126,10 @@ pub trait Procedure: Send + Sync {
 /// Vector and text search procedures additionally require
 /// [`ProcedureContext::lpg_store`] to reach the HNSW and BM25 indexes owned
 /// by the LPG store.
+///
+/// Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are set so
+/// that text search procedures can call `search_text_visible` (snapshot-pinned
+/// + SSI read recording) instead of the committed-latest `index.read().search`.
 pub struct ProcedureContext<'a> {
     /// Read-only graph store, sufficient for graph algorithms and catalog
     /// introspection (labels, edge types, property keys).
@@ -83,6 +140,13 @@ pub struct ProcedureContext<'a> {
     /// not an LPG store (e.g., pure RDF) or in contexts that do not need it.
     #[cfg(feature = "lpg")]
     pub lpg_store: Option<&'a LpgStore>,
+
+    /// Snapshot epoch for Serializable transactions.  When `Some`, text search
+    /// procedures must call `search_text_visible` rather than the raw index.
+    pub snapshot_epoch: Option<EpochId>,
+
+    /// Transaction ID paired with `snapshot_epoch` for SSI read recording.
+    pub snapshot_tx: Option<TransactionId>,
 }
 
 impl<'a> ProcedureContext<'a> {
@@ -93,6 +157,8 @@ impl<'a> ProcedureContext<'a> {
             store,
             #[cfg(feature = "lpg")]
             lpg_store: None,
+            snapshot_epoch: None,
+            snapshot_tx: None,
         }
     }
 
@@ -103,19 +169,41 @@ impl<'a> ProcedureContext<'a> {
         Self {
             store,
             lpg_store: Some(lpg_store),
+            snapshot_epoch: None,
+            snapshot_tx: None,
+        }
+    }
+
+    /// Creates a context with a graph store, LPG store, and Serializable
+    /// snapshot context (epoch + transaction ID) for SSI-recording text search.
+    #[cfg(feature = "lpg")]
+    #[must_use]
+    pub fn with_lpg_store_and_snapshot(
+        store: &'a dyn GraphStoreSearch,
+        lpg_store: &'a LpgStore,
+        epoch: EpochId,
+        tx: TransactionId,
+    ) -> Self {
+        Self {
+            store,
+            lpg_store: Some(lpg_store),
+            snapshot_epoch: Some(epoch),
+            snapshot_tx: Some(tx),
         }
     }
 }
 
-/// Adapter that presents a [`GraphAlgorithm`] as a [`Procedure`].
+/// Adapter that presents a `GraphAlgorithm` as a [`Procedure`].
 ///
 /// Canonical output column names (e.g., `score` instead of `pagerank`) are
 /// captured at construction time via [`canonical_output_columns`].
+#[cfg(feature = "algos")]
 pub struct GraphAlgorithmProcedure {
     inner: Arc<dyn GraphAlgorithm>,
     output_columns: Vec<String>,
 }
 
+#[cfg(feature = "algos")]
 impl GraphAlgorithmProcedure {
     /// Wraps a graph algorithm as a procedure.
     pub fn new(algorithm: Arc<dyn GraphAlgorithm>) -> Self {
@@ -127,6 +215,7 @@ impl GraphAlgorithmProcedure {
     }
 }
 
+#[cfg(feature = "algos")]
 impl Procedure for GraphAlgorithmProcedure {
     fn name(&self) -> &str {
         self.inner.name()
@@ -142,6 +231,17 @@ impl Procedure for GraphAlgorithmProcedure {
 
     fn output_columns(&self) -> Vec<String> {
         self.output_columns.clone()
+    }
+
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// Graph algorithms are Serializable-safe: the executor wraps the store in
+    /// a `SnapshotView` so reads are pinned to the transaction epoch and
+    /// recorded for SSI conflict detection.
+    fn serializable_safe(&self) -> bool {
+        true
     }
 
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
@@ -173,9 +273,24 @@ impl Procedure for LabelsProcedure {
         vec!["label".into()]
     }
 
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// Snapshot enumeration records the dataset scan and visible entity reads.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, _params: &Parameters) -> Result<AlgorithmResult> {
+        let mut labels = std::collections::BTreeSet::new();
+        for id in ctx.store.node_ids() {
+            if let Some(node) = ctx.store.get_node(id) {
+                labels.extend(node.labels.into_iter().map(|label| label.to_string()));
+            }
+        }
         let mut result = AlgorithmResult::new(vec!["label".into()]);
-        for label in ctx.store.all_labels() {
+        for label in labels {
             result.rows.push(vec![Value::String(label.into())]);
         }
         Ok(result)
@@ -202,9 +317,22 @@ impl Procedure for RelationshipTypesProcedure {
         vec!["relationshipType".into()]
     }
 
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// Snapshot enumeration records the dataset scan and visible entity reads.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, _params: &Parameters) -> Result<AlgorithmResult> {
+        let mut edge_types = std::collections::BTreeSet::new();
+        for edge in visible_edges(ctx.store) {
+            edge_types.insert(edge.edge_type.to_string());
+        }
         let mut result = AlgorithmResult::new(vec!["relationshipType".into()]);
-        for t in ctx.store.all_edge_types() {
+        for t in edge_types {
             result.rows.push(vec![Value::String(t.into())]);
         }
         Ok(result)
@@ -231,13 +359,49 @@ impl Procedure for PropertyKeysProcedure {
         vec!["propertyKey".into()]
     }
 
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// Snapshot enumeration records the dataset scan and visible entity reads.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, _params: &Parameters) -> Result<AlgorithmResult> {
+        let mut keys = std::collections::BTreeSet::new();
+        for id in ctx.store.node_ids() {
+            if let Some(node) = ctx.store.get_node(id) {
+                keys.extend(node.properties.iter().map(|(key, _)| key.to_string()));
+            }
+        }
+        for edge in visible_edges(ctx.store) {
+            keys.extend(edge.properties.iter().map(|(key, _)| key.to_string()));
+        }
         let mut result = AlgorithmResult::new(vec!["propertyKey".into()]);
-        for key in ctx.store.all_property_keys() {
+        for key in keys {
             result.rows.push(vec![Value::String(key.into())]);
         }
         Ok(result)
     }
+}
+
+/// Enumerates each snapshot-visible edge exactly once through the graph-store
+/// interface. `SnapshotView::node_ids` records the complete dataset predicate;
+/// `edges_from` and `get_edge` preserve exact MVCC visibility and SSI reads.
+fn visible_edges(store: &dyn GraphStoreSearch) -> Vec<grafeo_core::graph::lpg::Edge> {
+    let mut ids = std::collections::BTreeSet::new();
+    for node in store.node_ids() {
+        ids.extend(
+            store
+                .edges_from(node, Direction::Outgoing)
+                .into_iter()
+                .map(|(_, edge)| edge),
+        );
+    }
+    ids.into_iter()
+        .filter_map(|edge| store.get_edge(edge))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +524,19 @@ impl Procedure for SearchVectorProcedure {
         vec!["node_id".into(), "distance".into()]
     }
 
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// `grafeo.search.vector` is Serializable-safe: the executor supplies
+    /// `(epoch, tx)` via `ProcedureContext::snapshot_epoch` /
+    /// `::snapshot_tx`, and `execute` routes through
+    /// `LpgStore::search_vector_visible` which records the index read for
+    /// SSI conflict detection.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         use grafeo_core::index::vector::{PropertyVectorAccessor, VectorAccessorKind};
 
@@ -374,9 +551,34 @@ impl Procedure for SearchVectorProcedure {
                 "CALL grafeo.search.vector: missing required parameter 'property'".into(),
             )
         })?;
+        if lpg.get_vector_index(label, property).is_none() {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "No vector index found for :{label}({property}). Call CREATE VECTOR INDEX first."
+            )));
+        }
         let query = coerce_params_to_vector(params, "query")?;
         let k = k_limit(params, 10);
 
+        // Every planned CALL has a snapshot context. Route through the logical
+        // store so a Layered backend scores both compact and overlay vectors;
+        // the LPG owner alone may contain no vectors after compaction. The
+        // visible search retains snapshot/own-write filtering, SSI index reads,
+        // and its existing visibility-safe beam floor.
+        if let (Some(epoch), Some(tx)) = (ctx.snapshot_epoch, ctx.snapshot_tx) {
+            let results = ctx
+                .store
+                .vector_search_visible(label, property, &query, k, epoch, tx);
+
+            let mut result = AlgorithmResult::new(vec!["node_id".into(), "distance".into()]);
+            for (node_id, distance) in results {
+                result
+                    .rows
+                    .push(vec![node_id_to_value(node_id), Value::Float64(distance)]);
+            }
+            return Ok(result);
+        }
+
+        // SI / RC: committed-latest, no SSI recording.
         let index = lpg.get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
                 "No vector index found for :{label}({property}). Call CREATE VECTOR INDEX first."
@@ -478,6 +680,21 @@ impl Procedure for SearchMmrProcedure {
         vec!["node_id".into(), "distance".into()]
     }
 
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// `grafeo.search.mmr` is Serializable-safe: the executor supplies
+    /// `(epoch, tx)` via `ProcedureContext::snapshot_epoch` /
+    /// `::snapshot_tx`, and `execute` routes the initial candidate fetch
+    /// through `LpgStore::search_vector_visible` which records the index
+    /// read for SSI conflict detection and applies snapshot visibility.
+    /// The MMR re-rank is deterministic post-processing and does not add
+    /// additional reads beyond those already recorded by the candidate fetch.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         use grafeo_core::index::vector::{
             PropertyVectorAccessor, VectorAccessor, VectorAccessorKind, mmr_select,
@@ -494,6 +711,11 @@ impl Procedure for SearchMmrProcedure {
                 "CALL grafeo.search.mmr: missing required parameter 'property'".into(),
             )
         })?;
+        if lpg.get_vector_index(label, property).is_none() {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "No vector index found for :{label}({property}). Call CREATE VECTOR INDEX first."
+            )));
+        }
         let query = coerce_params_to_vector(params, "query")?;
         let k = k_limit(params, 10);
         let fetch_k = params
@@ -507,6 +729,71 @@ impl Procedure for SearchMmrProcedure {
         )]
         let lambda = params.get_float("lambda").unwrap_or(0.5) as f32;
 
+        // Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are
+        // set by the executor.  Route through `search_vector_visible` to merge
+        // the per-tx write delta, pin candidates to the snapshot epoch, and
+        // record the index read in the SSI read-set so concurrent indexed-SET
+        // writes form an rw-antidependency edge.
+        //
+        // For the MMR re-rank we retrieve each candidate's as-of-epoch vector
+        // via `read_node_property_visible` so the pairwise similarity in
+        // `mmr_select` is also consistent with the snapshot (same epoch/tx).
+        if let (Some(epoch), Some(tx)) = (ctx.snapshot_epoch, ctx.snapshot_tx) {
+            let index_key = encode_index_key(label, property);
+            let initial = lpg.search_vector_visible(&index_key, &query, fetch_k, epoch, tx);
+            if initial.is_empty() {
+                return Ok(AlgorithmResult::new(vec![
+                    "node_id".into(),
+                    "distance".into(),
+                ]));
+            }
+
+            // Fetch as-of-epoch vectors for MMR pairwise comparison.
+            let prop_key = grafeo_common::types::PropertyKey::new(property);
+            let candidates: Vec<(grafeo_common::types::NodeId, f32, std::sync::Arc<[f32]>)> =
+                initial
+                    .into_iter()
+                    .filter_map(|(id, dist)| {
+                        let val = lpg.read_node_property_visible(id, &prop_key, epoch, Some(tx))?;
+                        match val {
+                            Value::Vector(v) => Some((id, dist, v)),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+
+            if candidates.is_empty() {
+                return Ok(AlgorithmResult::new(vec![
+                    "node_id".into(),
+                    "distance".into(),
+                ]));
+            }
+
+            let candidate_refs: Vec<(grafeo_common::types::NodeId, f32, &[f32])> = candidates
+                .iter()
+                .map(|(id, dist, vec)| (*id, *dist, vec.as_ref()))
+                .collect();
+
+            // Determine the distance metric from the committed index (fallback: Cosine).
+            let metric = lpg
+                .get_vector_index_by_key(&index_key)
+                .as_ref()
+                .map_or(grafeo_core::index::vector::DistanceMetric::Cosine, |idx| {
+                    idx.config().metric
+                });
+            let selected = mmr_select(&query, &candidate_refs, k, lambda, metric);
+
+            let mut result = AlgorithmResult::new(vec!["node_id".into(), "distance".into()]);
+            for (node_id, distance) in selected {
+                result.rows.push(vec![
+                    node_id_to_value(node_id),
+                    Value::Float64(f64::from(distance)),
+                ]);
+            }
+            return Ok(result);
+        }
+
+        // SI / RC: committed-latest, no SSI recording.
         let index = lpg.get_vector_index(label, property).ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(format!(
                 "No vector index found for :{label}({property}). Call CREATE VECTOR INDEX first."
@@ -612,6 +899,18 @@ impl Procedure for SearchTextProcedure {
         vec!["node_id".into(), "score".into()]
     }
 
+    fn effect(&self) -> ProcedureEffect {
+        ProcedureEffect::ReadOnly
+    }
+
+    /// `grafeo.search.text` is Serializable-safe: the executor supplies
+    /// `(epoch, tx)` via `ProcedureContext::snapshot_epoch` /
+    /// `::snapshot_tx`, and `execute` routes through `search_text_visible`
+    /// which records the index read for SSI conflict detection.
+    fn serializable_safe(&self) -> bool {
+        true
+    }
+
     fn execute(&self, ctx: &ProcedureContext<'_>, params: &Parameters) -> Result<AlgorithmResult> {
         let lpg = ctx.lpg_store.ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(
@@ -628,6 +927,11 @@ impl Procedure for SearchTextProcedure {
                 "CALL grafeo.search.text: missing required parameter 'property'".into(),
             )
         })?;
+        if lpg.get_text_index(label, property).is_none() {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "No text index found for :{label}({property}). Call CREATE TEXT INDEX first."
+            )));
+        }
         let query = params.get_string("query").ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal(
                 "CALL grafeo.search.text: missing required parameter 'query'".into(),
@@ -635,13 +939,23 @@ impl Procedure for SearchTextProcedure {
         })?;
         let k = k_limit(params, 10);
 
-        let index = lpg.get_text_index(label, property).ok_or_else(|| {
-            grafeo_common::utils::error::Error::Internal(format!(
-                "No text index found for :{label}({property}). Call CREATE TEXT INDEX first."
-            ))
-        })?;
-
-        let results = index.read().search(query, k);
+        // Under Serializable isolation `snapshot_epoch` and `snapshot_tx` are
+        // set by the executor.  Use `search_text_visible` to merge the per-tx
+        // write delta, pin results to the snapshot epoch, and record the index
+        // read in the SSI read-set so concurrent indexed-SET writes can form an
+        // rw-antidependency edge.
+        let results = if let (Some(epoch), Some(tx)) = (ctx.snapshot_epoch, ctx.snapshot_tx) {
+            let index_key = encode_index_key(label, property);
+            lpg.search_text_visible(&index_key, query, k, epoch, tx)?
+        } else {
+            // SI / RC: committed-latest, no SSI recording.
+            let index = lpg.get_text_index(label, property).ok_or_else(|| {
+                grafeo_common::utils::error::Error::Internal(format!(
+                    "No text index found for :{label}({property}). Call CREATE TEXT INDEX first."
+                ))
+            })?;
+            index.read().search(query, k)
+        };
 
         let mut result = AlgorithmResult::new(vec!["node_id".into(), "score".into()]);
         for (node_id, score) in results {
@@ -668,52 +982,55 @@ impl BuiltinProcedures {
     pub fn new() -> Self {
         let mut procedures: HashMap<String, Arc<dyn Procedure>> = HashMap::new();
 
-        // Graph algorithms, wrapped via the adapter.
-        let mut register_algo = |algo: Arc<dyn GraphAlgorithm>| {
-            let proc = Arc::new(GraphAlgorithmProcedure::new(algo));
-            procedures.insert(proc.name().to_string(), proc);
-        };
+        #[cfg(feature = "algos")]
+        {
+            // Graph algorithms, wrapped via the adapter.
+            let mut register_algo = |algo: Arc<dyn GraphAlgorithm>| {
+                let proc = Arc::new(GraphAlgorithmProcedure::new(algo));
+                procedures.insert(proc.name().to_string(), proc);
+            };
 
-        // Centrality
-        register_algo(Arc::new(PageRankAlgorithm));
-        register_algo(Arc::new(BetweennessCentralityAlgorithm));
-        register_algo(Arc::new(ClosenessCentralityAlgorithm));
-        register_algo(Arc::new(DegreeCentralityAlgorithm));
+            // Centrality
+            register_algo(Arc::new(PageRankAlgorithm));
+            register_algo(Arc::new(BetweennessCentralityAlgorithm));
+            register_algo(Arc::new(ClosenessCentralityAlgorithm));
+            register_algo(Arc::new(DegreeCentralityAlgorithm));
 
-        // Traversal
-        register_algo(Arc::new(BfsAlgorithm));
-        register_algo(Arc::new(DfsAlgorithm));
+            // Traversal
+            register_algo(Arc::new(BfsAlgorithm));
+            register_algo(Arc::new(DfsAlgorithm));
 
-        // Components
-        register_algo(Arc::new(ConnectedComponentsAlgorithm));
-        register_algo(Arc::new(StronglyConnectedComponentsAlgorithm));
-        register_algo(Arc::new(TopologicalSortAlgorithm));
+            // Components
+            register_algo(Arc::new(ConnectedComponentsAlgorithm));
+            register_algo(Arc::new(StronglyConnectedComponentsAlgorithm));
+            register_algo(Arc::new(TopologicalSortAlgorithm));
 
-        // Shortest Path
-        register_algo(Arc::new(DijkstraAlgorithm));
-        register_algo(Arc::new(SsspAlgorithm));
-        register_algo(Arc::new(BellmanFordAlgorithm));
-        register_algo(Arc::new(FloydWarshallAlgorithm));
+            // Shortest Path
+            register_algo(Arc::new(DijkstraAlgorithm));
+            register_algo(Arc::new(SsspAlgorithm));
+            register_algo(Arc::new(BellmanFordAlgorithm));
+            register_algo(Arc::new(FloydWarshallAlgorithm));
 
-        // Clustering
-        register_algo(Arc::new(ClusteringCoefficientAlgorithm));
+            // Clustering
+            register_algo(Arc::new(ClusteringCoefficientAlgorithm));
 
-        // Community
-        register_algo(Arc::new(LabelPropagationAlgorithm));
-        register_algo(Arc::new(LouvainAlgorithm));
+            // Community
+            register_algo(Arc::new(LabelPropagationAlgorithm));
+            register_algo(Arc::new(LouvainAlgorithm));
 
-        // MST
-        register_algo(Arc::new(KruskalAlgorithm));
-        register_algo(Arc::new(PrimAlgorithm));
+            // MST
+            register_algo(Arc::new(KruskalAlgorithm));
+            register_algo(Arc::new(PrimAlgorithm));
 
-        // Flow
-        register_algo(Arc::new(MaxFlowAlgorithm));
-        register_algo(Arc::new(MinCostFlowAlgorithm));
+            // Flow
+            register_algo(Arc::new(MaxFlowAlgorithm));
+            register_algo(Arc::new(MinCostFlowAlgorithm));
 
-        // Structure
-        register_algo(Arc::new(ArticulationPointsAlgorithm));
-        register_algo(Arc::new(BridgesAlgorithm));
-        register_algo(Arc::new(KCoreAlgorithm));
+            // Structure
+            register_algo(Arc::new(ArticulationPointsAlgorithm));
+            register_algo(Arc::new(BridgesAlgorithm));
+            register_algo(Arc::new(KCoreAlgorithm));
+        }
 
         // Catalog introspection
         let mut register = |proc: Arc<dyn Procedure>| {
@@ -768,6 +1085,127 @@ impl Default for BuiltinProcedures {
     }
 }
 
+/// Returns the process-wide immutable builtin procedure registry.
+///
+/// Resolution and effect analysis share this exact registry so a call cannot
+/// be authorized as one implementation and planned as another.
+#[must_use]
+pub(crate) fn builtin_registry() -> &'static BuiltinProcedures {
+    static PROCEDURES: std::sync::OnceLock<BuiltinProcedures> = std::sync::OnceLock::new();
+    PROCEDURES.get_or_init(BuiltinProcedures::new)
+}
+
+/// Security-relevant effects of builtin calls in one logical plan.
+///
+/// This classifier deliberately lives outside the GQL-only catalog procedure
+/// implementation: SQL/PGQ and any future query language can also produce a
+/// `CALL`, and the fail-closed [`Procedure::effect`] default must apply in
+/// every supported feature profile.
+#[derive(Clone, Copy)]
+#[cfg(not(feature = "gql"))]
+pub(crate) struct BuiltinProcedureEffects {
+    pub(crate) mutates: bool,
+    #[cfg(any(
+        feature = "cypher",
+        feature = "gremlin",
+        feature = "graphql",
+        feature = "sql-pgq"
+    ))]
+    pub(crate) contains_call: bool,
+    pub(crate) contains_mutating_call: bool,
+}
+
+/// Classifies every reachable builtin call without consulting the mutable
+/// catalog. Unknown calls are semantic errors, not implicitly read-only.
+#[cfg(not(feature = "gql"))]
+pub(crate) fn analyze_builtin_procedure_effects(
+    root: &LogicalOperator,
+) -> Result<BuiltinProcedureEffects> {
+    let contains_call = root.contains_procedure_call();
+    if !contains_call {
+        return Ok(BuiltinProcedureEffects {
+            mutates: root.has_mutations(),
+            #[cfg(any(
+                feature = "cypher",
+                feature = "gremlin",
+                feature = "graphql",
+                feature = "sql-pgq"
+            ))]
+            contains_call: false,
+            contains_mutating_call: false,
+        });
+    }
+
+    fn visit(operator: &LogicalOperator) -> Result<ProcedureEffect> {
+        let mut effect = if operator.has_mutations() {
+            ProcedureEffect::MayWrite
+        } else {
+            ProcedureEffect::ReadOnly
+        };
+        if let LogicalOperator::CallProcedure(call) = operator {
+            effect = effect.max(builtin_call_effect(&call.name)?);
+        }
+        for child in operator.children() {
+            effect = effect.max(visit(child)?);
+        }
+        Ok(effect)
+    }
+
+    let effect = visit(root)?;
+    let contains_mutating_call =
+        contains_call && calls_contain_effect(root, ProcedureEffect::MayWrite)?;
+    Ok(BuiltinProcedureEffects {
+        mutates: root.has_mutations() || effect == ProcedureEffect::MayWrite,
+        #[cfg(any(
+            feature = "cypher",
+            feature = "gremlin",
+            feature = "graphql",
+            feature = "sql-pgq"
+        ))]
+        contains_call,
+        contains_mutating_call,
+    })
+}
+
+#[cfg(not(feature = "gql"))]
+fn calls_contain_effect(root: &LogicalOperator, expected: ProcedureEffect) -> Result<bool> {
+    if let LogicalOperator::CallProcedure(call) = root
+        && builtin_call_effect(&call.name)? == expected
+    {
+        return Ok(true);
+    }
+    for child in root.children() {
+        if calls_contain_effect(child, expected)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Resolves one builtin call for effect classification using the same registry
+/// as physical planning.
+#[cfg(not(feature = "gql"))]
+pub(crate) fn builtin_call_effect(name: &[String]) -> Result<ProcedureEffect> {
+    if matches!(name, [single] if single == "procedures")
+        || matches!(name, [namespace, procedure]
+            if namespace.eq_ignore_ascii_case("grafeo") && procedure == "procedures")
+    {
+        return Ok(ProcedureEffect::ReadOnly);
+    }
+    builtin_registry()
+        .get(name)
+        .map(|procedure| procedure.effect())
+        .ok_or_else(|| {
+            Error::Query(QueryError::new(
+                QueryErrorKind::Semantic,
+                format!(
+                    "unknown procedure '{}'; use CALL grafeo.procedures() to list available procedures",
+                    name.join(".")
+                ),
+            ))
+        })
+}
+
 /// Metadata about a registered procedure.
 pub struct ProcedureInfo {
     /// Qualified name (e.g., `"grafeo.pagerank"`).
@@ -807,6 +1245,7 @@ fn resolve_name(parts: &[String]) -> String {
 /// These user-facing names (e.g., `"score"` instead of `"pagerank"`) must
 /// match the column count produced by each algorithm's `execute()`.
 #[must_use]
+#[cfg(feature = "algos")]
 pub fn canonical_output_columns(algo: &dyn GraphAlgorithm) -> Vec<String> {
     match algo.name() {
         "pagerank" => vec!["node_id".into(), "score".into()],
@@ -961,6 +1400,94 @@ pub fn procedures_result(registry: &BuiltinProcedures) -> AlgorithmResult {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------
+    // serializable_safe classification
+    // ---------------------------------------------------------------
+
+    #[cfg(feature = "algos")]
+    #[test]
+    fn graph_algorithm_procedures_are_serializable_safe() {
+        let registry = BuiltinProcedures::new();
+        for name in ["pagerank", "connected_components", "dijkstra", "bfs"] {
+            let proc = registry
+                .get(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                proc.serializable_safe(),
+                "{name}: GraphAlgorithmProcedure must be serializable_safe() == true"
+            );
+        }
+    }
+
+    #[test]
+    fn introspection_procedures_are_serializable_safe() {
+        let registry = BuiltinProcedures::new();
+        for name in ["labels", "relationshipTypes", "propertyKeys"] {
+            let proc = registry
+                .get(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                proc.serializable_safe(),
+                "{name}: introspection procedure must be serializable_safe() == true"
+            );
+        }
+    }
+
+    /// All built-in search procedures are Serializable-safe after VI7+MMR
+    /// un-guarding.  Any future search procedure that is NOT yet snapshot-aware
+    /// must document why and set `serializable_safe() == false` deliberately.
+    #[cfg(all(feature = "lpg", feature = "vector-index", feature = "text-index"))]
+    #[test]
+    fn all_search_procedures_are_serializable_safe() {
+        let registry = BuiltinProcedures::new();
+        for name in ["search.vector", "search.mmr", "search.text"] {
+            let proc = registry
+                .get(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                proc.serializable_safe(),
+                "{name}: search procedure must be serializable_safe() == true \
+                 (VI7+MMR un-guarding: every search procedure routes through \
+                 the snapshot-visible API when epoch+tx are set)"
+            );
+        }
+    }
+
+    #[test]
+    fn default_serializable_safe_is_false() {
+        // The trait default must be false; UnknownAlgo (defined below) doesn't
+        // override it, so GraphAlgorithmProcedure wrapping it must still be true
+        // (the wrapper overrides), but a bare struct relying on the default must
+        // return false.
+        struct BareProc;
+        impl Procedure for BareProc {
+            fn name(&self) -> &str {
+                "bare"
+            }
+            fn description(&self) -> &str {
+                "bare"
+            }
+            fn parameters(&self) -> &[ParameterDef] {
+                &[]
+            }
+            fn output_columns(&self) -> Vec<String> {
+                vec![]
+            }
+            fn execute(
+                &self,
+                _ctx: &ProcedureContext<'_>,
+                _params: &Parameters,
+            ) -> Result<AlgorithmResult> {
+                Ok(AlgorithmResult::new(vec![]))
+            }
+        }
+        assert!(
+            !BareProc.serializable_safe(),
+            "default serializable_safe() must be false"
+        );
+    }
+
+    #[cfg(feature = "algos")]
     #[test]
     fn test_registry_has_all_algorithms() {
         let registry = BuiltinProcedures::new();
@@ -972,6 +1499,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn test_resolve_with_namespace() {
         let registry = BuiltinProcedures::new();
@@ -979,6 +1507,7 @@ mod tests {
         assert!(registry.get(&name).is_some());
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn test_resolve_without_namespace() {
         let registry = BuiltinProcedures::new();
@@ -1016,6 +1545,7 @@ mod tests {
         assert_eq!(params.get_float("damping"), None);
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn test_adapter_forwards_metadata() {
         let algo: Arc<dyn GraphAlgorithm> = Arc::new(PageRankAlgorithm);
@@ -1090,6 +1620,7 @@ mod tests {
     // here silently breaks RETURN / YIELD lists.
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "algos")]
     #[test]
     fn canonical_output_columns_for_shortest_path_algorithms() {
         let dijkstra: Arc<dyn GraphAlgorithm> = Arc::new(DijkstraAlgorithm);
@@ -1111,6 +1642,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn canonical_output_columns_for_community_algorithms() {
         let louvain: Arc<dyn GraphAlgorithm> = Arc::new(LouvainAlgorithm);
@@ -1126,6 +1658,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn canonical_output_columns_for_mst_algorithms() {
         let kruskal: Arc<dyn GraphAlgorithm> = Arc::new(KruskalAlgorithm);
@@ -1140,6 +1673,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn canonical_output_columns_for_structural_algorithms() {
         let ap: Arc<dyn GraphAlgorithm> = Arc::new(ArticulationPointsAlgorithm);
@@ -1160,7 +1694,9 @@ mod tests {
 
     /// A stand-in GraphAlgorithm whose name is not in the canonical list,
     /// used to verify the fallback branch.
+    #[cfg(feature = "algos")]
     struct UnknownAlgo;
+    #[cfg(feature = "algos")]
     impl GraphAlgorithm for UnknownAlgo {
         fn name(&self) -> &str {
             "totally_new_algorithm"
@@ -1180,6 +1716,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn canonical_output_columns_falls_back_to_node_id_value() {
         let unknown: Arc<dyn GraphAlgorithm> = Arc::new(UnknownAlgo);
@@ -1386,6 +1923,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "algos")]
     #[test]
     fn procedures_result_parameter_description_distinguishes_required_and_default() {
         let registry = BuiltinProcedures::new();

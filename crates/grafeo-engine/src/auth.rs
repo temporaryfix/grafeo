@@ -31,18 +31,19 @@
 //! let writer = db.session_with_identity(identity);
 //! ```
 
+use grafeo_common::types::GraphPath;
 use std::collections::HashSet;
 use std::fmt;
 
-/// A per-graph access grant.
+/// An access grant for one exact LPG graph path.
 ///
 /// When an identity has grants, it can only access the listed graphs at the
 /// specified role level. An identity with no grants has unrestricted access
 /// (governed only by its top-level roles).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Grant {
-    /// The graph name this grant applies to.
-    pub graph: String,
+    /// Root-relative graph identity; components are literal and case-sensitive.
+    pub graph: GraphPath,
     /// The maximum role level for this graph.
     pub role: Role,
 }
@@ -50,10 +51,62 @@ pub struct Grant {
 impl Grant {
     /// Creates a new grant for the given graph and role.
     #[must_use]
-    pub fn new(graph: impl Into<String>, role: Role) -> Self {
-        Self {
+    pub fn new(graph: GraphPath, role: Role) -> Self {
+        Self { graph, role }
+    }
+}
+
+/// A typed grant for one RDF dataset graph.
+///
+/// RDF graph IRIs are matched byte-for-byte and case-sensitively. The default
+/// graph is a distinct target, so a grant for the named graph IRI `default`
+/// never grants access to the default graph (or vice versa).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RdfGraphGrant {
+    /// Access to the RDF dataset's default graph.
+    Default {
+        /// The maximum role level for this graph.
+        role: Role,
+    },
+    /// Access to one exact named-graph IRI.
+    Named {
+        /// The exact, case-sensitive named-graph IRI.
+        graph: String,
+        /// The maximum role level for this graph.
+        role: Role,
+    },
+}
+
+impl RdfGraphGrant {
+    /// Creates a grant for the RDF dataset's default graph.
+    #[must_use]
+    pub const fn default_graph(role: Role) -> Self {
+        Self::Default { role }
+    }
+
+    /// Creates a grant for one exact named-graph IRI.
+    #[must_use]
+    pub fn named(graph: impl Into<String>, role: Role) -> Self {
+        Self::Named {
             graph: graph.into(),
             role,
+        }
+    }
+
+    /// Returns the maximum role granted for this graph.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        match self {
+            Self::Default { role } | Self::Named { role, .. } => *role,
+        }
+    }
+
+    /// Returns the named-graph IRI, or `None` for the default graph.
+    #[must_use]
+    pub fn graph(&self) -> Option<&str> {
+        match self {
+            Self::Default { .. } => None,
+            Self::Named { graph, .. } => Some(graph),
         }
     }
 }
@@ -69,9 +122,12 @@ pub struct Identity {
     user_id: String,
     /// Roles assigned to this identity.
     roles: HashSet<Role>,
-    /// Per-graph access grants. Empty means unrestricted (all graphs accessible
-    /// at the identity's role level).
+    /// LPG storage-coordinate access grants.
     grants: Vec<Grant>,
+    /// Typed RDF graph grants. These are separate from LPG storage-coordinate
+    /// grants because RDF graph IRIs are case-sensitive and the RDF default
+    /// graph is not a named graph called `default`.
+    rdf_grants: Vec<RdfGraphGrant>,
 }
 
 impl Identity {
@@ -82,6 +138,7 @@ impl Identity {
             user_id: user_id.into(),
             roles: roles.into_iter().collect(),
             grants: Vec::new(),
+            rdf_grants: Vec::new(),
         }
     }
 
@@ -95,6 +152,7 @@ impl Identity {
             user_id: "anonymous".to_owned(),
             roles: [Role::Admin].into_iter().collect(),
             grants: Vec::new(),
+            rdf_grants: Vec::new(),
         }
     }
 
@@ -106,6 +164,18 @@ impl Identity {
     #[must_use]
     pub fn with_grants(mut self, grants: impl IntoIterator<Item = Grant>) -> Self {
         self.grants = grants.into_iter().collect();
+        self
+    }
+
+    /// Adds typed RDF graph grants to this identity.
+    ///
+    /// Once either LPG or RDF graph grants are configured, access to either
+    /// model is fail-closed: each model needs its own explicit grant. This
+    /// prevents an LPG-only capability from becoming an RDF escape hatch in a
+    /// dual-model database.
+    #[must_use]
+    pub fn with_rdf_grants(mut self, grants: impl IntoIterator<Item = RdfGraphGrant>) -> Self {
+        self.rdf_grants = grants.into_iter().collect();
         self
     }
 
@@ -155,37 +225,69 @@ impl Identity {
         &self.grants
     }
 
-    /// Returns true if this identity has per-graph restrictions.
+    /// Returns the typed RDF graph grants, if any.
+    #[must_use]
+    pub fn rdf_grants(&self) -> &[RdfGraphGrant] {
+        &self.rdf_grants
+    }
+
+    /// Returns true if this identity has LPG or RDF per-graph restrictions.
     #[must_use]
     pub fn has_grants(&self) -> bool {
-        !self.grants.is_empty()
+        !self.grants.is_empty() || !self.rdf_grants.is_empty()
     }
 
     /// Checks whether this identity can access the given graph at the
     /// required role level.
     ///
-    /// If no grants are configured, access is governed only by the
-    /// identity's top-level roles. If grants are configured, the graph
-    /// must appear in the grant list with a sufficient role.
+    /// If no grants of either model are configured, access is governed only by
+    /// the identity's top-level roles. Otherwise the graph must appear in the
+    /// LPG grant list with a sufficient role. Matching is exact: the root is
+    /// distinct from every child, and a parent grant does not cover descendants.
     #[must_use]
-    pub fn can_access_graph(&self, graph: &str, required: Role) -> bool {
-        if self.grants.is_empty() {
+    pub fn can_access_graph(&self, graph: &GraphPath, required: Role) -> bool {
+        if !self.has_grants() {
             // No per-graph restrictions: use top-level role check
-            return match required {
-                Role::ReadOnly => self.can_read(),
-                Role::ReadWrite => self.can_write(),
-                Role::Admin => self.can_admin(),
-            };
+            return self.role_allows(required);
         }
         // Check if any grant covers this graph at the required level
-        self.grants.iter().any(|g| {
-            g.graph.eq_ignore_ascii_case(graph)
-                && match required {
-                    Role::ReadOnly => true, // Any grant implies read access
-                    Role::ReadWrite => g.role == Role::ReadWrite || g.role == Role::Admin,
-                    Role::Admin => g.role == Role::Admin,
-                }
-        })
+        self.grants
+            .iter()
+            .any(|g| &g.graph == graph && Self::grant_role_allows(g.role, required))
+    }
+
+    /// Checks whether this identity can access an exact RDF graph target.
+    ///
+    /// `None` denotes the RDF default graph. `Some(iri)` denotes a named graph
+    /// and is compared case-sensitively, including when `iri == "default"`.
+    /// LPG [`Grant`] values never authorize RDF access.
+    #[must_use]
+    pub fn can_access_rdf_graph(&self, graph: Option<&str>, required: Role) -> bool {
+        if !self.role_allows(required) {
+            return false;
+        }
+        if !self.has_grants() {
+            return true;
+        }
+        self.rdf_grants
+            .iter()
+            .any(|grant| grant.graph() == graph && Self::grant_role_allows(grant.role(), required))
+    }
+
+    fn role_allows(&self, required: Role) -> bool {
+        match required {
+            Role::ReadOnly => self.can_read(),
+            Role::ReadWrite => self.can_write(),
+            Role::Admin => self.can_admin(),
+        }
+    }
+
+    const fn grant_role_allows(granted: Role, required: Role) -> bool {
+        match required {
+            Role::ReadOnly => true,
+            Role::ReadWrite => matches!(granted, Role::ReadWrite | Role::Admin),
+            Role::Admin => matches!(granted, Role::Admin),
+        }
     }
 }
 
@@ -524,48 +626,137 @@ mod tests {
     // --- Grant tests ---
 
     #[test]
-    fn no_grants_means_unrestricted() {
+    fn no_grants_means_unrestricted() -> Result<(), Box<dyn std::error::Error>> {
         let id = Identity::new("alix", [Role::ReadWrite]);
-        assert!(id.can_access_graph("any_graph", Role::ReadWrite));
-        assert!(id.can_access_graph("other", Role::ReadOnly));
+        assert!(id.can_access_graph(
+            &GraphPath::from_components(&["any_graph"])?,
+            Role::ReadWrite
+        ));
+        assert!(id.can_access_graph(&GraphPath::from_components(&["other"])?, Role::ReadOnly));
         assert!(!id.has_grants());
+        Ok(())
     }
 
     #[test]
-    fn grant_restricts_to_listed_graphs() {
+    fn grant_restricts_to_listed_graphs() -> Result<(), Box<dyn std::error::Error>> {
+        let social = GraphPath::from_components(&["social"])?;
+        let analytics = GraphPath::from_components(&["analytics"])?;
         let id = Identity::new("gus", [Role::ReadWrite]).with_grants([
-            Grant::new("social", Role::ReadWrite),
-            Grant::new("analytics", Role::ReadOnly),
+            Grant::new(social.clone(), Role::ReadWrite),
+            Grant::new(analytics.clone(), Role::ReadOnly),
         ]);
         assert!(id.has_grants());
-        assert!(id.can_access_graph("social", Role::ReadWrite));
-        assert!(id.can_access_graph("social", Role::ReadOnly));
-        assert!(id.can_access_graph("analytics", Role::ReadOnly));
-        assert!(!id.can_access_graph("analytics", Role::ReadWrite));
-        assert!(!id.can_access_graph("secret", Role::ReadOnly));
+        assert!(id.can_access_graph(&social, Role::ReadWrite));
+        assert!(id.can_access_graph(&social, Role::ReadOnly));
+        assert!(id.can_access_graph(&analytics, Role::ReadOnly));
+        assert!(!id.can_access_graph(&analytics, Role::ReadWrite));
+        assert!(!id.can_access_graph(&GraphPath::from_components(&["secret"])?, Role::ReadOnly));
+        Ok(())
     }
 
     #[test]
-    fn grant_admin_implies_all() {
-        let id =
-            Identity::new("admin", [Role::Admin]).with_grants([Grant::new("prod", Role::Admin)]);
-        assert!(id.can_access_graph("prod", Role::Admin));
-        assert!(id.can_access_graph("prod", Role::ReadWrite));
-        assert!(id.can_access_graph("prod", Role::ReadOnly));
+    fn grant_admin_implies_all() -> Result<(), Box<dyn std::error::Error>> {
+        let prod = GraphPath::from_components(&["prod"])?;
+        let id = Identity::new("admin", [Role::Admin])
+            .with_grants([Grant::new(prod.clone(), Role::Admin)]);
+        assert!(id.can_access_graph(&prod, Role::Admin));
+        assert!(id.can_access_graph(&prod, Role::ReadWrite));
+        assert!(id.can_access_graph(&prod, Role::ReadOnly));
+        Ok(())
     }
 
     #[test]
-    fn grant_case_insensitive() {
-        let id = Identity::new("alix", [Role::ReadWrite])
-            .with_grants([Grant::new("Social", Role::ReadWrite)]);
-        assert!(id.can_access_graph("social", Role::ReadOnly));
-        assert!(id.can_access_graph("SOCIAL", Role::ReadWrite));
+    fn grant_paths_are_exact() -> Result<(), Box<dyn std::error::Error>> {
+        let paths = [
+            GraphPath::root(),
+            GraphPath::from_components(&["default"])?,
+            GraphPath::from_components(&[""])?,
+            GraphPath::from_components(&["a/b"])?,
+            GraphPath::from_components(&["a", "b"])?,
+            GraphPath::from_components(&["a"])?,
+        ];
+        for granted in &paths {
+            let identity = Identity::new("reader", [Role::ReadOnly])
+                .with_grants([Grant::new(granted.clone(), Role::ReadOnly)]);
+            for requested in &paths {
+                assert_eq!(
+                    identity.can_access_graph(requested, Role::ReadOnly),
+                    granted == requested
+                );
+                assert!(!identity.can_access_graph(requested, Role::ReadWrite));
+            }
+        }
+        let id = Identity::new("alix", [Role::ReadWrite]).with_grants([Grant::new(
+            GraphPath::from_components(&["Social"])?,
+            Role::ReadWrite,
+        )]);
+        assert!(id.can_access_graph(&GraphPath::from_components(&["Social"])?, Role::ReadWrite));
+        assert!(!id.can_access_graph(&GraphPath::from_components(&["social"])?, Role::ReadOnly));
+        assert!(!id.can_access_graph(&GraphPath::from_components(&["SOCIAL"])?, Role::ReadWrite));
+        Ok(())
     }
 
     #[test]
-    fn grant_display() {
-        let g = Grant::new("social", Role::ReadWrite);
-        assert_eq!(g.graph, "social");
+    fn grant_display() -> Result<(), Box<dyn std::error::Error>> {
+        let social = GraphPath::from_components(&["social"])?;
+        let g = Grant::new(social.clone(), Role::ReadWrite);
+        assert_eq!(g.graph, social);
         assert_eq!(g.role, Role::ReadWrite);
+        Ok(())
+    }
+
+    #[test]
+    fn rdf_grants_distinguish_default_named_and_case() {
+        let id = Identity::new("rdf-reader", [Role::ReadOnly]).with_rdf_grants([
+            RdfGraphGrant::default_graph(Role::ReadOnly),
+            RdfGraphGrant::named("http://example.org/claims", Role::ReadOnly),
+            RdfGraphGrant::named("default", Role::ReadOnly),
+        ]);
+
+        assert!(id.can_access_rdf_graph(None, Role::ReadOnly));
+        assert!(id.can_access_rdf_graph(Some("default"), Role::ReadOnly));
+        assert!(id.can_access_rdf_graph(Some("http://example.org/claims"), Role::ReadOnly));
+        assert!(!id.can_access_rdf_graph(Some("http://example.org/Claims"), Role::ReadOnly));
+    }
+
+    #[test]
+    fn rdf_grants_require_both_identity_and_graph_role() {
+        let reader_with_write_grant = Identity::new("reader", [Role::ReadOnly])
+            .with_rdf_grants([RdfGraphGrant::default_graph(Role::ReadWrite)]);
+        assert!(reader_with_write_grant.can_access_rdf_graph(None, Role::ReadOnly));
+        assert!(!reader_with_write_grant.can_access_rdf_graph(None, Role::ReadWrite));
+
+        let writer_with_read_grant = Identity::new("writer", [Role::ReadWrite])
+            .with_rdf_grants([RdfGraphGrant::default_graph(Role::ReadOnly)]);
+        assert!(writer_with_read_grant.can_access_rdf_graph(None, Role::ReadOnly));
+        assert!(!writer_with_read_grant.can_access_rdf_graph(None, Role::ReadWrite));
+    }
+
+    #[test]
+    fn lpg_and_rdf_grants_do_not_cross_authorize() -> Result<(), Box<dyn std::error::Error>> {
+        let claims = GraphPath::from_components(&["http://example.org/claims"])?;
+        let rdf_only =
+            Identity::new("rdf", [Role::ReadWrite]).with_rdf_grants([RdfGraphGrant::named(
+                "http://example.org/claims",
+                Role::ReadWrite,
+            )]);
+        assert!(!rdf_only.can_access_graph(&claims, Role::ReadWrite));
+
+        let lpg_only = Identity::new("lpg", [Role::ReadWrite])
+            .with_grants([Grant::new(claims, Role::ReadWrite)]);
+        assert!(!lpg_only.can_access_rdf_graph(Some("http://example.org/claims"), Role::ReadWrite));
+        Ok(())
+    }
+
+    #[test]
+    fn lpg_grants_retain_their_existing_capability_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let social = GraphPath::from_components(&["social"])?;
+        let id = Identity::new("capability", std::iter::empty::<Role>())
+            .with_grants([Grant::new(social.clone(), Role::ReadWrite)]);
+
+        assert!(id.can_access_graph(&social, Role::ReadWrite));
+        assert!(!id.can_access_graph(&GraphPath::from_components(&["other"])?, Role::ReadOnly));
+        Ok(())
     }
 }

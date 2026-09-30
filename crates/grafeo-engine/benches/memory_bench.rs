@@ -21,6 +21,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use grafeo_common::types::Value;
 use grafeo_engine::GrafeoDB;
+#[cfg(feature = "vector-index")]
+use grafeo_engine::{CreateIndexRequest, GraphPath, IndexCreateKind};
 
 // ============================================================================
 // Snapshot recording
@@ -90,9 +92,12 @@ fn setup_social_graph(node_count: usize, edge_multiplier: usize) -> GrafeoDB {
     let mut node_ids = Vec::with_capacity(node_count);
     for i in 0..node_count {
         let id = db.create_node(&["Person"]);
-        db.set_node_property(id, "id", Value::Int64(i as i64));
-        db.set_node_property(id, "name", Value::String(format!("User{i}").into()));
-        db.set_node_property(id, "age", Value::Int64((20 + (i % 50)) as i64));
+        db.set_node_property(id, "id", Value::Int64(i as i64))
+            .expect("set node property");
+        db.set_node_property(id, "name", Value::String(format!("User{i}").into()))
+            .expect("set node property");
+        db.set_node_property(id, "age", Value::Int64((20 + (i % 50)) as i64))
+            .expect("set node property");
         node_ids.push(id);
     }
 
@@ -201,15 +206,20 @@ fn bench_memory_vector_index(c: &mut Criterion) {
                     let query = format!("INSERT (:Item {{id: {}, embedding: [{vec_str}]}})", i);
                     session.execute(&query).unwrap();
                 }
-                db.create_vector_index(
-                    "Item",
-                    "embedding",
-                    Some(128),
-                    Some("cosine"),
-                    None,
-                    None,
-                    None,
-                )
+                db.create_index(CreateIndexRequest {
+                    graph: GraphPath::root(),
+                    name: None,
+                    label: Some("Item".into()),
+                    property: "embedding".into(),
+                    kind: IndexCreateKind::Vector {
+                        dimensions: Some(128),
+                        metric: Some("cosine".into()),
+                        m: None,
+                        ef_construction: None,
+                        ef: None,
+                        quantization: None,
+                    },
+                })
                 .unwrap();
                 black_box(db.memory_usage().total_bytes);
             }
@@ -227,15 +237,20 @@ fn bench_memory_vector_index(c: &mut Criterion) {
         let query = format!("INSERT (:Item {{id: {}, embedding: [{vec_str}]}})", i);
         session.execute(&query).unwrap();
     }
-    db.create_vector_index(
-        "Item",
-        "embedding",
-        Some(128),
-        Some("cosine"),
-        None,
-        None,
-        None,
-    )
+    db.create_index(CreateIndexRequest {
+        graph: GraphPath::root(),
+        name: None,
+        label: Some("Item".into()),
+        property: "embedding".into(),
+        kind: IndexCreateKind::Vector {
+            dimensions: Some(128),
+            metric: Some("cosine".into()),
+            m: None,
+            ef_construction: None,
+            ef: None,
+            quantization: None,
+        },
+    })
     .unwrap();
     recorder_record("memory_vector_index_1k", db.memory_usage().total_bytes);
 }

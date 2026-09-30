@@ -22,6 +22,7 @@ arcstr.workspace = true
 smallvec.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
+bigdecimal = { workspace = true, optional = true }
 
 # Concurrency
 parking_lot.workspace = true
@@ -31,6 +32,7 @@ rayon = { workspace = true, optional = true }
 # Serialization
 serde.workspace = true
 bincode.workspace = true
+blake3.workspace = true
 
 # Regex for SPARQL FILTER (use regex-lite for smaller WASM builds)
 regex = { workspace = true, optional = true }
@@ -57,19 +59,33 @@ ort = { version = "2.0.0-rc.12", optional = true, default-features = false, feat
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 hf-hub = { version = "0.5", optional = true }
 crc32fast = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 # Memory-mapped files (optional, for compact-store mmap spill)
 memmap2 = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 
 # Refcounted byte slices for mmap-backed column storage (Phase 3c)
 bytes.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+cap-std = { workspace = true, optional = true }
+cap-fs-ext = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion.workspace = true
+crc32fast.workspace = true
 tempfile.workspace = true
 serde_json = "1"
 tokio.workspace = true
 proptest.workspace = true
+grafeo-common.workspace = true
 
 [features]
 default = ["lpg", "gql", "parallel", "wal", "grafeo-file", "spill", "mmap", "regex"]
@@ -82,20 +98,23 @@ sparql = ["grafeo-adapters/sparql"]
 gremlin = ["grafeo-adapters/gremlin"]
 graphql = ["grafeo-adapters/graphql"]
 sql-pgq = ["grafeo-adapters/sql-pgq"]  # SQL/PGQ (SQL:2023 GRAPH_TABLE)
-triple-store = ["grafeo-core/triple-store", "grafeo-adapters/triple-store", "md5", "sha1", "sha2", "regex"]  # RDF triple store model and planner
+triple-store = ["grafeo-core/triple-store", "grafeo-adapters/triple-store", "md5", "sha1", "sha2", "regex", "dep:bigdecimal"]  # RDF triple store model and planner
 ring-index = ["grafeo-core/ring-index", "triple-store"]  # Ring Index for compact RDF (3x memory reduction)
-shacl = ["grafeo-core/shacl", "sparql"]  # SHACL validation (core constraints + SPARQL dispatch)
-rdf = ["triple-store"]  # Deprecated: use triple-store
+shacl = ["grafeo-core/shacl", "sparql", "triple-store"]  # SHACL validation (core constraints + SPARQL dispatch)
 parallel = ["rayon", "crossbeam", "grafeo-core/parallel", "grafeo-adapters/parallel"]  # Parallel execution
 algos = ["grafeo-adapters/algos"]  # Graph algorithm plugin (SSSP, PageRank, etc.)
-wal = ["dep:grafeo-storage", "grafeo-storage/wal"]  # Write-ahead log storage
+wal = ["dep:grafeo-storage", "dep:rustix", "dep:windows-sys", "grafeo-storage/wal", "grafeo-file"]  # WAL durability and exact persistent copies
 async-storage = ["dep:grafeo-storage", "grafeo-storage/async-storage", "dep:tokio"]  # Async WAL and storage backend
-grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast"]  # Single-file .grafeo format
-encryption = ["dep:grafeo-storage", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
-spill = ["grafeo-core/spill"]  # Disk spilling for out-of-core execution
-mmap = ["grafeo-core/mmap", "dep:memmap2"]  # File-backed vector storage and compact-store spill
-temporal = ["grafeo-core/temporal"]  # Append-only versioned properties
+grafeo-file = ["dep:grafeo-storage", "grafeo-storage/grafeo-file", "dep:crc32fast", "dep:rustix", "dep:windows-sys"]  # Single-file .grafeo format
+encryption = ["dep:grafeo-storage", "dep:zeroize", "grafeo-common/encryption", "grafeo-storage/encryption"]  # AES-256-GCM encryption at rest
+spill = ["grafeo-core/spill", "grafeo-common/encryption", "dep:zeroize", "dep:getrandom", "dep:cap-std", "dep:cap-fs-ext", "dep:rustix"]  # Authenticated roots and disk spilling
+mmap = ["grafeo-core/mmap", "dep:memmap2", "dep:getrandom"]  # File-backed vector storage and compact-store spill
 compact-store = ["grafeo-core/compact-store"]  # CompactStore — columnar graph for read-only workloads
+statement-table = ["grafeo-core/statement-table", "compact-store"]  # Claim/statement ingest
+# Temporal operational graph: as-of compact store + WAL + text search. No gql/gremlin/cdc/algos.
+temporal-host = ["lpg", "compact-store", "statement-table", "wal", "text-index"]
+# Parser-free dual native model: LPG CRUD + RDF quads + WAL. No query languages.
+native = ["lpg", "triple-store", "wal", "grafeo-file"]
 # Convenience groups
 languages = ["gql", "cypher", "sparql", "gremlin", "graphql", "sql-pgq"]  # All query language parsers
 ai = ["vector-index", "text-index", "hybrid-search", "cdc"]  # All AI/RAG features
@@ -105,7 +124,7 @@ storage = ["wal", "grafeo-file", "spill", "mmap"]  # Persistent storage (WAL, si
 embedded = ["lpg", "gql", "ai", "algos", "parallel", "regex", "jsonl-import", "grafeo-file", "arrow-export"]  # Python libs, MCP, in-process
 browser = ["lpg", "gql", "regex-lite"]  # WASM / grafeo-web
 server = ["full", "async-storage", "metrics", "tracing"]  # grafeo-server
-full = ["lpg", "languages", "ai", "triple-store", "parallel", "algos", "storage", "jsonl-import", "parquet-import"]
+full = ["lpg", "languages", "ai", "triple-store", "shacl", "ring-index", "parallel", "algos", "storage", "jsonl-import", "parquet-import", "arrow-export"]
 
 # Data import
 jsonl-import = ["grafeo-core/jsonl-import"]  # JSON Lines file import
@@ -125,7 +144,7 @@ arrow-export = ["dep:arrow-schema", "dep:arrow-array", "dep:arrow-ipc"]  # Arrow
 
 # Testing utilities (zero overhead when disabled)
 testing-crash-injection = ["dep:grafeo-storage", "grafeo-common/testing-crash-injection", "grafeo-storage/testing-crash-injection"]  # Crash injection for recovery testing
-testing-statement-injection = ["grafeo-common/testing-statement-injection"]  # Failure injection at statement / commit entry for rollback atomicity tests
+testing-statement-injection = ["grafeo-common/testing-statement-injection"]  # Failure injection at statement boundaries and commit for rollback atomicity tests
 
 [lints]
 workspace = true
@@ -137,6 +156,7 @@ harness = false
 [[bench]]
 name = "serialization_bench"
 harness = false
+required-features = ["lpg"]
 
 [[bench]]
 name = "regression_bench"
@@ -145,7 +165,17 @@ harness = false
 [[bench]]
 name = "memory_bench"
 harness = false
+required-features = ["lpg"]
 
 [[bench]]
 name = "topk_e2e"
 harness = false
+
+[[bench]]
+name = "serializable_overhead"
+harness = false
+
+[[bench]]
+name = "execute_parity_gate"
+harness = false
+required-features = ["lpg"]

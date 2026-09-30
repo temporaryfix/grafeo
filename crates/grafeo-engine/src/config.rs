@@ -31,8 +31,8 @@ impl fmt::Debug for EncryptionConfig {
 
 /// The graph data model for a database.
 ///
-/// Each database uses exactly one model, chosen at creation time and immutable
-/// after that. The engine initializes only the relevant store, saving memory.
+/// Select LPG, RDF, or both native models at creation time. The selection is
+/// immutable afterward; the engine initializes the selected model stores.
 ///
 /// Schema variants (OWL, RDFS, JSON Schema) are a server-level concern - from
 /// the engine's perspective those map to either `Lpg` or `Rdf`.
@@ -44,6 +44,60 @@ pub enum GraphModel {
     Lpg,
     /// RDF triple store. Supports SPARQL.
     Rdf,
+    /// Both native models in one physical database. No silent IRI≡node mirror.
+    Both,
+}
+
+impl GraphModel {
+    /// Stable on-disk tag.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Lpg => 0,
+            Self::Rdf => 1,
+            Self::Both => 2,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`].
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Lpg),
+            1 => Some(Self::Rdf),
+            2 => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Lowercase API name: `"lpg"`, `"rdf"`, or `"both"`.
+    #[must_use]
+    pub const fn as_name(self) -> &'static str {
+        match self {
+            Self::Lpg => "lpg",
+            Self::Rdf => "rdf",
+            Self::Both => "both",
+        }
+    }
+
+    /// Parse `"lpg"`, `"rdf"`, or `"both"` (case-insensitive).
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim() {
+            s if s.eq_ignore_ascii_case("lpg") => Some(Self::Lpg),
+            s if s.eq_ignore_ascii_case("rdf") => Some(Self::Rdf),
+            s if s.eq_ignore_ascii_case("both") => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for GraphModel {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::from_name(s).ok_or(())
+    }
 }
 
 impl fmt::Display for GraphModel {
@@ -51,6 +105,7 @@ impl fmt::Display for GraphModel {
         match self {
             Self::Lpg => write!(f, "LPG"),
             Self::Rdf => write!(f, "RDF"),
+            Self::Both => write!(f, "BOTH"),
         }
     }
 }
@@ -84,20 +139,21 @@ impl fmt::Display for AccessMode {
 
 /// Storage format for persistent databases.
 ///
-/// Controls whether the database uses a single `.grafeo` file or a legacy
-/// WAL directory. The default (`Auto`) auto-detects based on the path:
-/// files ending in `.grafeo` use single-file format, directories use WAL.
+/// Controls whether an operational database uses a single container file or a
+/// WAL directory. The default (`Auto`) recognizes existing container files
+/// regardless of suffix; new `.grafeo` paths select the container format.
+/// `GrafeoDB::save` always writes an exact container, independent of this option.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StorageFormat {
-    /// Auto-detect based on path: `.grafeo` extension = single file,
-    /// existing directory = WAL directory, new path without extension = WAL directory.
+    /// Auto-detect existing container files regardless of suffix. A new `.grafeo`
+    /// path selects a container; existing directories and other new paths use WAL directories.
     #[default]
     Auto,
-    /// Legacy WAL directory format (directory with `wal/` subdirectory).
+    /// Operational WAL directory format (directory with `wal/` subdirectory).
     WalDirectory,
-    /// Single `.grafeo` file with a sidecar `.grafeo.wal/` directory during operation.
-    /// At rest (after checkpoint), only the `.grafeo` file exists.
+    /// Single container file with a `<path>.wal/` sidecar during operation.
+    /// A completed close retires the WAL sidecar; coordination files may remain.
     SingleFile,
 }
 
@@ -119,16 +175,19 @@ impl fmt::Display for StorageFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DurabilityMode {
-    /// Fsync after every commit. Slowest but safest.
+    /// Fsync before acknowledging every commit. This is the default and gives
+    /// acknowledged transactions a stable-storage durability guarantee.
     Sync,
-    /// Batch fsync periodically. Good balance of performance and durability.
+    /// Batch fsync periodically. Explicit throughput-oriented opt-in that may
+    /// lose recently acknowledged commits after power loss or an OS crash.
     Batch {
         /// Maximum time between syncs in milliseconds.
         max_delay_ms: u64,
         /// Maximum records between syncs.
         max_records: u64,
     },
-    /// Adaptive sync via a background flusher thread.
+    /// Adaptive background fsync. Explicit throughput-oriented opt-in with a
+    /// bounded window in which acknowledged commits are not yet stable.
     Adaptive {
         /// Target interval between flushes in milliseconds.
         target_interval_ms: u64,
@@ -139,10 +198,7 @@ pub enum DurabilityMode {
 
 impl Default for DurabilityMode {
     fn default() -> Self {
-        Self::Batch {
-            max_delay_ms: 100,
-            max_records: 1000,
-        }
+        Self::Sync
     }
 }
 
@@ -158,6 +214,10 @@ pub enum ConfigError {
     ZeroWalFlushInterval,
     /// RDF graph model requires the `rdf` feature flag.
     RdfFeatureRequired,
+    /// LPG graph model requires the `lpg` feature flag.
+    LpgFeatureRequired,
+    /// `GraphModel::Both` requires LPG and RDF features.
+    BothFeaturesRequired,
 }
 
 impl fmt::Display for ConfigError {
@@ -174,6 +234,18 @@ impl fmt::Display for ConfigError {
                     "RDF graph model requires the `rdf` feature flag to be enabled"
                 )
             }
+            Self::LpgFeatureRequired => {
+                write!(
+                    f,
+                    "LPG graph model requires the `lpg` feature flag to be enabled"
+                )
+            }
+            Self::BothFeaturesRequired => {
+                write!(
+                    f,
+                    "GraphModel::Both requires the lpg and triple-store features"
+                )
+            }
         }
     }
 }
@@ -186,14 +258,48 @@ impl std::error::Error for ConfigError {}
 pub struct Config {
     /// Graph data model (LPG or RDF). Immutable after database creation.
     pub graph_model: GraphModel,
-    /// Path to the database directory (None for in-memory only).
+    /// True when the caller set the model via [`Config::with_graph_model`].
+    /// Unpinned opens adopt the stored model.
+    pub graph_model_pinned: bool,
+    /// Path to the database container or operational WAL directory (None for in-memory only).
     pub path: Option<PathBuf>,
+
+    /// Engine-internal identity seed used only by exact restore/save-as paths.
+    pub(crate) world_identity_override: Option<grafeo_common::types::WorldIdentityMetadataV1>,
 
     /// Memory limit in bytes (None for unlimited).
     pub memory_limit: Option<usize>,
 
-    /// Path for spilling data to disk under memory pressure.
+    /// Directory for spilling data to disk under memory pressure.
+    ///
+    /// Exact codec-shaped `.grafeo-owner-*` and `.grafeo-gen-*` entries in
+    /// this directory are an engine-reserved ephemeral cache namespace and
+    /// may be reclaimed after their owner lease is proven stale. Ordinary
+    /// caller files and malformed lookalikes are retained.
     pub spill_path: Option<PathBuf>,
+
+    /// Hard logical-byte limit for synchronous spill files retained by one query.
+    ///
+    /// `None` preserves the compatibility-unlimited policy. A value of zero
+    /// keeps spill configured but denies the first framed record. This option
+    /// requires both a configured [`Self::spill_path`] and the `spill` feature
+    /// (not enabled by the `grafeo` facade's default `embedded` profile), and
+    /// currently reaches the cache-ineligible (`cache_key = None`),
+    /// non-`PROFILE` GQL resource-context route. Other query routes remain
+    /// unchanged until resource-context convergence lands.
+    pub max_query_spill_bytes: Option<u64>,
+
+    /// Physical reservation budget shared by every query/process in a spill root.
+    ///
+    /// The budget is fixed when the store namespace is created; reopening it
+    /// with a different budget is rejected.
+    /// Queries retain their peak reservation until query cleanup; deleted file
+    /// capacity can be reused within that query.
+    /// Includes conservative allocation and metadata allowances. Reservations
+    /// survive restart and failed cleanup. `None` selects an unlimited budget;
+    /// all openers of an existing root must agree with its durable policy.
+    /// Requires a configured [`Self::spill_path`] and the `spill` feature.
+    pub max_root_spill_bytes: Option<u64>,
 
     /// Number of worker threads for query execution.
     pub threads: usize,
@@ -227,8 +333,9 @@ pub struct Config {
 
     /// Storage format for persistent databases.
     ///
-    /// `Auto` (default) detects the format from the path: `.grafeo` extension
-    /// uses single-file format, directories use the legacy WAL directory.
+    /// `Auto` (default) recognizes existing container files regardless of suffix;
+    /// new `.grafeo` paths select containers and other new paths use WAL directories.
+    /// This controls operational storage, not the exact container output of `save`.
     pub storage_format: StorageFormat,
 
     /// Whether to enable catalog schema constraint enforcement.
@@ -244,9 +351,13 @@ pub struct Config {
     /// returns `QueryError::timeout()` if the wall-clock limit is exceeded.
     /// `None` means no timeout (queries may run indefinitely).
     ///
-    /// Default: 30 seconds. Use `with_query_timeout()` to change or
-    /// `without_query_timeout()` to disable.
+    /// Default: 30 seconds on native targets, or `None` on wasm32 where no
+    /// monotonic deadline clock is qualified. Explicit wasm32 timeouts remain
+    /// configured and return a structured unsupported error when executed.
+    /// Use `with_query_timeout()` to change or `without_query_timeout()` to disable.
     pub query_timeout: Option<Duration>,
+    /// Default eager row/byte bounds, additionally constrained by query grants.
+    pub result_limits: crate::query::ResultLimits,
 
     /// Maximum size in bytes for a single property value.
     ///
@@ -263,6 +374,19 @@ pub struct Config {
     /// Old versions that are no longer visible to any active transaction are
     /// pruned to reclaim memory. Set to 0 to disable automatic GC.
     pub gc_interval: usize,
+
+    /// Live node-plus-edge threshold for explicit compaction checkpoints.
+    ///
+    /// [`crate::GrafeoDB::compact_if_needed`] invokes compaction when the
+    /// native store (before first compaction), or the layered overlay, exceeds
+    /// this value. `None` (the default) disables the policy checkpoint;
+    /// [`crate::GrafeoDB::compact`] remains available explicitly.
+    ///
+    /// Compaction is a quiescent maintenance operation (it folds only the
+    /// committed frontier), so `compact_if_needed` is a `&mut self` checkpoint an
+    /// application calls between transactions rather than an implicit per-commit
+    /// hook.
+    pub compaction_overlay_threshold: Option<usize>,
 
     /// Access mode: read-write (default) or read-only.
     ///
@@ -391,9 +515,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             graph_model: GraphModel::default(),
+            graph_model_pinned: false,
             path: None,
+            world_identity_override: None,
             memory_limit: None,
             spill_path: None,
+            max_query_spill_bytes: None,
+            max_root_spill_bytes: None,
             threads: num_cpus::get(),
             wal_enabled: true,
             wal_flush_interval_ms: 100,
@@ -404,9 +532,15 @@ impl Default for Config {
             wal_durability: DurabilityMode::default(),
             storage_format: StorageFormat::default(),
             schema_constraints: false,
-            query_timeout: Some(Duration::from_secs(30)),
+            query_timeout: if cfg!(target_arch = "wasm32") {
+                None
+            } else {
+                Some(Duration::from_secs(30))
+            },
+            result_limits: crate::query::ResultLimits::default(),
             max_property_size: Some(16 * 1024 * 1024), // 16 MiB
             gc_interval: 100,
+            compaction_overlay_threshold: None,
             access_mode: AccessMode::default(),
             cdc_enabled: false,
             #[cfg(feature = "cdc")]
@@ -420,6 +554,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Seeds an exact logical-store identity for an internal restore target.
+    #[must_use]
+    #[cfg(any(feature = "lpg", feature = "triple-store"))]
+    pub(crate) fn with_world_identity(
+        mut self,
+        identity: grafeo_common::types::WorldIdentityMetadataV1,
+    ) -> Self {
+        self.world_identity_override = Some(identity);
+        self
+    }
+
     /// Creates a new configuration for an in-memory database.
     #[must_use]
     pub fn in_memory() -> Self {
@@ -454,6 +599,20 @@ impl Config {
         self
     }
 
+    /// Sets the overlay node+edge count that
+    /// [`crate::GrafeoDB::compact_if_needed`] uses to trigger temporal
+    /// compaction. No background or per-commit hook is installed.
+    ///
+    /// ```compile_fail
+    /// # use grafeo_engine::Config;
+    /// Config::in_memory().with_auto_recompact_overlay_threshold(100);
+    /// ```
+    #[must_use]
+    pub fn with_compaction_overlay_threshold(mut self, threshold: usize) -> Self {
+        self.compaction_overlay_threshold = Some(threshold);
+        self
+    }
+
     /// Disables backward edges.
     #[must_use]
     pub fn without_backward_edges(mut self) -> Self {
@@ -481,9 +640,46 @@ impl Config {
     }
 
     /// Sets the spill directory for out-of-core processing.
+    ///
+    /// Exact codec-shaped `.grafeo-owner-*` and `.grafeo-gen-*` entries in
+    /// this directory are reserved for Grafeo's ephemeral cache lifecycle and
+    /// may be reclaimed after their owner lease is proven stale. Keep caller
+    /// files out of that namespace; ordinary and malformed names are retained.
     #[must_use]
     pub fn with_spill_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.spill_path = Some(path.into());
+        self
+    }
+
+    /// Sets a hard logical-byte limit for each synchronous query spill manager.
+    ///
+    /// Effective only with a configured spill path and the `spill` feature,
+    /// currently on the cache-ineligible (`cache_key = None`), non-`PROFILE`
+    /// GQL resource-context route.
+    #[must_use]
+    pub fn with_max_query_spill_bytes(mut self, bytes: u64) -> Self {
+        self.max_query_spill_bytes = Some(bytes);
+        self
+    }
+
+    /// Removes the per-query spill limit while retaining any configured path.
+    #[must_use]
+    pub fn without_max_query_spill_bytes(mut self) -> Self {
+        self.max_query_spill_bytes = None;
+        self
+    }
+
+    /// Sets the shared root's durable physical reservation budget.
+    #[must_use]
+    pub fn with_max_root_spill_bytes(mut self, bytes: u64) -> Self {
+        self.max_root_spill_bytes = Some(bytes);
+        self
+    }
+
+    /// Selects an unlimited shared root budget without changing the query limit.
+    #[must_use]
+    pub fn without_max_root_spill_bytes(mut self) -> Self {
+        self.max_root_spill_bytes = None;
         self
     }
 
@@ -516,6 +712,26 @@ impl Config {
     #[must_use]
     pub fn with_graph_model(mut self, model: GraphModel) -> Self {
         self.graph_model = model;
+        self.graph_model_pinned = true;
+        self
+    }
+
+    /// Resolves the model an unpinned configuration uses in this feature
+    /// profile. Explicit caller choices are never rewritten.
+    const fn effective_graph_model(&self) -> GraphModel {
+        #[cfg(all(not(feature = "lpg"), feature = "triple-store"))]
+        if !self.graph_model_pinned {
+            return GraphModel::Rdf;
+        }
+        self.graph_model
+    }
+
+    /// Materializes the feature-profile default while leaving it unpinned so
+    /// an existing persistent store can still supply its authoritative model.
+    pub(crate) fn resolve_unpinned_graph_model(mut self) -> Self {
+        if !self.graph_model_pinned {
+            self.graph_model = self.effective_graph_model();
+        }
         self
     }
 
@@ -551,6 +767,13 @@ impl Config {
     #[must_use]
     pub fn without_query_timeout(mut self) -> Self {
         self.query_timeout = None;
+        self
+    }
+
+    /// Sets default eager output limits for sessions created by this database.
+    #[must_use]
+    pub fn with_result_limits(mut self, limits: crate::query::ResultLimits) -> Self {
+        self.result_limits = limits;
         self
     }
 
@@ -697,6 +920,26 @@ impl Config {
     ///
     /// Returns [`ConfigError`] if any setting is invalid.
     pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        self.validate_for_graph_model(self.effective_graph_model())
+    }
+
+    /// Validates an already-resolved model, including one adopted from
+    /// persistent metadata. Unlike [`Self::validate`], this must not substitute
+    /// the feature-profile default for an unpinned stored model.
+    #[cfg(any(feature = "wal", feature = "grafeo-file"))]
+    pub(crate) fn validate_resolved_graph_model(&self) -> std::result::Result<(), ConfigError> {
+        self.validate_for_graph_model(self.graph_model)
+    }
+
+    fn validate_for_graph_model(
+        &self,
+        graph_model: GraphModel,
+    ) -> std::result::Result<(), ConfigError> {
+        // With both storage models compiled, all three variants are available;
+        // the feature-availability checks below compile out entirely.
+        #[cfg(all(feature = "lpg", feature = "triple-store"))]
+        let _ = graph_model;
+
         if let Some(limit) = self.memory_limit
             && limit == 0
         {
@@ -712,8 +955,18 @@ impl Config {
         }
 
         #[cfg(not(feature = "triple-store"))]
-        if self.graph_model == GraphModel::Rdf {
+        if graph_model == GraphModel::Rdf {
             return Err(ConfigError::RdfFeatureRequired);
+        }
+
+        #[cfg(not(feature = "lpg"))]
+        if graph_model == GraphModel::Lpg {
+            return Err(ConfigError::LpgFeatureRequired);
+        }
+
+        #[cfg(not(all(feature = "lpg", feature = "triple-store")))]
+        if graph_model == GraphModel::Both {
+            return Err(ConfigError::BothFeaturesRequired);
         }
 
         Ok(())
@@ -744,6 +997,7 @@ mod tests {
         assert!(config.path.is_none());
         assert!(config.memory_limit.is_none());
         assert!(config.spill_path.is_none());
+        assert!(config.max_query_spill_bytes.is_none());
         assert!(config.threads > 0);
         assert!(config.wal_enabled);
         assert_eq!(config.wal_flush_interval_ms, 100);
@@ -752,6 +1006,9 @@ mod tests {
         assert!(config.factorized_execution);
         assert_eq!(config.wal_durability, DurabilityMode::default());
         assert!(!config.schema_constraints);
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(config.query_timeout, None);
+        #[cfg(not(target_arch = "wasm32"))]
         assert_eq!(config.query_timeout, Some(Duration::from_secs(30)));
         assert_eq!(config.gc_interval, 100);
     }
@@ -805,6 +1062,17 @@ mod tests {
             config.spill_path.as_deref(),
             Some(std::path::Path::new("/tmp/spill"))
         );
+    }
+
+    #[test]
+    fn test_config_with_max_query_spill_bytes() {
+        let config = Config::in_memory()
+            .with_max_query_spill_bytes(4096)
+            .without_max_query_spill_bytes();
+        assert!(config.max_query_spill_bytes.is_none());
+
+        let config = config.with_max_query_spill_bytes(0);
+        assert_eq!(config.max_query_spill_bytes, Some(0));
     }
 
     #[test]
@@ -905,6 +1173,17 @@ mod tests {
     fn test_graph_model_display() {
         assert_eq!(GraphModel::Lpg.to_string(), "LPG");
         assert_eq!(GraphModel::Rdf.to_string(), "RDF");
+        assert_eq!(GraphModel::Both.to_string(), "BOTH");
+    }
+
+    #[test]
+    fn test_graph_model_from_name() {
+        assert_eq!(GraphModel::from_name("lpg"), Some(GraphModel::Lpg));
+        assert_eq!(GraphModel::from_name("RDF"), Some(GraphModel::Rdf));
+        assert_eq!(GraphModel::from_name("Both"), Some(GraphModel::Both));
+        assert_eq!(GraphModel::from_name("nope"), None);
+        assert_eq!(GraphModel::Lpg.as_name(), "lpg");
+        assert_eq!("both".parse::<GraphModel>().ok(), Some(GraphModel::Both));
     }
 
     #[test]
@@ -916,14 +1195,11 @@ mod tests {
     // --- DurabilityMode tests ---
 
     #[test]
-    fn test_durability_mode_default_is_batch() {
-        let mode = DurabilityMode::default();
+    fn test_durability_mode_default_is_sync() {
+        assert_eq!(DurabilityMode::default(), DurabilityMode::Sync);
         assert_eq!(
-            mode,
-            DurabilityMode::Batch {
-                max_delay_ms: 100,
-                max_records: 1000
-            }
+            Config::persistent("/tmp/db").wal_durability,
+            DurabilityMode::Sync
         );
     }
 
@@ -997,6 +1273,9 @@ mod tests {
     #[test]
     fn test_config_default_query_timeout() {
         let config = Config::in_memory();
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(config.query_timeout, None);
+        #[cfg(not(target_arch = "wasm32"))]
         assert_eq!(config.query_timeout, Some(Duration::from_secs(30)));
     }
 
@@ -1052,6 +1331,13 @@ mod tests {
         assert_eq!(config.validate(), Err(ConfigError::RdfFeatureRequired));
     }
 
+    #[cfg(not(feature = "lpg"))]
+    #[test]
+    fn test_validate_rejects_lpg_without_feature() {
+        let config = Config::in_memory().with_graph_model(GraphModel::Lpg);
+        assert_eq!(config.validate(), Err(ConfigError::LpgFeatureRequired));
+    }
+
     #[test]
     fn test_config_error_display() {
         assert_eq!(
@@ -1074,10 +1360,15 @@ mod tests {
 
     // --- Builder chaining with new fields ---
 
+    #[cfg(any(feature = "lpg", feature = "triple-store"))]
     #[test]
     fn test_config_full_builder_chaining() {
+        #[cfg(all(not(feature = "lpg"), feature = "triple-store"))]
+        let supported_model = GraphModel::Rdf;
+        #[cfg(not(all(not(feature = "lpg"), feature = "triple-store")))]
+        let supported_model = GraphModel::Lpg;
         let config = Config::persistent("/tmp/db")
-            .with_graph_model(GraphModel::Lpg)
+            .with_graph_model(supported_model)
             .with_memory_limit(512 * 1024 * 1024)
             .with_threads(4)
             .with_query_logging()
@@ -1087,7 +1378,7 @@ mod tests {
             .with_spill_path("/tmp/spill")
             .with_query_timeout(Duration::from_mins(1));
 
-        assert_eq!(config.graph_model, GraphModel::Lpg);
+        assert_eq!(config.graph_model, supported_model);
         assert!(config.path.is_some());
         assert_eq!(config.memory_limit, Some(512 * 1024 * 1024));
         assert_eq!(config.threads, 4);
@@ -1098,6 +1389,19 @@ mod tests {
         assert!(config.spill_path.is_some());
         assert_eq!(config.query_timeout, Some(Duration::from_mins(1)));
         assert!(config.validate().is_ok());
+    }
+
+    #[cfg(all(not(feature = "lpg"), feature = "triple-store"))]
+    #[test]
+    fn unpinned_model_resolves_to_rdf_without_becoming_pinned() {
+        let config = Config::in_memory();
+        assert_eq!(config.graph_model, GraphModel::Lpg);
+        assert!(!config.graph_model_pinned);
+        assert!(config.validate().is_ok());
+
+        let resolved = config.resolve_unpinned_graph_model();
+        assert_eq!(resolved.graph_model, GraphModel::Rdf);
+        assert!(!resolved.graph_model_pinned);
     }
 
     // --- AccessMode tests ---

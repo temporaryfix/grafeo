@@ -7,12 +7,12 @@
 //! cargo test -p grafeo-engine --all-features --test grafeo_memory_support
 //! ```
 
-#[cfg(feature = "temporal")]
+#![cfg(feature = "lpg")]
+
 use grafeo_common::types::NodeId;
 use grafeo_common::types::{PropertyKey, Value};
 use grafeo_engine::GrafeoDB;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::HashMap;
 
 fn db() -> GrafeoDB {
     GrafeoDB::new_in_memory()
@@ -131,8 +131,21 @@ mod batch_create_with_props {
         let db = db();
 
         // Create a vector index first
-        db.create_vector_index("Doc", "emb", Some(3), None, None, None, None)
-            .unwrap();
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Doc".into()),
+            property: "emb".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: None,
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .unwrap();
 
         let mut props_list = Vec::new();
         let mut p1 = HashMap::new();
@@ -167,6 +180,8 @@ mod batch_create_with_props {
 #[cfg(feature = "vector-index")]
 mod filter_optimization {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn make_memory(text: &str, user: &str, ts: i64, emb: Vec<f32>) -> HashMap<PropertyKey, Value> {
         let mut p = HashMap::new();
@@ -182,8 +197,21 @@ mod filter_optimization {
         let db = db();
 
         // Create index first
-        db.create_vector_index("Memory", "embedding", Some(3), None, None, None, None)
-            .unwrap();
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Memory".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(3),
+                metric: None,
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .unwrap();
 
         // Create nodes via batch (auto-inserts into vector index)
         db.batch_create_nodes_with_props(
@@ -222,8 +250,21 @@ mod filter_optimization {
     fn combined_equality_and_operator_filter() {
         let db = db();
 
-        db.create_vector_index("Memory", "embedding", Some(2), None, None, None, None)
-            .unwrap();
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Memory".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(2),
+                metric: None,
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .unwrap();
 
         let mut p1 = HashMap::new();
         p1.insert(PropertyKey::new("text"), Value::String("u1 old".into()));
@@ -271,8 +312,21 @@ mod filter_optimization {
     fn operator_filter_lt_works() {
         let db = db();
 
-        db.create_vector_index("Memory", "embedding", Some(2), None, None, None, None)
-            .unwrap();
+        db.create_index(grafeo_engine::CreateIndexRequest {
+            graph: Default::default(),
+            name: None,
+            label: Some("Memory".into()),
+            property: "embedding".into(),
+            kind: grafeo_engine::IndexCreateKind::Vector {
+                dimensions: Some(2),
+                metric: None,
+                m: None,
+                ef_construction: None,
+                ef: None,
+                quantization: None,
+            },
+        })
+        .unwrap();
 
         db.batch_create_nodes_with_props(
             "Memory",
@@ -323,7 +377,6 @@ mod filter_optimization {
 // Temporal property versioning API
 // =============================================================================
 
-#[cfg(feature = "temporal")]
 mod temporal_versioning {
     use super::*;
 

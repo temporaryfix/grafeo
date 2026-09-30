@@ -12,11 +12,127 @@
 //! cargo test -p grafeo-engine --test memory_leak_detection -- --ignored
 //! ```
 
+#![cfg(feature = "lpg")]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use grafeo_engine::GrafeoDB;
+
+mod support;
+
+#[test]
+fn property_tombstone_gc_preserves_snapshots_and_compact_shadows() {
+    use grafeo_common::types::Value;
+
+    const COMPACT: &[bool] = &[
+        false,
+        #[cfg(feature = "compact-store")]
+        true,
+    ];
+    for &compact in COMPACT {
+        let db = support::adversarial_path_graph();
+        db.session()
+            .execute("MATCH (n:Node) SET n.gc_value = 7")
+            .unwrap();
+        db.session()
+            .execute("MATCH ()-[r]->() SET r.gc_value = 11")
+            .unwrap();
+        #[cfg(feature = "compact-store")]
+        let mut db = db;
+        #[cfg(feature = "compact-store")]
+        if compact {
+            db.compact().unwrap();
+        }
+        #[cfg(not(feature = "compact-store"))]
+        assert!(!compact);
+
+        let query =
+            "MATCH (:Node {id: 's'})-[r]->(n) RETURN n.id, n.gc_value, r.gc_value ORDER BY n.id";
+        let mut snapshot = db.session();
+        snapshot.begin_transaction().unwrap();
+        let before = snapshot.execute(query).unwrap().rows().to_vec();
+        assert_eq!(before.len(), 4, "compact={compact}; rows={before:?}");
+        for (row, id) in before.iter().zip(["a", "b", "x", "x"]) {
+            assert_eq!(
+                row,
+                &vec![Value::from(id), Value::Int64(7), Value::Int64(11)]
+            );
+        }
+        let pinned = "MATCH (:Node {id: 's'})-[r:OTHER]->(:Node {id: 'x'}) RETURN id(r) AS edge ORDER BY edge";
+        let edge_ids = snapshot.execute(pinned).unwrap().rows().to_vec();
+        assert_eq!(edge_ids.len(), 2);
+        assert_ne!(edge_ids[0], edge_ids[1]);
+        let correlated = "UNWIND ['s', 'u'] AS start MATCH (a:Node {id: start})-[r]->(n) RETURN a.id, n.id ORDER BY a.id, n.id";
+        let correlated_rows = snapshot.execute(correlated).unwrap().rows().to_vec();
+        let expected_correlated: Vec<_> =
+            [("s", "a"), ("s", "b"), ("s", "x"), ("s", "x"), ("u", "v")]
+                .into_iter()
+                .map(|(start, end)| vec![Value::from(start), Value::from(end)])
+                .collect();
+        assert_eq!(correlated_rows, expected_correlated);
+        let mut writer = db.session();
+        writer.begin_transaction().unwrap();
+        writer
+            .execute("MATCH (n:Node) SET n.gc_value = null")
+            .unwrap();
+        writer
+            .execute("MATCH ()-[r]->() SET r.gc_value = null")
+            .unwrap();
+        db.gc().unwrap();
+        assert_eq!(snapshot.execute(query).unwrap().rows(), before);
+        assert_eq!(db.session().execute(query).unwrap().rows(), before);
+        writer.rollback().unwrap();
+        assert_eq!(db.session().execute(query).unwrap().rows(), before);
+
+        writer.begin_transaction().unwrap();
+        writer
+            .execute("MATCH (n:Node) SET n.gc_value = null")
+            .unwrap();
+        writer
+            .execute("MATCH ()-[r]->() SET r.gc_value = null")
+            .unwrap();
+        writer.commit().unwrap();
+        db.gc().unwrap();
+        assert_eq!(snapshot.execute(query).unwrap().rows(), before);
+        assert_eq!(snapshot.execute(pinned).unwrap().rows(), edge_ids);
+        assert_eq!(
+            snapshot.execute(correlated).unwrap().rows(),
+            correlated_rows
+        );
+        snapshot.rollback().unwrap();
+        db.gc().unwrap();
+        assert_eq!(db.session().execute(pinned).unwrap().rows(), edge_ids);
+        assert_eq!(
+            db.session().execute(correlated).unwrap().rows(),
+            correlated_rows
+        );
+        let after = db.session().execute(query).unwrap();
+        assert_eq!(after.row_count(), 4);
+        for (row, id) in after.rows().iter().zip(["a", "b", "x", "x"]) {
+            assert_eq!(
+                row,
+                &vec![Value::from(id), Value::Null, Value::Null],
+                "compact={compact}"
+            );
+        }
+        db.session()
+            .execute("MATCH (n:Node) SET n.gc_value = 9")
+            .unwrap();
+        db.session()
+            .execute("MATCH ()-[r]->() SET r.gc_value = 13")
+            .unwrap();
+        let rewritten = db.session().execute(query).unwrap();
+        assert_eq!(rewritten.row_count(), 4);
+        for (row, id) in rewritten.rows().iter().zip(["a", "b", "x", "x"]) {
+            assert_eq!(
+                row,
+                &vec![Value::from(id), Value::Int64(9), Value::Int64(13)]
+            );
+        }
+    }
+}
 
 // ============================================================================
 // MVCC Version Chain Leak Detection
@@ -35,7 +151,7 @@ fn test_version_chains_stabilize_after_gc() {
         s.execute("INSERT (:Warmup {val: 0})").unwrap();
         s.execute("MATCH (w:Warmup) DELETE w").unwrap();
     }
-    db.gc();
+    db.gc().expect("collect retained history");
     let baseline = db.memory_usage();
 
     // Run 50 create-update-delete cycles, each in its own committed transaction.
@@ -59,7 +175,7 @@ fn test_version_chains_stabilize_after_gc() {
     }
 
     // Force GC with no active transactions, so min_epoch == current_epoch.
-    db.gc();
+    db.gc().expect("collect retained history");
 
     let after = db.memory_usage();
 
@@ -102,7 +218,7 @@ fn test_property_update_chains_cleaned_by_gc() {
             .unwrap();
             s.commit().unwrap();
         }
-        db.gc();
+        db.gc().expect("collect retained history");
     }
 
     let usage = db.memory_usage();
@@ -132,7 +248,7 @@ fn test_session_lifecycle_no_leak() {
         s.execute("INSERT (:Anchor {id: 1})").unwrap();
         s.execute("MATCH (a:Anchor) RETURN a.id").unwrap();
     }
-    db.gc();
+    db.gc().expect("collect retained history");
     let baseline = db.memory_usage();
 
     // Create and drop 200 sessions, each executing a read query.
@@ -141,7 +257,7 @@ fn test_session_lifecycle_no_leak() {
         s.execute("MATCH (a:Anchor) RETURN a.id").unwrap();
         // session dropped here
     }
-    db.gc();
+    db.gc().expect("collect retained history");
     let after = db.memory_usage();
 
     // Total memory growth should be minimal: no new data was created, and the
@@ -158,7 +274,7 @@ fn test_session_lifecycle_no_leak() {
 #[test]
 fn test_abandoned_transaction_cleanup() {
     let db = GrafeoDB::new_in_memory();
-    db.gc();
+    db.gc().expect("collect retained history");
     let baseline = db.memory_usage();
 
     // Create 100 sessions that begin a transaction and write, but never commit.
@@ -168,7 +284,7 @@ fn test_abandoned_transaction_cleanup() {
         s.execute(&format!("INSERT (:Ghost {{id: {i}}})")).unwrap();
         // session dropped without commit: auto-rollback
     }
-    db.gc();
+    db.gc().expect("collect retained history");
 
     let after = db.memory_usage();
 
@@ -204,7 +320,7 @@ fn test_adjacency_index_cleanup_after_edge_churn() {
     let setup = db.session();
     setup.execute("INSERT (:Hub {name: 'center'})").unwrap();
     setup.execute("INSERT (:Spoke {name: 'target'})").unwrap();
-    db.gc();
+    db.gc().expect("collect retained history");
     let baseline = db.memory_usage();
 
     // 30 rounds: create an edge, then delete it.
@@ -220,7 +336,7 @@ fn test_adjacency_index_cleanup_after_edge_churn() {
         s2.execute("MATCH ()-[l:LINK]->() DELETE l").unwrap();
         s2.commit().unwrap();
     }
-    db.gc();
+    db.gc().expect("collect retained history");
 
     let after = db.memory_usage();
     let adj_growth = after
@@ -241,7 +357,7 @@ fn test_adjacency_index_cleanup_after_edge_churn() {
 #[test]
 fn test_label_index_cleanup_after_node_churn() {
     let db = GrafeoDB::new_in_memory();
-    db.gc();
+    db.gc().expect("collect retained history");
     let baseline = db.memory_usage();
 
     for _ in 0..50 {
@@ -255,7 +371,7 @@ fn test_label_index_cleanup_after_node_churn() {
         s2.execute("MATCH (t:Transient) DELETE t").unwrap();
         s2.commit().unwrap();
     }
-    db.gc();
+    db.gc().expect("collect retained history");
 
     let after = db.memory_usage();
     let label_growth = after
@@ -278,6 +394,31 @@ fn test_label_index_cleanup_after_node_churn() {
 #[test]
 #[ignore = "long-running stress test: run locally before releases"]
 fn test_stress_concurrent_workload_memory_convergence() {
+    fn execute_transaction(db: &GrafeoDB, query: &str) {
+        use grafeo_common::utils::error::{Error, TransactionError};
+
+        const MAX_ATTEMPTS: usize = 128;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut session = db.session();
+            session.begin_transaction().unwrap();
+            match session.execute(query).and_then(|_| session.commit()) {
+                Ok(_) => {
+                    assert!(!session.in_transaction());
+                    return;
+                }
+                Err(Error::Transaction(TransactionError::WriteConflict(_))) => {
+                    if session.in_transaction() {
+                        session.rollback().unwrap();
+                    }
+                    assert!(!session.in_transaction());
+                    thread::sleep(std::time::Duration::from_micros(1_u64 << attempt.min(10)));
+                }
+                Err(error) => panic!("unexpected stress transaction failure: {error}"),
+            }
+        }
+        panic!("stress transaction exhausted {MAX_ATTEMPTS} attempts: {query}");
+    }
+
     let db = Arc::new(GrafeoDB::new_in_memory());
 
     // Seed data.
@@ -287,7 +428,7 @@ fn test_stress_concurrent_workload_memory_convergence() {
             s.execute(&format!("INSERT (:Seed {{id: {i}}})")).unwrap();
         }
     }
-    db.gc();
+    db.gc().expect("collect retained history");
 
     // Record memory after 3 rounds and check convergence.
     let mut snapshots = Vec::new();
@@ -309,16 +450,8 @@ fn test_stress_concurrent_workload_memory_convergence() {
                     for i in 0..50 {
                         let label = format!("R{round}T{t}");
 
-                        let mut s = db.session();
-                        s.begin_transaction().unwrap();
-                        s.execute(&format!("INSERT (:{label} {{iter: {i}}})"))
-                            .unwrap();
-                        s.commit().unwrap();
-
-                        let mut s2 = db.session();
-                        s2.begin_transaction().unwrap();
-                        s2.execute(&format!("MATCH (n:{label}) DELETE n")).unwrap();
-                        s2.commit().unwrap();
+                        execute_transaction(&db, &format!("INSERT (:{label} {{iter: {i}}})"));
+                        execute_transaction(&db, &format!("MATCH (n:{label}) DELETE n"));
                     }
 
                     completed.fetch_add(1, Ordering::Relaxed);
@@ -329,8 +462,16 @@ fn test_stress_concurrent_workload_memory_convergence() {
         for h in handles {
             h.join().expect("worker thread panicked");
         }
+        assert_eq!(completed.load(Ordering::Relaxed), num_threads);
+        assert_eq!(
+            db.session()
+                .execute("MATCH (n) RETURN n")
+                .unwrap()
+                .row_count(),
+            10
+        );
 
-        db.gc();
+        db.gc().expect("collect retained history");
         snapshots.push(db.memory_usage().total_bytes);
     }
 
@@ -373,8 +514,8 @@ fn test_stress_sustained_workload_slow_leak_detection() {
         s2.execute("MATCH (w:Warmup) DELETE w").unwrap();
         s2.commit().unwrap();
     }
-    db.gc();
-    let baseline = db.memory_usage().total_bytes;
+    db.gc().expect("collect retained history");
+    let baseline = db.memory_usage();
 
     // Sustained phase: 500 more iterations with GC every 50.
     for i in 0..500 {
@@ -394,18 +535,19 @@ fn test_stress_sustained_workload_slow_leak_detection() {
         s3.commit().unwrap();
 
         if (i + 1) % 50 == 0 {
-            db.gc();
+            db.gc().expect("collect retained history");
         }
     }
-    db.gc();
-    let final_usage = db.memory_usage().total_bytes;
+    db.gc().expect("collect retained history");
+    let final_usage = db.memory_usage();
+    assert_eq!(db.node_count(), 0, "all workload nodes must be deleted");
 
     // After 500 full cycles with periodic GC, memory should not have grown
     // more than 256 KiB from the post-warmup baseline.
-    let growth = final_usage.saturating_sub(baseline);
+    let growth = final_usage.total_bytes.saturating_sub(baseline.total_bytes);
     assert!(
         growth < 256 * 1024,
-        "memory grew by {growth} bytes over 500 sustained cycles, expected < 256 KiB"
+        "memory grew by {growth} bytes over 500 sustained cycles, expected < 256 KiB; baseline={baseline:#?}; final={final_usage:#?}"
     );
 }
 
@@ -422,7 +564,7 @@ fn test_stress_star_topology_churn() {
         let s = db.session();
         s.execute("INSERT (:Setup)").unwrap();
     }
-    db.gc();
+    db.gc().expect("collect retained history");
     let baseline = db.memory_usage();
 
     for round in 0..20 {
@@ -452,10 +594,10 @@ fn test_stress_star_topology_churn() {
 
         // GC every 5 rounds.
         if (round + 1) % 5 == 0 {
-            db.gc();
+            db.gc().expect("collect retained history");
         }
     }
-    db.gc();
+    db.gc().expect("collect retained history");
 
     let after = db.memory_usage();
 

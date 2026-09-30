@@ -97,7 +97,7 @@ impl SparqlExecutor for SessionSparqlExecutor<'_> {
 
         let result = self
             .session
-            .execute_sparql(&substituted)
+            .execute_sparql_at_pinned_publication(&substituted)
             .map_err(|e| ShaclError::SparqlError(e.to_string()))?;
 
         // Convert QueryResult rows to Vec<HashMap<String, Term>>
@@ -185,15 +185,46 @@ pub fn validate_shacl(
     rdf_store: &Arc<RdfStore>,
     shapes_graph_name: &str,
 ) -> grafeo_common::utils::error::Result<ValidationReport> {
-    let shapes_store = rdf_store.graph(shapes_graph_name).ok_or_else(|| {
-        grafeo_common::utils::error::Error::Internal(format!(
-            "Named graph '{shapes_graph_name}' not found"
-        ))
-    })?;
+    let tid = session.current_rdf_transaction();
+    let shapes_store = rdf_store
+        .graph_in_transaction(shapes_graph_name, tid)
+        .ok_or_else(|| {
+            grafeo_common::utils::error::Error::Internal(format!(
+                "Named graph '{shapes_graph_name}' not found"
+            ))
+        })?;
 
     let executor = SessionSparqlExecutor::new(session);
-    grafeo_core::graph::rdf::shacl::validate(rdf_store, &shapes_store, Some(&executor))
+    let snapshot = session_rdf_snapshot(session, rdf_store);
+    let shapes_snapshot = rdf_snapshot_with_pending(&shapes_store, tid);
+    grafeo_core::graph::rdf::shacl::validate(&snapshot, &shapes_snapshot, Some(&executor))
         .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))
+}
+
+/// Default-graph snapshot including the session's uncommitted RDF writes.
+fn session_rdf_snapshot(session: &Session, rdf_store: &Arc<RdfStore>) -> Arc<RdfStore> {
+    let tid = session.current_rdf_transaction();
+    rdf_snapshot_with_pending(rdf_store, tid)
+}
+
+/// Materializes one RDF graph through a transaction's pending insert/delete
+/// overlay. SHACL parses shapes through ordinary store reads, so passing the
+/// shared or detached graph directly would otherwise hide the owner's pending
+/// shapes even though graph lifecycle lookup itself is transaction-aware.
+pub(crate) fn rdf_snapshot_with_pending(
+    rdf_store: &Arc<RdfStore>,
+    tid: Option<grafeo_common::types::TransactionId>,
+) -> Arc<RdfStore> {
+    let snap = Arc::new(RdfStore::new());
+    let pattern = grafeo_core::graph::rdf::TriplePattern {
+        subject: None,
+        predicate: None,
+        object: None,
+    };
+    for t in rdf_store.find_with_pending(&pattern, tid) {
+        snap.insert((*t).clone());
+    }
+    snap
 }
 
 #[cfg(test)]
