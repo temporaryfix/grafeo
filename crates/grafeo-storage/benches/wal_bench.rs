@@ -16,11 +16,15 @@ use grafeo_storage::wal::{DurabilityMode, WalConfig, WalManager, WalRecord, WalR
 
 /// Creates a representative WAL record for benchmarking.
 fn make_record(i: u64) -> WalRecord {
-    WalRecord::SetNodeProperty {
-        id: NodeId::new(i),
-        key: "name".to_string(),
-        value: Value::String(format!("node_{i}").into()),
-    }
+    WalRecord::lpg(
+        grafeo_common::types::TransactionId::new(1),
+        grafeo_common::types::GraphPath::root(),
+        grafeo_storage::wal::LpgMutationOp::SetNodeProperty {
+            id: NodeId::new(i),
+            key: "name".to_string(),
+            value: Value::String(format!("node_{i}").into()),
+        },
+    )
 }
 
 fn bench_wal_write_nosync(c: &mut Criterion) {
@@ -29,7 +33,7 @@ fn bench_wal_write_nosync(c: &mut Criterion) {
         durability: DurabilityMode::NoSync,
         ..WalConfig::default()
     };
-    let wal = WalManager::with_config(dir.path(), config).unwrap();
+    let wal = WalManager::with_config(dir.path().join("wal"), config).unwrap();
 
     let record = make_record(1);
 
@@ -49,7 +53,7 @@ fn bench_wal_write_batch(c: &mut Criterion) {
         },
         ..WalConfig::default()
     };
-    let wal = WalManager::with_config(dir.path(), config).unwrap();
+    let wal = WalManager::with_config(dir.path().join("wal"), config).unwrap();
 
     let record = make_record(1);
 
@@ -66,7 +70,7 @@ fn bench_wal_write_sync(c: &mut Criterion) {
         durability: DurabilityMode::Sync,
         ..WalConfig::default()
     };
-    let wal = WalManager::with_config(dir.path(), config).unwrap();
+    let wal = WalManager::with_config(dir.path().join("wal"), config).unwrap();
 
     let record = make_record(1);
 
@@ -87,7 +91,7 @@ fn bench_wal_batch_commit(c: &mut Criterion) {
         b.iter(|| {
             // Fresh directory per iteration so the log never grows across runs
             let dir = tempfile::tempdir().unwrap();
-            let wal = WalManager::with_config(dir.path(), config.clone()).unwrap();
+            let wal = WalManager::with_config(dir.path().join("wal"), config.clone()).unwrap();
 
             for i in 0..1000u64 {
                 wal.log(&make_record(i)).unwrap();
@@ -108,7 +112,7 @@ fn bench_wal_recovery_replay(c: &mut Criterion) {
         durability: DurabilityMode::NoSync,
         ..WalConfig::default()
     };
-    let wal = WalManager::with_config(dir.path(), config).unwrap();
+    let wal = WalManager::with_config(dir.path().join("wal"), config).unwrap();
 
     for i in 0..10_000u64 {
         wal.log(&make_record(i)).unwrap();
@@ -120,12 +124,12 @@ fn bench_wal_recovery_replay(c: &mut Criterion) {
     wal.sync().unwrap();
 
     // Keep dir alive but drop the wal so files are closed
-    let wal_dir = dir.path().to_path_buf();
+    let wal_dir = dir.path().join("wal");
     drop(wal);
 
     c.bench_function("wal_recovery_replay_10k", |b| {
         b.iter(|| {
-            let recovery = WalRecovery::new(&wal_dir);
+            let mut recovery = WalRecovery::new(&wal_dir).unwrap();
             let records = recovery.recover().unwrap();
             black_box(records.len());
         });

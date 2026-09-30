@@ -19,6 +19,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use grafeo_common::utils::error::{Error, Result};
 use grafeo_common::{grafeo_debug, grafeo_warn};
 
 use super::WalManager;
@@ -63,9 +64,10 @@ pub struct AdaptiveFlusher {
     /// Target interval between flushes.
     target_interval: Duration,
     /// Channel to signal shutdown (sends ack channel back).
-    shutdown_tx: Option<mpsc::Sender<mpsc::Sender<FlusherStats>>>,
+    shutdown_tx: Option<mpsc::Sender<()>>,
     /// Background thread handle.
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<FlusherStats>>>,
+    completed: Option<FlusherStats>,
 }
 
 impl AdaptiveFlusher {
@@ -82,20 +84,22 @@ impl AdaptiveFlusher {
     /// # Errors
     ///
     /// Returns an error if the background flusher thread cannot be spawned.
-    pub fn new(wal: Arc<WalManager>, target_interval_ms: u64) -> Result<Self, std::io::Error> {
+    pub fn new(
+        wal: Arc<WalManager>,
+        target_interval_ms: u64,
+    ) -> std::result::Result<Self, std::io::Error> {
         let target_interval = Duration::from_millis(target_interval_ms);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
             .name("grafeo-wal-flusher".to_string())
-            .spawn(move || {
-                Self::flusher_loop(wal, target_interval, shutdown_rx);
-            })?;
+            .spawn(move || Self::flusher_loop(wal, target_interval, shutdown_rx))?;
 
         Ok(Self {
             target_interval,
             shutdown_tx: Some(shutdown_tx),
             handle: Some(handle),
+            completed: None,
         })
     }
 
@@ -112,33 +116,34 @@ impl AdaptiveFlusher {
     /// # Errors
     ///
     /// Returns an error if the shutdown signal cannot be sent or acknowledged.
-    pub fn shutdown(&mut self) -> Result<FlusherStats, String> {
-        let stats = if let Some(tx) = self.shutdown_tx.take() {
-            let (ack_tx, ack_rx) = mpsc::channel();
-            tx.send(ack_tx)
-                .map_err(|e| format!("Failed to send shutdown signal: {e}"))?;
-            ack_rx
-                .recv()
-                .map_err(|e| format!("Failed to receive shutdown acknowledgment: {e}"))?
-        } else {
-            FlusherStats::default()
-        };
-
-        if let Some(handle) = self.handle.take() {
-            handle
-                .join()
-                .map_err(|_| "Flusher thread panicked".to_string())?;
+    pub fn shutdown(&mut self) -> Result<FlusherStats> {
+        if let Some(tx) = self.shutdown_tx.take() {
+            // A disconnected receiver already exited; joining still owns its result.
+            let _ = tx.send(());
         }
-
-        Ok(stats)
+        if let Some(handle) = self.handle.take() {
+            let stats = handle
+                .join()
+                .map_err(|_| Error::Internal("WAL flusher unwound".into()))??;
+            self.completed = Some(stats);
+            Ok(stats)
+        } else {
+            self.completed.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "WAL flusher already shut down without successful statistics",
+                )
+                .into()
+            })
+        }
     }
 
     /// The main flusher loop running in the background thread.
     fn flusher_loop(
         wal: Arc<WalManager>,
         target_interval: Duration,
-        shutdown_rx: mpsc::Receiver<mpsc::Sender<FlusherStats>>,
-    ) {
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<FlusherStats> {
         let mut last_flush_duration = Duration::ZERO;
         let mut stats = FlusherStats::default();
 
@@ -147,25 +152,15 @@ impl AdaptiveFlusher {
             let timeout = target_interval.saturating_sub(last_flush_duration);
 
             match shutdown_rx.recv_timeout(timeout) {
-                Ok(ack_tx) => {
-                    // Graceful shutdown requested - do final flush
-                    if let Err(e) = wal.sync() {
-                        grafeo_warn!("Final WAL flush failed: {e}");
-                    }
-                    // Send stats back to acknowledge shutdown
-                    let _ = ack_tx.send(stats);
-                    return;
+                Ok(()) => {
+                    wal.sync()?;
+                    return Ok(stats);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Time to flush
                     let start = Instant::now();
 
-                    if let Err(e) = wal.sync() {
-                        grafeo_warn!("WAL flush failed: {e}");
-                        // Still update timing to avoid spin loop on persistent errors
-                        last_flush_duration = Duration::from_millis(10);
-                        continue;
-                    }
+                    wal.sync()?;
 
                     last_flush_duration = start.elapsed();
 
@@ -189,7 +184,8 @@ impl AdaptiveFlusher {
                 Err(RecvTimeoutError::Disconnected) => {
                     // Channel closed without shutdown signal - exit gracefully
                     grafeo_debug!("Flusher shutdown channel disconnected");
-                    return;
+                    wal.sync()?;
+                    return Ok(stats);
                 }
             }
         }
@@ -198,7 +194,7 @@ impl AdaptiveFlusher {
 
 impl Drop for AdaptiveFlusher {
     fn drop(&mut self) {
-        if self.shutdown_tx.is_some()
+        if self.handle.is_some()
             && let Err(e) = self.shutdown()
         {
             grafeo_warn!("Error during flusher drop: {e}");
@@ -208,8 +204,8 @@ impl Drop for AdaptiveFlusher {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_wal_dir as tempdir;
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn test_adaptive_flusher_basic() {
