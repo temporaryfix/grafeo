@@ -213,3 +213,45 @@ class TestEdgeTypeVisibilityAfterTransaction:
         rows = list(db.execute("MATCH ()-[r:WORKS_AT]->() RETURN type(r) AS t"))
         assert len(rows) >= 1, "Type-filtered MATCH should find the edge"
         assert all(r["t"] == "WORKS_AT" for r in rows)
+
+
+def test_failed_commit_conflict_is_terminal_and_preserves_winner(db):
+    """A commit-time conflict cannot leave a reusable Python transaction owner."""
+    import grafeo
+    import pytest
+
+    db.execute("INSERT (:CommitConflict {id: 1, value: 0})")
+    read = "MATCH (n:CommitConflict {id: 1}) RETURN n.value AS value"
+    write = "MATCH (n:CommitConflict {id: 1}) SET n.value = $value"
+    stale = db.begin_transaction()
+    primary = None
+    active_after_failure = None
+    with pytest.raises(grafeo.GrafeoError) as escaped:
+        with stale:
+            assert list(stale.execute(read)) == [{"value": 0}]
+            with db.begin_transaction() as winner:
+                winner.execute(write, {"value": 1})
+                winner.commit()
+            assert list(db.execute(read)) == [{"value": 1}]
+            # Deliberately outside the commit exception handler: write-time
+            # rejection does not qualify this commit-state regression.
+            stale.execute(write, {"value": 2})
+            try:
+                stale.commit()
+            except grafeo.GrafeoError as error:
+                assert error.error_code == "GRAFEO-T001"
+                primary = error
+                active_after_failure = stale.is_active
+                with pytest.raises(RuntimeError, match="completed transaction"):
+                    stale.execute(write, {"value": 99})
+                raise
+    assert primary is not None, "the failing phase must be COMMIT"
+    assert escaped.value is primary, "context cleanup must preserve the commit conflict"
+    assert active_after_failure is False, "failed COMMIT already aborted the native owner"
+    assert stale.is_active is False
+    assert list(db.execute(read)) == [{"value": 1}]
+    with db.begin_transaction() as fresh:
+        assert list(fresh.execute(read)) == [{"value": 1}]
+        fresh.execute(write, {"value": 3})
+        fresh.commit()
+    assert list(db.execute(read)) == [{"value": 3}]

@@ -27,7 +27,7 @@ pytestmark = [
 @pytest.fixture
 def db():
     """Create a fresh database instance for each test."""
-    return GrafeoDB()
+    return GrafeoDB(graph_model="rdf")
 
 
 class TestSPARQLTransactions(BaseTransactionsTest):

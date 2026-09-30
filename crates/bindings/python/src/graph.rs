@@ -13,7 +13,7 @@ use crate::types::PyValue;
 /// Access properties with `node["name"]` or `node.get("name")`. Check labels
 /// with `node.has_label("Person")`. Nodes are returned by queries like
 /// `MATCH (n:Person) RETURN n`.
-#[pyclass(name = "Node")]
+#[pyclass(name = "Node", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyNode {
     pub(crate) id: NodeId,
@@ -42,16 +42,12 @@ impl PyNode {
 
     /// Get all properties as a dictionary.
     ///
-    /// # Panics
-    ///
-    /// Panics on memory exhaustion during Python dict allocation.
-    fn properties(&self, py: Python<'_>) -> Py<PyAny> {
+    fn properties(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = pyo3::types::PyDict::new(py);
         for (k, v) in &self.properties {
-            dict.set_item(k.as_str(), PyValue::to_py(v, py))
-                .expect("dict.set_item only fails on memory exhaustion");
+            dict.set_item(k.as_str(), PyValue::to_py(v, py)?)?;
         }
-        dict.unbind().into_any()
+        Ok(dict.unbind().into_any())
     }
 
     /// Check if node has a label.
@@ -65,10 +61,10 @@ impl PyNode {
     }
 
     /// Return a list of (key, value) pairs for all properties.
-    fn items(&self, py: Python<'_>) -> Vec<(String, Py<PyAny>)> {
+    fn items(&self, py: Python<'_>) -> PyResult<Vec<(String, Py<PyAny>)>> {
         self.properties
             .iter()
-            .map(|(k, v)| (k.to_string(), PyValue::to_py(v, py)))
+            .map(|(k, v)| Ok((k.to_string(), PyValue::to_py(v, py)?)))
             .collect()
     }
 
@@ -113,7 +109,7 @@ impl PyNode {
 /// Access properties with `edge["weight"]` or `edge.get("weight")`. Check the
 /// relationship type with `edge.edge_type`. Edges connect a `source_id` to a
 /// `target_id` and are returned by queries like `MATCH ()-[r:WORKS_AT]->() RETURN r`.
-#[pyclass(name = "Edge")]
+#[pyclass(name = "Edge", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyEdge {
     pub(crate) id: EdgeId,
@@ -156,16 +152,12 @@ impl PyEdge {
 
     /// Get all properties as a dictionary.
     ///
-    /// # Panics
-    ///
-    /// Panics on memory exhaustion during Python dict allocation.
-    fn properties(&self, py: Python<'_>) -> Py<PyAny> {
+    fn properties(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = pyo3::types::PyDict::new(py);
         for (k, v) in &self.properties {
-            dict.set_item(k.as_str(), PyValue::to_py(v, py))
-                .expect("dict.set_item only fails on memory exhaustion");
+            dict.set_item(k.as_str(), PyValue::to_py(v, py)?)?;
         }
-        dict.unbind().into_any()
+        Ok(dict.unbind().into_any())
     }
 
     /// Return a list of property key names.
@@ -174,10 +166,10 @@ impl PyEdge {
     }
 
     /// Return a list of (key, value) pairs for all properties.
-    fn items(&self, py: Python<'_>) -> Vec<(String, Py<PyAny>)> {
+    fn items(&self, py: Python<'_>) -> PyResult<Vec<(String, Py<PyAny>)>> {
         self.properties
             .iter()
-            .map(|(k, v)| (k.to_string(), PyValue::to_py(v, py)))
+            .map(|(k, v)| Ok((k.to_string(), PyValue::to_py(v, py)?)))
             .collect()
     }
 

@@ -76,17 +76,20 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         let result = match method {
             "dijkstra" => algorithms::dijkstra_path(
-                &**store,
+                store.as_ref(),
                 NodeId::new(source),
                 NodeId::new(target),
                 weight,
             ),
             "bellman_ford" => {
-                let bf_result = algorithms::bellman_ford(&**store, NodeId::new(source), weight);
+                let bf_result =
+                    algorithms::bellman_ford(store.as_ref(), NodeId::new(source), weight);
                 if bf_result.has_negative_cycle {
                     return Err(PyGrafeoError::InvalidArgument(
                         "Graph contains negative cycle".into(),
@@ -105,7 +108,7 @@ impl PySolvORAdapter {
             "astar" => {
                 // A* with zero heuristic (same as Dijkstra)
                 algorithms::astar(
-                    &**store,
+                    store.as_ref(),
                     NodeId::new(source),
                     NodeId::new(target),
                     weight,
@@ -148,9 +151,11 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
-        let result = algorithms::floyd_warshall(&**store, weight);
+        let result = algorithms::floyd_warshall(store.as_ref(), weight);
 
         let dict = PyDict::new(py);
         let nodes = result.nodes();
@@ -193,9 +198,16 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
-        match algorithms::max_flow(&**store, NodeId::new(source), NodeId::new(sink), capacity) {
+        match algorithms::max_flow(
+            store.as_ref(),
+            NodeId::new(source),
+            NodeId::new(sink),
+            capacity,
+        ) {
             Some(result) => {
                 let flow_edges: Vec<(u64, u64, f64)> = result
                     .flow_edges
@@ -238,10 +250,12 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         match algorithms::min_cost_max_flow(
-            &**store,
+            store.as_ref(),
             NodeId::new(source),
             NodeId::new(sink),
             capacity,
@@ -290,11 +304,13 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         let result = match method {
-            "kruskal" => algorithms::kruskal(&**store, weight),
-            "prim" => algorithms::prim(&**store, weight, None),
+            "kruskal" => algorithms::kruskal(store.as_ref(), weight),
+            "prim" => algorithms::prim(store.as_ref(), weight, None),
             _ => {
                 return Err(PyGrafeoError::InvalidArgument(format!(
                     "Unknown method: {}. Use 'kruskal' or 'prim'",
@@ -329,8 +345,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::connected_components(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::connected_components(store.as_ref());
         Ok(result.into_iter().map(|(n, c)| (n.0, c)).collect())
     }
 
@@ -342,8 +360,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::strongly_connected_components(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::strongly_connected_components(store.as_ref());
         Ok(result.into_iter().map(|(n, c)| (n.0, c)).collect())
     }
 
@@ -355,8 +375,11 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        Ok(algorithms::topological_sort(&**store).map(|v| v.into_iter().map(|n| n.0).collect()))
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        Ok(algorithms::topological_sort(store.as_ref())
+            .map(|v| v.into_iter().map(|n| n.0).collect()))
     }
 
     // ==========================================================================
@@ -377,8 +400,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::pagerank(&**store, damping, max_iter, tol);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::pagerank(store.as_ref(), damping, max_iter, tol);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -394,8 +419,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::betweenness_centrality(&**store, normalized);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::betweenness_centrality(store.as_ref(), normalized);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -415,8 +442,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::louvain(&**store, resolution);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::louvain(store.as_ref(), resolution);
 
         let communities: HashMap<u64, u64> = result
             .communities
@@ -444,8 +473,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::articulation_points(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::articulation_points(store.as_ref());
         Ok(result.into_iter().map(|n| n.0).collect())
     }
 
@@ -457,8 +488,10 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::bridges(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::bridges(store.as_ref());
         Ok(result.into_iter().map(|(s, t)| (s.0, t.0)).collect())
     }
 
@@ -470,7 +503,9 @@ impl PySolvORAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         let n = db.node_count();
         let e = db.edge_count();
@@ -479,7 +514,7 @@ impl PySolvORAdapter {
         } else {
             0.0
         };
-        let components = algorithms::connected_component_count(&**store);
+        let components = algorithms::connected_component_count(store.as_ref());
 
         let dict = PyDict::new(py);
         dict.set_item("nodes", n)?;

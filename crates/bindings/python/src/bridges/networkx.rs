@@ -70,14 +70,18 @@ impl PyNetworkXAdapter {
     /// Get list of all node IDs.
     fn nodes(&self) -> PyResult<Vec<u64>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         Ok(store.node_ids().into_iter().map(|n| n.0).collect())
     }
 
     /// Get list of all edges as (source, target) tuples.
     fn edges(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         let nodes = store.node_ids();
 
         let mut edges: Vec<(u64, u64)> = Vec::new();
@@ -93,9 +97,12 @@ impl PyNetworkXAdapter {
     /// Get neighbors of a node.
     fn neighbors(&self, node_id: u64) -> PyResult<Vec<u64>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         let neighbors: Vec<u64> = store
             .edges_from(NodeId::new(node_id), Direction::Outgoing)
+            .into_iter()
             .map(|(n, _)| n.0)
             .collect();
         Ok(neighbors)
@@ -104,14 +111,18 @@ impl PyNetworkXAdapter {
     /// Get in-degree of a node.
     fn in_degree(&self, node_id: u64) -> PyResult<usize> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         Ok(store.in_degree(NodeId::new(node_id)))
     }
 
     /// Get out-degree of a node.
     fn out_degree(&self, node_id: u64) -> PyResult<usize> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         Ok(store.out_degree(NodeId::new(node_id)))
     }
 
@@ -128,7 +139,9 @@ impl PyNetworkXAdapter {
     /// Check if an edge exists.
     fn has_edge(&self, source: u64, target: u64) -> PyResult<bool> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         for (neighbor, _) in store.edges_from(NodeId::new(source), Direction::Outgoing) {
             if neighbor.0 == target {
                 return Ok(true);
@@ -161,7 +174,9 @@ impl PyNetworkXAdapter {
         };
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         let nodes = store.node_ids();
 
         // Build a mapping from Grafeo NodeId -> NetworkX node identifier.
@@ -182,10 +197,10 @@ impl PyNetworkXAdapter {
                 // Add properties (skip _networkx_id from exported attrs)
                 for (key, value) in &node.properties {
                     if key.as_str() == "_networkx_id" {
-                        nx_id = crate::types::PyValue::to_py(value, py);
+                        nx_id = crate::types::PyValue::to_py(value, py)?;
                         continue;
                     }
-                    attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py))?;
+                    attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py)?)?;
                 }
 
                 id_map.insert(node_id.0, nx_id.clone_ref(py));
@@ -204,7 +219,7 @@ impl PyNetworkXAdapter {
 
                     // Add properties
                     for (key, value) in &edge.properties {
-                        attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py))?;
+                        attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py)?)?;
                     }
 
                     let src_nx = id_map.get(&node_id.0).map_or_else(
@@ -249,7 +264,9 @@ impl PyNetworkXAdapter {
         let is_directed: bool = g.call_method0("is_directed")?.extract()?;
 
         // Import nodes with data
-        let nodes_data = g.call_method1("nodes", (true,))?; // nodes(data=True)
+        let with_data = PyDict::new(py);
+        with_data.set_item("data", true)?;
+        let nodes_data = g.call_method("nodes", (), Some(&with_data))?;
 
         // We use a Python-hashable key -> NodeId mapping internally, and also
         // produce a Grafeo-ID -> original-NX-ID dict to return to the caller.
@@ -286,11 +303,15 @@ impl PyNetworkXAdapter {
 
             // Store the original NetworkX node ID as a property for round-tripping.
             if let Ok(nx_val) = crate::types::PyValue::from_py(&py_id_obj) {
-                db_guard.set_node_property(grafeo_id, "_networkx_id", nx_val);
+                db_guard
+                    .set_node_property(grafeo_id, "_networkx_id", nx_val)
+                    .map_err(PyGrafeoError::from)?;
             } else {
                 // Fallback: store as string representation.
                 let repr: String = py_id_obj.repr()?.extract()?;
-                db_guard.set_node_property(grafeo_id, "_networkx_id", Value::String(repr.into()));
+                db_guard
+                    .set_node_property(grafeo_id, "_networkx_id", Value::String(repr.into()))
+                    .map_err(PyGrafeoError::from)?;
             }
 
             // Record in the return mapping: grafeo_id (int) -> original NX id
@@ -307,14 +328,17 @@ impl PyNetworkXAdapter {
                         continue; // Skip labels, already handled
                     }
                     if let Ok(val) = crate::types::PyValue::from_py(&value) {
-                        db_guard.set_node_property(grafeo_id, &key_str, val);
+                        db_guard
+                            .set_node_property(grafeo_id, &key_str, val)
+                            .map_err(PyGrafeoError::from)?;
                     }
                 }
             }
         }
 
         // Import edges with data
-        let edges_data = g.call_method1("edges", (true,))?; // edges(data=True)
+        // EdgeView's first positional argument is nbunch, not data.
+        let edges_data = g.call_method("edges", (), Some(&with_data))?;
         for item in edges_data.try_iter()? {
             let item = item?;
             let tuple: &Bound<'_, PyTuple> = item.cast()?;
@@ -351,7 +375,9 @@ impl PyNetworkXAdapter {
                             continue; // Skip type, already handled
                         }
                         if let Ok(val) = crate::types::PyValue::from_py(&value) {
-                            db_guard.set_edge_property(edge_id, &key_str, val);
+                            db_guard
+                                .set_edge_property(edge_id, &key_str, val)
+                                .map_err(PyGrafeoError::from)?;
                         }
                     }
                 }
@@ -375,8 +401,10 @@ impl PyNetworkXAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::pagerank(&**store, alpha, max_iter, tol);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::pagerank(store.as_ref(), alpha, max_iter, tol);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -386,8 +414,10 @@ impl PyNetworkXAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::betweenness_centrality(&**store, normalized);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::betweenness_centrality(store.as_ref(), normalized);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -397,8 +427,10 @@ impl PyNetworkXAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::closeness_centrality(&**store, wf_improved);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::closeness_centrality(store.as_ref(), wf_improved);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -407,8 +439,10 @@ impl PyNetworkXAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
-        let components = algorithms::connected_components(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let components = algorithms::connected_components(store.as_ref());
 
         // Group by component
         let mut grouped: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -431,11 +465,13 @@ impl PyNetworkXAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         if let Some(target_id) = target {
             match algorithms::dijkstra_path(
-                &**store,
+                store.as_ref(),
                 NodeId::new(source),
                 NodeId::new(target_id),
                 weight,
@@ -448,7 +484,7 @@ impl PyNetworkXAdapter {
             }
         } else {
             // Return paths to all reachable nodes
-            let result = algorithms::dijkstra(&**store, NodeId::new(source), weight);
+            let result = algorithms::dijkstra(store.as_ref(), NodeId::new(source), weight);
             let dict = PyDict::new(py);
 
             for (target_node, _) in &result.distances {
@@ -474,11 +510,13 @@ impl PyNetworkXAdapter {
         use grafeo_adapters::plugins::algorithms;
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         if let Some(target_id) = target {
             match algorithms::dijkstra_path(
-                &**store,
+                store.as_ref(),
                 NodeId::new(source),
                 NodeId::new(target_id),
                 weight,
@@ -487,7 +525,7 @@ impl PyNetworkXAdapter {
                 None => Err(PyGrafeoError::InvalidArgument("No path found".into()).into()),
             }
         } else {
-            let result = algorithms::dijkstra(&**store, NodeId::new(source), weight);
+            let result = algorithms::dijkstra(store.as_ref(), NodeId::new(source), weight);
             let distances: HashMap<u64, f64> = result
                 .distances
                 .into_iter()
@@ -503,7 +541,9 @@ impl PyNetworkXAdapter {
     #[getter]
     fn adj(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         let nodes = store.node_ids();
 
         let outer = PyDict::new(py);
@@ -514,7 +554,7 @@ impl PyNetworkXAdapter {
                 if let Some(edge) = store.get_edge(edge_id) {
                     attrs.set_item("type", edge.edge_type.to_string())?;
                     for (key, value) in &edge.properties {
-                        attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py))?;
+                        attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py)?)?;
                     }
                 }
                 inner.set_item(neighbor.0, attrs)?;
@@ -545,7 +585,9 @@ impl PyNetworkXAdapter {
         };
 
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         let node_set: std::collections::HashSet<u64> = nodes.iter().copied().collect();
 
@@ -557,7 +599,7 @@ impl PyNetworkXAdapter {
                 let labels: Vec<String> = node.labels.iter().map(|s| s.to_string()).collect();
                 attrs.set_item("labels", labels)?;
                 for (key, value) in &node.properties {
-                    attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py))?;
+                    attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py)?)?;
                 }
                 graph.call_method("add_node", (node_id,), Some(&attrs))?;
             }
@@ -573,7 +615,7 @@ impl PyNetworkXAdapter {
                     let attrs = PyDict::new(py);
                     attrs.set_item("type", edge.edge_type.to_string())?;
                     for (key, value) in &edge.properties {
-                        attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py))?;
+                        attrs.set_item(key.as_str(), crate::types::PyValue::to_py(value, py)?)?;
                     }
                     graph.call_method("add_edge", (node_id, neighbor.0), Some(&attrs))?;
                 }

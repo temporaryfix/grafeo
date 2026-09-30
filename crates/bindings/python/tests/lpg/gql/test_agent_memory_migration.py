@@ -84,7 +84,7 @@ class TestPersistence:
                     ["Memory"],
                     {"embedding": random_384d_vector(i), "text": f"fact_{i}"},
                 )
-            db.create_vector_index("Memory", "embedding", dimensions=384, metric="cosine")
+            db.create_index("embedding", kind="vector", label="Memory", dimensions=384, metric="cosine")
 
             # Search works before close
             results = db.vector_search("Memory", "embedding", random_384d_vector(0), k=5)
@@ -97,7 +97,7 @@ class TestPersistence:
             assert db2.info()["node_count"] == 20
 
             # Recreate vector index after reopen
-            db2.create_vector_index("Memory", "embedding", dimensions=384, metric="cosine")
+            db2.create_index("embedding", kind="vector", label="Memory", dimensions=384, metric="cosine")
             results2 = db2.vector_search("Memory", "embedding", random_384d_vector(0), k=5)
             assert len(results2) == 5, "search works after reopen + index recreation"
             db2.close()
@@ -194,7 +194,7 @@ class TestBYOV:
                 ["Memory"],
                 {"embedding": random_384d_vector(i)},
             )
-        db.create_vector_index("Memory", "embedding", dimensions=384, metric="cosine")
+        db.create_index("embedding", kind="vector", label="Memory", dimensions=384, metric="cosine")
 
         # Search with the same vector as node 0
         results = db.vector_search("Memory", "embedding", random_384d_vector(0), k=5)
@@ -215,7 +215,7 @@ class TestBYOV:
         ids = db.batch_create_nodes("Memory", "embedding", vectors)
         assert len(ids) == 100
 
-        db.create_vector_index("Memory", "embedding", dimensions=384, metric="cosine")
+        db.create_index("embedding", kind="vector", label="Memory", dimensions=384, metric="cosine")
         results = db.vector_search("Memory", "embedding", random_384d_vector(0), k=10)
         assert len(results) == 10
 
@@ -236,8 +236,8 @@ class TestBYOV:
                 {"content": text, "embedding": random_384d_vector(seed)},
             )
 
-        db.create_text_index("Memory", "content")
-        db.create_vector_index("Memory", "embedding", dimensions=384, metric="cosine")
+        db.create_index("content", kind="text", label="Memory")
+        db.create_index("embedding", kind="vector", label="Memory", dimensions=384, metric="cosine")
 
         results = db.hybrid_search(
             "Memory",
@@ -306,7 +306,7 @@ class TestConcurrency:
                 ["Memory"],
                 {"embedding": random_384d_vector(i)},
             )
-        db.create_vector_index("Memory", "embedding", dimensions=384, metric="cosine")
+        db.create_index("embedding", kind="vector", label="Memory", dimensions=384, metric="cosine")
 
         errors = []
         results_count = []

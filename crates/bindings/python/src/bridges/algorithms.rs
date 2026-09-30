@@ -11,9 +11,11 @@ use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use grafeo_adapters::plugins::algorithms;
+use grafeo_adapters::plugins::Parameters;
+use grafeo_adapters::plugins::algorithms::{self, GraphAlgorithm};
 use grafeo_common::types::NodeId;
 use grafeo_common::types::Value;
+use grafeo_core::graph::Direction;
 use grafeo_engine::database::GrafeoDB;
 
 use crate::error::PyGrafeoError;
@@ -50,8 +52,10 @@ impl PyAlgorithms {
     ///     List of node IDs in BFS order
     fn bfs(&self, start: u64) -> PyResult<Vec<u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::bfs(&**store, NodeId::new(start));
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::bfs(store.as_ref(), NodeId::new(start));
         Ok(result.into_iter().map(|n| n.0).collect())
     }
 
@@ -59,13 +63,42 @@ impl PyAlgorithms {
     ///
     /// Args:
     ///     start: Starting node ID
+    ///     edge_type: Optional edge type filter
+    ///     max_depth: Optional maximum distance from start
+    ///     direction: `outgoing`, `incoming`, or `both` (default: `outgoing`)
     ///
     /// Returns:
     ///     List of lists, where result[i] contains nodes at distance i
-    fn bfs_layers(&self, start: u64) -> PyResult<Vec<Vec<u64>>> {
+    #[pyo3(signature = (start, edge_type=None, max_depth=None, direction="outgoing"))]
+    fn bfs_layers(
+        &self,
+        start: u64,
+        edge_type: Option<&str>,
+        max_depth: Option<usize>,
+        direction: &str,
+    ) -> PyResult<Vec<Vec<u64>>> {
         let db = self.db.read();
-        let store = db.store();
-        let layers = algorithms::bfs_layers(&**store, NodeId::new(start));
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let direction = match direction.to_ascii_lowercase().as_str() {
+            "outgoing" => Direction::Outgoing,
+            "incoming" => Direction::Incoming,
+            "both" => Direction::Both,
+            value => {
+                return Err(PyGrafeoError::InvalidArgument(format!(
+                    "direction must be one of outgoing, incoming, or both, got '{value}'"
+                ))
+                .into());
+            }
+        };
+        let layers = algorithms::bfs_layers_with_direction(
+            store.as_ref(),
+            NodeId::new(start),
+            edge_type,
+            max_depth,
+            direction,
+        );
         Ok(layers
             .into_iter()
             .map(|layer| layer.into_iter().map(|n| n.0).collect())
@@ -81,8 +114,10 @@ impl PyAlgorithms {
     ///     List of node IDs in post-order (finished order)
     fn dfs(&self, start: u64) -> PyResult<Vec<u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::dfs(&**store, NodeId::new(start));
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::dfs(store.as_ref(), NodeId::new(start));
         Ok(result.into_iter().map(|n| n.0).collect())
     }
 
@@ -92,8 +127,10 @@ impl PyAlgorithms {
     ///     List of all node IDs in DFS post-order
     fn dfs_all(&self) -> PyResult<Vec<u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::dfs_all(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::dfs_all(store.as_ref());
         Ok(result.into_iter().map(|n| n.0).collect())
     }
 
@@ -107,16 +144,20 @@ impl PyAlgorithms {
     ///     Dict mapping node ID to component ID
     fn connected_components(&self) -> PyResult<HashMap<u64, u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::connected_components(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::connected_components(store.as_ref());
         Ok(result.into_iter().map(|(n, c)| (n.0, c)).collect())
     }
 
     /// Count the number of connected components.
     fn connected_component_count(&self) -> PyResult<usize> {
         let db = self.db.read();
-        let store = db.store();
-        Ok(algorithms::connected_component_count(&**store))
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        Ok(algorithms::connected_component_count(store.as_ref()))
     }
 
     /// Find strongly connected components.
@@ -125,8 +166,10 @@ impl PyAlgorithms {
     ///     List of lists, each inner list is a strongly connected component
     fn strongly_connected_components(&self) -> PyResult<Vec<Vec<u64>>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::strongly_connected_components(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::strongly_connected_components(store.as_ref());
 
         // Group nodes by component ID
         let mut grouped: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -143,15 +186,20 @@ impl PyAlgorithms {
     ///     List of node IDs in topological order, or None if graph has cycle
     fn topological_sort(&self) -> PyResult<Option<Vec<u64>>> {
         let db = self.db.read();
-        let store = db.store();
-        Ok(algorithms::topological_sort(&**store).map(|v| v.into_iter().map(|n| n.0).collect()))
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        Ok(algorithms::topological_sort(store.as_ref())
+            .map(|v| v.into_iter().map(|n| n.0).collect()))
     }
 
     /// Check if the graph is a DAG.
     fn is_dag(&self) -> PyResult<bool> {
         let db = self.db.read();
-        let store = db.store();
-        Ok(algorithms::is_dag(&**store))
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        Ok(algorithms::is_dag(store.as_ref()))
     }
 
     // ==========================================================================
@@ -177,11 +225,13 @@ impl PyAlgorithms {
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         if let Some(target_id) = target {
             match algorithms::dijkstra_path(
-                &**store,
+                store.as_ref(),
                 NodeId::new(source),
                 NodeId::new(target_id),
                 weight,
@@ -193,7 +243,7 @@ impl PyAlgorithms {
                 None => Ok(py.None()),
             }
         } else {
-            let result = algorithms::dijkstra(&**store, NodeId::new(source), weight);
+            let result = algorithms::dijkstra(store.as_ref(), NodeId::new(source), weight);
             let distances: HashMap<u64, f64> = result
                 .distances
                 .into_iter()
@@ -203,67 +253,46 @@ impl PyAlgorithms {
         }
     }
 
-    /// Single-source shortest paths with string node name support.
-    ///
-    /// LDBC Graphanalytics-compatible API: accepts node names (or numeric IDs
-    /// as strings) and returns distances keyed by node name.
+    /// Single-source shortest paths resolved by internal node ID or an explicit property.
     ///
     /// Args:
-    ///     source: Source node name (or numeric ID as string)
+    ///     source: Internal node ID as a string, or a property value when key is set
     ///     weight_attr: Optional edge property name for weights (default: 1.0)
+    ///     key: Optional node property used to resolve source (default: None)
     ///
     /// Returns:
-    ///     Dict mapping node name (str) to distance (float)
-    #[pyo3(signature = (source, weight_attr=None))]
-    fn sssp(&self, source: &str, weight_attr: Option<&str>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    ///     Dict mapping internal node ID (int) to distance (float)
+    #[pyo3(signature = (source, weight_attr=None, key=None))]
+    fn sssp(
+        &self,
+        source: &str,
+        weight_attr: Option<&str>,
+        key: Option<&str>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
-
-        // Resolve source: try integer parse first, then name property lookup
-        let source_id = if let Ok(id) = source.parse::<u64>() {
-            NodeId::new(id)
-        } else {
-            let candidates = store.find_nodes_by_property("name", &Value::from(source));
-            match candidates.len() {
-                0 => {
-                    return Err(PyGrafeoError::InvalidArgument(format!(
-                        "No node found with name '{source}'"
-                    ))
-                    .into());
-                }
-                1 => candidates[0],
-                _ => {
-                    return Err(PyGrafeoError::InvalidArgument(format!(
-                        "Multiple nodes found with name '{source}', use node ID instead"
-                    ))
-                    .into());
-                }
-            }
-        };
-
-        let result = algorithms::dijkstra(&**store, source_id, weight_attr);
-
-        // Map node IDs to names (falling back to string ID)
-        let distances: HashMap<String, f64> = result
-            .distances
-            .into_iter()
-            .map(|(node, dist)| {
-                let name = store
-                    .get_node(node)
-                    .and_then(|n| n.get_property("name").cloned())
-                    .and_then(|v| {
-                        if let Value::String(s) = v {
-                            Some(s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| node.0.to_string());
-                (name, dist)
-            })
-            .collect();
-
-        Ok(distances.into_pyobject(py)?.into_any().unbind())
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let mut params = Parameters::new();
+        params.set_string("source", source);
+        if let Some(weight) = weight_attr {
+            params.set_string("weight", weight);
+        }
+        if let Some(key) = key {
+            params.set_string("key", key);
+        }
+        let result = algorithms::SsspAlgorithm
+            .execute(store.as_ref(), &params)
+            .map_err(|error| PyGrafeoError::InvalidArgument(error.to_string()))?;
+        let distances = PyDict::new(py);
+        for row in result.rows {
+            let [Value::Int64(node), Value::Float64(distance)] = row.as_slice() else {
+                return Err(PyGrafeoError::database("SSSP returned an invalid result row").into());
+            };
+            distances.set_item(node, distance)?;
+        }
+        Ok(distances.into_any().unbind())
     }
 
     /// A* shortest path algorithm.
@@ -286,7 +315,9 @@ impl PyAlgorithms {
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         // Build heuristic function
         let h_map: HashMap<u64, f64> = if let Some(h) = heuristic {
@@ -304,7 +335,7 @@ impl PyAlgorithms {
         let heuristic_fn = |n: NodeId| -> f64 { h_map.get(&n.0).copied().unwrap_or(0.0) };
 
         match algorithms::astar(
-            &**store,
+            store.as_ref(),
             NodeId::new(source),
             NodeId::new(target),
             weight,
@@ -334,9 +365,11 @@ impl PyAlgorithms {
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
-        let result = algorithms::bellman_ford(&**store, NodeId::new(source), weight);
+        let result = algorithms::bellman_ford(store.as_ref(), NodeId::new(source), weight);
 
         let distances: HashMap<u64, f64> = result
             .distances
@@ -367,9 +400,11 @@ impl PyAlgorithms {
     #[pyo3(signature = (weight=None))]
     fn floyd_warshall(&self, weight: Option<&str>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
-        let result = algorithms::floyd_warshall(&**store, weight);
+        let result = algorithms::floyd_warshall(store.as_ref(), weight);
 
         let dict = PyDict::new(py);
         let nodes = result.nodes();
@@ -399,14 +434,16 @@ impl PyAlgorithms {
     #[pyo3(signature = (normalized=false))]
     fn degree_centrality(&self, normalized: bool, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         if normalized {
-            let result = algorithms::degree_centrality_normalized(&**store);
+            let result = algorithms::degree_centrality_normalized(store.as_ref());
             let scores: HashMap<u64, f64> = result.into_iter().map(|(n, s)| (n.0, s)).collect();
             Ok(scores.into_pyobject(py)?.into_any().unbind())
         } else {
-            let result = algorithms::degree_centrality(&**store);
+            let result = algorithms::degree_centrality(store.as_ref());
             let dict = PyDict::new(py);
             for (node, total) in result.total_degree {
                 let in_d = *result.in_degree.get(&node).unwrap_or(&0);
@@ -438,8 +475,10 @@ impl PyAlgorithms {
         tolerance: f64,
     ) -> PyResult<HashMap<u64, f64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::pagerank(&**store, damping, max_iterations, tolerance);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::pagerank(store.as_ref(), damping, max_iterations, tolerance);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -453,8 +492,10 @@ impl PyAlgorithms {
     #[pyo3(signature = (normalized=true))]
     fn betweenness_centrality(&self, normalized: bool) -> PyResult<HashMap<u64, f64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::betweenness_centrality(&**store, normalized);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::betweenness_centrality(store.as_ref(), normalized);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -468,8 +509,10 @@ impl PyAlgorithms {
     #[pyo3(signature = (wf_improved=false))]
     fn closeness_centrality(&self, wf_improved: bool) -> PyResult<HashMap<u64, f64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::closeness_centrality(&**store, wf_improved);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::closeness_centrality(store.as_ref(), wf_improved);
         Ok(result.into_iter().map(|(n, s)| (n.0, s)).collect())
     }
 
@@ -487,8 +530,10 @@ impl PyAlgorithms {
     #[pyo3(signature = (max_iterations=100))]
     fn label_propagation(&self, max_iterations: usize) -> PyResult<HashMap<u64, u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::label_propagation(&**store, max_iterations);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::label_propagation(store.as_ref(), max_iterations);
         Ok(result.into_iter().map(|(n, c)| (n.0, c)).collect())
     }
 
@@ -502,8 +547,10 @@ impl PyAlgorithms {
     #[pyo3(signature = (resolution=1.0))]
     fn louvain(&self, resolution: f64, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::louvain(&**store, resolution);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::louvain(store.as_ref(), resolution);
 
         let communities: HashMap<u64, u64> = result
             .communities
@@ -533,8 +580,10 @@ impl PyAlgorithms {
     #[pyo3(signature = (weight=None))]
     fn kruskal(&self, weight: Option<&str>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::kruskal(&**store, weight);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::kruskal(store.as_ref(), weight);
 
         let edges: Vec<(u64, u64, f64)> = result
             .edges
@@ -565,9 +614,11 @@ impl PyAlgorithms {
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         let start_node = start.map(NodeId::new);
-        let result = algorithms::prim(&**store, weight, start_node);
+        let result = algorithms::prim(store.as_ref(), weight, start_node);
 
         let edges: Vec<(u64, u64, f64)> = result
             .edges
@@ -604,9 +655,16 @@ impl PyAlgorithms {
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
-        match algorithms::max_flow(&**store, NodeId::new(source), NodeId::new(sink), capacity) {
+        match algorithms::max_flow(
+            store.as_ref(),
+            NodeId::new(source),
+            NodeId::new(sink),
+            capacity,
+        ) {
             Some(result) => {
                 let flow_edges: Vec<(u64, u64, f64)> = result
                     .flow_edges
@@ -646,10 +704,12 @@ impl PyAlgorithms {
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         match algorithms::min_cost_max_flow(
-            &**store,
+            store.as_ref(),
             NodeId::new(source),
             NodeId::new(sink),
             capacity,
@@ -686,19 +746,30 @@ impl PyAlgorithms {
     ///
     /// Args:
     ///     parallel: Enable parallel computation (default: True)
+    ///     directed: Use LDBC directed coefficients (default: False)
     ///
     /// Returns:
     ///     Dict with 'coefficients', 'triangle_counts', 'total_triangles',
     ///     and 'global_coefficient' keys
-    #[pyo3(signature = (parallel=true))]
-    fn clustering_coefficient(&self, parallel: bool, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (parallel=true, directed=false))]
+    fn clustering_coefficient(
+        &self,
+        parallel: bool,
+        directed: bool,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
-        let result = if parallel {
-            algorithms::clustering_coefficient_parallel(&**store, 50)
-        } else {
-            algorithms::clustering_coefficient(&**store)
+        let result = match (directed, parallel) {
+            (true, true) => {
+                algorithms::clustering_coefficient_directed_parallel(store.as_ref(), 50)
+            }
+            (true, false) => algorithms::clustering_coefficient_directed(store.as_ref()),
+            (false, true) => algorithms::clustering_coefficient_parallel(store.as_ref(), 50),
+            (false, false) => algorithms::clustering_coefficient(store.as_ref()),
         };
 
         let coefficients: HashMap<u64, f64> = result
@@ -727,8 +798,10 @@ impl PyAlgorithms {
     ///     Dict mapping node ID to triangle count
     fn triangle_count(&self) -> PyResult<HashMap<u64, u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::triangle_count(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::triangle_count(store.as_ref());
         Ok(result.into_iter().map(|(n, t)| (n.0, t)).collect())
     }
 
@@ -740,8 +813,10 @@ impl PyAlgorithms {
     ///     Total unique triangle count
     fn total_triangles(&self) -> PyResult<u64> {
         let db = self.db.read();
-        let store = db.store();
-        Ok(algorithms::total_triangles(&**store))
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        Ok(algorithms::total_triangles(store.as_ref()))
     }
 
     /// Compute the global (average) clustering coefficient.
@@ -750,8 +825,10 @@ impl PyAlgorithms {
     ///     Average clustering coefficient across all nodes (0.0 to 1.0)
     fn global_clustering_coefficient(&self) -> PyResult<f64> {
         let db = self.db.read();
-        let store = db.store();
-        Ok(algorithms::global_clustering_coefficient(&**store))
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        Ok(algorithms::global_clustering_coefficient(store.as_ref()))
     }
 
     /// Compute local clustering coefficients for each node.
@@ -760,8 +837,10 @@ impl PyAlgorithms {
     ///     Dict mapping node ID to local clustering coefficient (0.0 to 1.0)
     fn local_clustering_coefficient(&self) -> PyResult<HashMap<u64, f64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::local_clustering_coefficient(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::local_clustering_coefficient(store.as_ref());
         Ok(result.into_iter().map(|(n, c)| (n.0, c)).collect())
     }
 
@@ -775,8 +854,10 @@ impl PyAlgorithms {
     ///     List of node IDs that are articulation points
     fn articulation_points(&self) -> PyResult<Vec<u64>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::articulation_points(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::articulation_points(store.as_ref());
         Ok(result.into_iter().map(|n| n.0).collect())
     }
 
@@ -786,8 +867,10 @@ impl PyAlgorithms {
     ///     List of (source, target) tuples representing bridges
     fn bridges(&self) -> PyResult<Vec<(u64, u64)>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::bridges(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::bridges(store.as_ref());
         Ok(result.into_iter().map(|(s, t)| (s.0, t.0)).collect())
     }
 
@@ -802,8 +885,10 @@ impl PyAlgorithms {
     #[pyo3(signature = (k=None))]
     fn kcore(&self, k: Option<usize>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.db.read();
-        let store = db.store();
-        let result = algorithms::kcore_decomposition(&**store);
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
+        let result = algorithms::kcore_decomposition(store.as_ref());
 
         if let Some(k_val) = k {
             let nodes: Vec<u64> = result.k_core(k_val).into_iter().map(|n| n.0).collect();

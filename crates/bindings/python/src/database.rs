@@ -8,12 +8,134 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use pyo3::prelude::*;
+#[cfg(feature = "gql")]
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use grafeo_common::storage::{SectionMemoryConfig, SectionType, TierOverride};
-use grafeo_common::types::{EdgeId, LogicalType, NodeId, Value};
-use grafeo_engine::config::Config;
-use grafeo_engine::database::{GrafeoDB, QueryResult};
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
+use grafeo_common::types::{EdgeId, NodeId};
+use grafeo_common::types::{LogicalType, Value};
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
+use grafeo_core::graph::Direction;
+use grafeo_engine::config::{Config, GraphModel};
+use grafeo_engine::database::{GrafeoDB, OwnedRows, QueryResult};
+
+fn prepare_python_execution(
+    language: &str,
+    params: Option<&Bound<'_, pyo3::types::PyDict>>,
+    control: Option<&crate::control::PyQueryControl>,
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+) -> PyResult<(
+    HashMap<String, Value>,
+    grafeo_engine::query::ExecutionOptions,
+)> {
+    let mut values = HashMap::new();
+    if let Some(params) = params {
+        for (key, value) in params.iter() {
+            values.insert(key.extract()?, PyValue::from_py(&value)?);
+        }
+    }
+    let defaults = grafeo_engine::query::ResultLimits::default();
+    let limits = grafeo_engine::query::ResultLimits {
+        max_rows: max_rows.unwrap_or(defaults.max_rows),
+        max_bytes: max_bytes.unwrap_or(defaults.max_bytes),
+    };
+    let control = match control {
+        Some(control) => control.take_control()?,
+        None => grafeo_core::execution::QueryExecutionControl::new(),
+    };
+    Ok((
+        values,
+        grafeo_engine::query::ExecutionOptions {
+            control,
+            language: Some(language.to_owned()),
+            result_limits: Some(limits),
+            result_admission: Some(crate::query::admit_python_result),
+        },
+    ))
+}
+
+#[cfg(feature = "triple-store")]
+fn parse_python_rdf_term(s: &str) -> PyResult<grafeo_engine::Term> {
+    let s = s.trim();
+    grafeo_engine::Term::from_ntriples(s)
+        .or_else(|| {
+            if s.starts_with('"') || s.starts_with("_:") || s.starts_with('<') || s.is_empty() {
+                None
+            } else {
+                Some(grafeo_engine::Term::iri(s))
+            }
+        })
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid RDF term '{s}': expected N-Triples or a bare IRI"
+            ))
+        })
+}
+
+#[cfg(feature = "triple-store")]
+fn parse_python_rdf_quad(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    graph: Option<&str>,
+) -> PyResult<grafeo_engine::Quad> {
+    let subject_term = parse_python_rdf_term(subject)?;
+    if !subject_term.is_iri() && !subject_term.is_blank_node() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "RDF subject must be an IRI or blank node",
+        ));
+    }
+    let predicate_term = parse_python_rdf_term(predicate)?;
+    if !predicate_term.is_iri() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "RDF predicate must be an IRI",
+        ));
+    }
+    let triple =
+        grafeo_engine::Triple::new(subject_term, predicate_term, parse_python_rdf_term(object)?);
+    match graph {
+        Some(g) if !g.is_empty() => {
+            let iri = g
+                .strip_prefix('<')
+                .and_then(|inner| inner.strip_suffix('>'))
+                .unwrap_or(g);
+            Ok(grafeo_engine::Quad::named(triple, iri))
+        }
+        _ => Ok(grafeo_engine::Quad::new(triple)),
+    }
+}
+
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
+fn parse_asof_direction(direction: &str) -> PyResult<Direction> {
+    match direction {
+        "outgoing" | "out" => Ok(Direction::Outgoing),
+        "incoming" | "in" => Ok(Direction::Incoming),
+        "both" => Ok(Direction::Both),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown direction '{other}': expected 'outgoing', 'incoming', or 'both'"
+        ))),
+    }
+}
 
 /// Parses a section name string ("LpgStore", "VectorStore", etc.) into a
 /// [`SectionType`]. Returns `Err` for unknown names.
@@ -90,34 +212,63 @@ use crate::types::PyValue;
 /// [`rows()`](Self::rows) to get all data.
 #[pyclass(name = "AsyncQueryResult")]
 pub struct AsyncQueryResult {
-    #[pyo3(get)]
     columns: Vec<String>,
-    rows: Vec<Vec<Value>>,
+    rows: OwnedRows,
     #[allow(dead_code)] // Stored for future typed access; currently only raw rows exposed
     column_types: Vec<LogicalType>,
     nodes: Vec<PyNode>,
     edges: Vec<PyEdge>,
+    conversion_limit: usize,
+}
+
+impl AsyncQueryResult {
+    fn admit_conversion(&self) -> PyResult<()> {
+        let mut budget = crate::types::CopyBudget::new(self.conversion_limit);
+        budget
+            .columns(&self.columns)
+            .map_err(crate::types::copy_error)?;
+        budget
+            .list(self.rows.len())
+            .map_err(crate::types::copy_error)?;
+        for row in &self.rows {
+            budget
+                .row(&self.columns, row)
+                .map_err(crate::types::copy_error)?;
+        }
+        crate::query::admit_entity_copies(&mut budget, &self.nodes, &self.edges)
+            .map_err(crate::types::copy_error)?;
+        Ok(())
+    }
 }
 
 #[pymethods]
 impl AsyncQueryResult {
+    /// Get column names.
+    #[getter]
+    fn columns(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::types::columns_to_py_bounded(py, &self.columns, self.conversion_limit)
+    }
+
     /// Get all nodes from the result.
-    fn nodes(&self) -> Vec<PyNode> {
-        self.nodes.clone()
+    fn nodes(&self) -> PyResult<Vec<PyNode>> {
+        self.admit_conversion()?;
+        Ok(self.nodes.clone())
     }
 
     /// Get all edges from the result.
-    fn edges(&self) -> Vec<PyEdge> {
-        self.edges.clone()
+    fn edges(&self) -> PyResult<Vec<PyEdge>> {
+        self.admit_conversion()?;
+        Ok(self.edges.clone())
     }
 
     /// Get all rows as a list of lists.
     fn rows(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let list = pyo3::types::PyList::empty(py);
+        self.admit_conversion()?;
+        let list = crate::types::new_list(py)?;
         for row in &self.rows {
-            let py_row = pyo3::types::PyList::empty(py);
+            let py_row = crate::types::new_list(py)?;
             for val in row {
-                let py_val = PyValue::to_py(val, py);
+                let py_val = PyValue::to_py_admitted(val, py)?;
                 py_row.append(py_val)?;
             }
             list.append(py_row)?;
@@ -133,7 +284,7 @@ impl AsyncQueryResult {
     /// Iterate over rows.
     fn __iter__(slf: PyRef<'_, Self>) -> AsyncQueryResultIter {
         AsyncQueryResultIter {
-            rows: slf.rows.clone(),
+            owner: slf.into(),
             index: 0,
         }
     }
@@ -143,19 +294,20 @@ impl AsyncQueryResult {
     /// Requires pandas to be installed (`uv add pandas`).
     #[pyo3(signature = ())]
     fn to_pandas(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.admit_conversion()?;
         let pd = py.import("pandas").map_err(|_| {
             pyo3::exceptions::PyModuleNotFoundError::new_err(
                 "pandas is required for to_pandas(). Install it with: uv add pandas",
             )
         })?;
 
-        let data = pyo3::types::PyDict::new(py);
+        let data = crate::types::new_dict(py)?;
         for (col_idx, col_name) in self.columns.iter().enumerate() {
-            let values = pyo3::types::PyList::empty(py);
+            let values = crate::types::new_list(py)?;
             for row in &self.rows {
                 let val = row
                     .get(col_idx)
-                    .map_or_else(|| py.None(), |v| PyValue::to_py(v, py));
+                    .map_or_else(|| Ok(py.None()), |v| PyValue::to_py_admitted(v, py))?;
                 values.append(val)?;
             }
             data.set_item(col_name, values)?;
@@ -170,19 +322,20 @@ impl AsyncQueryResult {
     /// Requires polars to be installed (`uv add polars`).
     #[pyo3(signature = ())]
     fn to_polars(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.admit_conversion()?;
         let pl = py.import("polars").map_err(|_| {
             pyo3::exceptions::PyModuleNotFoundError::new_err(
                 "polars is required for to_polars(). Install it with: uv add polars",
             )
         })?;
 
-        let data = pyo3::types::PyDict::new(py);
+        let data = crate::types::new_dict(py)?;
         for (col_idx, col_name) in self.columns.iter().enumerate() {
-            let values = pyo3::types::PyList::empty(py);
+            let values = crate::types::new_list(py)?;
             for row in &self.rows {
                 let val = row
                     .get(col_idx)
-                    .map_or_else(|| py.None(), |v| PyValue::to_py(v, py));
+                    .map_or_else(|| Ok(py.None()), |v| PyValue::to_py_admitted(v, py))?;
                 values.append(val)?;
             }
             data.set_item(col_name, values)?;
@@ -192,19 +345,26 @@ impl AsyncQueryResult {
         Ok(df.unbind())
     }
 
-    fn __repr__(&self) -> String {
-        format!(
+    fn __repr__(&self) -> PyResult<String> {
+        let mut budget = crate::types::CopyBudget::new(self.conversion_limit);
+        budget.charge(512).map_err(crate::types::copy_error)?;
+        for column in &self.columns {
+            budget
+                .repeated(column.len(), 64)
+                .map_err(crate::types::copy_error)?;
+        }
+        Ok(format!(
             "AsyncQueryResult(columns={:?}, rows={})",
             self.columns,
             self.rows.len()
-        )
+        ))
     }
 }
 
 /// Iterates through async query result rows one at a time.
 #[pyclass]
 pub struct AsyncQueryResultIter {
-    rows: Vec<Vec<Value>>,
+    owner: Py<AsyncQueryResult>,
     index: usize,
 }
 
@@ -214,19 +374,25 @@ impl AsyncQueryResultIter {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> Option<Py<PyAny>> {
-        if slf.index >= slf.rows.len() {
-            return None;
-        }
-        let row = slf.rows[slf.index].clone();
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let py_row = {
+            let owner = slf.owner.bind(py).borrow();
+            let Some(row) = owner.rows.get(slf.index) else {
+                return Ok(None);
+            };
+            let mut budget = crate::types::CopyBudget::new(owner.conversion_limit);
+            budget
+                .row(&owner.columns, row)
+                .map_err(crate::types::copy_error)?;
+            let py_row = crate::types::new_list(py)?;
+            for val in row {
+                let py_val = PyValue::to_py_admitted(val, py)?;
+                py_row.append(py_val)?;
+            }
+            py_row
+        };
         slf.index += 1;
-
-        let py_row = pyo3::types::PyList::empty(py);
-        for val in &row {
-            let py_val = PyValue::to_py(val, py);
-            let _ = py_row.append(py_val);
-        }
-        Some(py_row.into())
+        Ok(Some(py_row.into()))
     }
 }
 
@@ -252,6 +418,7 @@ pub struct PyGrafeoDB {
 
 impl PyGrafeoDB {
     /// Converts an optional Python dict of property filters to a Rust HashMap.
+    #[cfg(any(feature = "vector-index", feature = "hybrid-search"))]
     fn convert_filters(
         filters: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Option<HashMap<String, Value>>> {
@@ -271,8 +438,9 @@ impl PyGrafeoDB {
     #[cfg(feature = "arrow-export")]
     fn nodes_ipc_bytes(&self) -> PyResult<Vec<u8>> {
         let db = self.inner.read();
-        let store = db.store();
-        let nodes: Vec<_> = store.all_nodes().collect();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let nodes: Vec<_> = db.iter_nodes().collect();
         grafeo_engine::database::arrow::nodes_to_ipc_stream(&nodes).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Arrow export failed: {e}"))
         })
@@ -282,8 +450,9 @@ impl PyGrafeoDB {
     #[cfg(feature = "arrow-export")]
     fn edges_ipc_bytes(&self) -> PyResult<Vec<u8>> {
         let db = self.inner.read();
-        let store = db.store();
-        let edges: Vec<_> = store.all_edges().collect();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let edges: Vec<_> = db.iter_edges().collect();
         grafeo_engine::database::arrow::edges_to_ipc_stream(&edges).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Arrow export failed: {e}"))
         })
@@ -291,39 +460,46 @@ impl PyGrafeoDB {
 
     /// Executes a query in the given language, converting Python params and
     /// extracting entities from the result.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python keyword options share one native execution owner"
+    )]
     fn execute_language_impl(
         &self,
         language: &str,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
+        py: Python<'_>,
     ) -> PyResult<PyQueryResult> {
-        let db = self.inner.read();
-        let param_map = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (key, value) in p.iter() {
-                let key_str: String = key.extract()?;
-                let val = PyValue::from_py(&value)?;
-                map.insert(key_str, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-        let mut result = db
-            .execute_language(query, language, param_map)
+        let (params, options) =
+            prepare_python_execution(language, params, control, max_rows, max_bytes)?;
+        let conversion_limit = options.result_limits.unwrap_or_default().max_bytes;
+        let mut result = py
+            .detach(|| {
+                self.inner
+                    .read()
+                    .execute_with_options(query, params, options)
+            })
             .map_err(PyGrafeoError::from)?;
-        let (nodes, edges) = extract_entities(&result, &db);
+        let db = self.inner.read();
+        let (nodes, edges) = if result.is_int64_columnar() {
+            (Vec::new(), Vec::new())
+        } else {
+            extract_entities(&result, &db)
+        };
         let columns = std::mem::take(&mut result.columns);
         let exec_time = result.execution_time_ms;
         let scanned = result.rows_scanned;
-        Ok(PyQueryResult::with_metrics(
-            columns,
-            result.into_rows(),
-            nodes,
-            edges,
-            exec_time,
-            scanned,
-        ))
+        let int64_cols = result.take_int64_cols();
+        let rows = result.into_rows().map_err(PyGrafeoError::from)?;
+        Ok(
+            PyQueryResult::with_metrics(columns, rows, nodes, edges, exec_time, scanned)
+                .with_int64_cols(int64_cols)
+                .with_conversion_limit(conversion_limit),
+        )
     }
 }
 
@@ -345,17 +521,26 @@ impl PyGrafeoDB {
     /// "VectorStore", "TextIndex", "RdfRing", "PropertyIndex".
     /// Values: "auto" (default), "force_ram", "force_disk".
     #[new]
-    #[pyo3(signature = (path=None, *, cdc=false, section_tiers=None))]
+    #[pyo3(signature = (path=None, *, cdc=false, section_tiers=None, graph_model=None))]
     fn new(
         path: Option<String>,
         cdc: bool,
         section_tiers: Option<HashMap<String, String>>,
+        graph_model: Option<String>,
     ) -> PyResult<Self> {
         let mut config = if let Some(p) = path {
             Config::persistent(p)
         } else {
             Config::in_memory()
         };
+        if let Some(model) = graph_model {
+            let parsed = GraphModel::from_name(&model).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown graph_model '{model}': expected 'lpg', 'rdf', or 'both'"
+                ))
+            })?;
+            config = config.with_graph_model(parsed);
+        }
         if cdc {
             config = config.with_cdc();
         }
@@ -459,46 +644,53 @@ impl PyGrafeoDB {
     ///
     /// Query performance metrics are available via `result.execution_time_ms`
     /// and `result.rows_scanned` properties.
-    #[pyo3(signature = (query, params=None))]
+    #[cfg(feature = "gql")]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("gql", query, params)
+        self.execute_language_impl("gql", query, params, control, max_rows, max_bytes, py)
     }
 
-    /// Runs a read-only GQL query and returns a lazy iterator.
-    ///
-    /// Iterate with ``for row in db.execute_lazy(q):``. Each row is a dict
-    /// keyed by column name, and only one chunk (~2048 rows) is held in
-    /// memory at a time. Use this when the result set is too large to
-    /// materialize, or when you want first-row latency without waiting for
-    /// the full query to finish.
-    ///
-    /// **Supported queries:** plain read patterns (MATCH / WHERE / RETURN /
-    /// LIMIT). Not supported: mutations (INSERT / DELETE / SET), queries
-    /// that require ORDER BY / aggregation / DISTINCT, EXPLAIN / PROFILE,
-    /// and SESSION/SCHEMA commands. Use ``execute()`` for those.
-    ///
-    /// **Stability:** experimental. Parameterized streaming queries are not
-    /// yet supported and will be added in a follow-up release.
-    ///
-    /// Example:
-    ///     for row in db.execute_lazy("MATCH (p:Person) RETURN p.name, p.age"):
-    ///         print(row["p.name"], row["p.age"])
+    /// Runs a read-only query with bounded native chunks and copied Python rows.
+    /// Use a context manager or close() to release the publication snapshot.
+    /// Parameters, DISTINCT and supported PROFILE queries share the eager
+    /// execution control; unsupported native stream operators return an error.
     #[cfg(feature = "gql")]
-    fn execute_lazy(&self, query: &str) -> PyResult<crate::stream::PyResultStream> {
-        let db = self.inner.read();
-        let stream = db.execute_streaming(query).map_err(PyGrafeoError::from)?;
-        // Sync graph/schema state is not needed: execute_streaming rejects the
-        // session commands that would change them. We still drop the read
-        // guard explicitly for clarity.
-        drop(db);
+    #[pyo3(signature = (query, params=None, *, control=None, max_rows=None, max_bytes=None))]
+    fn execute_lazy(
+        &self,
+        query: &str,
+        params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
+        py: Python<'_>,
+    ) -> PyResult<crate::stream::PyResultStream> {
+        let (params, mut options) =
+            prepare_python_execution("gql", params, control, max_rows, max_bytes)?;
+        let conversion_limit = options.result_limits.unwrap_or_default().max_bytes;
+        // Streaming rows are admitted by the binding on each pull. Eager
+        // mutation-result admission is a different, pre-publication boundary.
+        options.result_admission = None;
+        let stream = py
+            .detach(|| {
+                self.inner
+                    .read()
+                    .stream_with_options(query, params, options)
+            })
+            .map_err(PyGrafeoError::from)?;
         Ok(crate::stream::PyResultStream::new(
             Arc::clone(&self.inner),
             stream,
+            conversion_limit,
+            max_rows,
         ))
     }
 
@@ -510,45 +702,48 @@ impl PyGrafeoDB {
     ///
     /// Example:
     ///     result = db.execute_at_epoch("MATCH (n:Server) RETURN n.status", epoch=5)
-    #[pyo3(signature = (query, epoch, params=None))]
+    #[cfg(feature = "gql")]
+    #[pyo3(signature = (query, epoch, params=None, *, control=None, max_rows=None, max_bytes=None))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python keyword options share one native execution owner"
+    )]
     fn execute_at_epoch(
         &self,
         query: &str,
         epoch: u64,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        let db = self.inner.read();
-        let session = db.session();
-        let param_map = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (key, value) in p.iter() {
-                let key_str: String = key.extract()?;
-                let val = PyValue::from_py(&value)?;
-                map.insert(key_str, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-        let mut result = session
-            .execute_at_epoch_with_params(
-                query,
-                grafeo_common::types::EpochId::new(epoch),
-                param_map,
-            )
+        let (params, options) =
+            prepare_python_execution("gql", params, control, max_rows, max_bytes)?;
+        let conversion_limit = options.result_limits.unwrap_or_default().max_bytes;
+        let mut result = py
+            .detach(|| {
+                self.inner.read().session().execute_at_epoch_with_options(
+                    query,
+                    grafeo_common::types::EpochId::new(epoch),
+                    params,
+                    options,
+                )
+            })
             .map_err(PyGrafeoError::from)?;
-        let (nodes, edges) = extract_entities(&result, &db);
+        let (nodes, edges) = extract_entities(&result, &self.inner.read());
         let columns = std::mem::take(&mut result.columns);
         let exec_time = result.execution_time_ms;
         let scanned = result.rows_scanned;
         Ok(PyQueryResult::with_metrics(
             columns,
-            result.into_rows(),
+            result.into_rows().map_err(PyGrafeoError::from)?,
             nodes,
             edges,
             exec_time,
             scanned,
-        ))
+        )
+        .with_conversion_limit(conversion_limit))
     }
 
     /// Execute a query and return a query builder.
@@ -558,35 +753,41 @@ impl PyGrafeoDB {
 
     /// Execute a Cypher query.
     #[cfg(feature = "cypher")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_cypher(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("cypher", query, params)
+        self.execute_language_impl("cypher", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a SQL/PGQ query (SQL:2023 GRAPH_TABLE).
     #[cfg(feature = "sql-pgq")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_sql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("sql", query, params)
+        self.execute_language_impl("sql", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a GQL query asynchronously.
     ///
     /// Returns a Python awaitable that can be used with ``asyncio``.
-    /// Internally uses ``spawn_blocking`` to release the GIL while the query
-    /// runs on a thread pool, so other Python coroutines can make progress.
-    /// The underlying database I/O is synchronous: this does not use truly
-    /// non-blocking I/O, but it avoids holding the GIL during execution.
+    /// Qualified read-only ORDER BY queries schedule input/output batches and
+    /// sort finalization on the blocking pool, retaining resource and cancellation owners
+    /// across awaits. Other query shapes execute on the blocking pool in one
+    /// call. Both routes release the GIL so other coroutines can make progress.
     ///
     /// Example:
     /// ```python
@@ -598,84 +799,106 @@ impl PyGrafeoDB {
     ///
     /// asyncio.run(main())
     /// ```
-    #[pyo3(signature = (query, params=None))]
+    #[cfg(feature = "gql")]
+    #[pyo3(signature = (query, params=None, *, control=None, max_rows=None, max_bytes=None))]
     fn execute_async<'py>(
         &self,
         py: Python<'py>,
         query: String,
         params: Option<&Bound<'py, pyo3::types::PyDict>>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Convert params before the async block since they contain Python references
-        let param_map: Option<HashMap<String, Value>> = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (key, value) in p.iter() {
-                let key_str: String = key.extract()?;
-                let val = PyValue::from_py(&value)?;
-                map.insert(key_str, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-
+        let (params, options) =
+            prepare_python_execution("gql", params, control, max_rows, max_bytes)?;
+        let conversion_limit = options.result_limits.unwrap_or_default().max_bytes;
         let db = self.inner.clone();
-
         future_into_py(py, async move {
-            // Perform the query execution in the async context
-            // We use spawn_blocking since the actual db.execute is synchronous
-            let mut result = tokio::task::spawn_blocking(move || {
-                let db = db.read();
-                if let Some(params) = param_map {
-                    db.execute_with_params(&query, params)
-                } else {
-                    db.execute(&query)
+            #[cfg(feature = "async-query")]
+            let mut result = {
+                use grafeo_engine::query::executor::AsyncSortDispatch;
+
+                let dispatch = tokio::task::spawn_blocking(move || {
+                    let dispatch = db
+                        .read()
+                        .execute_or_prepare_async_sort(&query, params, options)?;
+                    Ok::<_, grafeo_common::utils::error::Error>(match dispatch {
+                        AsyncSortDispatch::Completed(result) => {
+                            AsyncSortDispatch::Completed(result)
+                        }
+                        AsyncSortDispatch::Prepared(prepared) => {
+                            AsyncSortDispatch::Prepared(prepared.retain_database_owner(db))
+                        }
+                    })
+                })
+                .await
+                .map_err(|error| PyGrafeoError::database(error.to_string()))?
+                .map_err(PyGrafeoError::from)?;
+                match dispatch {
+                    AsyncSortDispatch::Completed(result) => result,
+                    AsyncSortDispatch::Prepared(prepared) => {
+                        prepared.execute().await.map_err(PyGrafeoError::from)?
+                    }
                 }
+            };
+            #[cfg(not(feature = "async-query"))]
+            let mut result = tokio::task::spawn_blocking(move || {
+                db.read().execute_with_options(&query, params, options)
             })
             .await
-            .map_err(|e| PyGrafeoError::database(e.to_string()))?
+            .map_err(|error| PyGrafeoError::database(error.to_string()))?
             .map_err(PyGrafeoError::from)?;
-
-            // Extract entities before consuming the result rows.
-            // Entity extraction only inspects Value::Map markers, no Python needed.
-            let (nodes, edges) = grafeo_bindings_common::entity::extract_and_map(
-                &result,
-                |n| PyNode::new(n.id, n.labels, n.properties),
-                |e| PyEdge::new(e.id, e.edge_type, e.source_id, e.target_id, e.properties),
-            );
+            let (nodes, edges) = if result.is_int64_columnar() {
+                (Vec::new(), Vec::new())
+            } else {
+                grafeo_bindings_common::entity::extract_and_map(
+                    &result,
+                    |n| PyNode::new(n.id, n.labels, n.properties),
+                    |e| PyEdge::new(e.id, e.edge_type, e.source_id, e.target_id, e.properties),
+                )
+            };
             let columns = std::mem::take(&mut result.columns);
             let column_types = std::mem::take(&mut result.column_types);
             Ok(AsyncQueryResult {
                 columns,
-                rows: result.into_rows(),
+                rows: result.into_rows().map_err(PyGrafeoError::from)?,
                 column_types,
                 nodes,
                 edges,
+                conversion_limit,
             })
         })
     }
 
     /// Execute a Gremlin query.
     #[cfg(feature = "gremlin")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_gremlin(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("gremlin", query, params)
+        self.execute_language_impl("gremlin", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a GraphQL query.
     #[cfg(feature = "graphql")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_graphql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("graphql", query, params)
+        self.execute_language_impl("graphql", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a SPARQL query against the RDF triple store.
@@ -685,78 +908,142 @@ impl PyGrafeoDB {
     /// Example:
     ///     result = db.execute_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
     #[cfg(feature = "sparql")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_sparql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("sparql", query, params)
+        self.execute_language_impl("sparql", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Return the physical execution plan for a SPARQL query without executing it.
     ///
     /// Equivalent to ``db.execute_sparql("EXPLAIN " + query)``.
     #[cfg(feature = "sparql")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn explain_sparql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("sparql", &format!("EXPLAIN {query}"), params)
+        self.execute_language_impl(
+            "sparql",
+            &format!("EXPLAIN {query}"),
+            params,
+            control,
+            max_rows,
+            max_bytes,
+            py,
+        )
     }
 
     /// Return the physical execution plan for a GQL query without executing it.
     ///
     /// Equivalent to ``db.execute("EXPLAIN " + query)``.
-    #[pyo3(signature = (query, params=None))]
+    #[cfg(feature = "gql")]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn explain(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("gql", &format!("EXPLAIN {query}"), params)
+        self.execute_language_impl(
+            "gql",
+            &format!("EXPLAIN {query}"),
+            params,
+            control,
+            max_rows,
+            max_bytes,
+            py,
+        )
     }
 
     /// Return the physical execution plan for a Cypher query without executing it.
     ///
     /// Equivalent to ``db.execute_cypher("EXPLAIN " + query)``.
     #[cfg(feature = "cypher")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn explain_cypher(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("cypher", &format!("EXPLAIN {query}"), params)
+        self.execute_language_impl(
+            "cypher",
+            &format!("EXPLAIN {query}"),
+            params,
+            control,
+            max_rows,
+            max_bytes,
+            py,
+        )
     }
 
     /// Return the physical execution plan for a SQL/PGQ query without executing it.
     ///
     /// Equivalent to ``db.execute_sql("EXPLAIN " + query)``.
     #[cfg(feature = "sql-pgq")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn explain_sql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("sql", &format!("EXPLAIN {query}"), params)
+        self.execute_language_impl(
+            "sql",
+            &format!("EXPLAIN {query}"),
+            params,
+            control,
+            max_rows,
+            max_bytes,
+            py,
+        )
     }
 
     /// Return the physical execution plan for a Gremlin query without executing it.
     ///
     /// Equivalent to ``db.execute_gremlin("EXPLAIN " + query)``.
     #[cfg(feature = "gremlin")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn explain_gremlin(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("gremlin", &format!("EXPLAIN {query}"), params)
+        self.execute_language_impl(
+            "gremlin",
+            &format!("EXPLAIN {query}"),
+            params,
+            control,
+            max_rows,
+            max_bytes,
+            py,
+        )
     }
 
     /// Validate the default graph against SHACL shapes in a named graph.
@@ -807,59 +1094,138 @@ impl PyGrafeoDB {
     }
 
     /// Execute a query in a named language (e.g. `"graphql-rdf"`).
-    #[pyo3(signature = (language, query, params=None))]
+    #[pyo3(signature = (language, query, params=None , *, control=None, max_rows=None, max_bytes=None))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python keyword options share one native execution owner"
+    )]
     fn execute_language(
         &self,
         language: &str,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl(language, query, params)
+        self.execute_language_impl(language, query, params, control, max_rows, max_bytes, py)
+    }
+
+    /// Graph model this database was created with: `"lpg"`, `"rdf"`, or `"both"`.
+    fn graph_model(&self) -> &'static str {
+        self.inner.read().graph_model().as_name()
+    }
+
+    /// Insert one RDF quad. Terms are N-Triples or bare IRIs.
+    ///
+    /// Returns ``(inserted, epoch)``. ``graph=None`` is the default graph.
+    #[cfg(feature = "triple-store")]
+    #[pyo3(signature = (subject, predicate, object, graph=None))]
+    fn insert_rdf_quad(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        graph: Option<&str>,
+    ) -> PyResult<(usize, u64)> {
+        let quad = parse_python_rdf_quad(subject, predicate, object, graph)?;
+        let db = self.inner.read();
+        let (n, epoch) = db.insert_rdf_quads([quad]).map_err(PyGrafeoError::from)?;
+        Ok((n, epoch.as_u64()))
+    }
+
+    /// Bulk-insert RDF quads. Each item is ``(subject, predicate, object)`` or
+    /// ``(subject, predicate, object, graph)``.
+    ///
+    /// Returns ``(inserted, epoch)``.
+    #[cfg(feature = "triple-store")]
+    fn insert_rdf_quads(
+        &self,
+        quads: Vec<(String, String, String, Option<String>)>,
+    ) -> PyResult<(usize, u64)> {
+        let parsed: Vec<grafeo_engine::Quad> = quads
+            .iter()
+            .map(|(s, p, o, g)| parse_python_rdf_quad(s, p, o, g.as_deref()))
+            .collect::<PyResult<_>>()?;
+        let db = self.inner.read();
+        let (n, epoch) = db.insert_rdf_quads(parsed).map_err(PyGrafeoError::from)?;
+        Ok((n, epoch.as_u64()))
+    }
+
+    /// Exact typed-quad membership (lexical form + datatype + graph).
+    #[cfg(feature = "triple-store")]
+    #[pyo3(signature = (subject, predicate, object, graph=None))]
+    fn contains_rdf_quad(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        graph: Option<&str>,
+    ) -> PyResult<bool> {
+        let quad = parse_python_rdf_quad(subject, predicate, object, graph)?;
+        Ok(self
+            .inner
+            .read()
+            .try_contains_rdf_quad(&quad)
+            .map_err(PyGrafeoError::from)?)
     }
 
     /// Create a node.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = (labels, properties=None))]
     fn create_node(
         &self,
-        labels: Vec<String>,
+        mut labels: Vec<String>,
         properties: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<PyNode> {
         let db = self.inner.read();
+        let session = db.session();
 
         // Convert labels from Vec<String> to Vec<&str>
+        labels.sort_unstable();
+        labels.dedup();
         let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
 
-        // Create node with or without properties
-        let id = if let Some(p) = properties {
-            // Convert properties
-            let mut props: Vec<(
-                grafeo_common::types::PropertyKey,
-                grafeo_common::types::Value,
-            )> = Vec::new();
+        let mut props: Vec<(
+            grafeo_common::types::PropertyKey,
+            grafeo_common::types::Value,
+        )> = Vec::new();
+        if let Some(p) = properties {
             for (key, value) in p.iter() {
                 let key_str: String = key.extract()?;
                 let val = PyValue::from_py(&value)?;
                 props.push((grafeo_common::types::PropertyKey::new(key_str), val));
             }
-            db.create_node_with_props(&label_refs, props)
-        } else {
-            db.create_node(&label_refs)
-        };
-
-        // Fetch the node back to get the full representation
-        if let Some(node) = db.get_node(id) {
-            let labels: Vec<String> = node.labels.iter().map(|s| s.to_string()).collect();
-            let properties: HashMap<
-                grafeo_common::types::PropertyKey,
-                grafeo_common::types::Value,
-            > = node.properties.into_iter().collect();
-            Ok(PyNode::new(id, labels, properties))
-        } else {
-            Err(PyGrafeoError::database("Failed to create node").into())
         }
+        let id = session
+            .create_node_with_props(
+                &label_refs,
+                props
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.clone())),
+            )
+            .map_err(PyGrafeoError::from)?;
+        // Return the committed creation image without resolving the graph again.
+        // Null removes a property in storage; do not return it as a retained key.
+        props.retain(|(_, value)| !matches!(value, grafeo_common::types::Value::Null));
+        Ok(PyNode::new(id, labels, props.into_iter().collect()))
     }
 
     /// Create an edge between two nodes.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = (source_id, target_id, edge_type, properties=None))]
     fn create_edge(
         &self,
@@ -869,45 +1235,49 @@ impl PyGrafeoDB {
         properties: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<PyEdge> {
         let db = self.inner.read();
+        let session = db.session();
         let src = NodeId(source_id);
         let dst = NodeId(target_id);
 
-        // Create edge with or without properties
-        let id = if let Some(p) = properties {
-            // Convert properties
-            let mut props: Vec<(
-                grafeo_common::types::PropertyKey,
-                grafeo_common::types::Value,
-            )> = Vec::new();
+        let mut props: Vec<(
+            grafeo_common::types::PropertyKey,
+            grafeo_common::types::Value,
+        )> = Vec::new();
+        if let Some(p) = properties {
             for (key, value) in p.iter() {
                 let key_str: String = key.extract()?;
                 let val = PyValue::from_py(&value)?;
                 props.push((grafeo_common::types::PropertyKey::new(key_str), val));
             }
-            db.create_edge_with_props(src, dst, &edge_type, props)
-        } else {
-            db.create_edge(src, dst, &edge_type)
-        };
-
-        // Fetch the edge back to get the full representation
-        if let Some(edge) = db.get_edge(id) {
-            let properties: HashMap<
-                grafeo_common::types::PropertyKey,
-                grafeo_common::types::Value,
-            > = edge.properties.into_iter().collect();
-            Ok(PyEdge::new(
-                id,
-                edge.edge_type.to_string(),
-                edge.src,
-                edge.dst,
-                properties,
-            ))
-        } else {
-            Err(PyGrafeoError::database("Failed to create edge").into())
         }
+        let id = session
+            .create_edge_with_props(
+                src,
+                dst,
+                &edge_type,
+                props
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.clone())),
+            )
+            .map_err(PyGrafeoError::from)?;
+        props.retain(|(_, value)| !matches!(value, grafeo_common::types::Value::Null));
+        Ok(PyEdge::new(
+            id,
+            edge_type,
+            src,
+            dst,
+            props.into_iter().collect(),
+        ))
     }
 
     /// Get a node by ID.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_node(&self, id: u64) -> PyResult<Option<PyNode>> {
         let db = self.inner.read();
         let node_id = NodeId(id);
@@ -925,6 +1295,13 @@ impl PyGrafeoDB {
     }
 
     /// Get an edge by ID.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_edge(&self, id: u64) -> PyResult<Option<PyEdge>> {
         let db = self.inner.read();
         let edge_id = EdgeId(id);
@@ -952,6 +1329,13 @@ impl PyGrafeoDB {
     /// properties and labels at that point in time.
     ///
     /// Returns None if the node didn't exist at that epoch.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_node_at_epoch(&self, id: u64, epoch: u64) -> PyResult<Option<PyNode>> {
         let db = self.inner.read();
         let node_id = NodeId(id);
@@ -975,6 +1359,13 @@ impl PyGrafeoDB {
     /// properties at that point in time.
     ///
     /// Returns None if the edge didn't exist at that epoch.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_edge_at_epoch(&self, id: u64, epoch: u64) -> PyResult<Option<PyEdge>> {
         let db = self.inner.read();
         let edge_id = EdgeId(id);
@@ -997,11 +1388,188 @@ impl PyGrafeoDB {
         }
     }
 
+    /// Whole-state as-of scrub: node frames plus edge frames at ``epoch``.
+    ///
+    /// Returns
+    /// ``{"nodes": [node_frame, ...], "edges": [edge_frame, ...]}``.
+    ///
+    /// Each node frame is
+    /// ``{"label": str, "node_ids": list[int], "columns": {prop: [value | None, ...]}}``.
+    /// Each edge frame is
+    /// ``{"edge_type": str, "edge_ids": list[int], "src_ids": list[int],
+    /// "dst_ids": list[int], "columns": {prop: [value | None, ...]}}``.
+    /// Columns are aligned to the id list by index (``None`` means the
+    /// property was absent at ``epoch``).
+    ///
+    /// ``epoch == 2**64 - 1`` (``EpochId::PENDING``) is the current snapshot
+    /// (derived open CSR). Requires a compacted database (after
+    /// :meth:`compact`); returns empty ``nodes`` / ``edges`` lists when
+    /// nothing has been compacted yet.
+    #[cfg(feature = "compact-store")]
+    fn scrub_at_epoch(&self, py: Python<'_>, epoch: u64) -> PyResult<Py<PyAny>> {
+        let db = self.inner.read();
+        let epoch_id = grafeo_common::types::EpochId::new(epoch);
+        let scrub = db.scrub_at_epoch(epoch_id);
+
+        let nodes = pyo3::types::PyList::empty(py);
+        for frame in &scrub.nodes {
+            let frame_dict = pyo3::types::PyDict::new(py);
+            frame_dict.set_item("label", frame.label.as_str())?;
+
+            let node_ids: Vec<u64> = frame.node_ids.iter().map(|n| n.as_u64()).collect();
+            frame_dict.set_item("node_ids", node_ids)?;
+
+            let columns = pyo3::types::PyDict::new(py);
+            for (key, values) in &frame.columns {
+                let col = pyo3::types::PyList::empty(py);
+                for v in values {
+                    let py_val = v
+                        .as_ref()
+                        .map_or_else(|| Ok(py.None()), |val| PyValue::to_py(val, py))?;
+                    col.append(py_val)?;
+                }
+                columns.set_item(key.as_str(), col)?;
+            }
+            frame_dict.set_item("columns", columns)?;
+            nodes.append(frame_dict)?;
+        }
+
+        let edges = pyo3::types::PyList::empty(py);
+        for frame in &scrub.edges {
+            let frame_dict = pyo3::types::PyDict::new(py);
+            frame_dict.set_item("edge_type", frame.edge_type.as_str())?;
+            let edge_ids: Vec<u64> = frame.edge_ids.iter().map(|e| e.as_u64()).collect();
+            let src_ids: Vec<u64> = frame.src_ids.iter().map(|n| n.as_u64()).collect();
+            let dst_ids: Vec<u64> = frame.dst_ids.iter().map(|n| n.as_u64()).collect();
+            frame_dict.set_item("edge_ids", edge_ids)?;
+            frame_dict.set_item("src_ids", src_ids)?;
+            frame_dict.set_item("dst_ids", dst_ids)?;
+
+            let columns = pyo3::types::PyDict::new(py);
+            for (key, values) in &frame.columns {
+                let col = pyo3::types::PyList::empty(py);
+                for v in values {
+                    let py_val = v
+                        .as_ref()
+                        .map_or_else(|| Ok(py.None()), |val| PyValue::to_py(val, py))?;
+                    col.append(py_val)?;
+                }
+                columns.set_item(key.as_str(), col)?;
+            }
+            frame_dict.set_item("columns", columns)?;
+            edges.append(frame_dict)?;
+        }
+
+        let out = pyo3::types::PyDict::new(py);
+        out.set_item("nodes", nodes)?;
+        out.set_item("edges", edges)?;
+        Ok(out.unbind().into_any())
+    }
+
+    /// Neighbors of ``node_id`` visible at ``epoch``.
+    ///
+    /// ``epoch is None`` (or ``2**64 - 1``) is the current 1-hop
+    /// (``EpochId::PENDING`` == derived open CSR). ``direction`` is
+    /// ``"outgoing"`` (default), ``"incoming"``, or ``"both"``.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    #[pyo3(signature = (node_id, epoch=None, direction="outgoing"))]
+    fn neighbors_at_epoch(
+        &self,
+        node_id: u64,
+        epoch: Option<u64>,
+        direction: &str,
+    ) -> PyResult<Vec<u64>> {
+        let dir = parse_asof_direction(direction)?;
+        let epoch_id = epoch.map_or(grafeo_common::types::EpochId::PENDING, |e| {
+            grafeo_common::types::EpochId::new(e)
+        });
+        let db = self.inner.read();
+        Ok(db
+            .neighbors_at_epoch(NodeId(node_id), dir, epoch_id)
+            .into_iter()
+            .map(|n| n.as_u64())
+            .collect())
+    }
+
+    /// Every edge visible at ``epoch`` (``None`` / ``2**64 - 1`` = current).
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    #[pyo3(signature = (epoch=None))]
+    fn edges_at_epoch(&self, epoch: Option<u64>) -> PyResult<Vec<PyEdge>> {
+        let epoch_id = epoch.map_or(grafeo_common::types::EpochId::PENDING, |e| {
+            grafeo_common::types::EpochId::new(e)
+        });
+        let db = self.inner.read();
+        Ok(db
+            .edges_at_epoch(epoch_id)
+            .into_iter()
+            .map(|edge| {
+                let properties: HashMap<
+                    grafeo_common::types::PropertyKey,
+                    grafeo_common::types::Value,
+                > = edge.properties.into_iter().collect();
+                PyEdge::new(
+                    edge.id,
+                    edge.edge_type.to_string(),
+                    edge.src,
+                    edge.dst,
+                    properties,
+                )
+            })
+            .collect())
+    }
+
+    /// Every node visible at ``epoch`` (``None`` / ``2**64 - 1`` = current).
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    #[pyo3(signature = (epoch=None))]
+    fn nodes_at_epoch(&self, epoch: Option<u64>) -> PyResult<Vec<PyNode>> {
+        let epoch_id = epoch.map_or(grafeo_common::types::EpochId::PENDING, |e| {
+            grafeo_common::types::EpochId::new(e)
+        });
+        let db = self.inner.read();
+        Ok(db
+            .nodes_at_epoch(epoch_id)
+            .into_iter()
+            .map(|node| {
+                let labels: Vec<String> = node.labels.iter().map(|s| s.to_string()).collect();
+                let properties: HashMap<
+                    grafeo_common::types::PropertyKey,
+                    grafeo_common::types::Value,
+                > = node.properties.into_iter().collect();
+                PyNode::new(node.id, labels, properties)
+            })
+            .collect())
+    }
+
     /// Get the version history of a node.
     ///
     /// Returns a list of (created_epoch, deleted_epoch, node) tuples
     /// representing each version of the node. When the `temporal` feature
     /// is enabled, each version includes the correct properties at that epoch.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_node_history(&self, id: u64) -> PyResult<Vec<(u64, Option<u64>, PyNode)>> {
         let db = self.inner.read();
         let node_id = NodeId(id);
@@ -1026,6 +1594,13 @@ impl PyGrafeoDB {
     /// Get the version history of an edge.
     ///
     /// Returns a list of (created_epoch, deleted_epoch, edge) tuples.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_edge_history(&self, id: u64) -> PyResult<Vec<(u64, Option<u64>, PyEdge)>> {
         let db = self.inner.read();
         let edge_id = EdgeId(id);
@@ -1057,52 +1632,68 @@ impl PyGrafeoDB {
     /// Returns the property value as it existed at the given epoch,
     /// or None if the property didn't exist at that epoch.
     ///
-    /// Requires the `temporal` feature.
-    #[cfg(feature = "temporal")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_node_property_at_epoch(
         &self,
         id: u64,
         key: &str,
         epoch: u64,
         py: Python<'_>,
-    ) -> Option<Py<PyAny>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let db = self.inner.read();
         let node_id = NodeId(id);
         let epoch_id = grafeo_common::types::EpochId::new(epoch);
         db.get_node_property_at_epoch(node_id, key, epoch_id)
             .map(|v| PyValue::to_py(&v, py))
+            .transpose()
     }
 
     /// Get the full version history for a specific property of a node.
     ///
     /// Returns a list of (epoch, value) tuples in ascending epoch order.
-    /// Requires the `temporal` feature.
-    #[cfg(feature = "temporal")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_node_property_history(
         &self,
         id: u64,
         key: &str,
         py: Python<'_>,
-    ) -> Vec<(u64, Py<PyAny>)> {
+    ) -> PyResult<Vec<(u64, Py<PyAny>)>> {
         let db = self.inner.read();
         let node_id = NodeId(id);
         let history = db.get_node_property_history(node_id, key);
         history
             .into_iter()
-            .map(|(epoch, value)| (epoch.as_u64(), PyValue::to_py(&value, py)))
+            .map(|(epoch, value)| Ok((epoch.as_u64(), PyValue::to_py(&value, py)?)))
             .collect()
     }
 
     /// Get the full version history for ALL properties of a node.
     ///
     /// Returns a dict mapping property names to lists of (epoch, value) tuples.
-    /// Requires the `temporal` feature.
-    #[cfg(feature = "temporal")]
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_all_node_property_history(
         &self,
         id: u64,
         py: Python<'_>,
-    ) -> HashMap<String, Vec<(u64, Py<PyAny>)>> {
+    ) -> PyResult<HashMap<String, Vec<(u64, Py<PyAny>)>>> {
         let db = self.inner.read();
         let node_id = NodeId(id);
         let history = db.get_all_node_property_history(node_id);
@@ -1110,16 +1701,19 @@ impl PyGrafeoDB {
         for (key, entries) in history {
             let py_entries: Vec<(u64, Py<PyAny>)> = entries
                 .into_iter()
-                .map(|(epoch, value)| (epoch.as_u64(), PyValue::to_py(&value, py)))
-                .collect();
+                .map(|(epoch, value)| Ok((epoch.as_u64(), PyValue::to_py(&value, py)?)))
+                .collect::<PyResult<_>>()?;
             result.insert(key.to_string(), py_entries);
         }
-        result
+        Ok(result)
     }
 
     /// Returns the current epoch of the database.
     ///
-    /// The epoch increments with each committed transaction.
+    /// Transactions and standalone metadata publications, including catalog
+    /// and projection declarations, share this ordered identity space. Failed
+    /// durable publications may leave intentional gaps, so the value is not a
+    /// transaction count.
     fn current_epoch(&self) -> u64 {
         self.inner.read().current_epoch().as_u64()
     }
@@ -1151,6 +1745,13 @@ impl PyGrafeoDB {
     ///
     /// Returns:
     ///     List of (node_id, properties_dict) tuples
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = (label, limit=None, offset=0))]
     fn get_nodes_by_label(
         &self,
@@ -1160,9 +1761,12 @@ impl PyGrafeoDB {
         offset: usize,
     ) -> PyResult<Vec<(u64, Py<pyo3::types::PyDict>)>> {
         let db = self.inner.read();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
 
         // Get node IDs by label
-        let all_node_ids = db.store().nodes_by_label(label);
+        let all_node_ids = store.nodes_by_label(label);
 
         // Apply offset
         let node_ids = if offset >= all_node_ids.len() {
@@ -1178,14 +1782,14 @@ impl PyGrafeoDB {
         };
 
         // Batch get all properties
-        let props_batch = db.store().get_nodes_properties_batch(node_ids);
+        let props_batch = store.get_nodes_properties_batch(node_ids);
 
         // Convert to Python
         let mut results = Vec::with_capacity(node_ids.len());
         for (node_id, props) in node_ids.iter().zip(props_batch) {
             let py_dict = pyo3::types::PyDict::new(py);
             for (key, value) in props {
-                py_dict.set_item(key.as_str(), PyValue::to_py(&value, py))?;
+                py_dict.set_item(key.as_str(), PyValue::to_py(&value, py)?)?;
             }
             results.push((node_id.0, py_dict.into()));
         }
@@ -1207,6 +1811,13 @@ impl PyGrafeoDB {
     ///     if age is not None:
     ///         print(f"Node {node_id} is {age} years old")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_property_batch(
         &self,
         py: Python<'_>,
@@ -1214,35 +1825,60 @@ impl PyGrafeoDB {
         property: &str,
     ) -> PyResult<Vec<Option<Py<pyo3::prelude::PyAny>>>> {
         let db = self.inner.read();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
+        let store = db.graph_store();
         let ids: Vec<NodeId> = node_ids.into_iter().map(NodeId).collect();
         let key = grafeo_common::types::PropertyKey::new(property);
-        let values = db.store().get_node_property_batch(&ids, &key);
+        let values = store.get_node_property_batch(&ids, &key);
 
-        Ok(values
+        values
             .into_iter()
-            .map(|opt| opt.map(|v| PyValue::to_py(&v, py)))
-            .collect())
+            .map(|opt| opt.map(|v| PyValue::to_py(&v, py)).transpose())
+            .collect()
     }
 
     /// Delete a node by ID.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn delete_node(&self, id: u64) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.delete_node(NodeId(id)))
     }
 
     /// Delete an edge by ID.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn delete_edge(&self, id: u64) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.delete_edge(EdgeId(id)))
     }
 
     /// Set a property on a node.
+    /// Raises GrafeoError if the node is missing or the write is rejected.
     ///
     /// Example:
     /// ```python
     /// db.set_node_property(node_id, "name", "Alix")
     /// db.set_node_property(node_id, "age", 30)
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn set_node_property(
         &self,
         node_id: u64,
@@ -1251,7 +1887,8 @@ impl PyGrafeoDB {
     ) -> PyResult<()> {
         let db = self.inner.read();
         let val = PyValue::from_py(value)?;
-        db.set_node_property(NodeId(node_id), key, val);
+        db.set_node_property(NodeId(node_id), key, val)
+            .map_err(PyGrafeoError::from)?;
         Ok(())
     }
 
@@ -1265,6 +1902,13 @@ impl PyGrafeoDB {
     /// alix = db.create_node(["Person"], {"name": "Alix"})
     /// db.add_node_label(alix.id, "Employee")  # Now has Person and Employee
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn add_node_label(&self, node_id: u64, label: &str) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.add_node_label(NodeId(node_id), label))
@@ -1279,6 +1923,13 @@ impl PyGrafeoDB {
     /// ```python
     /// db.remove_node_label(alix.id, "Contractor")  # Remove Contractor label
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn remove_node_label(&self, node_id: u64, label: &str) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.remove_node_label(NodeId(node_id), label))
@@ -1294,18 +1945,33 @@ impl PyGrafeoDB {
     /// if labels:
     ///     print(f"Alix has labels: {labels}")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn get_node_labels(&self, node_id: u64) -> PyResult<Option<Vec<String>>> {
         let db = self.inner.read();
         Ok(db.get_node_labels(NodeId(node_id)))
     }
 
     /// Set a property on an edge.
+    /// Raises GrafeoError if the edge is missing or the write is rejected.
     ///
     /// Example:
     /// ```python
     /// db.set_edge_property(edge_id, "weight", 1.5)
     /// db.set_edge_property(edge_id, "since", "2024-01-01")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn set_edge_property(
         &self,
         edge_id: u64,
@@ -1314,7 +1980,8 @@ impl PyGrafeoDB {
     ) -> PyResult<()> {
         let db = self.inner.read();
         let val = PyValue::from_py(value)?;
-        db.set_edge_property(EdgeId(edge_id), key, val);
+        db.set_edge_property(EdgeId(edge_id), key, val)
+            .map_err(PyGrafeoError::from)?;
         Ok(())
     }
 
@@ -1327,6 +1994,13 @@ impl PyGrafeoDB {
     /// if db.remove_node_property(node_id, "deprecated_field"):
     ///     print("Property removed")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn remove_node_property(&self, node_id: u64, key: &str) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.remove_node_property(NodeId(node_id), key))
@@ -1341,6 +2015,13 @@ impl PyGrafeoDB {
     /// if db.remove_edge_property(edge_id, "temporary"):
     ///     print("Property removed")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn remove_edge_property(&self, edge_id: u64, key: &str) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.remove_edge_property(EdgeId(edge_id), key))
@@ -1350,113 +2031,189 @@ impl PyGrafeoDB {
     // PROPERTY INDEX API
     // =========================================================================
 
-    /// Create an index on a node property for O(1) lookups.
+    /// Create a graph-qualified index and return its committed owner ID.
     ///
-    /// After creating an index, queries that filter by this property will be
-    /// significantly faster. The index is automatically maintained when
-    /// properties are set or removed.
-    ///
-    /// Example:
-    /// ```python
-    /// # Create index on 'email' property
-    /// db.create_property_index("email")
-    ///
-    /// # Now lookups by email are O(1) instead of O(n)
-    /// nodes = db.find_nodes_by_property("email", "alix@example.com")
-    /// ```
-    fn create_property_index(&self, property: &str) -> PyResult<()> {
-        let db = self.inner.read();
-        db.create_property_index(property);
-        Ok(())
-    }
-
-    /// Create a vector similarity index on a node property.
-    ///
-    /// Enables efficient similarity search on vector embeddings.
-    ///
-    /// Args:
-    ///     label: Node label to index (e.g., "Doc")
-    ///     property: Property containing vectors (e.g., "embedding")
-    ///     dimensions: Expected vector dimensions (inferred if not given)
-    ///     metric: Distance metric - "cosine" (default), "euclidean", "dot_product", "manhattan"
-    ///     m: HNSW links per node (default: 16). Higher = better recall, more memory.
-    ///     ef_construction: Construction beam width (default: 128). Higher = better quality, slower build.
-    ///     quantization: Quantization mode - None (default), "scalar", "binary", or "product".
-    ///         Quantized indexes use less memory at the cost of slightly lower recall.
+    /// `kind` is "property", "btree", "text", or "vector". Text/vector
+    /// require `label`; property/btree must omit it. `graph` is an array
+    /// of path components: [] is root, [""] is an empty child, and ["a/b"]
+    /// is distinct from ["a", "b"]. Omitted names receive a checked name.
+    /// Vector-only keywords: dimensions, metric, m, ef, ef_construction,
+    /// quantization. Unsupported features and invalid options raise errors.
     ///
     /// Example:
-    ///     db.create_node(['Doc'], {'embedding': [1.0, 0.0, 0.0]})
-    ///     db.create_vector_index("Doc", "embedding", metric="cosine", m=32, ef_construction=200)
-    ///     db.create_vector_index("Doc", "embedding", quantization="scalar")
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (label, property, dimensions=None, metric=None, m=None, ef_construction=None, quantization=None))]
-    fn create_vector_index(
+    ///     owner = db.create_index("embedding", kind="vector", label="Doc", dimensions=3)
+    ///     db.rebuild_index(owner)
+    ///     db.drop_index(owner)
+    ///     text = db.create_index("body", kind="text", label="Doc", min_token_length=3)
+    /// Text min_token_length defaults to 2; explicit zero is valid.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    #[pyo3(signature = (property, *, kind="property", graph=None, name=None, label=None, **options))]
+    fn create_index(
         &self,
-        label: &str,
         property: &str,
-        dimensions: Option<usize>,
-        metric: Option<&str>,
-        m: Option<usize>,
-        ef_construction: Option<usize>,
-        quantization: Option<&str>,
-    ) -> PyResult<()> {
-        let db = self.inner.read();
-        db.create_vector_index(
-            label,
-            property,
-            dimensions,
-            metric,
-            m,
-            ef_construction,
-            quantization,
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        kind: &str,
+        graph: Option<Vec<String>>,
+        name: Option<String>,
+        label: Option<String>,
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<u32> {
+        use grafeo_common::types::GraphPath;
+        use grafeo_engine::{CreateIndexRequest, IndexCreateKind};
+        use pyo3::exceptions::PyValueError;
+
+        if let Some(options) = options {
+            for (key, value) in options.iter() {
+                let key: String = key.extract()?;
+                if !matches!(
+                    key.as_str(),
+                    "dimensions"
+                        | "metric"
+                        | "m"
+                        | "ef"
+                        | "ef_construction"
+                        | "quantization"
+                        | "min_token_length"
+                ) {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown index option '{key}'"
+                    )));
+                }
+                if !value.is_none() {
+                    if key == "min_token_length" && kind != "text" {
+                        return Err(PyValueError::new_err(
+                            "min_token_length requires kind='text'",
+                        ));
+                    }
+                    if key != "min_token_length" && kind != "vector" {
+                        return Err(PyValueError::new_err(
+                            "vector options require kind='vector'",
+                        ));
+                    }
+                }
+            }
+        }
+        let get = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+            match options {
+                Some(options) => Ok(options.get_item(key)?.filter(|value| !value.is_none())),
+                None => Ok(None),
+            }
+        };
+        let kind = match kind {
+            "property" => IndexCreateKind::Property,
+            "btree" => IndexCreateKind::BTree,
+            "text" => IndexCreateKind::Text {
+                min_token_length: get("min_token_length")?
+                    .map(|value| {
+                        if value.is_instance_of::<pyo3::types::PyBool>() {
+                            return Err(pyo3::exceptions::PyTypeError::new_err(
+                                "min_token_length must be a nonnegative integer, not bool",
+                            ));
+                        }
+                        value.extract::<usize>()
+                    })
+                    .transpose()?,
+            },
+            "vector" => IndexCreateKind::Vector {
+                dimensions: get("dimensions")?
+                    .map(|value| value.extract::<usize>())
+                    .transpose()?,
+                metric: get("metric")?
+                    .map(|value| value.extract::<String>())
+                    .transpose()?,
+                m: get("m")?
+                    .map(|value| value.extract::<usize>())
+                    .transpose()?,
+                ef: get("ef")?
+                    .map(|value| {
+                        if value.is_instance_of::<pyo3::types::PyBool>() {
+                            return Err(pyo3::exceptions::PyTypeError::new_err(
+                                "ef must be a positive integer, not bool",
+                            ));
+                        }
+                        let ef = value.extract::<usize>()?;
+                        if ef == 0 {
+                            return Err(pyo3::exceptions::PyValueError::new_err(
+                                "ef must be a positive integer",
+                            ));
+                        }
+                        Ok(ef)
+                    })
+                    .transpose()?,
+                ef_construction: get("ef_construction")?
+                    .map(|value| value.extract::<usize>())
+                    .transpose()?,
+                quantization: get("quantization")?
+                    .map(|value| value.extract::<String>())
+                    .transpose()?,
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown index kind '{other}'"
+                )));
+            }
+        };
+        let components: Vec<&str> = graph
+            .as_deref()
+            .map_or(&[][..], |path| path)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let graph = GraphPath::from_components(&components)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.inner
+            .read()
+            .create_index(CreateIndexRequest {
+                graph,
+                name,
+                label,
+                property: property.to_owned(),
+                kind,
+            })
+            .map(|owner| owner.as_u32())
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
     }
 
-    /// Drop a vector index for the given label and property.
-    ///
-    /// Returns True if the index existed and was removed, False if not found.
-    ///
-    /// Args:
-    ///     label: Node label of the index
-    ///     property: Property name of the index
-    ///
-    /// Example:
-    ///     removed = db.drop_vector_index("Doc", "embedding")
-    fn drop_vector_index(&self, label: &str, property: &str) -> bool {
-        let db = self.inner.read();
-        db.drop_vector_index(label, property)
+    /// Drop an index by owner ID; return False only when that owner is absent.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn drop_index(&self, owner: u32) -> PyResult<bool> {
+        self.inner
+            .read()
+            .drop_index(grafeo_common::types::IndexId::new(owner))
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
     }
 
-    /// Rebuild a vector index by rescanning all matching nodes.
+    /// Atomically rebuild an existing owner, preserving its ID and configuration.
     ///
-    /// Drops the existing index and recreates it from scratch, preserving
-    /// the original configuration (dimensions, metric, M, ef_construction).
-    ///
-    /// Note: In most cases you do NOT need to call this. Vector indexes
-    /// auto-sync when you call set_node_property(), batch_create_nodes(),
-    /// or batch_create_nodes_with_props() with vector data. Use this only
-    /// after importing data through non-standard paths or to compact the
-    /// index after many deletions.
-    ///
-    /// Args:
-    ///     label: Node label of the index
-    ///     property: Property name of the index
-    ///
-    /// Raises:
-    ///     RuntimeError: If no index exists for this label+property pair.
-    ///
-    /// Example:
-    ///     db.rebuild_vector_index("Doc", "embedding")
-    fn rebuild_vector_index(&self, label: &str, property: &str) -> PyResult<()> {
-        let db = self.inner.read();
-        db.rebuild_vector_index(label, property)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    /// A missing owner raises RuntimeError; rebuild never creates a new index.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn rebuild_index(&self, owner: u32) -> PyResult<()> {
+        self.inner
+            .read()
+            .rebuild_index(grafeo_common::types::IndexId::new(owner))
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
     }
 
     /// Search for the k nearest neighbors of a query vector.
     ///
-    /// Uses the HNSW index created by create_vector_index().
+    /// Uses the HNSW index created by create_index(kind="vector").
     ///
     /// Args:
     ///     label: Node label that was indexed
@@ -1478,6 +2235,7 @@ impl PyGrafeoDB {
     ///
     ///     # With property filters (only search among user_id=42 nodes):
     ///     results = db.vector_search("Doc", "embedding", query, k=10, filters={"user_id": 42})
+    #[cfg(feature = "vector-index")]
     #[pyo3(signature = (label, property, query, k, ef=None, filters=None))]
     fn vector_search(
         &self,
@@ -1514,6 +2272,13 @@ impl PyGrafeoDB {
     ///
     /// Example:
     ///     ids = db.batch_create_nodes("Doc", "embedding", [[1.0, 0.0], [0.0, 1.0]])
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = (label, property, vectors))]
     fn batch_create_nodes(
         &self,
@@ -1544,6 +2309,13 @@ impl PyGrafeoDB {
     ///         {"text": "hello", "user_id": "u1", "embedding": [0.1, 0.2]},
     ///         {"text": "world", "user_id": "u1", "embedding": [0.3, 0.4]},
     ///     ])
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = (label, properties_list))]
     fn batch_create_nodes_with_props(
         &self,
@@ -1582,6 +2354,7 @@ impl PyGrafeoDB {
     ///
     /// Example:
     ///     results = db.batch_vector_search("Doc", "embedding", [[1.0, 0.0], [0.0, 1.0]], k=5)
+    #[cfg(feature = "vector-index")]
     #[pyo3(signature = (label, property, queries, k, ef=None, filters=None))]
     fn batch_vector_search(
         &self,
@@ -1633,6 +2406,7 @@ impl PyGrafeoDB {
     ///     results = db.mmr_search("Doc", "embedding", [1.0, 0.0, 0.0], k=4, lambda_mult=0.5)
     ///     for node_id, distance in results:
     ///         print(f"Node {node_id}: distance={distance:.4f}")
+    #[cfg(feature = "vector-index")]
     #[pyo3(signature = (label, property, query, k, fetch_k=None, lambda_mult=None, ef=None, filters=None))]
     #[allow(clippy::too_many_arguments)]
     fn mmr_search(
@@ -1667,56 +2441,6 @@ impl PyGrafeoDB {
     }
 
     // ── Text Search ──────────────────────────────────────────────
-
-    /// Create a BM25 text index on a node property for full-text search.
-    ///
-    /// Indexes all existing nodes with the given label and text property.
-    /// The index is automatically kept in sync as nodes are created,
-    /// updated, or deleted. You do NOT need to call rebuild_text_index()
-    /// after normal write operations.
-    ///
-    /// Args:
-    ///     label: Node label to index
-    ///     property: Text property to index
-    ///
-    /// Example:
-    ///     db.create_node(['Article'], {'title': 'Graph Databases'})
-    ///     db.create_text_index("Article", "title")
-    #[cfg(feature = "text-index")]
-    fn create_text_index(&self, label: &str, property: &str) -> PyResult<()> {
-        let db = self.inner.read();
-        db.create_text_index(label, property)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Drop a text index for the given label and property.
-    ///
-    /// Returns True if the index existed and was removed.
-    ///
-    /// Args:
-    ///     label: Node label of the index
-    ///     property: Property name of the index
-    #[cfg(feature = "text-index")]
-    fn drop_text_index(&self, label: &str, property: &str) -> bool {
-        let db = self.inner.read();
-        db.drop_text_index(label, property)
-    }
-
-    /// Rebuild a text index by rescanning all matching nodes.
-    ///
-    /// Note: Text indexes auto-sync on normal writes (set_node_property,
-    /// batch_create_nodes_with_props, delete_node). You only need this
-    /// after importing data through non-standard paths.
-    ///
-    /// Args:
-    ///     label: Node label of the index
-    ///     property: Property name of the index
-    #[cfg(feature = "text-index")]
-    fn rebuild_text_index(&self, label: &str, property: &str) -> PyResult<()> {
-        let db = self.inner.read();
-        db.rebuild_text_index(label, property)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
 
     /// Search a text index using BM25 scoring.
     ///
@@ -1760,7 +2484,7 @@ impl PyGrafeoDB {
     ///
     /// Runs both text and vector search, then fuses results using
     /// Reciprocal Rank Fusion (RRF) by default. Requires both a text
-    /// index (create_text_index) and a vector index (create_vector_index).
+    /// index and a vector index, both created with create_index.
     /// If either index is missing, that source is silently omitted.
     ///
     /// Args:
@@ -1925,27 +2649,20 @@ impl PyGrafeoDB {
 
     // ── Property Indexes ────────────────────────────────────────────
 
-    /// Remove an index on a node property.
-    ///
-    /// Returns True if the index existed and was removed.
-    ///
-    /// Example:
-    /// ```python
-    /// if db.drop_property_index("deprecated_field"):
-    ///     print("Index removed")
-    /// ```
-    fn drop_property_index(&self, property: &str) -> PyResult<bool> {
-        let db = self.inner.read();
-        Ok(db.drop_property_index(property))
-    }
-
     /// Check if a property has an index.
     ///
     /// Example:
     /// ```python
     /// if not db.has_property_index("email"):
-    ///     db.create_property_index("email")
+    ///     db.create_index("email")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn has_property_index(&self, property: &str) -> PyResult<bool> {
         let db = self.inner.read();
         Ok(db.has_property_index(property))
@@ -1953,7 +2670,7 @@ impl PyGrafeoDB {
 
     /// Find all nodes with a specific property value.
     ///
-    /// If the property is indexed (via create_property_index), this is O(1).
+    /// If the property is indexed (via create_index), this is O(1).
     /// Otherwise it scans all nodes, which is O(n).
     ///
     /// Returns a list of node IDs.
@@ -1961,7 +2678,7 @@ impl PyGrafeoDB {
     /// Example:
     /// ```python
     /// # Create index for fast lookups (optional but recommended)
-    /// db.create_property_index("email")
+    /// db.create_index("email")
     ///
     /// # Find nodes by property value
     /// alice_ids = db.find_nodes_by_property("email", "alix@example.com")
@@ -1969,6 +2686,13 @@ impl PyGrafeoDB {
     ///     node = db.get_node(node_id)
     ///     print(f"Found: {node}")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn find_nodes_by_property(
         &self,
         property: &str,
@@ -2018,7 +2742,7 @@ impl PyGrafeoDB {
     /// with db.begin_transaction_with_cdc(True) as tx:
     ///     tx.execute("INSERT (:Person {name: 'Alix'})")
     ///     tx.commit()
-    /// # This transaction's changes appear in node_history()
+    /// # Read this transaction's changes with bounded node_history_after() pages
     /// ```
     #[cfg(feature = "cdc")]
     #[pyo3(signature = (cdc_enabled, isolation_level=None))]
@@ -2035,12 +2759,20 @@ impl PyGrafeoDB {
     /// Normally GC runs automatically after a configurable number of commits.
     /// Call this to force an immediate GC pass, freeing memory from old
     /// transaction snapshots that are no longer needed.
-    fn gc(&self) {
+    fn gc(&self) -> PyResult<()> {
         let db = self.inner.read();
-        db.gc();
+        db.gc().map_err(PyGrafeoError::from)?;
+        Ok(())
     }
 
     /// Get database statistics.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn stats(&self) -> PyResult<PyDatabaseStats> {
         let db = self.inner.read();
         Ok(PyDatabaseStats {
@@ -2090,6 +2822,13 @@ impl PyGrafeoDB {
     /// Example:
     ///     stats = db.detailed_stats()
     ///     print(f"Memory: {stats['memory_bytes']} bytes")
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn detailed_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.inner.read();
         let stats = db.detailed_stats();
@@ -2120,6 +2859,13 @@ impl PyGrafeoDB {
     ///     usage = db.memory_usage()
     ///     print(f"Total: {usage['total_bytes']} bytes")
     ///     print(f"Store: {usage['store']['total_bytes']} bytes")
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn memory_usage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.inner.read();
         let usage = db.memory_usage();
@@ -2306,6 +3052,13 @@ impl PyGrafeoDB {
     ///     schema = db.schema()
     ///     for label in schema['labels']:
     ///         print(f"{label['name']}: {label['count']} nodes")
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.inner.read();
         let schema = db.schema();
@@ -2369,6 +3122,13 @@ impl PyGrafeoDB {
     ///     errors = db.validate()
     ///     if not errors:
     ///         print("Database is valid")
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn validate(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.inner.read();
         let result = db.validate();
@@ -2394,9 +3154,16 @@ impl PyGrafeoDB {
     /// Example:
     ///     wal = db.wal_status()
     ///     print(f"WAL size: {wal['size_bytes']} bytes")
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn wal_status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let db = self.inner.read();
-        let status = db.wal_status();
+        let status = db.wal_status().map_err(PyGrafeoError::from)?;
 
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("enabled", status.enabled)?;
@@ -2432,6 +3199,7 @@ impl PyGrafeoDB {
     ///     db = GrafeoDB()  # in-memory
     ///     db.create_node(["Person"], {"name": "Alix"})
     ///     db.save("./mydb")  # save to file
+    #[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
     fn save(&self, path: String) -> PyResult<()> {
         let db = self.inner.read();
         db.save(path).map_err(PyGrafeoError::from)?;
@@ -2446,6 +3214,16 @@ impl PyGrafeoDB {
     /// Example:
     ///     db = GrafeoDB("./mydb.grafeo")
     ///     db.backup_full("./backups/mydb")
+    #[cfg(all(
+        any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native"
+        ),
+        any(feature = "storage", feature = "embedded", feature = "native")
+    ))]
     fn backup_full(&self, backup_dir: String) -> PyResult<()> {
         let db = self.inner.read();
         db.backup_full(std::path::Path::new(&backup_dir))
@@ -2459,6 +3237,16 @@ impl PyGrafeoDB {
     ///
     /// Example:
     ///     db.backup_incremental("./backups/mydb")
+    #[cfg(all(
+        any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native"
+        ),
+        any(feature = "storage", feature = "embedded", feature = "native")
+    ))]
     fn backup_incremental(&self, backup_dir: String) -> PyResult<()> {
         let db = self.inner.read();
         db.backup_incremental(std::path::Path::new(&backup_dir))
@@ -2470,6 +3258,7 @@ impl PyGrafeoDB {
     ///
     /// Example:
     ///     GrafeoDB.restore_to_epoch("./backups/mydb", 500, "./restored.grafeo")
+    #[cfg(any(feature = "storage", feature = "native", feature = "embedded"))]
     #[staticmethod]
     fn restore_to_epoch(backup_dir: String, epoch: u64, output_path: String) -> PyResult<()> {
         grafeo_engine::GrafeoDB::restore_to_epoch(
@@ -2490,6 +3279,14 @@ impl PyGrafeoDB {
     ///     file_db = GrafeoDB("./production.db")
     ///     test_db = file_db.to_memory()  # safe copy
     ///     test_db.create_node(...)  # doesn't affect production
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    ))]
     fn to_memory(&self) -> PyResult<Self> {
         let db = self.inner.read();
         let new_db = db.to_memory().map_err(PyGrafeoError::from)?;
@@ -2507,6 +3304,7 @@ impl PyGrafeoDB {
     /// Example:
     ///     db = GrafeoDB.open_in_memory("./mydb")
     ///     db.create_node(...)  # doesn't affect file
+    #[cfg(any(feature = "storage", feature = "embedded", feature = "native"))]
     #[staticmethod]
     fn open_in_memory(path: String) -> PyResult<Self> {
         let db = grafeo_engine::GrafeoDB::open_in_memory(path).map_err(PyGrafeoError::from)?;
@@ -2546,18 +3344,17 @@ impl PyGrafeoDB {
         self.inner.read().clear_plan_cache();
     }
 
-    /// Converts the database to a read-only CompactStore for faster queries.
+    /// Folds retained committed LPG history into a columnar base with a writable overlay.
     ///
-    /// Takes a snapshot of all nodes and edges, builds a columnar store with
-    /// CSR adjacency, and switches to read-only mode. The original store is
-    /// dropped to free memory, giving ~60x memory reduction and 100x+
-    /// traversal speedup for read-only workloads.
-    ///
-    /// After calling this, write queries will fail.
+    /// Call again to fold later overlay writes. Requires no active transactions
+    /// or live Sessions; closed or durability-poisoned databases are rejected.
+    /// Compaction is not a durability checkpoint or a history-retention lease.
     ///
     /// Example:
     ///     db = GrafeoDB()
     ///     db.execute("INSERT (:Person {name: 'Alix', age: 30})")
+    ///     db.compact()
+    ///     db.execute("MATCH (p:Person) SET p.age = 31")
     ///     db.compact()
     ///     result = db.execute("MATCH (p:Person) RETURN p.name")
     #[cfg(feature = "compact-store")]
@@ -2621,6 +3418,13 @@ impl PyGrafeoDB {
     }
 
     /// Get number of nodes.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[getter]
     fn node_count(&self) -> usize {
         let db = self.inner.read();
@@ -2628,6 +3432,13 @@ impl PyGrafeoDB {
     }
 
     /// Get number of edges.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[getter]
     fn edge_count(&self) -> usize {
         let db = self.inner.read();
@@ -2724,6 +3535,13 @@ impl PyGrafeoDB {
     /// df = db.nodes_df()
     /// print(df[df["labels"].apply(lambda l: "Person" in l)])
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = ())]
     fn nodes_df(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Fast path: use Arrow IPC when pyarrow is available
@@ -2740,13 +3558,14 @@ impl PyGrafeoDB {
         })?;
 
         let db = self.inner.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
 
         // Collect all nodes and discover property keys.
         // Skip properties whose names collide with structural columns
         // to prevent silent overwrites (GrafeoDB/grafeo#254).
         const RESERVED_NODE_COLS: &[&str] = &["_id", "_labels"];
-        let nodes: Vec<_> = store.all_nodes().collect();
+        let nodes: Vec<_> = db.iter_nodes().collect();
         let mut prop_keys: Vec<String> = Vec::new();
         let mut prop_key_set = std::collections::HashSet::new();
         for node in &nodes {
@@ -2778,7 +3597,7 @@ impl PyGrafeoDB {
             for (i, key) in prop_keys.iter().enumerate() {
                 let prop_key = grafeo_common::types::PropertyKey::new(key.clone());
                 match node.properties.get(&prop_key) {
-                    Some(v) => prop_columns[i].append(PyValue::to_py(v, py))?,
+                    Some(v) => prop_columns[i].append(PyValue::to_py(v, py)?)?,
                     None => prop_columns[i].append(py.None())?,
                 }
             }
@@ -2875,6 +3694,13 @@ impl PyGrafeoDB {
     /// df = db.edges_df()
     /// print(df[df["_type"] == "KNOWS"])
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[pyo3(signature = ())]
     fn edges_df(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Fast path: use Arrow IPC when pyarrow is available
@@ -2891,13 +3717,14 @@ impl PyGrafeoDB {
         })?;
 
         let db = self.inner.read();
-        let store = db.store();
+        let session = db.session();
+        let _snapshot = session.snapshot().map_err(PyGrafeoError::from)?;
 
         // Collect all edges and discover property keys.
         // Skip properties whose names collide with structural columns
         // to prevent silent overwrites (GrafeoDB/grafeo#254).
         const RESERVED_EDGE_COLS: &[&str] = &["_id", "_source", "_target", "_type"];
-        let edges: Vec<_> = store.all_edges().collect();
+        let edges: Vec<_> = db.iter_edges().collect();
         let mut prop_keys: Vec<String> = Vec::new();
         let mut prop_key_set = std::collections::HashSet::new();
         for edge in &edges {
@@ -2930,7 +3757,7 @@ impl PyGrafeoDB {
             for (i, key) in prop_keys.iter().enumerate() {
                 let prop_key = grafeo_common::types::PropertyKey::new(key.clone());
                 match edge.properties.get(&prop_key) {
-                    Some(v) => prop_columns[i].append(PyValue::to_py(v, py))?,
+                    Some(v) => prop_columns[i].append(PyValue::to_py(v, py)?)?,
                     None => prop_columns[i].append(py.None())?,
                 }
             }
@@ -2972,6 +3799,13 @@ impl PyGrafeoDB {
     /// edges = pd.DataFrame({"source": [0, 1], "target": [1, 0], "since": [2020, 2021]})
     /// db.import_df(edges, mode="edges", edge_type="KNOWS")
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (df, mode, *, label=None, edge_type=None, source="source", target="target"))]
     fn import_df(
@@ -3233,87 +4067,88 @@ impl PyGrafeoDB {
         self.inner.read().is_cdc_enabled()
     }
 
-    /// Returns the full change history for a node.
-    ///
-    /// Each event is a dict with keys: entity_id, entity_type, kind, epoch,
-    /// timestamp, before, after.
+    /// Reads an owned bounded node history page, optionally from an inclusive epoch.
+    // The foreign-function boundary keeps entity, cursor, both bounds and epoch explicit.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "cdc")]
-    fn node_history(
+    #[pyo3(signature = (node_id, cursor, max_events, max_bytes, *, since_epoch=0))]
+    fn node_history_after<'py>(
         &self,
+        py: Python<'py>,
         node_id: u64,
-    ) -> PyResult<Vec<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>> {
-        let db = self.inner.read();
-        let id = grafeo_common::types::NodeId::new(node_id);
-        let events = db
-            .history(id)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        pyo3::Python::attach(|py| {
-            Ok(events
-                .into_iter()
-                .map(|e| change_event_to_dict(py, &e))
-                .collect())
-        })
-    }
-
-    /// Returns the full change history for an edge.
-    #[cfg(feature = "cdc")]
-    fn edge_history(
-        &self,
-        edge_id: u64,
-    ) -> PyResult<Vec<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>> {
-        let db = self.inner.read();
-        let id = grafeo_common::types::EdgeId::new(edge_id);
-        let events = db
-            .history(id)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        pyo3::Python::attach(|py| {
-            Ok(events
-                .into_iter()
-                .map(|e| change_event_to_dict(py, &e))
-                .collect())
-        })
-    }
-
-    /// Returns change events for a node since a given epoch.
-    #[cfg(feature = "cdc")]
-    fn node_history_since(
-        &self,
-        node_id: u64,
+        cursor: Option<&[u8]>,
+        max_events: usize,
+        max_bytes: usize,
         since_epoch: u64,
-    ) -> PyResult<Vec<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>> {
-        let db = self.inner.read();
-        let id = grafeo_common::types::NodeId::new(node_id);
-        let events = db
-            .history_since(id, grafeo_common::types::EpochId(since_epoch))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        pyo3::Python::attach(|py| {
-            Ok(events
-                .into_iter()
-                .map(|e| change_event_to_dict(py, &e))
-                .collect())
-        })
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let cursor = cursor
+            .map(grafeo_common::types::DurableCursor::from_bytes)
+            .transpose()
+            .map_err(PyGrafeoError::from)?;
+        let mut query =
+            grafeo_engine::cdc::EntityHistoryQuery::new(grafeo_common::types::NodeId::new(node_id));
+        query.since_epoch = grafeo_common::types::EpochId::new(since_epoch);
+        let page = self
+            .inner
+            .read()
+            .session()
+            .history_after(&query, cursor.as_ref(), max_events, max_bytes)
+            .map_err(PyGrafeoError::from)?;
+        change_page_to_dict(py, page)
     }
 
-    /// Returns all change events across entities in an epoch range.
+    /// Reads an owned bounded edge history page, optionally from an inclusive epoch.
+    // The foreign-function boundary keeps entity, cursor, both bounds and epoch explicit.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "cdc")]
-    fn changes_between(
+    #[pyo3(signature = (edge_id, cursor, max_events, max_bytes, *, since_epoch=0))]
+    fn edge_history_after<'py>(
         &self,
-        start_epoch: u64,
-        end_epoch: u64,
-    ) -> PyResult<Vec<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>> {
-        let db = self.inner.read();
-        let events = db
-            .changes_between(
-                grafeo_common::types::EpochId(start_epoch),
-                grafeo_common::types::EpochId(end_epoch),
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        pyo3::Python::attach(|py| {
-            Ok(events
-                .into_iter()
-                .map(|e| change_event_to_dict(py, &e))
-                .collect())
-        })
+        py: Python<'py>,
+        edge_id: u64,
+        cursor: Option<&[u8]>,
+        max_events: usize,
+        max_bytes: usize,
+        since_epoch: u64,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let cursor = cursor
+            .map(grafeo_common::types::DurableCursor::from_bytes)
+            .transpose()
+            .map_err(PyGrafeoError::from)?;
+        let mut query =
+            grafeo_engine::cdc::EntityHistoryQuery::new(grafeo_common::types::EdgeId::new(edge_id));
+        query.since_epoch = grafeo_common::types::EpochId::new(since_epoch);
+        let page = self
+            .inner
+            .read()
+            .session()
+            .history_after(&query, cursor.as_ref(), max_events, max_bytes)
+            .map_err(PyGrafeoError::from)?;
+        change_page_to_dict(py, page)
+    }
+
+    /// Reads an owned bounded feed page. Resume with the returned canonical bytes.
+    /// An unchanged cursor marks the end; an empty filtered page may advance.
+    #[cfg(feature = "cdc")]
+    #[pyo3(signature = (cursor, max_events, max_bytes))]
+    fn changes_after<'py>(
+        &self,
+        py: Python<'py>,
+        cursor: Option<&[u8]>,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let cursor = cursor
+            .map(grafeo_common::types::DurableCursor::from_bytes)
+            .transpose()
+            .map_err(PyGrafeoError::from)?;
+        let page = self
+            .inner
+            .read()
+            .session()
+            .changes_after(cursor.as_ref(), max_events, max_bytes)
+            .map_err(PyGrafeoError::from)?;
+        change_page_to_dict(py, page)
     }
 
     // -----------------------------------------------------------------
@@ -3363,6 +4198,13 @@ impl PyGrafeoDB {
     ///     db.create_graph("social")
     ///     db.set_graph("social")
     ///     db.execute("INSERT (:Person {name: 'Alix'})")
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn create_graph(&self, name: &str) -> PyResult<bool> {
         Ok(self
             .inner
@@ -3372,12 +4214,30 @@ impl PyGrafeoDB {
     }
 
     /// Drops a named graph. Returns ``True`` if dropped, ``False`` if it did
-    /// not exist.
-    fn drop_graph(&self, name: &str) -> bool {
-        self.inner.read().drop_graph(name)
+    /// not exist. Rejected lifecycle mutations raise an exception.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    fn drop_graph(&self, name: &str) -> PyResult<bool> {
+        Ok(self
+            .inner
+            .read()
+            .drop_graph(name)
+            .map_err(PyGrafeoError::from)?)
     }
 
     /// Returns a list of all named graph names.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
     fn list_graphs(&self) -> Vec<String> {
         self.inner.read().list_graphs()
     }
@@ -3494,6 +4354,7 @@ fn extract_isolation_level(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<
 /// String values ``"read_committed"``, ``"snapshot"``, ``"serializable"`` are also accepted.
 #[pyclass(
     name = "IsolationLevel",
+    from_py_object,
     eq,
     eq_int,
     rename_all = "SCREAMING_SNAKE_CASE"
@@ -3559,50 +4420,53 @@ pub struct PyTransaction {
 
 impl PyTransaction {
     /// Executes a query in the given language within this transaction.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python keyword options share one native execution owner"
+    )]
     fn execute_language_impl(
         &self,
         language: &str,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
+        py: Python<'_>,
     ) -> PyResult<PyQueryResult> {
         if self.committed || self.rolled_back {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Cannot execute on completed transaction",
             ));
         }
-
-        let db = self.db.read();
-        let mut session_guard = self.session.lock();
-        let session = session_guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Transaction session not available")
-        })?;
-
-        let param_map = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (key, value) in p.iter() {
-                let key_str: String = key.extract()?;
-                let val = PyValue::from_py(&value)?;
-                map.insert(key_str, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-        let mut result = session
-            .execute_language(query, language, param_map)
+        let (params, options) =
+            prepare_python_execution(language, params, control, max_rows, max_bytes)?;
+        let conversion_limit = options.result_limits.unwrap_or_default().max_bytes;
+        let mut result = py
+            .detach(|| {
+                let mut guard = self.session.lock();
+                let session = guard.as_mut().ok_or_else(|| {
+                    grafeo_common::utils::error::Error::Internal(
+                        "Transaction session not available".into(),
+                    )
+                })?;
+                session.execute_with_options(query, params, options)
+            })
             .map_err(PyGrafeoError::from)?;
+        let db = self.db.read();
         let (nodes, edges) = extract_entities(&result, &db);
         let columns = std::mem::take(&mut result.columns);
         let exec_time = result.execution_time_ms;
         let scanned = result.rows_scanned;
         Ok(PyQueryResult::with_metrics(
             columns,
-            result.into_rows(),
+            result.into_rows().map_err(PyGrafeoError::from)?,
             nodes,
             edges,
             exec_time,
             scanned,
-        ))
+        )
+        .with_conversion_limit(conversion_limit))
     }
 
     /// Create a new transaction with an optional isolation level and CDC override.
@@ -3611,57 +4475,81 @@ impl PyTransaction {
         isolation_level: Option<&str>,
         _cdc_override: Option<bool>,
     ) -> PyResult<Self> {
-        // Parse isolation level string
-        let (level, level_name) = match isolation_level {
-            Some("read_committed") => (
-                Some(grafeo_engine::transaction::IsolationLevel::ReadCommitted),
-                "read_committed",
-            ),
-            Some("serializable") => (
-                Some(grafeo_engine::transaction::IsolationLevel::Serializable),
-                "serializable",
-            ),
-            Some("snapshot") | None => (None, "snapshot"),
-            Some(other) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown isolation level '{}'. Use 'read_committed', 'snapshot', or 'serializable'",
-                    other
-                )));
-            }
-        };
-
-        // Create session from db, using CDC override when available
-        let mut session = {
-            let db_guard = db.read();
-            #[cfg(feature = "cdc")]
-            {
-                match _cdc_override {
-                    Some(cdc) => db_guard.session_with_cdc(cdc),
-                    None => db_guard.session(),
+        #[cfg(any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native",
+            feature = "triple-store"
+        ))]
+        {
+            // Parse isolation level string
+            let (level, level_name) = match isolation_level {
+                Some("read_committed") => (
+                    Some(grafeo_engine::transaction::IsolationLevel::ReadCommitted),
+                    "read_committed",
+                ),
+                Some("serializable") => (
+                    Some(grafeo_engine::transaction::IsolationLevel::Serializable),
+                    "serializable",
+                ),
+                Some("snapshot") | None => (None, "snapshot"),
+                Some(other) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unknown isolation level '{}'. Use 'read_committed', 'snapshot', or 'serializable'",
+                        other
+                    )));
                 }
-            }
-            #[cfg(not(feature = "cdc"))]
-            {
-                db_guard.session()
-            }
-        };
+            };
 
-        // Begin the transaction with the specified isolation level
-        if let Some(level) = level {
-            session
-                .begin_transaction_with_isolation(level)
-                .map_err(PyGrafeoError::from)?;
-        } else {
-            session.begin_transaction().map_err(PyGrafeoError::from)?;
+            // Create session from db, using CDC override when available
+            let mut session = {
+                let db_guard = db.read();
+                #[cfg(feature = "cdc")]
+                {
+                    match _cdc_override {
+                        Some(cdc) => db_guard.session_with_cdc(cdc),
+                        None => db_guard.session(),
+                    }
+                }
+                #[cfg(not(feature = "cdc"))]
+                {
+                    db_guard.session()
+                }
+            };
+
+            // Begin the transaction with the specified isolation level.
+            if let Some(level) = level {
+                session
+                    .begin_transaction_with_isolation(level)
+                    .map_err(PyGrafeoError::from)?;
+            } else {
+                session.begin_transaction().map_err(PyGrafeoError::from)?;
+            }
+
+            Ok(Self {
+                db,
+                session: parking_lot::Mutex::new(Some(session)),
+                committed: false,
+                rolled_back: false,
+                isolation_level_name: level_name.to_string(),
+            })
         }
-
-        Ok(Self {
-            db,
-            session: parking_lot::Mutex::new(Some(session)),
-            committed: false,
-            rolled_back: false,
-            isolation_level_name: level_name.to_string(),
-        })
+        #[cfg(not(any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native",
+            feature = "triple-store"
+        )))]
+        {
+            let _ = (db, isolation_level, _cdc_override);
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "transactions require a native LPG or RDF store feature",
+            ))
+        }
     }
 }
 
@@ -3675,43 +4563,105 @@ impl PyTransaction {
         &self.isolation_level_name
     }
 
-    /// Commit the transaction.
+    /// Commit the transaction and return the assigned epoch.
     ///
     /// Makes all changes permanent. Raises an error if the transaction is
     /// already completed or if there's a write-write conflict.
-    fn commit(&mut self) -> PyResult<()> {
-        if self.committed || self.rolled_back {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Transaction already completed",
-            ));
-        }
+    fn commit(&mut self) -> PyResult<u64> {
+        #[cfg(any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native",
+            feature = "triple-store"
+        ))]
+        {
+            if self.committed || self.rolled_back {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Transaction already completed",
+                ));
+            }
 
-        let mut session_guard = self.session.lock();
-        if let Some(ref mut session) = *session_guard {
-            session.commit().map_err(PyGrafeoError::from)?;
+            let mut session_guard = self.session.lock();
+            let epoch = if let Some(ref mut session) = *session_guard {
+                match session.commit() {
+                    Ok(epoch) => epoch.as_u64(),
+                    Err(error) => {
+                        // Commit validation can end the native transaction before
+                        // returning its error. Do not leave that session reachable
+                        // through an active Python handle (and implicit autocommit).
+                        // Earlier failures can retain an active transaction, which
+                        // still needs explicit rollback or context cleanup.
+                        if !session.in_transaction() {
+                            *session_guard = None;
+                            self.rolled_back = true;
+                        }
+                        return Err(PyGrafeoError::from(error).into());
+                    }
+                }
+            } else {
+                0
+            };
+            *session_guard = None; // Drop the session
+            self.committed = true;
+            Ok(epoch)
         }
-        *session_guard = None; // Drop the session
-        self.committed = true;
-        Ok(())
+        #[cfg(not(any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native",
+            feature = "triple-store"
+        )))]
+        {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "transactions require a native LPG or RDF store feature",
+            ))
+        }
     }
 
     /// Rollback the transaction.
     ///
     /// Discards all changes made within this transaction.
     fn rollback(&mut self) -> PyResult<()> {
-        if self.committed || self.rolled_back {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Transaction already completed",
-            ));
-        }
+        #[cfg(any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native",
+            feature = "triple-store"
+        ))]
+        {
+            if self.committed || self.rolled_back {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Transaction already completed",
+                ));
+            }
 
-        let mut session_guard = self.session.lock();
-        if let Some(ref mut session) = *session_guard {
-            session.rollback().map_err(PyGrafeoError::from)?;
+            let mut session_guard = self.session.lock();
+            if let Some(ref mut session) = *session_guard {
+                session.rollback().map_err(PyGrafeoError::from)?;
+            }
+            *session_guard = None; // Drop the session
+            self.rolled_back = true;
+            Ok(())
         }
-        *session_guard = None; // Drop the session
-        self.rolled_back = true;
-        Ok(())
+        #[cfg(not(any(
+            feature = "lpg",
+            feature = "compact-store",
+            feature = "embedded",
+            feature = "edge",
+            feature = "native",
+            feature = "triple-store"
+        )))]
+        {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "transactions require a native LPG or RDF store feature",
+            ))
+        }
     }
 
     /// Create a savepoint within this transaction.
@@ -3726,6 +4676,14 @@ impl PyTransaction {
     /// tx.rollback_to_savepoint("sp1")  # undo the insert
     /// tx.commit()  # commits without the Temp node
     /// ```
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    ))]
     fn savepoint(&self, name: &str) -> PyResult<()> {
         if self.committed || self.rolled_back {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -3744,6 +4702,14 @@ impl PyTransaction {
     ///
     /// Undoes all writes made after the savepoint was created.
     /// The savepoint remains active and can be rolled back to again.
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native",
+        feature = "triple-store"
+    ))]
     fn rollback_to_savepoint(&self, name: &str) -> PyResult<()> {
         if self.committed || self.rolled_back {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -3784,38 +4750,175 @@ impl PyTransaction {
     ///
     /// All queries executed through this method see the same snapshot
     /// and their changes are isolated until commit.
-    #[pyo3(signature = (query, params=None))]
+    #[cfg(feature = "gql")]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("gql", query, params)
+        self.execute_language_impl("gql", query, params, control, max_rows, max_bytes, py)
+    }
+
+    /// Insert one RDF quad in this transaction.
+    #[cfg(feature = "triple-store")]
+    #[pyo3(signature = (subject, predicate, object, graph=None))]
+    fn insert_rdf_quad(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        graph: Option<&str>,
+    ) -> PyResult<usize> {
+        if self.committed || self.rolled_back {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Transaction already completed",
+            ));
+        }
+        let quad = parse_python_rdf_quad(subject, predicate, object, graph)?;
+        let session_guard = self.session.lock();
+        let session = session_guard.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Transaction session not available")
+        })?;
+        Ok(session
+            .insert_rdf_quads([quad])
+            .map_err(PyGrafeoError::from)?)
+    }
+
+    /// Bulk-insert RDF quads in this transaction.
+    ///
+    /// Each item is ``(subject, predicate, object)`` or
+    /// ``(subject, predicate, object, graph)``.
+    #[cfg(feature = "triple-store")]
+    fn insert_rdf_quads(
+        &self,
+        quads: Vec<(String, String, String, Option<String>)>,
+    ) -> PyResult<usize> {
+        if self.committed || self.rolled_back {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Transaction already completed",
+            ));
+        }
+        let parsed: Vec<grafeo_engine::Quad> = quads
+            .iter()
+            .map(|(s, p, o, g)| parse_python_rdf_quad(s, p, o, g.as_deref()))
+            .collect::<PyResult<_>>()?;
+        let session_guard = self.session.lock();
+        let session = session_guard.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Transaction session not available")
+        })?;
+        Ok(session
+            .insert_rdf_quads(parsed)
+            .map_err(PyGrafeoError::from)?)
+    }
+
+    /// Create a node inside this transaction (parser-free LPG mutation).
+    #[cfg(any(
+        feature = "lpg",
+        feature = "compact-store",
+        feature = "embedded",
+        feature = "edge",
+        feature = "native"
+    ))]
+    #[pyo3(signature = (labels, properties=None))]
+    fn create_node(
+        &self,
+        labels: Vec<String>,
+        properties: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<PyNode> {
+        if self.committed || self.rolled_back {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Transaction already completed",
+            ));
+        }
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let session_guard = self.session.lock();
+        let session = session_guard.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Transaction session not available")
+        })?;
+        let id = if let Some(p) = properties {
+            let mut owned: Vec<(String, grafeo_common::types::Value)> = Vec::new();
+            for (key, value) in p.iter() {
+                owned.push((key.extract()?, PyValue::from_py(&value)?));
+            }
+            session
+                .create_node_with_props(
+                    &label_refs,
+                    owned.iter().map(|(k, v)| (k.as_str(), v.clone())),
+                )
+                .map_err(PyGrafeoError::from)?
+        } else {
+            session.create_node(&label_refs)
+        };
+        if !id.is_valid() {
+            return Err(PyGrafeoError::database("Failed to create node").into());
+        }
+        let node = session
+            .get_node(id)
+            .ok_or_else(|| PyGrafeoError::database("Failed to create node"))?;
+        let labels: Vec<String> = node.labels.iter().map(|s| s.to_string()).collect();
+        let properties: HashMap<grafeo_common::types::PropertyKey, grafeo_common::types::Value> =
+            node.properties.into_iter().collect();
+        Ok(PyNode::new(id, labels, properties))
+    }
+
+    /// Exact typed-quad membership in this transaction (includes pending writes).
+    #[cfg(feature = "triple-store")]
+    #[pyo3(signature = (subject, predicate, object, graph=None))]
+    fn contains_rdf_quad(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        graph: Option<&str>,
+    ) -> PyResult<bool> {
+        if self.committed || self.rolled_back {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Transaction already completed",
+            ));
+        }
+        let quad = parse_python_rdf_quad(subject, predicate, object, graph)?;
+        let session_guard = self.session.lock();
+        let session = session_guard.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Transaction session not available")
+        })?;
+        Ok(session
+            .try_contains_rdf_quad(&quad)
+            .map_err(PyGrafeoError::from)?)
     }
 
     /// Execute a Cypher query within this transaction.
     #[cfg(feature = "cypher")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_cypher(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("cypher", query, params)
+        self.execute_language_impl("cypher", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a SQL/PGQ query (SQL:2023 GRAPH_TABLE) within this transaction.
     #[cfg(feature = "sql-pgq")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_sql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("sql", query, params)
+        self.execute_language_impl("sql", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a Gremlin query within this transaction.
@@ -3823,14 +4926,17 @@ impl PyTransaction {
     /// All queries executed through this method see the same snapshot
     /// and their changes are isolated until commit.
     #[cfg(feature = "gremlin")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_gremlin(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("gremlin", query, params)
+        self.execute_language_impl("gremlin", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a GraphQL query within this transaction.
@@ -3838,14 +4944,17 @@ impl PyTransaction {
     /// All queries executed through this method see the same snapshot
     /// and their changes are isolated until commit.
     #[cfg(feature = "graphql")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_graphql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("graphql", query, params)
+        self.execute_language_impl("graphql", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a SPARQL query within this transaction.
@@ -3860,25 +4969,36 @@ impl PyTransaction {
     ///         result = tx.execute_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
     ///         tx.commit()
     #[cfg(feature = "sparql")]
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None , *, control=None, max_rows=None, max_bytes=None))]
     fn execute_sparql(
         &self,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
-        _py: Python<'_>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl("sparql", query, params)
+        self.execute_language_impl("sparql", query, params, control, max_rows, max_bytes, py)
     }
 
     /// Execute a query in a named language (e.g. `"graphql-rdf"`).
-    #[pyo3(signature = (language, query, params=None))]
+    #[pyo3(signature = (language, query, params=None , *, control=None, max_rows=None, max_bytes=None))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Python keyword options share one native execution owner"
+    )]
     fn execute_language(
         &self,
         language: &str,
         query: &str,
         params: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+        control: Option<&crate::control::PyQueryControl>,
+        max_rows: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> PyResult<PyQueryResult> {
-        self.execute_language_impl(language, query, params)
+        self.execute_language_impl(language, query, params, control, max_rows, max_bytes, py)
     }
 
     /// Check if transaction is active.
@@ -3945,6 +5065,9 @@ impl PyDatabaseStats {
 
 /// Pulls nodes and edges out of query results so Python can work with them.
 fn extract_entities(result: &QueryResult, _db: &GrafeoDB) -> (Vec<PyNode>, Vec<PyEdge>) {
+    if result.is_int64_columnar() {
+        return (Vec::new(), Vec::new());
+    }
     grafeo_bindings_common::entity::extract_and_map(
         result,
         |n| PyNode::new(n.id, n.labels, n.properties),
@@ -3957,7 +5080,7 @@ fn extract_entities(result: &QueryResult, _db: &GrafeoDB) -> (Vec<PyNode>, Vec<P
 fn change_event_to_dict(
     py: pyo3::Python<'_>,
     event: &grafeo_engine::cdc::ChangeEvent,
-) -> std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>> {
+) -> PyResult<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>> {
     use crate::types::PyValue;
     use pyo3::conversion::IntoPyObjectExt;
 
@@ -3966,23 +5089,16 @@ fn change_event_to_dict(
     // entity_id and entity_type
     map.insert(
         "entity_id".to_string(),
-        event
-            .entity_id
-            .as_u64()
-            .into_py_any(py)
-            .expect("u64 to Python conversion"),
+        event.entity_id.as_u64().into_py_any(py)?,
     );
     let entity_type = if event.entity_id.is_node() {
         "node"
+    } else if event.entity_id.is_triple() {
+        "triple"
     } else {
         "edge"
     };
-    map.insert(
-        "entity_type".to_string(),
-        entity_type
-            .into_py_any(py)
-            .expect("str to Python conversion"),
-    );
+    map.insert("entity_type".to_string(), entity_type.into_py_any(py)?);
 
     // kind
     let kind = match event.kind {
@@ -3991,37 +5107,36 @@ fn change_event_to_dict(
         grafeo_engine::cdc::ChangeKind::Delete => "delete",
         _ => "unknown",
     };
+    map.insert("kind".to_string(), kind.into_py_any(py)?);
+
     map.insert(
-        "kind".to_string(),
-        kind.into_py_any(py).expect("str to Python conversion"),
+        "graph_incarnation".into(),
+        event
+            .graph_incarnation
+            .map(|id| id.as_u64())
+            .into_py_any(py)?,
     );
 
     // epoch and timestamp
-    map.insert(
-        "epoch".to_string(),
-        event
-            .epoch
-            .0
-            .into_py_any(py)
-            .expect("u64 to Python conversion"),
-    );
+    map.insert("epoch".to_string(), event.epoch.0.into_py_any(py)?);
     map.insert(
         "timestamp".to_string(),
-        event
-            .timestamp
-            .as_u64()
-            .into_py_any(py)
-            .expect("u64 to Python conversion"),
+        event.timestamp.as_u64().into_py_any(py)?,
     );
+
+    map.insert("labels".into(), event.labels.clone().into_py_any(py)?);
+    map.insert("edge_type".into(), event.edge_type.clone().into_py_any(py)?);
+    map.insert("src_id".into(), event.src_id.into_py_any(py)?);
+    map.insert("dst_id".into(), event.dst_id.into_py_any(py)?);
 
     // before (Option<HashMap<String, Value>> -> dict or None)
     let before_py = match &event.before {
         Some(props) => {
             let d: std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>> = props
                 .iter()
-                .map(|(k, v)| (k.clone(), PyValue::to_py(v, py)))
-                .collect();
-            d.into_py_any(py).expect("dict to Python conversion")
+                .map(|(k, v)| Ok((k.clone(), PyValue::to_py(v, py)?)))
+                .collect::<PyResult<_>>()?;
+            d.into_py_any(py)?
         }
         None => py.None(),
     };
@@ -4032,20 +5147,50 @@ fn change_event_to_dict(
         Some(props) => {
             let d: std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>> = props
                 .iter()
-                .map(|(k, v)| (k.clone(), PyValue::to_py(v, py)))
-                .collect();
-            d.into_py_any(py).expect("dict to Python conversion")
+                .map(|(k, v)| Ok((k.clone(), PyValue::to_py(v, py)?)))
+                .collect::<PyResult<_>>()?;
+            d.into_py_any(py)?
         }
         None => py.None(),
     };
     map.insert("after".to_string(), after_py);
 
-    map
+    map.insert(
+        "lpg_graph".into(),
+        event
+            .graph_path()
+            .map(|path| path.components().to_vec())
+            .into_py_any(py)?,
+    );
+    map.insert(
+        "triple_graph".into(),
+        event.triple_graph.clone().into_py_any(py)?,
+    );
+    map.insert(
+        "triple_subject".into(),
+        event.triple_subject.clone().into_py_any(py)?,
+    );
+    map.insert(
+        "triple_predicate".into(),
+        event.triple_predicate.clone().into_py_any(py)?,
+    );
+    map.insert(
+        "triple_object".into(),
+        event.triple_object.clone().into_py_any(py)?,
+    );
+    Ok(map)
 }
 
 /// Extracts column names and row data from a pandas or polars DataFrame.
 ///
 /// Returns `(column_names, rows)` where each row is a `Vec<Value>`.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 fn extract_dataframe(
     py: Python<'_>,
     df: &Bound<'_, PyAny>,
@@ -4104,6 +5249,13 @@ fn extract_dataframe(
 }
 
 /// Check if a Python value is pandas NA / NaN / NaT.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 fn is_pandas_na(py: Python<'_>, obj: &Bound<'_, PyAny>) -> bool {
     // float NaN
     if let Ok(f) = obj.extract::<f64>()
@@ -4205,6 +5357,13 @@ fn read_jsonl_keys(path: &std::path::Path) -> PyResult<Vec<String>> {
 }
 
 /// Convert a Value to a NodeId, validating that it's a valid integer.
+#[cfg(any(
+    feature = "lpg",
+    feature = "compact-store",
+    feature = "embedded",
+    feature = "edge",
+    feature = "native"
+))]
 fn value_to_node_id(value: &Value, col_name: &str) -> PyResult<NodeId> {
     match value {
         Value::Int64(i) => {
@@ -4237,4 +5396,21 @@ fn value_to_node_id(value: &Value, col_name: &str) -> PyResult<NodeId> {
             "column '{col_name}' must contain integer node IDs, got {value:?}"
         ))),
     }
+}
+
+/// Converts one owned bounded native page without collecting the entire feed.
+#[cfg(feature = "cdc")]
+fn change_page_to_dict(
+    py: Python<'_>,
+    page: grafeo_engine::cdc::ChangePage,
+) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+    let events = page
+        .events
+        .iter()
+        .map(|event| change_event_to_dict(py, event))
+        .collect::<PyResult<Vec<_>>>()?;
+    let result = pyo3::types::PyDict::new(py);
+    result.set_item("events", events)?;
+    result.set_item("next", pyo3::types::PyBytes::new(py, &page.next.to_bytes()))?;
+    Ok(result)
 }

@@ -13,6 +13,8 @@ before they propagate to grafeo-memory.
 
 import pytest
 
+from tests.fixtures.cdc import collect_history
+
 # =============================================================================
 # batch_create_nodes_with_props
 # =============================================================================
@@ -75,7 +77,7 @@ class TestBatchCreateNodesWithProps:
 
     def test_vector_auto_indexed(self, db):
         """Vectors in batch-created nodes are auto-inserted into matching indexes."""
-        db.create_vector_index("Doc", "emb", dimensions=3, metric="cosine")
+        db.create_index("emb", kind="vector", label="Doc", dimensions=3, metric="cosine")
 
         db.batch_create_nodes_with_props(
             "Doc",
@@ -108,11 +110,11 @@ class TestBatchCreateNodesWithProps:
 
 class TestPropertyIndexes:
     def test_create_and_check_index(self, db):
-        db.create_property_index("user_id")
+        db.create_index("user_id")
         assert db.has_property_index("user_id")
 
     def test_find_nodes_by_property(self, db):
-        db.create_property_index("user_id")
+        db.create_index("user_id")
         db.batch_create_nodes_with_props(
             "Memory",
             [
@@ -125,9 +127,9 @@ class TestPropertyIndexes:
         assert len(nodes) == 2
 
     def test_drop_index(self, db):
-        db.create_property_index("temp_field")
+        owner = db.create_index("temp_field")
         assert db.has_property_index("temp_field")
-        db.drop_property_index("temp_field")
+        assert db.drop_index(owner) is True
         assert not db.has_property_index("temp_field")
 
     def test_index_does_not_exist(self, db):
@@ -143,7 +145,7 @@ class TestVectorSearchOperatorFilters:
     @pytest.fixture
     def memory_db(self, db):
         """Set up a DB with indexed Memory nodes for filter tests."""
-        db.create_vector_index("Memory", "embedding", dimensions=3, metric="cosine")
+        db.create_index("embedding", kind="vector", label="Memory", dimensions=3, metric="cosine")
         db.batch_create_nodes_with_props(
             "Memory",
             [
@@ -338,26 +340,26 @@ class TestTransactions:
 
 class TestCDCNodeHistory:
     def test_node_history_after_create(self, db):
-        if not hasattr(db, "node_history"):
+        if not hasattr(db, "node_history_after"):
             pytest.skip("CDC not available")
         db.enable_cdc()
         node = db.create_node(["Memory"], {"text": "hello"})
         node_id = node.id if hasattr(node, "id") else node
-        events = db.node_history(node_id)
+        events = collect_history(db, node_id)
         assert len(events) == 1
 
     def test_node_history_after_property_change(self, db):
-        if not hasattr(db, "node_history"):
+        if not hasattr(db, "node_history_after"):
             pytest.skip("CDC not available")
         db.enable_cdc()
         node = db.create_node(["Memory"], {"text": "v1"})
         node_id = node.id if hasattr(node, "id") else node
         db.set_node_property(node_id, "text", "v2")
-        events = db.node_history(node_id)
+        events = collect_history(db, node_id)
         assert len(events) == 2
 
     def test_node_history_empty_for_nonexistent(self, db):
-        if not hasattr(db, "node_history"):
+        if not hasattr(db, "node_history_after"):
             pytest.skip("CDC not available")
-        events = db.node_history(99999)
+        events = collect_history(db, 99999)
         assert events == []

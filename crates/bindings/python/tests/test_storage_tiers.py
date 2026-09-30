@@ -36,19 +36,19 @@ def test_default_tiers_are_in_memory():
 def test_force_disk_on_vector_store_at_open():
     """section_tiers={'VectorStore': 'force_disk'} triggers spill at open.
 
-    Skips if vector-index feature isn't built (no create_vector_index).
+    Skips if vector-index feature isn't built (no vector_search).
     """
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "fd.grafeo")
         db = GrafeoDB(path, section_tiers={"VectorStore": "force_disk"})
 
-        # If vector-index isn't compiled, the create_vector_index call
+        # If vector-index isn't compiled, the vector index creation call
         # below will raise — bail out gracefully.
-        if not hasattr(db, "create_vector_index"):
+        if not hasattr(db, "vector_search"):
             pytest.skip("vector-index feature not built")
 
         db.execute("CREATE (n:Item {embedding: [0.1, 0.2, 0.3, 0.4]})")
-        db.create_vector_index("Item", "embedding", dimensions=4)
+        db.create_index("embedding", kind="vector", label="Item", dimensions=4)
 
         # The Phase 8a wiring already spilled VectorStore at open;
         # storage_tiers() must reflect the OnDisk state.

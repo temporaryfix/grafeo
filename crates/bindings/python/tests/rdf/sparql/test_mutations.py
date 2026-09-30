@@ -8,13 +8,19 @@ import pytest
 
 # Try to import grafeo
 try:
-    from grafeo import GrafeoDB  # noqa: F401
+    from grafeo import GrafeoDB
 
     GRAFEO_AVAILABLE = True
 except ImportError:
     GRAFEO_AVAILABLE = False
 
 pytestmark = pytest.mark.skipif(not GRAFEO_AVAILABLE, reason="Grafeo Python bindings not installed")
+
+
+@pytest.fixture
+def db():
+    """Create an RDF database for SPARQL mutation tests."""
+    return GrafeoDB(graph_model="rdf")
 
 
 class TestSPARQLMutations:

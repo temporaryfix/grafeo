@@ -122,3 +122,33 @@ impl From<grafeo_common::utils::error::Error> for PyGrafeoError {
 
 /// Convenience type for functions that may fail with a Python-compatible error.
 pub type PyGrafeoResult<T> = Result<T, PyGrafeoError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grafeo_common::utils::error::{Error, QueryError};
+
+    #[test]
+    fn timeout_and_cancellation_keep_exact_python_error_metadata() {
+        for (query_error, expected_code, expected_retryable) in [
+            (QueryError::timeout(), ErrorCode::QueryTimeout, true),
+            (QueryError::cancelled(), ErrorCode::QueryCancelled, false),
+        ] {
+            for contextual in [false, true] {
+                let error = Error::Query(query_error.clone());
+                let error = if contextual {
+                    error.with_context("cleanup also failed")
+                } else {
+                    error
+                };
+                let converted = PyGrafeoError::from(error);
+                let PyGrafeoError::Query { code, .. } = converted else {
+                    panic!("query errors must retain their binding category");
+                };
+                let code = code.expect("typed query errors retain an exact code");
+                assert_eq!(code, expected_code);
+                assert_eq!(code.is_retryable(), expected_retryable);
+            }
+        }
+    }
+}

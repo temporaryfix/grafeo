@@ -1,7 +1,7 @@
 """Tests for vector support in Python bindings.
 
 Covers: list[float] → Vector conversion, vector() function,
-cosine_similarity/distance functions, and create_vector_index().
+cosine_similarity/distance functions, and create_index(kind="vector").
 """
 
 import pytest
@@ -213,41 +213,41 @@ class TestVectorFunction:
 
 
 class TestCreateVectorIndex:
-    """Test create_vector_index() method."""
+    """Test create_index(kind="vector") method."""
 
     def test_create_vector_index_basic(self, db):
         """Basic vector index creation should succeed."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
         db.create_node(["Doc"], {"embedding": [0.0, 1.0, 0.0]})
-        db.create_vector_index("Doc", "embedding")
+        db.create_index("embedding", kind="vector", label="Doc")
 
     def test_create_vector_index_with_metric(self, db):
         """Vector index with explicit metric should succeed."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
-        db.create_vector_index("Doc", "embedding", metric="euclidean")
+        db.create_index("embedding", kind="vector", label="Doc", metric="euclidean")
 
     def test_create_vector_index_with_dimensions(self, db):
         """Vector index with explicit dimensions should succeed."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
-        db.create_vector_index("Doc", "embedding", dimensions=3)
+        db.create_index("embedding", kind="vector", label="Doc", dimensions=3)
 
     def test_create_vector_index_no_vectors_fails(self, db):
         """Creating index on nodes without vectors should fail."""
         db.create_node(["Doc"], {"name": "no embedding"})
         with pytest.raises(RuntimeError, match="No vector properties"):
-            db.create_vector_index("Doc", "embedding")
+            db.create_index("embedding", kind="vector", label="Doc")
 
     def test_create_vector_index_dimension_mismatch_fails(self, db):
         """Dimension mismatch should fail."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
         with pytest.raises(RuntimeError, match="dimension mismatch"):
-            db.create_vector_index("Doc", "embedding", dimensions=5)
+            db.create_index("embedding", kind="vector", label="Doc", dimensions=5)
 
     def test_create_vector_index_invalid_metric_fails(self, db):
         """Invalid metric should fail."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
         with pytest.raises(RuntimeError, match="Unknown distance metric"):
-            db.create_vector_index("Doc", "embedding", metric="invalid")
+            db.create_index("embedding", kind="vector", label="Doc", metric="invalid")
 
     def test_schema_ddl_error_message(self, db):
         """CREATE VECTOR INDEX via execute() should give helpful error."""
@@ -258,19 +258,35 @@ class TestCreateVectorIndex:
         """Vector index with custom m parameter should succeed."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
         db.create_node(["Doc"], {"embedding": [0.0, 1.0, 0.0]})
-        db.create_vector_index("Doc", "embedding", m=32)
+        db.create_index("embedding", kind="vector", label="Doc", m=32)
 
     def test_create_vector_index_with_ef_construction(self, db):
         """Vector index with custom ef_construction should succeed."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
         db.create_node(["Doc"], {"embedding": [0.0, 1.0, 0.0]})
-        db.create_vector_index("Doc", "embedding", ef_construction=200)
+        db.create_index("embedding", kind="vector", label="Doc", ef_construction=200)
 
     def test_create_vector_index_all_tuning_params(self, db):
         """Vector index with all tuning parameters should succeed."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
         db.create_node(["Doc"], {"embedding": [0.0, 1.0, 0.0]})
-        db.create_vector_index("Doc", "embedding", metric="cosine", m=32, ef_construction=256)
+        db.create_index("embedding", kind="vector", label="Doc", metric="cosine", m=32, ef_construction=256)
+
+    def test_create_vector_index_with_search_ef(self, db):
+        """Vector index search ef should be accepted and retained by the index."""
+        db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
+        db.create_index("embedding", kind="vector", label="Doc", ef=128)
+
+    def test_create_vector_index_search_ef_requires_positive_int(self, db):
+        db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
+        with pytest.raises(ValueError, match="positive integer"):
+            db.create_index("embedding", kind="vector", label="Doc", ef=0)
+        with pytest.raises(TypeError, match="positive integer"):
+            db.create_index("embedding", kind="vector", label="Doc", ef=True)
+
+    def test_create_index_search_ef_rejects_non_vector_kind(self, db):
+        with pytest.raises(ValueError, match="vector options"):
+            db.create_index("embedding", kind="property", ef=128)
 
 
 class TestVectorSearch:
@@ -281,7 +297,7 @@ class TestVectorSearch:
         db.create_node(["Doc"], {"id": "a", "embedding": [1.0, 0.0, 0.0]})
         db.create_node(["Doc"], {"id": "b", "embedding": [0.9, 0.1, 0.0]})
         db.create_node(["Doc"], {"id": "c", "embedding": [0.0, 1.0, 0.0]})
-        db.create_vector_index("Doc", "embedding", metric="cosine")
+        db.create_index("embedding", kind="vector", label="Doc", metric="cosine")
 
     def test_vector_search_basic(self, db):
         """Basic vector search should return k results."""
@@ -328,6 +344,34 @@ class TestVectorSearch:
         _, first_dist = results[0]
         assert first_dist < 0.01
 
+    def test_gql_vector_call_matches_declared_index_ef(self, db):
+        """The index-requiring GQL ANN procedure shares the declared default."""
+        # Fixed corpus; index topology itself is entropy-seeded by the public
+        # constructor. Deterministic low/high discrimination belongs in the
+        # engine's fixed-seed HNSW caller control, not a probabilistic assertion.
+        state = 42
+        vectors = []
+        for _ in range(196):
+            vector = []
+            for _ in range(8):
+                state = (1664525 * state + 1013904223) & 0xFFFFFFFF
+                vector.append(((state >> 16) - 32768) / 32768.0)
+            vectors.append(vector)
+        for i, vector in enumerate(vectors[:192]):
+            db.create_node(["Doc"], {"id": i, "embedding": vector})
+        db.create_index(
+            "embedding", kind="vector", label="Doc", metric="cosine",
+            m=4, ef_construction=16, ef=128,
+        )
+        for query in vectors[192:]:
+            gql = f"CALL grafeo.search.vector('Doc', 'embedding', {query}, 5)"
+            expected = db.vector_search("Doc", "embedding", query, k=5, ef=128)
+            assert db.vector_search("Doc", "embedding", query, k=5) == expected
+            gql_rows = list(db.execute(gql))
+            assert [(row["node_id"], row["distance"]) for row in gql_rows] == expected
+            db.vector_search("Doc", "embedding", query, k=5, ef=5)
+            assert db.vector_search("Doc", "embedding", query, k=5) == expected
+
     def test_vector_search_no_index_fails(self, db):
         """Searching without an index should fail."""
         db.create_node(["Doc"], {"embedding": [1.0, 0.0, 0.0]})
@@ -338,7 +382,7 @@ class TestVectorSearch:
         """Vector search with euclidean metric should work."""
         db.create_node(["Vec"], {"data": [1.0, 0.0, 0.0]})
         db.create_node(["Vec"], {"data": [0.0, 1.0, 0.0]})
-        db.create_vector_index("Vec", "data", metric="euclidean")
+        db.create_index("data", kind="vector", label="Vec", metric="euclidean")
         results = db.vector_search("Vec", "data", [1.0, 0.0, 0.0], k=2)
         assert len(results) == 2
         # Identical vector has distance ~0
@@ -375,7 +419,7 @@ class TestBatchCreateNodes:
         """Batch-inserted nodes should be indexable and searchable."""
         vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         db.batch_create_nodes("Doc", "embedding", vectors)
-        db.create_vector_index("Doc", "embedding", metric="cosine")
+        db.create_index("embedding", kind="vector", label="Doc", metric="cosine")
         results = db.vector_search("Doc", "embedding", [1.0, 0.0, 0.0], k=3)
         assert len(results) == 3
         # Closest should be nearly 0 distance
@@ -395,7 +439,7 @@ class TestBatchVectorSearch:
         """Insert test vectors and build index."""
         vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         db.batch_create_nodes("Doc", "embedding", vectors)
-        db.create_vector_index("Doc", "embedding", metric="cosine")
+        db.create_index("embedding", kind="vector", label="Doc", metric="cosine")
 
     def test_batch_vector_search_basic(self, db):
         """Batch search should return results for each query."""

@@ -37,14 +37,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(all(
+    feature = "full",
+    not(all(feature = "rdf", feature = "shacl", feature = "analytics"))
+))]
+compile_error!("Python `full` must retain RDF, SHACL, and analytics support");
+
 use pyo3::prelude::*;
 
 mod bridges;
+mod control;
 mod database;
 mod error;
 mod graph;
 mod quantization;
 mod query;
+#[cfg(feature = "gql")]
 mod stream;
 mod types;
 
@@ -53,6 +61,7 @@ use bridges::{PyAlgorithms, PyNetworkXAdapter, PySolvORAdapter};
 use database::{AsyncQueryResult, AsyncQueryResultIter, PyGrafeoDB, PyIsolationLevel};
 use graph::{PyEdge, PyNode};
 use query::PyQueryResult;
+#[cfg(feature = "gql")]
 use stream::PyResultStream;
 use types::PyValue;
 
@@ -71,16 +80,18 @@ fn simd_support() -> &'static str {
 }
 
 /// Grafeo Python module.
-#[pymodule]
+#[pymodule(gil_used = true)]
 fn grafeo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "GrafeoError",
         m.py().get_type::<crate::error::GrafeoError>(),
     )?;
     m.add_class::<PyGrafeoDB>()?;
+    m.add_class::<control::PyQueryControl>()?;
     m.add_class::<PyNode>()?;
     m.add_class::<PyEdge>()?;
     m.add_class::<PyQueryResult>()?;
+    #[cfg(feature = "gql")]
     m.add_class::<PyResultStream>()?;
     m.add_class::<AsyncQueryResult>()?;
     m.add_class::<AsyncQueryResultIter>()?;

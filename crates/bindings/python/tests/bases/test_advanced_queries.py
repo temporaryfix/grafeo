@@ -33,6 +33,15 @@ class BaseAdvancedQueriesTest(ABC):
     # UNWIND
     # =========================================================================
 
+    def test_query_result_column_is_list_not_dicts(self, db):
+        self.setup_social_graph(db)
+        result = self.execute_query(db, "MATCH (n:Person) RETURN n.age AS age")
+        ages = result.column("age")
+        assert isinstance(ages, list)
+        assert sorted(ages) == [25, 30, 35]
+        assert result.column(0) == ages
+        assert len(result) == 3
+
     def test_unwind_literal_list(self, db):
         result = self.execute_query(db, "UNWIND [1, 2, 3] AS x RETURN x")
         rows = list(result)

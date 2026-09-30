@@ -11,10 +11,40 @@ Focus:
 
 import threading
 import time
+import asyncio
+import gc
 
 import pytest
+import grafeo
 
 pytestmark = pytest.mark.gql
+
+
+def test_async_iterator_keeps_native_result_alive(db):
+    async def execute():
+        return await db.execute_async("UNWIND [1,2,3] AS x RETURN x")
+
+    result = asyncio.run(execute())
+    first = iter(result)
+    second = iter(result)
+    del result
+    gc.collect()
+    assert next(first) == [1]
+    assert list(second) == [[1], [2], [3]]
+    assert list(first) == [[2], [3]]
+
+
+def test_compound_parameters_survive_eager_and_async_result_conversion(db):
+    payload = ["x" * 8192, [1, None], {"key": "value"}]
+    assert list(db.execute("RETURN $payload AS payload", {"payload": payload})) == [
+        {"payload": payload}
+    ]
+
+    async def execute():
+        return await db.execute_async("RETURN $payload AS payload", {"payload": payload})
+
+    result = asyncio.run(execute())
+    assert list(result) == [[payload]]
 
 
 @pytest.fixture
@@ -78,6 +108,22 @@ def test_streaming_early_break(people_db):
     # Subsequent query on the same DB works.
     rows = list(people_db.execute("MATCH (p:Person) RETURN p.name"))
     assert len(rows) == 5
+
+
+def test_streaming_pre_cancel_is_typed_and_does_not_leak_to_next_stream(db):
+    control = grafeo.QueryControl()
+    control.cancel()
+    with pytest.raises(grafeo.GrafeoError) as exc_info:
+        db.execute_lazy("UNWIND range(1, 4) AS x RETURN x", control=control)
+    assert exc_info.value.error_code == "GRAFEO-Q007"
+    assert list(db.execute_lazy("RETURN 1 AS value")) == [{"value": 1}]
+
+
+def test_streaming_accepts_parameters_and_limits(people_db):
+    stream = people_db.execute_lazy(
+        "RETURN $value AS value", {"value": 9}, max_rows=1, max_bytes=1024
+    )
+    assert list(stream) == [{"value": 9}]
 
 
 def test_streaming_rejects_mutation(people_db):
@@ -155,3 +201,90 @@ def test_concurrent_iteration_does_not_deadlock(people_db):
     # Sanity cap: two threads of 2k rows should finish in far under 30s;
     # blowing past that points at GIL starvation even without strict timing.
     assert elapsed < 20.0, f"concurrent iteration took {elapsed:.2f}s"
+
+
+def test_close_releases_publication_while_stream_object_remains_alive(people_db):
+    stream = people_db.execute_lazy("MATCH (p:Person) RETURN p.name AS name")
+    assert "name" in next(stream)
+    stream.close()
+    stream.close()
+    assert list(stream) == []
+    # The writer has its own deadline so a retained read publication guard
+    # produces a bounded failure instead of hanging the test process.
+    people_db.execute(
+        "INSERT (:AfterStreamClose {value: 1})",
+        control=grafeo.QueryControl(timeout_ms=2000),
+    )
+    assert stream.columns == ["name"]
+    assert list(people_db.execute("MATCH (n:AfterStreamClose) RETURN n.value AS value")) == [{"value": 1}]
+
+
+def test_context_manager_closes_after_early_exit_and_preserves_body_exception(people_db):
+    class BodyFailure(Exception):
+        pass
+
+    failure = BodyFailure("body sentinel")
+    with pytest.raises(BodyFailure) as error:
+        with people_db.execute_lazy("MATCH (p:Person) RETURN p.name AS name") as stream:
+            assert "name" in next(stream)
+            raise failure
+    assert error.value is failure
+    assert list(stream) == []
+    stream.close()
+    people_db.execute("INSERT (:AfterContextClose)", control=grafeo.QueryControl(timeout_ms=2000))
+
+
+def test_buffered_stream_cancel_is_error_once_and_close_resolution_is_repeatable(db):
+    control = grafeo.QueryControl()
+    stream = db.execute_lazy("UNWIND range(1, 20) AS x RETURN x", control=control)
+    assert control.consumed
+    assert next(stream) == {"x": 1}
+    control.cancel()
+    with pytest.raises(grafeo.GrafeoError) as error:
+        next(stream)
+    assert error.value.error_code == "GRAFEO-Q007"
+    assert list(stream) == []
+    # The primary cancellation is emitted once; close exposes cleanup only.
+    stream.close()
+    stream.close()
+    assert list(db.execute_lazy("RETURN 2 AS value")) == [{"value": 2}]
+
+
+def test_python_row_conversion_failure_closes_stream_before_next_pull(db):
+    # The resident row fits the native query grant; the per-row Python copy
+    # cannot fit the explicitly smaller conversion cap.
+    payload = ["x" * 8192, [1, None]]
+    stream = db.execute_lazy("RETURN $payload AS payload", {"payload": payload}, max_bytes=1024)
+    with pytest.raises(grafeo.GrafeoError) as error:
+        next(stream)
+    assert error.value.error_code == "GRAFEO-S001"
+    assert "Python result conversion" in str(error.value)
+    assert list(stream) == []
+    stream.close()
+    stream.close()
+    db.execute("INSERT (:AfterCopyDenial)", control=grafeo.QueryControl(timeout_ms=2000))
+
+
+def test_stream_row_cap_emits_prefix_then_errors_once_and_releases_query(db):
+    stream = db.execute_lazy("UNWIND [1, 2] AS x RETURN x", max_rows=1)
+    assert next(stream) == {"x": 1}
+    with pytest.raises(grafeo.GrafeoError) as error:
+        next(stream)
+    assert error.value.error_code == "GRAFEO-S001"
+    assert list(stream) == []
+    stream.close()
+    stream.close()
+    db.execute("INSERT (:AfterStreamRowCap)", control=grafeo.QueryControl(timeout_ms=2000))
+
+
+def test_stream_row_cap_allows_exact_limit_and_empty_zero_limit(db):
+    with db.execute_lazy("UNWIND [1] AS x RETURN x", max_rows=1) as exact:
+        assert list(exact) == [{"x": 1}]
+    with db.execute_lazy("UNWIND [] AS x RETURN x", max_rows=0) as empty:
+        assert list(empty) == []
+    nonempty = db.execute_lazy("UNWIND [1] AS x RETURN x", max_rows=0)
+    with pytest.raises(grafeo.GrafeoError) as error:
+        next(nonempty)
+    assert error.value.error_code == "GRAFEO-S001"
+    assert list(nonempty) == []
+    nonempty.close()

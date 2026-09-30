@@ -141,10 +141,13 @@ class TestNodesDf:
         company_rows = df[df["_labels"].apply(lambda labels: "Company" in labels)]
         assert company_rows["age"].isna().all()
 
-    def test_labels_are_lists(self, populated_db):
+    def test_labels_preserve_exact_sequences_across_dataframe_backends(self, populated_db):
         df = populated_db.nodes_df()
-        for labels in df["_labels"]:
-            assert isinstance(labels, list)
+        for name, labels in zip(df["name"], df["_labels"]):
+            # Arrow's pandas conversion stores list columns as NumPy arrays;
+            # the existing Python fallback stores lists. Both retain labels.
+            assert pd.api.types.is_list_like(labels)
+            assert list(labels) == (["Company"] if name == "Acme Corp" else ["Person"])
 
     def test_empty_graph(self):
         db = grafeo.GrafeoDB()

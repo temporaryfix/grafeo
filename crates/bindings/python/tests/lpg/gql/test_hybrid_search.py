@@ -37,8 +37,8 @@ def hybrid_db(db):
         {"content": "Graph neural network", "emb": [0.5, 0.5, 0.0]},
     )
 
-    db.create_text_index("Doc", "content")
-    db.create_vector_index("Doc", "emb", dimensions=3, metric="cosine")
+    db.create_index("content", kind="text", label="Doc")
+    db.create_index("emb", kind="vector", label="Doc", dimensions=3, metric="cosine")
     return db
 
 

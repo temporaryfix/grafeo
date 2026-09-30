@@ -2,7 +2,7 @@
 
 Covers: set_node_property, set_edge_property, remove_node_property,
 remove_edge_property, add_node_label, remove_node_label, get_node_labels,
-create_property_index, drop_property_index, has_property_index,
+create_index, drop_index, has_property_index,
 find_nodes_by_property, get_nodes_by_label, get_property_batch.
 """
 
@@ -213,7 +213,7 @@ class TestPropertyIndex:
 
     def test_create_and_has_index(self, populated_db):
         db = populated_db["db"]
-        db.create_property_index("name")
+        db.create_index("name")
         assert db.has_property_index("name") is True
 
     def test_has_index_nonexistent(self, populated_db):
@@ -222,19 +222,19 @@ class TestPropertyIndex:
 
     def test_drop_index(self, populated_db):
         db = populated_db["db"]
-        db.create_property_index("name")
-        dropped = db.drop_property_index("name")
+        owner = db.create_index("name")
+        dropped = db.drop_index(owner)
         assert dropped is True
         assert db.has_property_index("name") is False
 
     def test_drop_nonexistent_index(self, populated_db):
         db = populated_db["db"]
-        dropped = db.drop_property_index("nonexistent")
+        dropped = db.drop_index(2**32 - 1)
         assert dropped is False
 
     def test_find_nodes_by_property(self, populated_db):
         db = populated_db["db"]
-        db.create_property_index("name")
+        db.create_index("name")
         ids = db.find_nodes_by_property("name", "Alix")
         assert len(ids) == 1
         node = db.get_node(ids[0])
@@ -242,13 +242,13 @@ class TestPropertyIndex:
 
     def test_find_nodes_by_property_no_match(self, populated_db):
         db = populated_db["db"]
-        db.create_property_index("name")
+        db.create_index("name")
         ids = db.find_nodes_by_property("name", "NonExistent")
         assert len(ids) == 0
 
     def test_find_nodes_by_int_property(self, populated_db):
         db = populated_db["db"]
-        db.create_property_index("age")
+        db.create_index("age")
         ids = db.find_nodes_by_property("age", 30)
         assert len(ids) == 1
 
@@ -456,23 +456,53 @@ class TestErrorHandling:
 
     def test_execute_on_closed_in_memory_db(self, db):
         db.close()
-        # In-memory DB close is a no-op; operations still work
-        result = db.execute("MATCH (n) RETURN n")
-        assert list(result) == []
+        with pytest.raises(grafeo.GrafeoError) as exc:
+            db.execute("MATCH (n) RETURN n")
+        assert exc.value.error_code == "GRAFEO-T004"
 
     def test_get_node_nonexistent(self, db):
         node = db.get_node(999999)
         assert node is None
 
-    def test_set_property_nonexistent_node_silent(self, db):
-        # Setting property on nonexistent node succeeds silently
-        db.set_node_property(999999, "key", "value")
+    def test_set_property_nonexistent_node_rejected(self, db):
+        with pytest.raises(grafeo.GrafeoError) as exc:
+            db.set_node_property(999999, "key", "value")
+        assert exc.value.error_code == "GRAFEO-V002"
 
-    def test_set_property_nonexistent_edge_silent(self, db):
-        # Setting property on nonexistent edge succeeds silently
-        db.set_edge_property(999999, "key", "value")
+    def test_set_property_nonexistent_edge_rejected(self, db):
+        with pytest.raises(grafeo.GrafeoError) as exc:
+            db.set_edge_property(999999, "key", "value")
+        assert exc.value.error_code == "GRAFEO-V003"
 
     def test_double_close(self, db):
         db.close()
         # Second close should not raise
         db.close()
+
+class TestIndexOwnerContract:
+    def test_duplicate_create_preserves_owner(self, populated_db):
+        db = populated_db["db"]
+        owner = db.create_index("owner_contract")
+        assert isinstance(owner, int)
+        with pytest.raises(RuntimeError, match=r"(?i)index|owner"):
+            db.create_index("owner_contract")
+        assert db.has_property_index("owner_contract")
+        db.rebuild_index(owner)
+        assert db.drop_index(owner) is True
+        assert db.drop_index(owner) is False
+        with pytest.raises(RuntimeError, match=r"(?i)index|owner"):
+            db.rebuild_index(owner)
+        replacement = db.create_index("owner_contract")
+        assert replacement > owner
+        assert db.drop_index(replacement) is True
+
+    def test_invalid_index_requests_reject(self, populated_db):
+        db = populated_db["db"]
+        with pytest.raises((TypeError, ValueError)):
+            db.create_index("p", graph="a/b")
+        with pytest.raises(ValueError):
+            db.create_index("p", kind="mystery")
+        with pytest.raises(ValueError):
+            db.create_index("p", dimensions=3)
+        with pytest.raises(ValueError):
+            db.create_index("p", typo=1)

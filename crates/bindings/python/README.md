@@ -56,6 +56,59 @@ result = db.execute_graphql(query)              # GraphQL
 result = db.execute_sql(query)                  # SQL/PGQ (SQL:2023)
 ```
 
+### Execution Controls and Output Limits
+
+Use a fresh `QueryControl` for each query. Its deadline starts when the
+control is created, and `cancel()` is terminal; a consumed control cannot be
+reused.
+
+```python
+import grafeo
+
+control = grafeo.QueryControl(timeout_ms=250)
+result = db.execute(
+    "MATCH (p:Person) WHERE p.name = $name RETURN p.name",
+    {"name": "Alix"},
+    control=control,
+    max_rows=100,
+    max_bytes=16 * 1024,
+)
+
+control = grafeo.QueryControl()
+control.cancel()
+# Raises GrafeoError with error_code == "GRAFEO-Q007".
+db.execute("RETURN 1", control=control)
+```
+
+The same `params`, `control`, `max_rows`, and `max_bytes` arguments are
+available on `execute_lazy()` and `execute_async()` (pass the latter's result
+to `await`). Explicit `execute_cypher()`, `execute_sparql()`, and transaction
+execution accept them when those language/features are enabled.
+
+```python
+with db.execute_lazy(
+    "MATCH (p:Person) WHERE p.name = $name RETURN p.name",
+    {"name": "Alix"},
+    max_rows=100,
+    max_bytes=16 * 1024,
+) as stream:
+    for row in stream:
+        print(row)
+
+async_result = await db.execute_async(
+    "RETURN $value AS value",
+    {"value": 7},
+    control=grafeo.QueryControl(timeout_ms=500),
+    max_rows=1,
+    max_bytes=16 * 1024,
+)
+```
+
+Native eager execution defaults to 1,000,000 rows and 64 MiB per query.
+Binding-owned copied output is also constrained by `max_bytes`; lazy streams
+enforce their per-row byte cap and an explicit `max_rows` total, if supplied. Limits cover Grafeo-owned result storage and do not
+promise to account for allocations made inside third-party Python libraries.
+
 ### Node & Edge CRUD
 
 ```python
@@ -150,7 +203,7 @@ result.scalar()         # first column of first row
 
 ```python
 # Create an HNSW index
-db.create_vector_index("Document", "embedding", dimensions=384)
+db.create_index("embedding", kind="vector", label="Document", dimensions=384)
 
 # Insert vectors
 node = db.create_node(["Document"], {"embedding": [0.1, 0.2, ...]})
@@ -184,3 +237,27 @@ results = db.vector_search("Document", "embedding", query_vector, k=10)
 ## License
 
 Apache-2.0
+
+## Index owners
+
+`create_index(property, *, kind="property", graph=None, name=None, label=None, **options)`
+returns an unsigned 32-bit owner ID. Kinds are property, btree, text, and vector;
+only text/vector take a label. Graphs are component arrays: `[]` is root,
+`[""]` is an empty child, and `["a/b"]` differs from `["a", "b"]`.
+Duplicate creation raises; generated names occupy a reserved namespace.
+
+Text accepts `min_token_length` (default 2, zero is valid); other kinds reject
+that option. For example, `db.create_index("body", kind="text", label="Doc",
+min_token_length=3)` retains only tokens of at least three UTF-8 bytes. Rebuild
+and persistence retain the resolved tokenizer configuration.
+
+```python
+owner = db.create_index("email")
+db.rebuild_index(owner)  # Atomic; preserves owner and resolved configuration.
+assert db.drop_index(owner)
+assert not db.drop_index(owner)  # Absent owner; other failures raise.
+```
+
+Rebuilding a missing owner raises. Explicit recreation returns a new owner.
+Vector-only options are dimensions, metric, m, ef_construction, and quantization.
+Malformed requests and unavailable features raise errors.
