@@ -7,7 +7,7 @@ use crate::execution::pipeline::{ChunkSizeHint, PushOperator, Sink};
 #[cfg(feature = "spill")]
 use crate::execution::spill::{PartitionedState, SpillManager};
 use crate::execution::vector::ValueVector;
-use grafeo_common::types::Value;
+use grafeo_common::types::{HashableValue as ValueKey, Value};
 use std::collections::HashMap;
 #[cfg(feature = "spill")]
 use std::io::{Read, Write};
@@ -61,20 +61,37 @@ fn update_accumulator(
 
 /// Hash key for grouping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GroupKey(Vec<u64>);
+struct GroupKey(Vec<GroupKeyPart>);
+
+// Cache the existing hash, but retain the full value for collision checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupKeyPart {
+    hash: u64,
+    value: ValueKey,
+}
+
+impl std::hash::Hash for GroupKeyPart {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.hash, state);
+    }
+}
 
 impl GroupKey {
     fn from_row(chunk: &DataChunk, row: usize, group_by: &[usize]) -> Self {
-        let hashes: Vec<u64> = group_by
+        let parts = group_by
             .iter()
             .map(|&col| {
-                chunk
+                let value = chunk
                     .column(col)
                     .and_then(|c| c.get_value(row))
-                    .map_or(0, |v| hash_value(&v))
+                    .unwrap_or(Value::Null);
+                GroupKeyPart {
+                    hash: hash_value(&value),
+                    value: value.into(),
+                }
             })
             .collect();
-        Self(hashes)
+        Self(parts)
     }
 }
 
@@ -916,8 +933,14 @@ impl PushOperator for SpillableAggregatePushOperator {
                 self.groups.len()
             };
             let key_size = self.group_by.len() * std::mem::size_of::<Value>();
+            // In-memory groups also retain full key witnesses for equality.
+            let witness_size = if self.using_partitioned {
+                0
+            } else {
+                self.group_by.len() * std::mem::size_of::<GroupKeyPart>()
+            };
             let acc_size = self.aggregates.len() * 64; // rough accumulator size
-            self.estimated_bytes = group_count * (key_size + acc_size + 48);
+            self.estimated_bytes = group_count * (key_size + witness_size + acc_size + 48);
             spill_state.set_usage(self.estimated_bytes);
         }
 
@@ -996,6 +1019,88 @@ mod tests {
     use super::*;
     use crate::execution::operators::accumulator::AggregateFunction;
     use crate::execution::sink::CollectorSink;
+
+    fn check_counter_group_identity(mut aggregate: impl PushOperator) {
+        use grafeo_common::types::HashableValue as ValueKey;
+        use std::sync::Arc;
+
+        let empty = Arc::new(HashMap::new());
+        let actor = Arc::new(HashMap::from([("actor".to_owned(), 1_u64)]));
+        let positive = Value::OnCounter {
+            pos: Arc::clone(&actor),
+            neg: Arc::clone(&empty),
+        };
+        let negative = Value::OnCounter {
+            pos: empty,
+            neg: actor,
+        };
+        let mut sink = CollectorSink::new();
+        for values in [
+            vec![positive.clone(), negative.clone()],
+            vec![positive.clone()],
+        ] {
+            aggregate
+                .push(
+                    DataChunk::new(vec![ValueVector::from_values(&values)]),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        aggregate.finalize(&mut sink).unwrap();
+        let chunks = sink.into_chunks();
+        let actual: HashMap<ValueKey, i64> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk.selected_indices().map(|row| {
+                    (
+                        chunk.column(0).unwrap().get_value(row).unwrap().into(),
+                        chunk
+                            .column(1)
+                            .unwrap()
+                            .get_value(row)
+                            .unwrap()
+                            .as_int64()
+                            .unwrap(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(chunks.iter().map(DataChunk::row_count).sum::<usize>(), 2);
+        assert_eq!(
+            actual,
+            HashMap::from([(positive.into(), 2), (negative.into(), 1)])
+        );
+    }
+
+    #[test]
+    fn group_identity_keeps_opposite_counter_states() {
+        check_counter_group_identity(AggregatePushOperator::new(
+            vec![0],
+            vec![AggregateExpr::count_star()],
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn group_identity_keeps_counters_in_spillable_fallback() {
+        check_counter_group_identity(SpillableAggregatePushOperator::new(
+            vec![0],
+            vec![AggregateExpr::count_star()],
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn group_identity_keeps_counters_in_partitioned_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SpillManager::new(dir.path()).unwrap());
+        check_counter_group_identity(SpillableAggregatePushOperator::with_spilling(
+            vec![0],
+            vec![AggregateExpr::count_star()],
+            manager,
+            1,
+        ));
+    }
 
     fn create_test_chunk(values: &[i64]) -> DataChunk {
         let v: Vec<Value> = values.iter().map(|&i| Value::Int64(i)).collect();
