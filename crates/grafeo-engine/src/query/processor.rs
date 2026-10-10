@@ -606,30 +606,38 @@ impl QueryProcessor {
             return Ok(physical_explain_result(&optimized_plan, entries));
         }
 
-        // 3b. EXPLAIN ANALYZE (PROFILE): execute with instrumentation, report stats.
-        if optimized_plan.profile {
-            let planner = RdfPlanner::new(Arc::clone(rdf_store));
-            let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
+        // 4. Plan and execute. An update runs in a private transaction of
+        // the processor's, whose triples apply once it succeeds.
+        let run = |writer: Option<crate::transaction::RdfWriter>| -> Result<QueryResult> {
+            let planner = RdfPlanner::new(Arc::clone(rdf_store)).with_writer(writer);
 
-            let start = std::time::Instant::now();
+            // EXPLAIN ANALYZE (PROFILE): execute with instrumentation, report stats.
+            if optimized_plan.profile {
+                let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
+
+                let start = std::time::Instant::now();
+                let executor = Executor::with_columns(physical_plan.columns.clone());
+                let _result = executor.execute(physical_plan.operator.as_mut())?;
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                let tree = crate::query::profile::build_profile_tree(
+                    &optimized_plan.root,
+                    &mut entries.into_iter(),
+                );
+                return Ok(crate::query::profile::profile_result(&tree, elapsed_ms));
+            }
+
+            let mut physical_plan = planner.plan(&optimized_plan)?;
             let executor = Executor::with_columns(physical_plan.columns.clone());
-            let _result = executor.execute(physical_plan.operator.as_mut())?;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            let tree = crate::query::profile::build_profile_tree(
-                &optimized_plan.root,
-                &mut entries.into_iter(),
-            );
-            return Ok(crate::query::profile::profile_result(&tree, elapsed_ms));
+            executor.execute(physical_plan.operator.as_mut())
+        };
+        if optimized_plan.root.has_mutations() {
+            crate::transaction::update_privately(rdf_store, &self.transaction_manager, |writer| {
+                run(Some(writer))
+            })
+        } else {
+            run(None)
         }
-
-        // 4. Convert to physical plan (using RDF planner)
-        let planner = RdfPlanner::new(Arc::clone(rdf_store));
-        let mut physical_plan = planner.plan(&optimized_plan)?;
-
-        // 5. Execute and collect results
-        let executor = Executor::with_columns(physical_plan.columns.clone());
-        executor.execute(physical_plan.operator.as_mut())
     }
 
     /// Translates an RDF query to a logical plan.

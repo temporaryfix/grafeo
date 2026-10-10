@@ -410,7 +410,7 @@ impl GrafeoDB {
             && !changes.is_empty()
         {
             use grafeo_storage::wal::WalRecord;
-            let group = crate::transaction::wal_buffer::build_group(
+            let group = crate::transaction::v1_group::build_group(
                 crate::transaction::v1_group::v1_records(&changes),
                 &[
                     WalRecord::TransactionCommit {
@@ -601,7 +601,7 @@ impl GrafeoDB {
         {
             use grafeo_storage::wal::WalRecord;
             let records = changes.read(crate::transaction::v1_group::v1_records);
-            let group = crate::transaction::wal_buffer::build_group(
+            let group = crate::transaction::v1_group::build_group(
                 records,
                 &[
                     WalRecord::TransactionCommit {

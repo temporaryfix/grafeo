@@ -2,7 +2,9 @@
 //! build with the triple store: after `close()`, which checkpoints them into
 //! the file; after a crash before any checkpoint, from the sidecar WAL; after
 //! a crash that follows a checkpoint, from the file and the WAL; and after a
-//! crash at any point of `close()` (with `testing-crash-injection`). A crash
+//! crash at any point of `close()` (with `testing-crash-injection`). So do
+//! whole-graph operations (`COPY`, `MOVE`, `ADD`, `CLEAR ALL`), and nothing
+//! comes back of what a rollback to a savepoint undid (#414). A crash
 //! runs in a child process that exits without `close()` and without
 //! destructors, and each test checks the files a crash leaves (the sidecar
 //! WAL still there) before it reopens them.
@@ -70,6 +72,31 @@ const INSERT_MORE: &str = r#"INSERT DATA {
 
 /// The statements of the first write.
 const FIRST_WRITE: &[&str] = &[FIRST];
+
+/// Whole-graph operations after [`FIRST`]: Amsterdam copied to Berlin, the
+/// default graph added to Paris, Amsterdam moved to Prague.
+const GRAPH_OPS: &[&str] = &[
+    "COPY <http://ex.org/amsterdam> TO <http://ex.org/berlin>",
+    "ADD DEFAULT TO <http://ex.org/paris>",
+    "MOVE <http://ex.org/amsterdam> TO <http://ex.org/prague>",
+];
+
+/// `CLEAR ALL` after [`FIRST`], then one triple.
+const CLEAR_ALL: &[&str] = &[
+    "CLEAR ALL",
+    "INSERT DATA { <http://ex.org/butch> <http://ex.org/knows> <http://ex.org/mia> }",
+];
+
+/// The insert of a transaction before its savepoint, which it commits.
+const KEPT: &str =
+    "INSERT DATA { <http://ex.org/vincent> <http://ex.org/knows> <http://ex.org/jules> }";
+
+/// The insert of a transaction after its savepoint, which a rollback to the
+/// savepoint undoes.
+const UNDONE: &str = r#"INSERT DATA {
+    <http://ex.org/hans> <http://ex.org/knows> <http://ex.org/shosanna> .
+    GRAPH <http://ex.org/berlin> { <http://ex.org/hans> <http://ex.org/name> "Hans" . }
+}"#;
 
 /// The statements of the second write, after the first one was checkpointed.
 const THEN_CHANGE: &[&str] = &[DELETE, INSERT_MORE];
@@ -188,6 +215,25 @@ fn crash_child() {
     match scenario.as_str() {
         // A crash before any checkpoint: the WAL alone holds the triples.
         "first_write" => {}
+        // A crash after whole-graph operations, which the WAL alone holds.
+        "graph_ops" => run(&db, GRAPH_OPS),
+        "clear_all" => run(&db, CLEAR_ALL),
+        // A crash after a transaction that rolled back to a savepoint and
+        // committed: neither the store nor the WAL holds what it undid.
+        "savepoint" => {
+            let mut session = db.session();
+            session.begin_transaction().unwrap();
+            session.execute_sparql(KEPT).unwrap();
+            session.savepoint("before_hans").unwrap();
+            session.execute_sparql(UNDONE).unwrap();
+            session.rollback_to_savepoint("before_hans").unwrap();
+            session.commit().unwrap();
+            assert_eq!(
+                triples(&db),
+                expected(&[FIRST_WRITE, &[KEPT]]),
+                "in memory, before the crash"
+            );
+        }
         // A crash after a checkpoint: the file holds the first write, the WAL
         // the change.
         "checkpoint_then_change" => {
@@ -326,6 +372,40 @@ fn triples_survive_a_crash_before_any_checkpoint() {
         &after_first_write(),
         "after a crash before any checkpoint",
     );
+}
+
+/// Whole-graph operations come back from the WAL as they ran: a copy, an
+/// add and a move, and a `CLEAR ALL`, which clears every graph (#414).
+#[test]
+fn whole_graph_operations_survive_a_crash() {
+    for (scenario, writes, shape) in [
+        ("graph_ops", GRAPH_OPS, (3, 5)),
+        ("clear_all", CLEAR_ALL, (1, 0)),
+    ] {
+        let want = expected(&[FIRST_WRITE, writes]);
+        assert_eq!(counts(&want), shape, "{scenario}: {want:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("amsterdam.grafeo");
+        crash_after(scenario, &path);
+        assert_crashed(&path, scenario);
+
+        assert_reopens_with(&path, &want, scenario);
+    }
+}
+
+/// A rollback to a savepoint drops the RDF changes after it from the
+/// transaction, in memory and in the WAL: after a crash, the reopen shows
+/// what the transaction kept, and nothing of what it undid (#414).
+#[test]
+fn a_rolled_back_savepoint_drops_rdf_changes_in_memory_and_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("berlin.grafeo");
+    crash_after("savepoint", &path);
+    assert_crashed(&path, "a crash after the commit");
+
+    let want = expected(&[FIRST_WRITE, &[KEPT]]);
+    assert_eq!(counts(&want), (4, 1), "{want:?}");
+    assert_reopens_with(&path, &want, "after a rollback to a savepoint");
 }
 
 /// A process that exits after a checkpoint (`wal_checkpoint()`, or the one of

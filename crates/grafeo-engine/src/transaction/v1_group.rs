@@ -7,7 +7,8 @@
 //! as the store's create and the writes of its values logged them; every
 //! other entry is one record. Each record carries the storage key of its
 //! graph (`None` for the default graph), for the `SwitchGraph` records the
-//! group gets where the graph changes.
+//! group gets where the graph changes ([`build_group`]). A triple is an RDF
+//! record, which names its graph itself.
 //!
 //! A standalone change (a graph command, a schema statement, an index call)
 //! is a group of its own ([`standalone_group`]): a named graph created or
@@ -19,7 +20,7 @@
 
 #[cfg(feature = "lpg")]
 use grafeo_common::change::StandaloneOp;
-use grafeo_common::change::{Change, ChangeSet, DataOp};
+use grafeo_common::change::{Change, ChangeSet, DataModel, DataOp};
 #[cfg(feature = "lpg")]
 use grafeo_common::storage::LogRecordRef;
 #[cfg(feature = "lpg")]
@@ -62,10 +63,39 @@ pub(crate) fn standalone_group(change: &StandaloneChange) -> Result<Vec<WalRecor
     Ok(records)
 }
 
+/// A record waiting for its group, with the storage key of the labeled
+/// property graph it applies to (`None` for the default graph).
+pub(crate) type PendingRecord = (Option<String>, WalRecord);
+
+/// The group of `pending`, closed by `markers`: the records, with
+/// `SwitchGraph` wherever the graph changes and a switch back to the default
+/// graph before the markers, so replay of every group starts and ends in the
+/// default graph. A commit writes its group with one call, so no other
+/// session's records land inside it (#411).
+pub(crate) fn build_group(pending: Vec<PendingRecord>, markers: &[WalRecord]) -> Vec<WalRecord> {
+    let mut group = Vec::with_capacity(pending.len() + markers.len() + 2);
+    let mut context: Option<String> = None;
+    for (graph, record) in pending {
+        if graph != context {
+            group.push(WalRecord::SwitchGraph {
+                name: graph.clone(),
+            });
+            context = graph;
+        }
+        group.push(record);
+    }
+    if context.is_some() {
+        group.push(WalRecord::SwitchGraph { name: None });
+    }
+    group.extend(markers.iter().cloned());
+    group
+}
+
 /// The v1 records of `set`'s entries, in recorded order, each with its
-/// graph's storage key. Bulk ranges and triples have none: a bulk write
-/// and the RDF store log their own.
-pub(crate) fn v1_records(set: &ChangeSet) -> Vec<(Option<String>, WalRecord)> {
+/// graph's storage key. Bulk ranges have none: a bulk write logs its own. A
+/// triple's record names its RDF graph itself and needs no switch, so it
+/// carries the default graph's key.
+pub(crate) fn v1_records(set: &ChangeSet) -> Vec<PendingRecord> {
     let mut records = Vec::with_capacity(set.len());
     for change in set.entries() {
         let Change::Data { graph, op, .. } = change else {
@@ -74,7 +104,13 @@ pub(crate) fn v1_records(set: &ChangeSet) -> Vec<(Option<String>, WalRecord)> {
         let key = set
             .graph(*graph)
             .and_then(|graph| graph.key.as_ref().map(ToString::to_string));
-        let mut push = |record: WalRecord| records.push((key.clone(), record));
+        // A triple's record names its graph itself: it needs no switch.
+        let context = if op.model() == DataModel::Rdf {
+            None
+        } else {
+            key.clone()
+        };
+        let mut push = |record: WalRecord| records.push((context.clone(), record));
         match op {
             DataOp::CreateNode {
                 id,
@@ -142,7 +178,28 @@ pub(crate) fn v1_records(set: &ChangeSet) -> Vec<(Option<String>, WalRecord)> {
                 id: *id,
                 label: label.to_string(),
             }),
-            // The RDF store logs its own triples until W3.6 records them.
+            #[cfg(feature = "triple-store")]
+            DataOp::InsertTriple { triple } => {
+                let (subject, predicate, object) = super::ntriples_terms(triple);
+                push(WalRecord::InsertRdfTriple {
+                    subject,
+                    predicate,
+                    object,
+                    graph: key.clone(),
+                });
+            }
+            #[cfg(feature = "triple-store")]
+            DataOp::DeleteTriple { triple } => {
+                let (subject, predicate, object) = super::ntriples_terms(triple);
+                push(WalRecord::DeleteRdfTriple {
+                    subject,
+                    predicate,
+                    object,
+                    graph: key.clone(),
+                });
+            }
+            // A build without the triple store records no triple.
+            #[cfg(not(feature = "triple-store"))]
             DataOp::InsertTriple { .. } | DataOp::DeleteTriple { .. } => {}
         }
     }
@@ -157,7 +214,7 @@ mod tests {
     use grafeo_common::types::{ArcStr, EdgeId, NodeId, PropertyKey, TransactionId, Value};
     use grafeo_storage::wal::WalRecord;
 
-    use super::v1_records;
+    use super::{build_group, v1_records};
 
     /// Every kind of entry maps to the records its write logged before, a
     /// create to one record per value besides its own, each with its graph.
@@ -351,5 +408,143 @@ mod tests {
             .unwrap();
             assert_eq!(decoded, [LogRecord::Standalone(op)]);
         }
+    }
+
+    fn create(id: u64) -> WalRecord {
+        WalRecord::CreateNode {
+            id: NodeId::new(id),
+            labels: vec!["N".to_string()],
+        }
+    }
+
+    fn commit() -> WalRecord {
+        WalRecord::TransactionCommit {
+            transaction_id: TransactionId::new(7),
+        }
+    }
+
+    /// Short form of a group for assertions.
+    fn shape(group: &[WalRecord]) -> Vec<String> {
+        group
+            .iter()
+            .map(|record| match record {
+                WalRecord::CreateNode { id, .. } => format!("node {}", id.as_u64()),
+                WalRecord::SwitchGraph { name } => format!("switch {name:?}"),
+                WalRecord::TransactionCommit { .. } => "commit".to_string(),
+                WalRecord::EpochAdvance { epoch } => format!("epoch {}", epoch.as_u64()),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_graph_group_has_no_switches() {
+        let group = build_group(vec![(None, create(1)), (None, create(2))], &[commit()]);
+        assert_eq!(shape(&group), ["node 1", "node 2", "commit"]);
+    }
+
+    #[test]
+    fn group_switches_graphs_and_returns_to_default() {
+        let pending = vec![
+            (Some("g".to_string()), create(1)),
+            (Some("g".to_string()), create(2)),
+            (None, create(3)),
+            (Some("h".to_string()), create(4)),
+        ];
+        let markers = [
+            commit(),
+            WalRecord::EpochAdvance {
+                epoch: grafeo_common::types::EpochId::new(5),
+            },
+        ];
+        assert_eq!(
+            shape(&build_group(pending, &markers)),
+            [
+                "switch Some(\"g\")",
+                "node 1",
+                "node 2",
+                "switch None",
+                "node 3",
+                "switch Some(\"h\")",
+                "node 4",
+                "switch None",
+                "commit",
+                "epoch 5",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_group_is_only_markers() {
+        assert_eq!(shape(&build_group(Vec::new(), &[commit()])), ["commit"]);
+        assert!(build_group(Vec::new(), &[]).is_empty());
+    }
+
+    /// A triple is the RDF record of its op, which names its graph and
+    /// holds its terms as N-Triples strings, and needs no switch.
+    #[cfg(feature = "triple-store")]
+    #[test]
+    fn a_triple_is_an_rdf_record_naming_its_graph() {
+        use grafeo_common::storage::log_record::TripleRecord;
+        use grafeo_core::graph::rdf::{Term, Triple};
+
+        let mut set = ChangeSet::new();
+        let paris = set
+            .slot(GraphRef {
+                model: DataModel::Rdf,
+                key: Some(ArcStr::from("http://example.org/paris")),
+            })
+            .unwrap();
+        let default = set
+            .slot(GraphRef {
+                model: DataModel::Rdf,
+                key: None,
+            })
+            .unwrap();
+        let triple = |object: Term| {
+            Box::new(TripleRecord::from(&Triple::new(
+                Term::iri("http://example.org/alix"),
+                Term::iri("http://example.org/name"),
+                object,
+            )))
+        };
+        for (graph, op) in [
+            (
+                paris,
+                DataOp::InsertTriple {
+                    triple: triple(Term::lang_literal("Alix", "nl")),
+                },
+            ),
+            (
+                default,
+                DataOp::DeleteTriple {
+                    triple: triple(Term::literal("Gus \"de bus\"")),
+                },
+            ),
+        ] {
+            set.push(graph, op, Before::Absent, PendingVersion::Created)
+                .unwrap();
+        }
+        let records = v1_records(&set);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records.iter().all(|(context, _)| context.is_none()));
+        let WalRecord::InsertRdfTriple {
+            subject,
+            predicate,
+            object,
+            graph,
+        } = &records[0].1
+        else {
+            panic!("{:?} is no insert", records[0].1);
+        };
+        assert_eq!(subject, "<http://example.org/alix>");
+        assert_eq!(predicate, "<http://example.org/name>");
+        assert_eq!(object, "\"Alix\"@nl");
+        assert_eq!(graph.as_deref(), Some("http://example.org/paris"));
+        let WalRecord::DeleteRdfTriple { object, graph, .. } = &records[1].1 else {
+            panic!("{:?} is no delete", records[1].1);
+        };
+        assert_eq!(object, "\"Gus \\\"de bus\\\"\"");
+        assert_eq!(*graph, None);
     }
 }

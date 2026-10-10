@@ -64,6 +64,10 @@ struct State {
     targets: Vec<Option<(GraphSlot, Arc<dyn ChangeTarget>)>>,
     /// The position before the first entry, which a rollback undoes to.
     start: ChangeMark,
+    /// The net effect of the RDF entries, which the transaction's reads lay
+    /// over the store.
+    #[cfg(feature = "triple-store")]
+    triples: super::rdf::PendingTriples,
 }
 
 /// Why an undo did not restore everything.
@@ -90,6 +94,8 @@ impl TransactionChanges {
                 set,
                 targets: Vec::new(),
                 start,
+                #[cfg(feature = "triple-store")]
+                triples: super::rdf::PendingTriples::default(),
             }),
         }
     }
@@ -221,6 +227,13 @@ impl TransactionChanges {
         if tail.is_empty() {
             return Ok(None);
         }
+        #[cfg(feature = "triple-store")]
+        if tail
+            .iter()
+            .any(|change| matches!(change, Change::Data { op, .. } if op.model() == DataModel::Rdf))
+        {
+            state.triples = super::rdf::PendingTriples::of(&state.set);
+        }
         let mut failure = None;
         for (slot, target) in state.targets.iter().flatten() {
             if target.undo_support() != UndoSupport::Exact {
@@ -267,6 +280,142 @@ impl TransactionChanges {
         let state = self.state.lock();
         for (slot, target) in state.targets.iter().flatten() {
             target.stamp(self.id, &mut state.set.in_graph(*slot), epoch)?;
+        }
+        Ok(())
+    }
+
+    /// Records the insert (`insert`) or the delete of `triple` in the RDF
+    /// graph `graph` (`None` for the default graph). The store changes at
+    /// the commit ([`apply_triples`](Self::apply_triples)); the
+    /// transaction's reads see it before (see
+    /// [`pending_triple`](Self::pending_triple)).
+    ///
+    /// # Errors
+    ///
+    /// When the set refuses the entry: it then records nothing.
+    #[cfg(feature = "triple-store")]
+    pub(crate) fn record_triple(
+        &self,
+        graph: Option<&str>,
+        triple: grafeo_core::graph::rdf::Triple,
+        insert: bool,
+    ) -> Result<()> {
+        use grafeo_common::storage::log_record::TripleRecord;
+
+        let mut state = self.state.lock();
+        let slot = state.set.slot(GraphRef {
+            model: DataModel::Rdf,
+            key: graph.map(ArcStr::from),
+        })?;
+        let record = Box::new(TripleRecord::from(&triple));
+        let op = if insert {
+            DataOp::InsertTriple { triple: record }
+        } else {
+            DataOp::DeleteTriple { triple: record }
+        };
+        state
+            .set
+            .push(slot, op, Before::Absent, PendingVersion::Created)?;
+        state.triples.note(graph, Arc::new(triple), insert);
+        Ok(())
+    }
+
+    /// Whether `triple` is in the RDF graph `graph` once the transaction
+    /// commits, if the transaction wrote it there.
+    #[cfg(feature = "triple-store")]
+    pub(crate) fn pending_triple(
+        &self,
+        graph: Option<&str>,
+        triple: &grafeo_core::graph::rdf::Triple,
+    ) -> Option<bool> {
+        self.state.lock().triples.state(graph, triple)
+    }
+
+    /// The triples the transaction wrote that match `pattern` in the graphs
+    /// `graphs` names, each with its graph and whether it is there once the
+    /// transaction commits (see `PendingTriples::matching`).
+    #[cfg(feature = "triple-store")]
+    pub(crate) fn pending_triples_matching(
+        &self,
+        pattern: &grafeo_core::graph::rdf::TriplePattern,
+        graphs: Option<&[&str]>,
+    ) -> Vec<(Option<String>, Arc<grafeo_core::graph::rdf::Triple>, bool)> {
+        let state = self.state.lock();
+        if state.triples.is_empty() {
+            return Vec::new();
+        }
+        state.triples.matching(pattern, graphs)
+    }
+
+    /// Whether the transaction has an RDF entry.
+    #[cfg(feature = "triple-store")]
+    pub(crate) fn has_pending_triples(&self) -> bool {
+        !self.state.lock().triples.is_empty()
+    }
+
+    /// The first RDF graph that `graph` takes in which the transaction has
+    /// an entry, as an error names it (see `PendingTriples::written_graph`).
+    #[cfg(feature = "triple-store")]
+    pub(crate) fn written_rdf_graph(&self, graph: impl Fn(Option<&str>) -> bool) -> Option<String> {
+        self.state.lock().triples.written_graph(graph)
+    }
+
+    /// Applies the RDF entries to `store`, in recorded order, at the commit,
+    /// and drops the ones that changed nothing there (a triple another
+    /// transaction inserted or deleted first since this one wrote it): the
+    /// log and change data capture then hear only of the triples the commit
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// When the set refuses an entry it held before (a broken invariant):
+    /// the commit must not complete.
+    #[cfg(feature = "triple-store")]
+    pub(crate) fn apply_triples(&self, store: &grafeo_core::graph::rdf::RdfStore) -> Result<()> {
+        use grafeo_core::graph::rdf::Triple;
+
+        let mut state = self.state.lock();
+        if state.triples.is_empty() {
+            return Ok(());
+        }
+        let mut unchanged = Vec::new();
+        for (at, change) in state.set.entries().iter().enumerate() {
+            let Change::Data { graph, op, .. } = change else {
+                continue;
+            };
+            let key = state
+                .set
+                .graph(*graph)
+                .and_then(|graph| graph.key.as_deref());
+            let changed = match op {
+                DataOp::InsertTriple { triple } => store.insert_into(key, Triple::from(&**triple)),
+                DataOp::DeleteTriple { triple } => store.remove_from(key, &Triple::from(&**triple)),
+                _ => continue,
+            };
+            if !changed {
+                unchanged.push(at);
+            }
+        }
+        if unchanged.is_empty() {
+            return Ok(());
+        }
+        // Take the entries out and put back those that changed the store.
+        let start = state.start;
+        let entries = state.set.split_off(start);
+        let mut unchanged = unchanged.into_iter().peekable();
+        for (at, change) in entries.into_iter().enumerate() {
+            if unchanged.next_if_eq(&at).is_some() {
+                continue;
+            }
+            match change {
+                Change::Data {
+                    graph,
+                    op,
+                    before,
+                    version,
+                } => state.set.push(graph, op, before, version)?,
+                Change::Bulk(range) => state.set.push_bulk(range)?,
+            }
         }
         Ok(())
     }

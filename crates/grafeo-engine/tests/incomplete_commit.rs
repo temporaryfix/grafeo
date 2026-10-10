@@ -247,6 +247,48 @@ fn after_a_commit_that_does_not_complete_no_commit_publishes_part_of_it() {
     assert_eq!(db.current_epoch(), before);
 }
 
+/// After a commit that did not complete, SPARQL updates and graph operations
+/// fail with the incomplete-commit error (`GRAFEO-T008`), through a session
+/// and through `GrafeoDB::execute_sparql`, and change nothing (#414).
+#[cfg(all(feature = "sparql", feature = "triple-store"))]
+#[test]
+fn after_a_commit_that_does_not_complete_sparql_updates_fail_with_its_code() {
+    let db = GrafeoDB::new_in_memory();
+    db.execute_sparql("CREATE GRAPH <http://ex.org/paris>")
+        .unwrap();
+    let alix = db
+        .create_node_with_props(&["Person"], [("name", Value::from("Alix"))])
+        .unwrap();
+    fail_a_commit(&db, alix);
+
+    let session = db.session();
+    for update in [
+        "INSERT DATA { <http://ex.org/gus> <http://ex.org/city> \"Berlin\" }",
+        "CREATE GRAPH <http://ex.org/berlin>",
+        "CLEAR ALL",
+        "DROP GRAPH <http://ex.org/paris>",
+        "COPY DEFAULT TO <http://ex.org/prague>",
+    ] {
+        for (through, outcome) in [
+            ("a session", session.execute_sparql(update)),
+            ("execute_sparql", db.execute_sparql(update)),
+        ] {
+            let error = outcome.expect_err(update);
+            assert_eq!(
+                error.error_code().as_str(),
+                "GRAFEO-T008",
+                "{update} through {through}: {error}"
+            );
+        }
+    }
+    assert!(db.rdf_store().is_empty(), "no triple was added");
+    assert_eq!(
+        db.rdf_store().graph_names(),
+        ["http://ex.org/paris".to_string()],
+        "no graph was created or dropped"
+    );
+}
+
 /// After a commit that did not complete, an RDF batch insert refuses before
 /// it pulls the caller's iterator (which may parse or compute the triples),
 /// and an import before it opens its file or parses its data: a refused call

@@ -1409,7 +1409,15 @@ impl GrafeoDB {
                     // Used by incremental backup and point-in-time recovery.
                 }
                 WalRecord::Standalone { record } => {
-                    standalone::replay(record, wal, store, catalog, unbuilt)?;
+                    standalone::replay(
+                        record,
+                        wal,
+                        store,
+                        #[cfg(feature = "triple-store")]
+                        rdf_store,
+                        catalog,
+                        unbuilt,
+                    )?;
                 }
             }
         }

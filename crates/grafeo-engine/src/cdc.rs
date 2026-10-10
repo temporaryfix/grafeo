@@ -841,9 +841,10 @@ impl CdcLog {
 }
 
 /// The change events of a commit at `epoch` from its change set, one per
-/// entry in recorded order (bulk ranges and triples have none: their
-/// writers report their own), each naming its graph, timestamped by `clock`
-/// in that order. An event is built from its entry's op and before-image: a
+/// entry in recorded order (bulk ranges have none: a bulk write reports its
+/// own), each naming its graph, timestamped by `clock` in that order. A
+/// triple's event names its RDF graph as `triple_graph`, as the RDF bulk
+/// writes report theirs. An event is built from its entry's op and before-image: a
 /// create carries its labels or type and endpoints and the values it was
 /// created with, a delete what the entity held, an update the value or the
 /// labels before and after. The transaction's later changes to an entity it
@@ -889,6 +890,32 @@ pub(crate) fn events_for_commit(
             DataOp::SetEdgeProperty { id, .. } | DataOp::RemoveEdgeProperty { id, .. } => {
                 (EntityId::Edge(*id), ChangeKind::Update)
             }
+            #[cfg(feature = "triple-store")]
+            DataOp::InsertTriple { triple } => {
+                events.push(triple_event(
+                    set,
+                    *graph,
+                    triple,
+                    ChangeKind::Create,
+                    epoch,
+                    clock,
+                ));
+                continue;
+            }
+            #[cfg(feature = "triple-store")]
+            DataOp::DeleteTriple { triple } => {
+                events.push(triple_event(
+                    set,
+                    *graph,
+                    triple,
+                    ChangeKind::Delete,
+                    epoch,
+                    clock,
+                ));
+                continue;
+            }
+            // A build without the triple store records no triple.
+            #[cfg(not(feature = "triple-store"))]
             DataOp::InsertTriple { .. } | DataOp::DeleteTriple { .. } => continue,
         };
         let mut event = ChangeEvent {
@@ -984,6 +1011,42 @@ pub(crate) fn events_for_commit(
         events.push(event);
     }
     fold_into_creates(events)
+}
+
+/// The event of a triple entry of graph `graph` (`kind` says whether it was
+/// inserted or deleted), as [`CdcLog::record_triple_insert`] and
+/// [`CdcLog::record_triple_delete`] build it: the terms as N-Triples strings.
+#[cfg(feature = "triple-store")]
+fn triple_event(
+    set: &grafeo_common::change::ChangeSet,
+    graph: grafeo_common::change::GraphSlot,
+    triple: &grafeo_common::storage::log_record::TripleRecord,
+    kind: ChangeKind,
+    epoch: EpochId,
+    clock: &HlcClock,
+) -> ChangeEvent {
+    let (subject, predicate, object) = crate::transaction::ntriples_terms(triple);
+    let graph = set
+        .graph(graph)
+        .and_then(|graph| graph.key.as_ref().map(ToString::to_string));
+    ChangeEvent {
+        entity_id: EntityId::Triple(triple_hash(&subject, &predicate, &object, graph.as_deref())),
+        graph: None,
+        kind,
+        epoch,
+        timestamp: clock.now(),
+        before: None,
+        after: None,
+        labels: None,
+        before_labels: None,
+        edge_type: None,
+        src_id: None,
+        dst_id: None,
+        triple_subject: Some(subject),
+        triple_predicate: Some(predicate),
+        triple_object: Some(object),
+        triple_graph: graph,
+    }
 }
 
 /// Folds a transaction's changes to the entities it created into their

@@ -198,6 +198,8 @@ mod manager;
 mod mvcc;
 #[cfg(feature = "lpg")]
 mod prepared;
+#[cfg(feature = "triple-store")]
+mod rdf;
 #[cfg(feature = "wal")]
 pub(crate) mod v1_group;
 
@@ -214,6 +216,7 @@ pub use manager::{
 pub use mvcc::{VersionChain, VersionInfo};
 #[cfg(feature = "lpg")]
 pub use prepared::{CommitInfo, PreparedCommit};
-
-#[cfg(feature = "wal")]
-pub(crate) mod wal_buffer;
+#[cfg(all(feature = "triple-store", any(feature = "wal", feature = "cdc")))]
+pub(crate) use rdf::ntriples_terms;
+#[cfg(feature = "triple-store")]
+pub(crate) use rdf::{RdfWriter, update_privately};

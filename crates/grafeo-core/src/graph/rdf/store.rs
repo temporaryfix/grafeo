@@ -6,6 +6,8 @@
 use super::sink::TripleSink;
 use super::term::Term;
 use super::triple::{Triple, TriplePattern};
+use grafeo_common::change::RdfGraphOp;
+use grafeo_common::storage::log_record::RdfGraphTarget;
 use grafeo_common::types::TransactionId;
 use grafeo_common::utils::hash::FxHashSet;
 use hashbrown::HashMap;
@@ -53,9 +55,10 @@ impl Default for RdfStoreConfig {
 /// - POS (Predicate, Object, Subject): for predicate-based queries
 /// - OSP (Object, Subject, Predicate): for object-based queries (optional)
 ///
-/// The store also supports transactional operations through buffering.
-/// When operations are performed within a transaction context, they are
-/// buffered until commit (applied) or rollback (discarded).
+/// The store holds committed triples only: a database transaction records
+/// its RDF writes in its change set and applies them when it commits. The
+/// deprecated per-transaction buffer (`insert_in_transaction` and the
+/// methods around it) is no part of a database transaction.
 pub struct RdfStore {
     /// Configuration.
     config: RdfStoreConfig,
@@ -78,7 +81,7 @@ pub struct RdfStore {
     /// Object+Subject composite index: (object, subject) -> triples.
     os_index:
         RwLock<hashbrown::HashMap<(Term, Term), Vec<Arc<Triple>>, foldhash::fast::RandomState>>,
-    /// Transaction buffers for pending operations.
+    /// The deprecated per-transaction buffers (removed in 0.7.0).
     tx_buffer: RwLock<TransactionBuffer>,
     /// Named graphs, each a separate `RdfStore` partition.
     named_graphs: RwLock<HashMap<String, Arc<RdfStore>>>,
@@ -1265,6 +1268,68 @@ impl RdfStore {
         }
     }
 
+    /// Applies a whole-graph operation: what a SPARQL `CREATE`, `DROP`,
+    /// `CLEAR`, `COPY`, `MOVE` or `ADD` changes, and what the replay of its
+    /// logged operation changes. `DROP` and `CLEAR` of the default graph
+    /// empty it (it always exists); of `ALL`, they empty the default graph
+    /// and remove every named graph; of `NAMED`, they remove every named
+    /// graph. `CLEAR` of one named graph empties it and keeps it.
+    ///
+    /// Returns `false` when the operation found nothing to change that it
+    /// names: a graph to create that exists, or a named graph to drop that
+    /// does not.
+    pub fn apply_graph_op(&self, op: &RdfGraphOp) -> bool {
+        match op {
+            RdfGraphOp::Create { name } => self.create_graph(name),
+            RdfGraphOp::Drop {
+                target: RdfGraphTarget::Named(name),
+            } => self.drop_graph(name),
+            RdfGraphOp::Drop { target } | RdfGraphOp::Clear { target } => {
+                match target {
+                    RdfGraphTarget::Default => self.clear(),
+                    RdfGraphTarget::Named(name) => self.clear_graph(Some(name)),
+                    RdfGraphTarget::AllNamed => self.clear_all_named(),
+                    RdfGraphTarget::All => {
+                        self.clear();
+                        self.clear_all_named();
+                    }
+                }
+                true
+            }
+            RdfGraphOp::Copy { source, target } => {
+                self.copy_graph(source.as_deref(), target.as_deref());
+                true
+            }
+            RdfGraphOp::Move { source, target } => {
+                self.move_graph(source.as_deref(), target.as_deref());
+                true
+            }
+            RdfGraphOp::Add { source, target } => {
+                self.add_graph(source.as_deref(), target.as_deref());
+                true
+            }
+        }
+    }
+
+    /// Inserts `triple` into `graph` (`None` for the default graph), creating
+    /// a named graph that does not exist. Returns whether the triple is new.
+    pub fn insert_into(&self, graph: Option<&str>, triple: Triple) -> bool {
+        match graph {
+            None => self.insert(triple),
+            Some(name) => self.graph_or_create(name).insert(triple),
+        }
+    }
+
+    /// Removes `triple` from `graph` (`None` for the default graph). Returns
+    /// whether the graph held it; a named graph that does not exist holds
+    /// nothing and is not created.
+    pub fn remove_from(&self, graph: Option<&str>, triple: &Triple) -> bool {
+        match graph {
+            None => self.remove(triple),
+            Some(name) => self.graph(name).is_some_and(|store| store.remove(triple)),
+        }
+    }
+
     /// Finds triples across specific graphs.
     ///
     /// - `graphs = None` searches the default graph only (backward compatible).
@@ -1309,6 +1374,10 @@ impl RdfStore {
     /// Like [`find_in_graphs`](Self::find_in_graphs), but as seen by
     /// `transaction_id`: each graph's pending changes from that transaction
     /// are applied (see [`find_with_pending`](Self::find_with_pending)).
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     pub fn find_in_graphs_with_pending(
         &self,
         pattern: &TriplePattern,
@@ -1321,14 +1390,14 @@ impl RdfStore {
         let tx = Some(transaction_id);
         match graphs {
             None => self
-                .find_with_pending(pattern, tx)
+                .buffered_find(pattern, tx)
                 .into_iter()
                 .map(|t| (None, t))
                 .collect(),
             Some([]) => {
                 let mut results = Vec::new();
                 for (name, store) in self.named_graphs.read().iter() {
-                    for t in store.find_with_pending(pattern, tx) {
+                    for t in store.buffered_find(pattern, tx) {
                         results.push((Some(name.clone()), t));
                     }
                 }
@@ -1339,7 +1408,7 @@ impl RdfStore {
                 let graphs = self.named_graphs.read();
                 for name in names {
                     if let Some(store) = graphs.get(*name) {
-                        for t in store.find_with_pending(pattern, tx) {
+                        for t in store.buffered_find(pattern, tx) {
                             results.push((Some((*name).to_string()), t));
                         }
                     }
@@ -1357,6 +1426,10 @@ impl RdfStore {
     ///
     /// The insert is buffered until the transaction is committed.
     /// If the transaction is rolled back, the insert is discarded.
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     pub fn insert_in_transaction(&self, transaction_id: TransactionId, triple: Triple) {
         let mut buffer = self.tx_buffer.write();
         buffer
@@ -1370,6 +1443,10 @@ impl RdfStore {
     ///
     /// The removal is buffered until the transaction is committed.
     /// If the transaction is rolled back, the removal is discarded.
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     pub fn remove_in_transaction(&self, transaction_id: TransactionId, triple: Triple) {
         let mut buffer = self.tx_buffer.write();
         buffer
@@ -1383,6 +1460,10 @@ impl RdfStore {
     /// this graph and in every named graph.
     ///
     /// Returns the number of operations applied.
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     pub fn commit_transaction(&self, transaction_id: TransactionId) -> usize {
         let ops = {
             let mut buffer = self.tx_buffer.write();
@@ -1410,6 +1491,10 @@ impl RdfStore {
     /// graph and in every named graph.
     ///
     /// Returns the number of operations discarded.
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     pub fn rollback_transaction(&self, transaction_id: TransactionId) -> usize {
         let mut count = self
             .tx_buffer
@@ -1430,6 +1515,10 @@ impl RdfStore {
     }
 
     /// Checks if a transaction has pending operations.
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     #[must_use]
     pub fn has_pending_ops(&self, transaction_id: TransactionId) -> bool {
         let buffer = self.tx_buffer.read();
@@ -1445,7 +1534,20 @@ impl RdfStore {
     /// the result is exactly what the store will hold once the transaction
     /// commits: a triple inserted and then deleted is absent, one deleted and
     /// then re-inserted is present, and a triple is never returned twice.
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     pub fn find_with_pending(
+        &self,
+        pattern: &TriplePattern,
+        transaction_id: Option<TransactionId>,
+    ) -> Vec<Arc<Triple>> {
+        self.buffered_find(pattern, transaction_id)
+    }
+
+    /// What [`find_with_pending`](Self::find_with_pending) returns.
+    fn buffered_find(
         &self,
         pattern: &TriplePattern,
         transaction_id: Option<TransactionId>,
@@ -1494,6 +1596,10 @@ impl RdfStore {
 
     /// Whether `triple` is present as seen by `transaction_id` (committed
     /// state plus that transaction's pending changes).
+    #[deprecated(
+        since = "0.6.0",
+        note = "a database transaction records its RDF writes in its change set; this buffer is no part of it (removed in 0.7.0)"
+    )]
     #[must_use]
     pub fn contains_with_pending(&self, triple: &Triple, transaction_id: TransactionId) -> bool {
         let pattern = TriplePattern {
@@ -1502,7 +1608,7 @@ impl RdfStore {
             object: Some(triple.object().clone()),
         };
         !self
-            .find_with_pending(&pattern, Some(transaction_id))
+            .buffered_find(&pattern, Some(transaction_id))
             .is_empty()
     }
 }
@@ -2009,6 +2115,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "tests the deprecated per-transaction buffer until 0.7.0 removes it"
+    )]
     fn test_find_with_pending_filters_deletes() {
         let store = RdfStore::new();
         let triples = sample_triples();
@@ -2061,6 +2171,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "tests the deprecated per-transaction buffer until 0.7.0 removes it"
+    )]
     fn test_find_with_pending_applies_ops_in_order() {
         let store = RdfStore::new();
         let committed = Triple::new(
@@ -2114,6 +2228,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "tests the deprecated per-transaction buffer until 0.7.0 removes it"
+    )]
     fn test_transaction_commit_and_rollback_reach_named_graphs() {
         let store = RdfStore::new();
         let triple = Triple::new(
@@ -2254,6 +2372,141 @@ mod tests {
         assert_eq!(results[0].0.as_deref(), Some("http://example.org/g1"));
     }
 
+    /// Each whole-graph operation changes the graphs it names, and only
+    /// them; `ALL` and `NAMED` reach every named graph, `ALL` the default
+    /// graph too. An operation that finds nothing to change says so.
+    #[test]
+    fn a_graph_operation_changes_the_graphs_it_names() {
+        let knows = |subject: &str| {
+            Triple::new(
+                Term::iri(format!("http://example.org/{subject}")),
+                Term::iri("http://example.org/knows"),
+                Term::iri("http://example.org/gus"),
+            )
+        };
+        let paris = "http://example.org/paris";
+        let berlin = "http://example.org/berlin";
+        let filled = || {
+            let store = RdfStore::new();
+            store.insert_into(None, knows("alix"));
+            store.insert_into(Some(paris), knows("vincent"));
+            store.insert_into(Some(berlin), knows("mia"));
+            store
+        };
+        // (graph, triple count) of the default graph, then of each named graph.
+        let shape = |store: &RdfStore| {
+            let mut named: Vec<(String, usize)> = store
+                .graph_names()
+                .into_iter()
+                .map(|name| {
+                    let len = store.graph(&name).unwrap().len();
+                    (name, len)
+                })
+                .collect();
+            named.sort();
+            (store.len(), named)
+        };
+        let named = |graphs: &[(&str, usize)]| -> Vec<(String, usize)> {
+            graphs
+                .iter()
+                .map(|(name, len)| ((*name).to_string(), *len))
+                .collect()
+        };
+        let target = |name: &str| RdfGraphTarget::Named(name.to_string());
+
+        let cases: Vec<(RdfGraphOp, (usize, Vec<(String, usize)>))> = vec![
+            (
+                RdfGraphOp::Clear {
+                    target: target(paris),
+                },
+                (1, named(&[(berlin, 1), (paris, 0)])),
+            ),
+            (
+                RdfGraphOp::Drop {
+                    target: target(paris),
+                },
+                (1, named(&[(berlin, 1)])),
+            ),
+            (
+                RdfGraphOp::Clear {
+                    target: RdfGraphTarget::Default,
+                },
+                (0, named(&[(berlin, 1), (paris, 1)])),
+            ),
+            (
+                RdfGraphOp::Drop {
+                    target: RdfGraphTarget::AllNamed,
+                },
+                (1, Vec::new()),
+            ),
+            (
+                RdfGraphOp::Clear {
+                    target: RdfGraphTarget::All,
+                },
+                (0, Vec::new()),
+            ),
+            (
+                RdfGraphOp::Copy {
+                    source: Some(paris.to_string()),
+                    target: None,
+                },
+                (1, named(&[(berlin, 1), (paris, 1)])),
+            ),
+            (
+                RdfGraphOp::Move {
+                    source: Some(paris.to_string()),
+                    target: Some(berlin.to_string()),
+                },
+                (1, named(&[(berlin, 1)])),
+            ),
+            (
+                RdfGraphOp::Add {
+                    source: None,
+                    target: Some(berlin.to_string()),
+                },
+                (1, named(&[(berlin, 2), (paris, 1)])),
+            ),
+        ];
+        for (op, expected) in cases {
+            let store = filled();
+            assert!(store.apply_graph_op(&op), "{op:?}");
+            assert_eq!(shape(&store), expected, "{op:?}");
+        }
+
+        let store = filled();
+        assert!(!store.apply_graph_op(&RdfGraphOp::Create {
+            name: paris.to_string()
+        }));
+        assert!(!store.apply_graph_op(&RdfGraphOp::Drop {
+            target: target("http://example.org/prague"),
+        }));
+        assert_eq!(shape(&store), (1, named(&[(berlin, 1), (paris, 1)])));
+    }
+
+    /// A triple applied to a named graph that does not exist creates it on
+    /// insert and changes nothing on remove.
+    #[test]
+    fn a_triple_applies_to_its_graph() {
+        let store = RdfStore::new();
+        let triple = Triple::new(
+            Term::iri("http://example.org/jules"),
+            Term::iri("http://example.org/knows"),
+            Term::iri("http://example.org/butch"),
+        );
+        let prague = Some("http://example.org/prague");
+        assert!(!store.remove_from(prague, &triple));
+        assert_eq!(
+            store.graph_names(),
+            Vec::<String>::new(),
+            "a remove creates no graph"
+        );
+        assert!(store.insert_into(prague, triple.clone()));
+        assert!(!store.insert_into(prague, triple.clone()));
+        assert!(store.is_empty(), "the default graph holds nothing");
+        assert!(store.remove_from(prague, &triple));
+        assert!(!store.remove_from(prague, &triple));
+    }
+
     #[test]
     fn test_copy_move_add_graph() {
         let store = RdfStore::new();
@@ -2293,6 +2546,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "tests the deprecated per-transaction buffer until 0.7.0 removes it"
+    )]
     fn test_transaction_commit_and_rollback() {
         let store = RdfStore::new();
         let triples = sample_triples();

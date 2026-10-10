@@ -11,6 +11,10 @@
 //!
 //! Such a change takes effect at once, also inside a transaction, whose
 //! rollback keeps it (0.6.0 has no transactional DDL).
+//!
+//! An RDF graph operation (`CREATE`, `DROP`, `CLEAR`, `COPY`, `MOVE`, `ADD`)
+//! is one too: [`commit_rdf`] logs it as a group of its own and applies it
+//! to the RDF store through [`apply_rdf`], which replay applies it with.
 
 use std::sync::Arc;
 
@@ -240,10 +244,72 @@ pub(crate) fn apply(
         }
         StandaloneOp::PutCatalog(record) => put(op, record, built, store, catalog, applying),
         StandaloneOp::DropCatalog(key) => drop_entry(op, key, store, catalog, applying),
+        // A change of the RDF store, which `commit_rdf` and `replay` apply
+        // through `apply_rdf`: a change of the labeled property graphs and
+        // the catalog never holds one.
         StandaloneOp::RdfGraph(_) => Err(not_applied(
             op,
-            "RDF graph operations are not logged on their own by this release",
+            "an RDF graph operation applies to the RDF store, through `apply_rdf`",
         )),
+    }
+}
+
+/// Logs the RDF graph operation `op` as one WAL group of its own (to `wal`,
+/// when the database logs), then applies it to `rdf`. The caller checked it
+/// while holding commits off (`_held`), so a checkpoint or `close()` sees
+/// all of it or none of it.
+///
+/// # Errors
+///
+/// As [`commit`].
+#[cfg(feature = "triple-store")]
+pub(crate) fn commit_rdf(
+    op: grafeo_common::change::RdfGraphOp,
+    _held: &CommitsHeld<'_>,
+    #[cfg(feature = "wal")] wal: Option<&grafeo_storage::wal::LpgWal>,
+    rdf: &grafeo_core::graph::rdf::RdfStore,
+    manager: &TransactionManager,
+) -> Result<()> {
+    let op = StandaloneOp::RdfGraph(op);
+    #[cfg(feature = "wal")]
+    if let Some(wal) = wal {
+        let mut change = StandaloneChange::new();
+        change.push(op.clone());
+        wal.log_batch(&crate::transaction::v1_group::standalone_group(&change)?)?;
+    }
+    if let Err(error) = apply_rdf(&op, rdf, &Applying::Live) {
+        manager.poison(&format!("a logged change did not apply: {error}"));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Applies `op`, an RDF graph operation, to `rdf`: what a statement does
+/// once it is logged, and what replay does with the logged op. A create of a
+/// graph that exists, or a drop of a named graph that does not, applies
+/// nothing: an error live (the statement's checks refuse it), skipped on
+/// replay.
+///
+/// # Errors
+///
+/// Live: an op the statement's checks should have refused.
+#[cfg(feature = "triple-store")]
+pub(crate) fn apply_rdf(
+    op: &StandaloneOp,
+    rdf: &grafeo_core::graph::rdf::RdfStore,
+    applying: &Applying<'_>,
+) -> Result<()> {
+    let StandaloneOp::RdfGraph(graph_op) = op else {
+        return Err(not_applied(op, "it is no RDF graph operation"));
+    };
+    if rdf.apply_graph_op(graph_op) {
+        return Ok(());
+    }
+    match graph_op {
+        grafeo_common::change::RdfGraphOp::Create { .. } => {
+            applying.missing(op, "the graph exists")
+        }
+        _ => applying.missing(op, "the graph does not exist"),
     }
 }
 
@@ -551,6 +617,7 @@ pub(crate) fn replay(
     record: &[u8],
     wal: &std::path::Path,
     store: &Arc<LpgStore>,
+    #[cfg(feature = "triple-store")] rdf: &grafeo_core::graph::rdf::RdfStore,
     catalog: &Catalog,
     unbuilt: &mut Vec<GraphIndexes>,
 ) -> Result<()> {
@@ -574,8 +641,24 @@ pub(crate) fn replay(
             return Err(failed(format!("{record:?} is no standalone change")));
         };
         refuse_unbuildable(&op, wal)?;
-        apply(&op, None, store, catalog, &mut Applying::Replay { unbuilt })
-            .map_err(|error| failed(error.to_string()))?;
+        let applied = if matches!(op, StandaloneOp::RdfGraph(_)) {
+            #[cfg(feature = "triple-store")]
+            {
+                apply_rdf(&op, rdf, &Applying::Replay { unbuilt })
+            }
+            // This build cannot replay it: the next checkpoint would write
+            // the file without its change, and remove the WAL.
+            #[cfg(not(feature = "triple-store"))]
+            {
+                return Err(super::sections::refusal(
+                    wal,
+                    &[(&super::sections::RDF_TRIPLES, "WAL records".to_string())],
+                ));
+            }
+        } else {
+            apply(&op, None, store, catalog, &mut Applying::Replay { unbuilt })
+        };
+        applied.map_err(|error| failed(error.to_string()))?;
     }
     Ok(())
 }

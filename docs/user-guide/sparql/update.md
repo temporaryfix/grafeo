@@ -252,6 +252,12 @@ Use `SILENT` to suppress errors if the source does not exist:
 ADD SILENT <http://ex.org/extra> TO <http://ex.org/main>
 ```
 
+### Graph operations and transactions
+
+An update of triples (`INSERT`, `DELETE` and the forms above) belongs to its transaction: the triples change when the transaction commits, and a rollback leaves nothing of them. Without an open transaction, each update commits on its own, and one that fails changes nothing.
+
+A graph operation (`CREATE`, `DROP`, `CLEAR`, `COPY`, `MOVE`, `ADD`) takes effect at once, also inside a transaction, and a rollback keeps it. While an open transaction, the caller's own included, has uncommitted changes in a graph the operation changes (its destination, and for `MOVE` its source too), the operation fails with a write conflict (`GRAFEO-T001`): run it once that transaction commits or rolls back. `COPY` and `ADD` read their source as committed.
+
 ## Complete Example
 
 === "Python"

@@ -79,6 +79,8 @@ File format release: every database is now a single file in a new format, and 0.
 - **GQL `GROUP BY` errors say why**: grouping by an aggregate alias, by an alias inside an expression, or by a name that is both an incoming variable and the alias of another item fails with a reason, as does a `RETURN` item that reads a variable that is not a grouping key; these failed with "Undefined variable".
 - **SQL/PGQ: an aggregate in `COLUMNS` is an error**: it returned null on every row.
 - **Breaking (Rust): `hybrid_search` and `text_search` take a `filters` argument** ([#397](https://github.com/GrafeoDB/grafeo/issues/397)): pass `None` to search as before. Python, Node.js and WASM take it as an optional argument.
+- **SPARQL graph operations wait for open changes**: `CLEAR`, `DROP`, `COPY`, `MOVE` and `ADD` fail with a write conflict (`GRAFEO-T001`) while an open transaction, the caller's own included, has uncommitted changes in a graph they change (the destination, and for `MOVE` the source); run them once that transaction commits or rolls back. They still take effect at once inside a transaction, and a rollback keeps them.
+- **`GrafeoDB::execute_sparql` reports updates to change data capture**, as a session does; sessions run SPARQL and GraphQL `PROFILE`.
 
 ### Fixed
 
@@ -241,6 +243,9 @@ File format release: every database is now a single file in a new format, and 0.
 - **SQL/PGQ `HAVING` on a grouping column dropped every group**: `... GROUP BY gender HAVING gender = 'male'` returned no rows.
 - **Python: `nodes_df()` and `edges_df()` return the same values with pyarrow installed as without it**: labels, lists and vectors came back as numpy arrays or text with pyarrow, and maps and durations as text.
 - **Python: `nodes_to_polars()` and `edges_to_polars()` failed with "out-of-spec: InvalidFooter"** (polars 2.0): they read Arrow stream bytes as a file.
+- **SPARQL and GraphQL updates are all or nothing, and a rollback leaves nothing of them** ([#414](https://github.com/GrafeoDB/grafeo/issues/414)): an update that failed part way kept the triples it wrote before the error, in and outside a transaction; a rollback to a savepoint kept the triples written after it; and the change feed reported triples of updates that rolled back, and of inserts and deletes that changed nothing. Triples now change when the transaction commits, and the change feed reports each triple a commit changed, at that commit's epoch.
+- **`COPY`, `MOVE` and `ADD` survive a crash, and `CLEAR ALL` replays as written**: they were not in the write-ahead log, and `CLEAR ALL` cleared nothing on recovery.
+- **An insert into a new named graph that rolls back leaves no empty graph behind.**
 
 ### Result changes
 
@@ -252,6 +257,8 @@ File format release: every database is now a single file in a new format, and 0.
 - **The average clustering coefficient no longer changes from call to call** ([#592](https://github.com/GrafeoDB/grafeo/issues/592)): `global_clustering_coefficient` and the `clustering_coefficient` average summed in hash-map order, so their last digits changed with each call and the thread count; they now depend only on the graph.
 - **Clustering coefficients and triangle counts ignore self-loops**: a node counted itself as a neighbour, so `clustering_coefficient` (`CALL` and `db.algorithms`), `local_clustering_coefficient` and `triangle_count` reported triangles that are not there: a node linked to two unlinked nodes and to itself had coefficient 0.67 and 2 triangles; it now has 0 and 0. `total_triangles` was right.
 - **Rust (`grafeo-adapters`): `k_truss`, `ktruss_decomposition` and `edge_triangle_support` use the simple graph**: a self-loop was a truss edge (even in the 4-truss of a triangle) and raised its node's edge supports; self-loops are now in no k-truss.
+- **SPARQL `COUNT` in a transaction counts its own writes**: it counted the committed triples only.
+- **SPARQL `DROP ALL` drops every graph**: it failed with `Graph <> does not exist`.
 
 ### Deprecated
 
@@ -261,6 +268,7 @@ File format release: every database is now a single file in a new format, and 0.
 - **Rust: `Config::adaptive`, `Config::with_adaptive`, `Config::without_adaptive` and `AdaptiveConfig`**, removed in 0.7.0: adaptive execution was never wired in, and these settings have no effect.
 - **The `compact-store` feature** (the Rust crates and the bindings), removed in 0.7.0: it enables nothing, as every build that opens files reads a database compacted by 0.5.x, the `grafeo` crate and the command line tool included. The bindings' default profiles no longer list it, and neither does Python's `grafeo.features()`.
 - **Rust (`grafeo-core`): `InvertedIndex::with_tokenizer`**, removed in 0.7.0: a database cannot keep a custom tokenizer. Use `InvertedIndex::with_options` with a `TokenizerKind`.
+- **Rust (`grafeo-core`): `RdfStore::insert_in_transaction`, `remove_in_transaction`, `commit_transaction`, `rollback_transaction`, `has_pending_ops`, `find_with_pending`, `contains_with_pending` and `find_in_graphs_with_pending`**, removed in 0.7.0: a database transaction records its RDF writes in its change set, and this per-transaction buffer is no part of it. Run updates in a session transaction.
 
 ### Internal
 

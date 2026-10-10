@@ -261,11 +261,10 @@ pub struct Session {
     commit_counter: Arc<AtomicUsize>,
     /// GC every N commits (0 = disabled).
     gc_interval: usize,
-    /// The WAL this session's commits write their groups to, with the RDF
-    /// records of the open transaction until its commit (`None` without a
-    /// WAL).
+    /// The WAL this session's commits write their groups to (`None`
+    /// without a WAL).
     #[cfg(feature = "wal")]
-    wal: Option<Arc<crate::transaction::wal_buffer::WalBuffer>>,
+    wal: Option<Arc<grafeo_storage::wal::LpgWal>>,
     /// CDC log for change tracking.
     #[cfg(feature = "cdc")]
     cdc_log: Arc<crate::cdc::CdcLog>,
@@ -338,10 +337,6 @@ struct SavepointState {
     name: String,
     /// The position in the transaction's change set.
     mark: grafeo_common::change::ChangeMark,
-    /// The number of RDF records the WAL buffer held when the savepoint was
-    /// taken: a rollback to it drops the later ones.
-    #[cfg(feature = "wal")]
-    wal_position: usize,
 }
 
 impl Session {
@@ -408,37 +403,19 @@ impl Session {
         Arc::clone(&self.store)
     }
 
-    /// The session's WAL buffer, if it logs its writes.
+    /// The session's WAL, if it logs its writes.
     #[cfg(feature = "wal")]
-    fn wal(&self) -> Option<&Arc<crate::transaction::wal_buffer::WalBuffer>> {
+    fn wal(&self) -> Option<&Arc<grafeo_storage::wal::LpgWal>> {
         self.wal.as_ref()
     }
 
     /// Sets the WAL for this session (shared with the database).
     ///
     /// Each commit writes one group: the records of its change set (see
-    /// `transaction::v1_group`), then the RDF records the session's
-    /// [`WalBuffer`](crate::transaction::wal_buffer::WalBuffer) holds.
+    /// `transaction::v1_group`), its RDF triples included.
     #[cfg(all(feature = "wal", feature = "lpg"))]
     pub(crate) fn set_wal(&mut self, wal: Arc<grafeo_storage::wal::LpgWal>) {
-        self.wal = Some(Arc::new(crate::transaction::wal_buffer::WalBuffer::new(
-            wal,
-        )));
-    }
-
-    /// Writes the RDF records of an update outside a transaction to the WAL
-    /// as an implicit group with its own commit marker. Does nothing inside
-    /// a transaction, whose records are written at commit.
-    ///
-    /// WAL write failures are logged via `grafeo_warn!` and not propagated.
-    #[cfg(feature = "wal")]
-    fn flush_wal_outside_transaction(&self) {
-        if let Some(wal) = self.wal()
-            && self.current_transaction.lock().is_none()
-            && let Err(e) = wal.flush_implicit()
-        {
-            grafeo_common::grafeo_warn!("Session: failed to write WAL records: {}", e);
-        }
+        self.wal = Some(wal);
     }
 
     /// Sets the CDC log for this session (shared with the database): each
@@ -885,36 +862,6 @@ impl Session {
         // `TransactionManager::check_open`): fail before writing, also a
         // write outside a transaction, which has no commit.
         self.transaction_manager.check_open()
-    }
-
-    /// Holds commits off for a change that takes effect at once and logs its
-    /// own WAL group, outside any commit (an RDF update outside a
-    /// transaction; schema and graph commands take
-    /// [`hold_for_standalone`](Self::hold_for_standalone)), for as long as
-    /// the guard lives: a checkpoint, a copy or `close()` sees all of it or
-    /// none of it. Waits for a commit or checkpoint in progress, then fails
-    /// once the database is closed or after a commit that did not complete.
-    #[cfg(feature = "triple-store")]
-    fn hold_commits_for_change(&self) -> Result<crate::transaction::CommitsHeld<'_>> {
-        self.transaction_manager.hold_commits_for_change()
-    }
-
-    /// What an RDF update needs before it runs: it fails once the database is
-    /// closed (also for an admin identity, which skips the other write
-    /// checks), and outside a transaction it holds commits off until the
-    /// returned guard drops, as a schema change does (see
-    /// [`hold_commits_for_change`](Self::hold_commits_for_change)): it changes
-    /// the store at once and logs its own WAL group. Inside a transaction the
-    /// commit writes it, and checks again.
-    #[cfg(feature = "triple-store")]
-    pub(super) fn hold_for_rdf_update(
-        &self,
-    ) -> Result<Option<crate::transaction::CommitsHeld<'_>>> {
-        if self.current_transaction.lock().is_some() {
-            self.transaction_manager.check_open()?;
-            return Ok(None);
-        }
-        self.hold_commits_for_change().map(Some)
     }
 
     /// Executes a session or transaction command, returning an empty result.
@@ -1368,7 +1315,7 @@ impl Session {
             change,
             held,
             #[cfg(feature = "wal")]
-            self.wal().map(|buffer| &**buffer.wal()),
+            self.wal().map(|wal| &**wal),
             &self.root_store(),
             &self.catalog,
             &self.transaction_manager,
@@ -3916,16 +3863,6 @@ impl Session {
             return Ok(());
         }
 
-        // Records made before this transaction must not join its group.
-        // (`current` is held, so this cannot go through
-        // `flush_wal_outside_transaction`.)
-        #[cfg(feature = "wal")]
-        if let Some(wal) = self.wal()
-            && let Err(e) = wal.flush_implicit()
-        {
-            grafeo_common::grafeo_warn!("Session: failed to write WAL records: {}", e);
-        }
-
         let transaction_id = if let Some(level) = isolation_level {
             self.transaction_manager.begin_with_isolation(level)
         } else {
@@ -4026,11 +3963,6 @@ impl Session {
             }
         };
         let commit_epoch = commit.epoch();
-        // Until the WAL group is written, a panic leaves the commit's RDF
-        // records in this session's WAL buffer, from which a later flush of
-        // records outside a transaction (or the session's drop) would write
-        // a commit that never completed: the guard drops them on unwind.
-        let unwritten = UnwrittenCommit::new(self);
 
         #[cfg(feature = "testing-statement-injection")]
         grafeo_common::testing::commit_hook::run_after_commit_epoch();
@@ -4048,8 +3980,19 @@ impl Session {
             )));
         }
 
+        // Apply the RDF triples, in recorded order: the store holds only
+        // committed triples, so readers see them from now on. The ones that
+        // changed nothing (another transaction wrote them first) are dropped
+        // from the set, so the log and change data capture skip them.
         #[cfg(feature = "triple-store")]
-        self.commit_rdf_transaction(transaction_id);
+        if let Some(changes) = &changes
+            && let Err(error) = changes.apply_triples(&self.rdf_store)
+        {
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "the commit of transaction {transaction_id:?} could not apply its RDF changes: \
+                 {error}"
+            )));
+        }
 
         #[cfg(feature = "testing-statement-injection")]
         grafeo_common::testing::commit_hook::run_after_commit_stamped();
@@ -4068,8 +4011,7 @@ impl Session {
         // the commit marker and the epoch advance, so crash recovery can
         // identify committed transactions and their epoch boundaries (#252)
         // and no other session's records can land inside the group (#411):
-        // the records of its change set, then those the session buffered
-        // (RDF).
+        // the records of its change set, written with one call.
         #[cfg(feature = "wal")]
         if let Some(wal) = self.wal() {
             use grafeo_storage::wal::WalRecord;
@@ -4077,7 +4019,7 @@ impl Session {
                 .as_ref()
                 .map(|changes| changes.read(crate::transaction::v1_group::v1_records))
                 .unwrap_or_default();
-            if let Err(e) = wal.flush_with(
+            let group = crate::transaction::v1_group::build_group(
                 records,
                 &[
                     WalRecord::TransactionCommit { transaction_id },
@@ -4085,11 +4027,11 @@ impl Session {
                         epoch: commit_epoch,
                     },
                 ],
-            ) {
+            );
+            if let Err(e) = wal.log_batch(&group) {
                 grafeo_common::grafeo_warn!("Failed to write transaction to WAL: {}", e);
             }
         }
-        unwritten.written();
 
         #[cfg(feature = "testing-statement-injection")]
         grafeo_common::testing::commit_hook::run_after_commit_logged();
@@ -4229,10 +4171,10 @@ impl Session {
 
     /// Aborts a transaction that has already been taken out of
     /// `current_transaction`: undoes what it changed (`changes`), in every
-    /// graph it wrote, and its RDF changes, marks it aborted in the
-    /// transaction manager and drops its buffered RDF records. Nothing of it
-    /// reached the WAL or change data capture, which hear of a transaction
-    /// at its commit.
+    /// graph it wrote (its RDF triples, which only its commit applies, are
+    /// dropped with the rest of the set), and marks it aborted in the
+    /// transaction manager. Nothing of it reached the WAL or change data
+    /// capture, which hear of a transaction at its commit.
     ///
     /// Shared by rollback and by a commit that fails validation, so a failed
     /// commit leaves no active transaction holding its entities.
@@ -4262,20 +4204,9 @@ impl Session {
             None => Ok(None),
         };
 
-        #[cfg(feature = "triple-store")]
-        self.rollback_rdf_transaction(transaction_id);
-
         self.savepoints.lock().clear();
 
         let result = self.transaction_manager.abort(transaction_id);
-
-        // The transaction's RDF records were only buffered: drop them.
-        // Nothing of it reached the WAL, so there is nothing to undo on
-        // replay.
-        #[cfg(feature = "wal")]
-        if let Some(wal) = self.wal() {
-            wal.clear();
-        }
 
         match undone {
             Ok(None) => result,
@@ -4334,8 +4265,7 @@ impl Session {
     }
 
     /// The state a savepoint named `name` restores: how far the open
-    /// transaction's changes reach, and how many RDF records its WAL buffer
-    /// holds.
+    /// transaction's changes reach.
     #[cfg(feature = "lpg")]
     fn capture_savepoint(&self, name: &str) -> SavepointState {
         let mark = self.changes.lock().as_ref().map_or_else(
@@ -4345,8 +4275,6 @@ impl Session {
         SavepointState {
             name: name.to_string(),
             mark,
-            #[cfg(feature = "wal")]
-            wal_position: self.wal().map_or(0, |w| w.len()),
         }
     }
 
@@ -4392,7 +4320,7 @@ impl Session {
     }
 
     /// Undoes what transaction `transaction_id` did after `sp_state` was
-    /// captured: its changes in every graph and its buffered RDF records.
+    /// captured: its changes in every graph, its RDF triples included.
     ///
     /// # Errors
     ///
@@ -4420,12 +4348,6 @@ impl Session {
         };
         if let Err(crate::transaction::UndoFailure::External(graph)) = &undone {
             return Err(crate::transaction::kept_by_external_store(graph));
-        }
-
-        // Drop the RDF records buffered after the savepoint.
-        #[cfg(feature = "wal")]
-        if let Some(wal) = self.wal() {
-            wal.truncate(sp_state.wal_position);
         }
 
         match undone {
@@ -4620,6 +4542,19 @@ impl Session {
         if has_mutations {
             self.check_writable()?;
         }
+        self.in_statement_transaction(has_mutations, body)
+    }
+
+    /// Runs `body`, one statement, as a transaction runs it: a write
+    /// (`has_mutations`) outside a transaction in one of its own, which
+    /// commits when `body` succeeds and rolls back when it fails; inside the
+    /// open transaction, whose writes from `body` are undone when it fails,
+    /// and which goes on. A read runs as it is.
+    #[cfg(feature = "lpg")]
+    pub(super) fn in_statement_transaction<T, F>(&self, has_mutations: bool, body: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
         if self.needs_auto_commit(has_mutations) {
             self.begin_transaction_inner(false, None)?;
             match body() {
@@ -4759,7 +4694,8 @@ impl Session {
         }
     }
 
-    /// Non-LPG stub: no auto-commit wrapping (SPARQL UPDATE is atomic).
+    /// Without the labeled property graph there are no transactions, and
+    /// nothing to write (the triple store needs the labeled property graph).
     #[cfg(not(feature = "lpg"))]
     fn with_auto_commit<T, F>(&self, has_mutations: bool, body: F) -> Result<T>
     where
@@ -4768,10 +4704,7 @@ impl Session {
         if has_mutations {
             self.check_writable()?;
         }
-        let result = body();
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
-        result
+        body()
     }
 
     /// Returns `Err(Transaction(InvalidState))` if any `ResultStream` is
@@ -5751,48 +5684,6 @@ fn with_kept_writes(
     }
 }
 
-/// The RDF records of a commit that are not written yet (see
-/// `commit_inner`). Dropped before [`written`](Self::written), which happens
-/// only when the commit unwinds, it drops them from the session's WAL
-/// buffer: written later as records outside a transaction, they would make a
-/// commit that never completed durable. (RDF changes join the change set
-/// with W3.6, and this goes with the buffer.)
-#[cfg(feature = "lpg")]
-struct UnwrittenCommit<'a> {
-    session: &'a Session,
-    written: bool,
-}
-
-#[cfg(feature = "lpg")]
-impl<'a> UnwrittenCommit<'a> {
-    fn new(session: &'a Session) -> Self {
-        Self {
-            session,
-            written: false,
-        }
-    }
-
-    /// The commit's records and events are written.
-    fn written(mut self) {
-        self.written = true;
-    }
-}
-
-#[cfg(feature = "lpg")]
-impl Drop for UnwrittenCommit<'_> {
-    fn drop(&mut self) {
-        if self.written {
-            return;
-        }
-        #[cfg(feature = "wal")]
-        if let Some(ref wal) = self.session.wal {
-            wal.clear();
-        }
-        #[cfg(not(feature = "wal"))]
-        let _ = self.session;
-    }
-}
-
 impl Drop for Session {
     fn drop(&mut self) {
         // Auto-rollback any active transaction to prevent leaked MVCC state,
@@ -5801,11 +5692,6 @@ impl Drop for Session {
         if self.in_transaction() {
             let _ = self.rollback_inner();
         }
-
-        // RDF records made outside a transaction that no statement boundary
-        // wrote yet.
-        #[cfg(feature = "wal")]
-        self.flush_wal_outside_transaction();
 
         #[cfg(feature = "metrics")]
         if let Some(ref reg) = self.metrics {

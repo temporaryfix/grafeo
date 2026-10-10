@@ -6,6 +6,7 @@
 //! - Literals (data values)
 //! - Variables (for query patterns, not stored)
 
+use grafeo_common::storage::log_record::TermRecord;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -542,6 +543,41 @@ impl fmt::Display for Literal {
             write!(f, "^^<{}>", self.datatype)
         } else {
             Ok(())
+        }
+    }
+}
+
+/// A term as a log record or a change set stores it: every part kept as
+/// it is, so [`Term::from`] the record gives the term back.
+impl From<&Term> for TermRecord {
+    fn from(term: &Term) -> Self {
+        match term {
+            Term::Iri(iri) => Self::Iri(iri.as_str().to_string()),
+            Term::BlankNode(blank) => Self::Blank(blank.id().to_string()),
+            Term::Literal(literal) => Self::Literal {
+                value: literal.value.to_string(),
+                datatype: literal.datatype.to_string(),
+                language: literal.language.as_deref().map(ToString::to_string),
+            },
+        }
+    }
+}
+
+/// The term a log record or a change set stores.
+impl From<&TermRecord> for Term {
+    fn from(record: &TermRecord) -> Self {
+        match record {
+            TermRecord::Iri(iri) => Self::iri(iri.as_str()),
+            TermRecord::Blank(id) => Self::blank(id.as_str()),
+            TermRecord::Literal {
+                value,
+                datatype,
+                language,
+            } => Self::Literal(Literal {
+                value: value.as_str().into(),
+                datatype: datatype.as_str().into(),
+                language: language.as_deref().map(Into::into),
+            }),
         }
     }
 }

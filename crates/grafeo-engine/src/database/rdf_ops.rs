@@ -39,9 +39,7 @@ impl GrafeoDB {
     /// ```
     #[cfg(feature = "sparql")]
     pub fn execute_sparql(&self, query: &str) -> Result<super::QueryResult> {
-        use crate::query::{
-            Executor, optimizer::Optimizer, planner::rdf::RdfPlanner, translators::sparql,
-        };
+        use crate::query::{optimizer::Optimizer, planner::rdf::RdfPlanner, translators::sparql};
 
         // Parse and translate the SPARQL query to a logical plan
         let logical_plan = sparql::translate(query)?;
@@ -52,8 +50,7 @@ impl GrafeoDB {
         let optimized_plan = optimizer.optimize(logical_plan)?;
 
         // An update on a read-only database fails, as in a session.
-        let mutates = optimized_plan.root.has_mutations();
-        if mutates && self.read_only {
+        if optimized_plan.root.has_mutations() && self.read_only {
             return Err(grafeo_common::utils::error::Error::Transaction(
                 grafeo_common::utils::error::TransactionError::ReadOnly,
             ));
@@ -68,74 +65,10 @@ impl GrafeoDB {
             return Ok(physical_explain_result(&optimized_plan, entries));
         }
 
-        // No transaction here: an update changes the store at once and its
-        // WAL records are written as one implicit group once it has run, so
-        // it holds commits off meanwhile (a checkpoint or `close()` sees all
-        // of it or none), and fails once the database is closed.
-        let held = if mutates {
-            Some(self.transaction_manager.hold_commits_for_change()?)
-        } else {
-            None
-        };
-        // Tests start a checkpoint or `close()` here, which must wait.
-        #[cfg(feature = "testing-statement-injection")]
-        if held.is_some() {
-            grafeo_common::testing::commit_hook::run_during_held_change();
-        }
-        #[cfg(feature = "wal")]
-        let wal_buffer = self.wal.as_ref().map(|wal| {
-            Arc::new(crate::transaction::wal_buffer::WalBuffer::new(Arc::clone(
-                wal,
-            )))
-        });
-        #[cfg(feature = "wal")]
-        let flush_wal = || {
-            if let Some(ref buffer) = wal_buffer
-                && let Err(e) = buffer.flush_implicit()
-            {
-                grafeo_common::grafeo_warn!("Failed to write SPARQL update to WAL: {}", e);
-            }
-        };
-
-        // EXPLAIN ANALYZE: execute with profiling, report actual stats
-        if optimized_plan.profile {
-            let planner = RdfPlanner::new(Arc::clone(&self.rdf_store))
-                .with_shuffle_unordered(self.config.shuffle_unordered);
-            #[cfg(feature = "wal")]
-            let planner = planner.with_wal(wal_buffer.clone());
-            let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
-
-            let start = std::time::Instant::now();
-            let executor = Executor::with_columns(physical_plan.columns.clone());
-            let result = executor.execute(physical_plan.operator.as_mut());
-            #[cfg(feature = "wal")]
-            flush_wal();
-            drop(held);
-            let _result = result?;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            let tree = crate::query::profile::build_profile_tree(
-                &optimized_plan.root,
-                &mut entries.into_iter(),
-            );
-            return Ok(crate::query::profile::profile_result(&tree, elapsed_ms));
-        }
-
-        // Convert to physical plan using RDF planner
-        let planner = RdfPlanner::new(Arc::clone(&self.rdf_store))
-            .with_shuffle_unordered(self.config.shuffle_unordered);
-        #[cfg(feature = "wal")]
-        let planner = planner.with_wal(wal_buffer.clone());
-        let mut physical_plan = planner.plan(&optimized_plan)?;
-
-        // Execute the plan
-        let executor = Executor::with_columns(physical_plan.columns.clone());
-        let result = executor.execute(physical_plan.operator.as_mut());
-        #[cfg(feature = "wal")]
-        flush_wal();
-        // The update and its WAL group are written: commits may go on.
-        drop(held);
-        result
+        // Everything else runs as in a session: an update in a transaction
+        // of its own, which logs it and reports it to change data capture
+        // when it commits.
+        self.session().run_rdf_plan(&optimized_plan, "sparql")
     }
 
     /// Returns the RDF store.
@@ -255,6 +188,7 @@ pub(super) fn replay_rdf_wal_record(
     rdf_store: &Arc<RdfStore>,
     record: &grafeo_storage::wal::WalRecord,
 ) -> Result<()> {
+    use grafeo_common::change::RdfGraphOp;
     use grafeo_storage::wal::WalRecord;
 
     match record {
@@ -271,11 +205,7 @@ pub(super) fn replay_rdf_wal_record(
                 predicate,
                 object,
             )?;
-            let target = match graph {
-                Some(name) => rdf_store.graph_or_create(name),
-                None => Arc::clone(rdf_store),
-            };
-            target.insert(triple);
+            rdf_store.insert_into(graph.as_deref(), triple);
         }
         WalRecord::DeleteRdfTriple {
             subject,
@@ -290,27 +220,41 @@ pub(super) fn replay_rdf_wal_record(
                 predicate,
                 object,
             )?;
-            let target = match graph {
-                Some(name) => rdf_store.graph_or_create(name),
-                None => Arc::clone(rdf_store),
-            };
-            target.remove(&triple);
+            rdf_store.remove_from(graph.as_deref(), &triple);
         }
+        // The graph operations an earlier release logged as these records
+        // (this one logs them as standalone changes): applied as the live
+        // operation applies them, an empty name standing for `ALL`, as the
+        // statement meant it.
         WalRecord::ClearRdfGraph { graph } => {
-            rdf_store.clear_graph(graph.as_deref());
+            rdf_store.apply_graph_op(&RdfGraphOp::Clear {
+                target: logged_target(graph.as_deref()),
+            });
         }
         WalRecord::CreateRdfGraph { name } => {
-            let _ = rdf_store.create_graph(name);
+            rdf_store.apply_graph_op(&RdfGraphOp::Create { name: name.clone() });
         }
-        WalRecord::DropRdfGraph { name } => match name {
-            None => rdf_store.clear(),
-            Some(graph_name) => {
-                rdf_store.drop_graph(graph_name);
-            }
-        },
+        WalRecord::DropRdfGraph { name } => {
+            rdf_store.apply_graph_op(&RdfGraphOp::Drop {
+                target: logged_target(name.as_deref()),
+            });
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// The graphs a logged `CLEAR` or `DROP` names: `None` for the default
+/// graph, the empty name for `ALL`.
+#[cfg(feature = "wal")]
+fn logged_target(graph: Option<&str>) -> grafeo_common::storage::log_record::RdfGraphTarget {
+    use grafeo_common::storage::log_record::RdfGraphTarget;
+
+    match graph {
+        None => RdfGraphTarget::Default,
+        Some("") => RdfGraphTarget::All,
+        Some(name) => RdfGraphTarget::Named(name.to_string()),
+    }
 }
 
 /// The triple of an RDF WAL record of kind `record` in `graph`, its terms
