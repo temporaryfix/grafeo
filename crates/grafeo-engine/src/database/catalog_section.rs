@@ -352,6 +352,9 @@ pub struct CatalogSection {
     dirty: AtomicBool,
     /// The index definitions the last load read.
     loaded_indexes: Vec<GraphIndexes>,
+    /// The database epoch the last load read: a 0.5.x catalog holds the epoch
+    /// of its checkpoint, a 0.6 one none (0).
+    loaded_epoch: u64,
     /// The caps the record stream is cut at, taken when the section is built.
     caps: ChunkCaps,
 }
@@ -373,6 +376,7 @@ impl CatalogSection {
             epoch_fn: Box::new(epoch_fn),
             dirty: AtomicBool::new(false),
             loaded_indexes: Vec::new(),
+            loaded_epoch: 0,
             caps: ChunkCaps::current(),
         }
     }
@@ -382,6 +386,13 @@ impl CatalogSection {
     /// names).
     pub(crate) fn take_loaded_indexes(&mut self) -> Vec<GraphIndexes> {
         std::mem::take(&mut self.loaded_indexes)
+    }
+
+    /// The database epoch the last load read, which the database continues
+    /// from: a 0.5.x catalog (the version 1 layout) holds the epoch of its
+    /// checkpoint, a 0.6 one none (0, the database header holds it).
+    pub(crate) fn loaded_epoch(&self) -> u64 {
+        self.loaded_epoch
     }
 
     /// Mark this section as dirty.
@@ -913,6 +924,7 @@ impl Section for CatalogSection {
         for (graph_name, type_name) in &snapshot.schema.graph_type_bindings {
             let _ = self.catalog.bind_graph_type(graph_name, type_name.clone());
         }
+        self.loaded_epoch = snapshot.epoch;
         // The node types restored above already hold the constraints.
         let mut rest = &data[read..];
         if !rest.is_empty() {

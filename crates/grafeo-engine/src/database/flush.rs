@@ -190,17 +190,18 @@ impl CheckpointSources {
             .transaction_manager
             .last_assigned_transaction_id()
             .map_or(0, |t| t.0);
+        let epoch = self.epoch();
         #[cfg(feature = "lpg")]
         if let Some(store) = &self.root_store() {
             return FlushContext {
-                epoch: store.current_epoch().0,
+                epoch,
                 transaction_id,
                 node_count: store.node_count() as u64,
                 edge_count: store.edge_count() as u64,
             };
         }
         FlushContext {
-            epoch: 0,
+            epoch,
             transaction_id,
             node_count: 0,
             edge_count: 0,

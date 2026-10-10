@@ -248,6 +248,8 @@ File format release: every database is now a single file in a new format, and 0.
 - **An insert into a new named graph that rolls back leaves no empty graph behind.**
 - **SPARQL `MOVE` of a graph onto itself dropped it**: `MOVE <g> TO <g>` deleted the graph and `MOVE DEFAULT TO DEFAULT` emptied the default graph. A `COPY`, `MOVE` or `ADD` of a graph onto itself now leaves it as it is, as SPARQL 1.1 Update specifies; a source that does not exist still fails without `SILENT`.
 - **SPARQL `CLEAR NAMED` and `DROP NAMED` also cleared the default graph**: they now reach the named graphs only.
+- **A reopened database started its epochs over** (without the `temporal` feature): after a clean close, a crash, a read-only open, `open_in_memory()` or `to_memory()`, `current_epoch()`, CDC events and backup segments restarted at 0 and repeated earlier epochs, so a restore to an epoch from before the reopen could return later data. An open now continues at the epoch of the file's last checkpoint or of the last commit its WAL logs, whichever is higher, and a restored database opens at the epoch it was restored to. With `temporal`, a checkpoint after `restore_snapshot()` no longer records the snapshot's older epoch.
+- **A database migrated from 0.5.x started at epoch 0**: the migration now continues at the highest epoch the 0.5.x header, catalog and WAL hold, so a 0.5.x backup chain continued after the upgrade does not reuse its epochs.
 
 ### Result changes
 

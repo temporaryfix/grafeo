@@ -614,6 +614,7 @@ impl GrafeoDB {
                                 &rdf_store,
                             )
                         })?;
+                        Self::continue_from_checkpoint(&fm, &store);
                     }
                     // A writer that exited without `close()` left its commits
                     // since the last checkpoint in the sidecar WAL. They are
@@ -733,6 +734,7 @@ impl GrafeoDB {
                         &rdf_store,
                     )
                 })?;
+                Self::continue_from_checkpoint(&fm, &store);
             }
 
             // A sidecar WAL holds the commits since the last checkpoint that a
@@ -837,30 +839,9 @@ impl GrafeoDB {
         let query_cache = Arc::new(QueryCache::default());
 
         // After all snapshot/WAL recovery, the database continues at the
-        // highest epoch any graph reached: replay advances the epoch of the
-        // graph each commit lands in, and a 0.5.43 WAL never switched back to
-        // the default graph, so its named graphs can be ahead of the root
-        // store. The root store, every named graph and the transaction
-        // manager move to that epoch (as a live commit keeps them on one),
-        // so reads see every replayed version, a checkpoint records that
-        // epoch, and new commits continue above it.
-        #[cfg(all(feature = "temporal", feature = "lpg"))]
-        {
-            let graphs: Vec<Arc<LpgStore>> = store
-                .graph_names()
-                .iter()
-                .filter_map(|name| store.graph(name))
-                .collect();
-            let epoch = graphs
-                .iter()
-                .map(|graph| graph.current_epoch())
-                .fold(store.current_epoch(), std::cmp::max);
-            store.sync_epoch(epoch);
-            for graph in &graphs {
-                graph.sync_epoch(epoch);
-            }
-            transaction_manager.sync_epoch(epoch);
-        }
+        // highest epoch the file, its WAL or any graph reached.
+        #[cfg(feature = "lpg")]
+        Self::continue_epochs(&store, &transaction_manager);
 
         #[cfg(feature = "cdc")]
         let cdc_enabled_val = config.cdc_enabled;
@@ -1205,6 +1186,41 @@ impl GrafeoDB {
         self.compact()
     }
 
+    /// Moves the root store, every named graph and the transaction manager
+    /// to one epoch, as a live commit keeps them on one: the highest epoch
+    /// a store reached. A load leaves them apart: the root store holds the
+    /// epoch of the file's checkpoint and of the last commit its WAL logs,
+    /// and with `temporal` replay advances the graph each commit lands in (a
+    /// 0.5.43 WAL never switched back to the default graph, so its named
+    /// graphs can be ahead of the root store). Reads then see every loaded
+    /// and replayed version, a checkpoint records that epoch, and new
+    /// commits continue above it.
+    #[cfg(feature = "lpg")]
+    fn continue_epochs(store: &LpgStore, transaction_manager: &TransactionManager) {
+        let graphs: Vec<Arc<LpgStore>> = store
+            .graph_names()
+            .iter()
+            .filter_map(|name| store.graph(name))
+            .collect();
+        let epoch = graphs
+            .iter()
+            .map(|graph| graph.current_epoch())
+            .fold(store.current_epoch(), std::cmp::max);
+        store.sync_epoch(epoch);
+        for graph in &graphs {
+            graph.sync_epoch(epoch);
+        }
+        transaction_manager.sync_epoch(epoch);
+    }
+
+    /// Raises the root store to the epoch of the file's last checkpoint, which
+    /// its database header holds (the LPG section holds it only with
+    /// `temporal`), before the commits its WAL logs after it are replayed.
+    #[cfg(all(feature = "lpg", feature = "grafeo-file"))]
+    fn continue_from_checkpoint(fm: &GrafeoFileManager, store: &LpgStore) {
+        store.sync_epoch(grafeo_common::types::EpochId::new(fm.active_header().epoch));
+    }
+
     /// Whether replaying `records` leaves the graph cursor on a named graph.
     ///
     /// Logs written before 0.5.44 could end inside a named graph; new groups
@@ -1404,9 +1420,11 @@ impl GrafeoDB {
                     // Transaction control records don't need replay action
                     // (recovery already filtered to only committed transactions)
                 }
-                WalRecord::EpochAdvance { .. } => {
-                    // Metadata record: no store mutation needed.
-                    // Used by incremental backup and point-in-time recovery.
+                WalRecord::EpochAdvance { epoch } => {
+                    // The epoch the commit before took: the database goes
+                    // on at or above the last one the WAL logs, also
+                    // without `temporal` (the epoch only moves up).
+                    store.sync_epoch(*epoch);
                 }
                 WalRecord::Standalone { record } => {
                     standalone::replay(
@@ -1677,6 +1695,10 @@ impl GrafeoDB {
                 )?;
             }
         }
+        // The epoch of its last checkpoint. 0.5.x started the epochs over at
+        // every open, so its WAL can log lower ones after it (replay keeps
+        // the highest), and a migration continues above both.
+        store.sync_epoch(grafeo_common::types::EpochId::new(file.header().epoch));
 
         #[cfg(feature = "wal")]
         {

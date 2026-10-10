@@ -389,8 +389,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Test encryption at rest, triples in a WAL without triple-store
-        run: cargo nextest run -p grafeo-engine --no-default-features --features lpg,gql,wal,grafeo-file,encryption --test encryption_at_rest --test rdf_file_without_triple_store
+      - name: Test encryption at rest, triples in a WAL without triple-store, epochs across a reopen without temporal
+        run: cargo nextest run -p grafeo-engine --no-default-features --features lpg,gql,wal,grafeo-file,encryption --test encryption_at_rest --test rdf_file_without_triple_store --test epochs_across_reopen
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"

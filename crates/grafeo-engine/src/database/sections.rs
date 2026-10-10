@@ -51,6 +51,23 @@ impl CheckpointSources {
         self.store.clone()
     }
 
+    /// The epoch a checkpoint or copy of the database records, which a
+    /// reopen continues from: the root store's, which follows every commit,
+    /// or the transaction manager's when that is ahead (`restore_snapshot`
+    /// resets the store's epoch, and a direct write that fails still takes
+    /// its epoch), so the file never names an epoch below one the database
+    /// published. Taken while commits are held, both are the epoch of the
+    /// last complete commit.
+    #[cfg(any(feature = "lpg", feature = "grafeo-file"))]
+    pub fn epoch(&self) -> u64 {
+        let published = self.transaction_manager.current_epoch();
+        #[cfg(feature = "lpg")]
+        if let Some(store) = &self.root_store() {
+            return store.current_epoch().max(published).as_u64();
+        }
+        published.as_u64()
+    }
+
     /// Builds every section of the database. The caller holds commits off
     /// (`_commits`, see
     /// [`TransactionManager::hold_commits`](crate::transaction::TransactionManager)):
@@ -474,6 +491,7 @@ pub(super) fn load_sections(
 
     // The catalog first: the schema is needed before the data.
     let mut indexes = Vec::new();
+    let mut catalog_epoch = 0;
     if let Some(source) = image.section_source(SectionType::Catalog) {
         let transaction_manager = Arc::new(crate::transaction::TransactionManager::new());
         let mut section = CatalogSection::new(Arc::clone(catalog), Arc::clone(store), move || {
@@ -481,6 +499,7 @@ pub(super) fn load_sections(
         });
         section.read_from(&*source)?;
         indexes = section.take_loaded_indexes();
+        catalog_epoch = section.loaded_epoch();
     }
     if let Some(path) = file {
         refuse_unreadable(image, &indexes, path)?;
@@ -514,6 +533,10 @@ pub(super) fn load_sections(
     // file holds a compacted base: a copy (`to_memory`) never does.
     #[cfg(feature = "grafeo-file")]
     fold_compacted_base(image, store)?;
+
+    // The epoch a 0.5.x catalog names, once the data is in (with `temporal`
+    // the data keeps the epochs it was loaded at).
+    store.sync_epoch(grafeo_common::types::EpochId::new(catalog_epoch));
 
     loaded.unbuilt = restore_indexes(image, store, indexes)?;
     Ok(loaded)

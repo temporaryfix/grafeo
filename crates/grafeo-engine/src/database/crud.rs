@@ -206,8 +206,11 @@ impl super::GrafeoDB {
     /// is complete.
     ///
     /// Every committed write advances it, from a query or from the direct
-    /// API, once the commit is complete. With an external store, the epochs
-    /// start from the store's own when it is opened.
+    /// API, once the commit is complete. A reopen continues where the
+    /// database left off: at the epoch of the file's last checkpoint or of
+    /// the last commit its WAL logs (after a crash), whichever is higher. With
+    /// an external store, the epochs start from the store's own when it is
+    /// opened.
     #[must_use]
     pub fn current_epoch(&self) -> EpochId {
         self.read_epoch()

@@ -907,17 +907,21 @@ impl super::GrafeoDB {
             #[cfg(feature = "triple-store")]
             &target.rdf_store,
         )?;
-        #[cfg(feature = "temporal")]
+        // The copy continues at the epoch of what it holds, which
+        // `copy_into` gave its transaction manager, as a reopen of a
+        // checkpoint continues at the checkpoint's epoch.
         target
-            .transaction_manager
-            .sync_epoch(target.lpg_store().current_epoch());
+            .lpg_store()
+            .sync_epoch(target.transaction_manager.current_epoch());
+        Self::continue_epochs(&target.lpg_store(), &target.transaction_manager);
         target.finish_load(loaded);
         Ok(target)
     }
 
     /// Copies this database's nodes and edges into `target`, and returns an
     /// image of every other section of a checkpoint, for
-    /// [`to_memory`](Self::to_memory) to load.
+    /// [`to_memory`](Self::to_memory) to load. `target`'s transaction
+    /// manager takes the epoch of the commits they hold.
     ///
     /// Both are taken under one commit hold, so they hold the same commits:
     /// every commit whole, none that did not complete, and nothing of a
@@ -937,6 +941,11 @@ impl super::GrafeoDB {
         let mut image = MemoryImage::new();
         let commits = self.transaction_manager.hold_commits()?;
         let sources = self.checkpoint_sources();
+        // The epoch of the commits the copy holds, for `to_memory` to
+        // continue from once its stores are loaded.
+        target
+            .transaction_manager
+            .sync_epoch(EpochId::new(sources.epoch()));
         let open = sources.has_open_changes(&commits);
         for section in sources.sections(&commits) {
             if section.section_type() == SectionType::LpgStore && !open {

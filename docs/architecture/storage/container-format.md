@@ -66,7 +66,7 @@ on disk.
 | 4 | 4 | `u32` | `format_revision` | Which additions to v3 the image may use (see below) |
 | 8 | 8 | `u64` | `iteration` | Checkpoint counter, higher = current |
 | 16 | 8 | `u64` | `checkpoint_lsn` | WAL position the checkpoint covers (currently always 0) |
-| 24 | 8 | `u64` | `epoch` | MVCC epoch at the checkpoint |
+| 24 | 8 | `u64` | `epoch` | MVCC epoch at the checkpoint, which an open continues from |
 | 32 | 8 | `u64` | `last_transaction_id` | Last committed transaction id |
 | 40 | 8 | `u64` | `root.offset` | Offset of the image's first directory block |
 | 48 | 4 | `u32` | `root.length` | Length of that block |
