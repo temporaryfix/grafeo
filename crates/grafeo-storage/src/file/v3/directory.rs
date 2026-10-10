@@ -975,8 +975,8 @@ mod tests {
     #[test]
     fn an_entry_with_an_unknown_namespace_is_refused() {
         for (namespace, flags) in [
-            (18, 0),
-            (49, 0),
+            (20, 0),
+            (36, 0),
             (255, ENTRY_SECTION_OPTIONAL | ENTRY_CHUNK_OPTIONAL),
         ] {
             let mut bytes = encoded(&DirectoryEntry {

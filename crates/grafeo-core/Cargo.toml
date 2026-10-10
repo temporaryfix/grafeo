@@ -97,6 +97,11 @@ name = "top_k"
 harness = false
 
 [[bench]]
+name = "store_apply"
+harness = false
+required-features = ["lpg"]
+
+[[bench]]
 name = "morsel_pipeline"
 harness = false
 required-features = ["parallel"]

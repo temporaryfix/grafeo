@@ -19,7 +19,7 @@ mod chunked;
 #[cfg(feature = "lpg")]
 mod committed;
 #[cfg(feature = "lpg")]
-mod dictionary;
+pub(crate) mod dictionary;
 mod edge;
 mod node;
 pub mod overlay;

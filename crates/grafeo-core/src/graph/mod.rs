@@ -23,8 +23,15 @@
 //! 0.5.x database file, so that opening the file folds it into the LPG store.
 
 pub mod apply;
+/// The conformance suite of the stores behind the change set.
+#[cfg(all(test, feature = "lpg"))]
+mod conformance;
 pub mod lpg;
 pub mod projection;
+/// The row-group store (workstream H): not used by the engine until H2d.
+#[cfg(feature = "lpg")]
+#[doc(hidden)]
+pub mod rowgroup;
 pub mod traits;
 
 #[cfg(feature = "lpg")]

@@ -5298,6 +5298,93 @@ mod tests {
                 "namespace Section",
             ),
             (
+                "a chunk in the node delete namespace, which version 3 does not have",
+                vec![
+                    alix(),
+                    Raw {
+                        meta: ChunkMeta::column(0, 0, 0, 1, 0)
+                            .in_namespace(ChunkNamespace::NodeDeletes),
+                        values: vec![(0, Value::Bool(true))],
+                        epochs: None,
+                    },
+                    Meta,
+                ],
+                "namespace NodeDeletes",
+            ),
+            (
+                "a chunk in the node label namespace, which version 3 does not have",
+                vec![
+                    alix(),
+                    Raw {
+                        meta: ChunkMeta::column(0, 0, 0, 1, 0)
+                            .in_namespace(ChunkNamespace::NodeLabels),
+                        values: vec![(0, Value::Bool(true))],
+                        epochs: None,
+                    },
+                    Meta,
+                ],
+                "namespace NodeLabels",
+            ),
+            (
+                "a chunk in the edge delete namespace, which version 3 does not have",
+                vec![
+                    alix(),
+                    Raw {
+                        meta: ChunkMeta::column(0, 0, 0, 1, 0)
+                            .in_namespace(ChunkNamespace::EdgeDeletes),
+                        values: vec![(0, Value::Bool(true))],
+                        epochs: None,
+                    },
+                    Meta,
+                ],
+                "namespace EdgeDeletes",
+            ),
+            (
+                "a chunk in the outgoing adjacency namespace, which version 3 does not have",
+                vec![
+                    alix(),
+                    Raw {
+                        meta: ChunkMeta::column(0, 0, 0, 1, 0)
+                            .in_namespace(ChunkNamespace::OutgoingAdjacency),
+                        values: vec![(0, Value::Bool(true))],
+                        epochs: None,
+                    },
+                    Meta,
+                ],
+                "namespace OutgoingAdjacency",
+            ),
+            (
+                "a chunk in the incoming adjacency namespace, which version 3 does not have",
+                vec![
+                    alix(),
+                    Raw {
+                        meta: ChunkMeta::column(0, 0, 0, 1, 0)
+                            .in_namespace(ChunkNamespace::IncomingAdjacency),
+                        values: vec![(0, Value::Bool(true))],
+                        epochs: None,
+                    },
+                    Meta,
+                ],
+                "namespace IncomingAdjacency",
+            ),
+            (
+                "an adjacency chunk, which version 3 does not have",
+                vec![
+                    alix(),
+                    Raw {
+                        meta: ChunkMeta {
+                            kind: ChunkKind::Adjacency,
+                            ..ChunkMeta::column(0, 0, 0, 1, 0)
+                                .in_namespace(ChunkNamespace::OutgoingAdjacency)
+                        },
+                        values: vec![(0, Value::Bool(true))],
+                        epochs: None,
+                    },
+                    Meta,
+                ],
+                "a Adjacency chunk",
+            ),
+            (
                 // The namespace says which table a key's column is of: one
                 // in the edge namespace holds edge rows.
                 "a property value in the edge namespace for a row with no edge",

@@ -282,6 +282,10 @@ pub enum ChunkKind {
     /// A piece of a byte stream; `row_start` is the piece's offset in the
     /// stream, `column_id` the stream.
     Stream = 4,
+    /// The adjacency lists of a range of a node row group's rows, in one
+    /// direction (`LPG_STORE` version 4): each node's edges sorted by edge
+    /// type and other node.
+    Adjacency = 5,
 }
 
 impl ChunkKind {
@@ -300,7 +304,12 @@ impl ChunkKind {
     pub const fn is_optional(self) -> bool {
         // No wildcard: a new chunk kind must say which it is.
         match self {
-            Self::Raw | Self::Meta | Self::Column | Self::History | Self::Stream => false,
+            Self::Raw
+            | Self::Meta
+            | Self::Column
+            | Self::History
+            | Self::Stream
+            | Self::Adjacency => false,
         }
     }
 
@@ -313,6 +322,7 @@ impl ChunkKind {
             2 => Some(Self::Column),
             3 => Some(Self::History),
             4 => Some(Self::Stream),
+            5 => Some(Self::Adjacency),
             _ => None,
         }
     }
@@ -325,10 +335,9 @@ impl ChunkKind {
 /// The byte of each namespace is part of the file format and never changes.
 /// The bytes come in groups with room to grow: 0 for a section's own
 /// numbering, 16 to 31 for the node table, 32 to 47 for the edge table and
-/// 48 to 63 for adjacency. These are reserved and not written yet, so a
-/// reader refuses them as it refuses any byte it does not know: 18 node
-/// deletes, 19 node label bitmaps, 20 node versions, 34 edge deletes, 36 edge
-/// versions, 48 outgoing adjacency and 49 incoming adjacency.
+/// 48 to 63 for adjacency. 20 (node versions) and 36 (edge versions) are
+/// reserved and not written, so a reader refuses them as it refuses any byte
+/// it does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -336,15 +345,31 @@ pub enum ChunkNamespace {
     /// The section's own numbering: metadata, raw chunks, streams, and every
     /// section without node and edge tables.
     Section = 0,
-    /// The node table's fixed columns: column 0 holds the labels.
+    /// The node table's fixed columns: column 0 holds the labels (`LPG_STORE`
+    /// version 3) or which rows are nodes (version 4).
     NodeStructure = 16,
     /// The node table's property columns.
     NodeProperties = 17,
+    /// The node table's delete chunks (`LPG_STORE` version 4): column 0, the
+    /// rows deleted since their row group's other chunks were written.
+    NodeDeletes = 18,
+    /// The node table's label chunks (`LPG_STORE` version 4): the column id is
+    /// the label's id, the rows the nodes that have it.
+    NodeLabels = 19,
     /// The edge table's fixed columns: 1 the source node, 2 the target node,
     /// 3 the edge type.
     EdgeStructure = 32,
     /// The edge table's property columns.
     EdgeProperties = 33,
+    /// The edge table's delete chunks (`LPG_STORE` version 4), as
+    /// [`NodeDeletes`](Self::NodeDeletes).
+    EdgeDeletes = 34,
+    /// The nodes' outgoing adjacency chunks (`LPG_STORE` version 4): column 0,
+    /// or a piece number for a node whose list takes chunks of its own.
+    OutgoingAdjacency = 48,
+    /// The nodes' incoming adjacency chunks, as
+    /// [`OutgoingAdjacency`](Self::OutgoingAdjacency).
+    IncomingAdjacency = 49,
 }
 
 impl ChunkNamespace {
@@ -364,6 +389,11 @@ impl ChunkNamespace {
             17 => Some(Self::NodeProperties),
             32 => Some(Self::EdgeStructure),
             33 => Some(Self::EdgeProperties),
+            18 => Some(Self::NodeDeletes),
+            19 => Some(Self::NodeLabels),
+            34 => Some(Self::EdgeDeletes),
+            48 => Some(Self::OutgoingAdjacency),
+            49 => Some(Self::IncomingAdjacency),
             _ => None,
         }
     }
@@ -895,6 +925,7 @@ mod tests {
             ChunkKind::Column,
             ChunkKind::History,
             ChunkKind::Stream,
+            ChunkKind::Adjacency,
         ] {
             assert!(!kind.is_optional(), "{kind:?}");
         }
@@ -1308,10 +1339,12 @@ mod tests {
             ChunkKind::Column,
             ChunkKind::History,
             ChunkKind::Stream,
+            ChunkKind::Adjacency,
         ] {
             assert_eq!(ChunkKind::from_byte(kind.to_byte()), Some(kind));
         }
-        assert_eq!(ChunkKind::from_byte(5), None);
+        assert_eq!(ChunkKind::from_byte(5), Some(ChunkKind::Adjacency));
+        assert_eq!(ChunkKind::from_byte(6), None);
         assert_eq!(ChunkKind::from_byte(88), None);
     }
 
@@ -1394,12 +1427,17 @@ mod tests {
             (ChunkNamespace::NodeProperties, 17),
             (ChunkNamespace::EdgeStructure, 32),
             (ChunkNamespace::EdgeProperties, 33),
+            (ChunkNamespace::NodeDeletes, 18),
+            (ChunkNamespace::NodeLabels, 19),
+            (ChunkNamespace::EdgeDeletes, 34),
+            (ChunkNamespace::OutgoingAdjacency, 48),
+            (ChunkNamespace::IncomingAdjacency, 49),
         ];
         for (namespace, byte) in known {
             assert_eq!(namespace.to_byte(), byte, "{namespace:?}");
             assert_eq!(ChunkNamespace::from_byte(byte), Some(namespace), "{byte}");
         }
-        for reserved in [18, 19, 20, 34, 36, 48, 49] {
+        for reserved in [20, 36] {
             assert_eq!(
                 ChunkNamespace::from_byte(reserved),
                 None,
