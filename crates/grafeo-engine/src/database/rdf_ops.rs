@@ -92,6 +92,12 @@ impl GrafeoDB {
     ///
     /// Returns the number of triples that were newly inserted.
     ///
+    /// The insert is one bulk write: its triples are written to the WAL as it
+    /// goes, closed by one commit marker, and inserted once the marker is
+    /// written, so after a crash the database holds all of them or none, and
+    /// once the call returns they survive a crash. It reports no change data
+    /// capture events.
+    ///
     /// While it changes the store, commits, new transactions and checkpoints
     /// wait for it; `triples` is collected before, without blocking anything,
     /// and only once the database takes the insert: a refused call never
@@ -112,7 +118,44 @@ impl GrafeoDB {
         self.check_import_allowed()?;
         // Collected before commits are held off, for the same reason.
         let triples: Vec<_> = triples.into_iter().collect();
-        let _held = self.hold_commits_for_import()?;
+        let held = self.hold_commits_for_import()?;
+        self.insert_triples_streamed(&held, triples)
+    }
+
+    /// Inserts `triples` into the default RDF graph as one bulk write, while
+    /// the caller holds commits off (`held`): their WAL records are written
+    /// as a group that one commit marker closes, then the triples are
+    /// inserted. Returns how many were new.
+    ///
+    /// # Errors
+    ///
+    /// Fails, inserting nothing, when the WAL write of a run of records
+    /// fails.
+    pub(super) fn insert_triples_streamed(
+        &self,
+        held: &crate::transaction::CommitsHeld<'_>,
+        triples: Vec<grafeo_core::graph::rdf::Triple>,
+    ) -> Result<usize> {
+        if triples.is_empty() {
+            return Ok(0);
+        }
+        let changes = self.streaming_changes(held);
+        #[cfg(feature = "wal")]
+        let changes = {
+            let mut changes = changes;
+            for triple in &triples {
+                changes.log(grafeo_storage::wal::WalRecord::InsertRdfTriple {
+                    subject: triple.subject().to_string(),
+                    predicate: triple.predicate().to_string(),
+                    object: triple.object().to_string(),
+                    graph: None,
+                })?;
+            }
+            changes
+        };
+        // No epoch: the RDF store has none, and the triples apply after the
+        // marker.
+        changes.commit(None)?;
         Ok(self.rdf_store.batch_insert(triples))
     }
 }

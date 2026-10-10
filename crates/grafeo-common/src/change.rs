@@ -33,8 +33,13 @@
 //! names: a store maps them to ids of its own.
 //!
 //! A bulk write records a [`BulkRange`] instead of an entry per row: the ids
-//! it reserved in one table, undone and stamped as a range. Its rows are
-//! logged as the bulk write applies them, and are not kept.
+//! it reserved in one table, undone and stamped as a range. A bulk write that
+//! holds commits off for its whole run (an import) logs its rows as it
+//! applies them and keeps none. One inside a transaction (a batch call)
+//! cannot log before its commit, so when the commit's log or change data
+//! capture reads its rows it keeps them with the range
+//! ([`ChangeSet::push_bulk_rows`]): each a create, without an entry, a
+//! before-image or a pending version of its own.
 //!
 //! A [`StandaloneOp`] (a graph, catalog or RDF graph operation) is no entry
 //! of a set: it is validated, logged in a group of its own
@@ -416,7 +421,8 @@ pub struct EdgeImage {
 /// The ids a bulk write reserved in one table of a graph: one entry however
 /// many rows it creates there. Undo removes what exists in the range, and
 /// the commit stamps it, as a range. The rows themselves are logged as the
-/// bulk write applies them, and are not kept.
+/// bulk write applies them, or kept with the range for the commit's log
+/// (see [`ChangeSet::push_bulk_rows`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BulkRange {
     /// The graph, a labeled property graph.
@@ -425,6 +431,20 @@ pub struct BulkRange {
     pub table: Table,
     /// The ids reserved, as raw node or edge ids.
     pub ids: Range<u64>,
+}
+
+impl BulkRange {
+    /// Whether `row` is a create in this range: a node create for a node
+    /// range, an edge create with real endpoints for an edge range, at one
+    /// of the range's ids.
+    fn holds(&self, row: &DataOp) -> bool {
+        let id = match (self.table, row) {
+            (Table::Nodes, DataOp::CreateNode { id, .. }) => id.as_u64(),
+            (Table::Edges, DataOp::CreateEdge { id, .. }) if row.names_real_ids() => id.as_u64(),
+            _ => return false,
+        };
+        self.ids.contains(&id)
+    }
 }
 
 /// One entry of a change set. Matches over it are exhaustive on purpose: an
@@ -541,9 +561,16 @@ pub struct ChangeSet {
     slots: GrafeoMap<GraphRef, GraphSlot>,
     /// The entries, in recorded order.
     entries: Vec<Change>,
-    /// What the entries hold on the heap.
+    /// The rows kept with bulk ranges (see [`push_bulk_rows`](Self::push_bulk_rows)):
+    /// the index of each range's entry with its rows, in entry order.
+    bulk_rows: Vec<(usize, Vec<DataOp>)>,
+    /// What the entries and the kept rows hold on the heap.
     held: Held,
 }
+
+/// The before-image of a row kept with a bulk range: a create replaced
+/// nothing.
+static ABSENT: Before = Before::Absent;
 
 impl ChangeSet {
     /// An empty change set.
@@ -662,6 +689,82 @@ impl ChangeSet {
         Ok(())
     }
 
+    /// Keeps `rows`, which a bulk write applied in the range it recorded
+    /// last ([`push_bulk`](Self::push_bulk)), with that range for the
+    /// commit's log and change data capture ([`ops`](Self::ops),
+    /// [`log_records`](Self::log_records)), after the rows kept with it
+    /// before. They add no entry: the range stays the one entry undo and
+    /// stamp read. A rollback to a savepoint before the range drops them
+    /// with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`], and keeps nothing, when the last entry is
+    /// not a range of `graph`, or a row is not a create in the range's table
+    /// at one of its ids (with real endpoints for an edge).
+    pub fn push_bulk_rows(&mut self, graph: GraphSlot, rows: Vec<DataOp>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let at = self.entries.len().checked_sub(1);
+        let range = match at.map(|at| &self.entries[at]) {
+            Some(Change::Bulk(range)) if range.graph == graph => range,
+            last => {
+                return Err(Error::Internal(format!(
+                    "{} rows of a bulk write in graph slot {}, but the last entry is not a bulk \
+                     range of that graph: {last:?}",
+                    rows.len(),
+                    graph.index()
+                )));
+            }
+        };
+        if let Some(row) = rows.iter().find(|row| !range.holds(row)) {
+            return Err(Error::Internal(format!(
+                "a row that is no create in the bulk range of {:?} ids {:?}: {row:?}",
+                range.table, range.ids
+            )));
+        }
+        for row in &rows {
+            self.held.row(row, Count::Add);
+        }
+        // `at` is the last entry: the rows kept last are its or older.
+        let at = self.entries.len() - 1;
+        match self.bulk_rows.last_mut() {
+            Some((index, kept)) if *index == at => kept.extend(rows),
+            _ => self.bulk_rows.push((at, rows)),
+        }
+        Ok(())
+    }
+
+    /// The rows kept with the bulk range of entry `index`.
+    fn rows_of(&self, index: usize) -> &[DataOp] {
+        self.bulk_rows
+            .binary_search_by_key(&index, |(at, _)| *at)
+            .map_or(&[], |found| self.bulk_rows[found].1.as_slice())
+    }
+
+    /// What the set's writes did, in the order they were applied, with the
+    /// graph of each and what it replaced: the op of each data entry, and at
+    /// a bulk range's place the rows kept with it (see
+    /// [`push_bulk_rows`](Self::push_bulk_rows)), creates that replaced
+    /// nothing. What the commit logs and reports to change data capture.
+    pub fn ops(&self) -> impl Iterator<Item = (GraphSlot, &DataOp, &Before)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .flat_map(move |(index, change)| {
+                let (data, rows) = match change {
+                    Change::Data {
+                        graph, op, before, ..
+                    } => (Some((*graph, op, before)), &[][..]),
+                    Change::Bulk(_) => (None, self.rows_of(index)),
+                };
+                let graph = change.graph();
+                data.into_iter()
+                    .chain(rows.iter().map(move |row| (graph, row, &ABSENT)))
+            })
+    }
+
     /// Checks that `graph` is a slot of this set, of `model`; `what` names
     /// the change in the error.
     fn check_graph(
@@ -738,6 +841,12 @@ impl ChangeSet {
         for change in &tail {
             self.held.change(change, Count::Remove);
         }
+        let kept = self.bulk_rows.partition_point(|(index, _)| *index < mark.0);
+        for (_, rows) in self.bulk_rows.drain(kept..) {
+            for row in &rows {
+                self.held.row(row, Count::Remove);
+            }
+        }
         tail
     }
 
@@ -777,18 +886,17 @@ impl ChangeSet {
             .saturating_add(self.held.bytes)
     }
 
-    /// The log records of the entries, in recorded order: the op of each data
-    /// entry, naming its graph by storage key. A bulk range has none: the
-    /// bulk write logs its rows as it applies them. Before-images and
-    /// pending versions are never logged.
+    /// The log records of the set's writes, in the order they were applied
+    /// (see [`ops`](Self::ops)), each naming its graph by storage key: the
+    /// op of each data entry and the rows kept with a bulk range. A range
+    /// whose rows were logged as they were applied has none. Before-images
+    /// and pending versions are never logged.
     pub fn log_records(&self) -> impl Iterator<Item = LogRecordRef<'_>> {
-        self.entries.iter().filter_map(|change| match change {
-            Change::Data { graph, op, .. } => Some(LogRecordRef::Data {
-                // `push` took only slots of this set, and slots stay.
-                graph: self.graphs[graph.index()].key.as_deref(),
-                op,
-            }),
-            Change::Bulk(_) => None,
+        self.ops().map(|(graph, op, _)| LogRecordRef::Data {
+            // `push` and `push_bulk` took only slots of this set, and slots
+            // stay.
+            graph: self.graphs[graph.index()].key.as_deref(),
+            op,
         })
     }
 }
@@ -825,6 +933,13 @@ impl Held {
             }
             Change::Bulk(_) => {}
         }
+    }
+
+    /// Counts a row kept with a bulk range: its op, and its place in the
+    /// range's list of rows.
+    fn row(&mut self, row: &DataOp, count: Count) {
+        self.own(size_of::<DataOp>(), count);
+        self.op(row, count);
     }
 
     fn op(&mut self, op: &DataOp, count: Count) {
@@ -1807,6 +1922,123 @@ mod tests {
             assert!(matches!(error, Error::Internal(_)), "{error:?}");
         }
         assert_eq!(set.len(), 2, "a refused range records nothing");
+    }
+
+    /// The rows a bulk write inside a transaction applied (a batch call)
+    /// stay with its range for the commit: the log and change data capture
+    /// read them at the range's place among the entries, each a create that
+    /// replaced nothing, while the range stays one entry for undo and stamp.
+    /// A rollback to a savepoint before the range drops them with it. Rows
+    /// that do not belong to the range are refused, and nothing is kept.
+    #[test]
+    fn a_bulk_range_keeps_the_rows_it_is_given_for_the_commit() {
+        let mut set = ChangeSet::new();
+        let default = set.slot(lpg(None)).unwrap();
+        let trips = set.slot(lpg(Some("trips"))).unwrap();
+        set.push(
+            default,
+            create_node(1, &["Person"], vec![("name".into(), Value::from("Alix"))]),
+            Before::Absent,
+            Created,
+        )
+        .unwrap();
+        let mark = set.mark();
+        let empty = set.approx_bytes();
+        set.push_bulk(BulkRange {
+            graph: default,
+            table: Table::Nodes,
+            ids: 3..6,
+        })
+        .unwrap();
+        let range_only = set.approx_bytes();
+        let city = |id: u64, name: &str| {
+            create_node(id, &["City"], vec![("name".into(), Value::from(name))])
+        };
+        // Two chunks for one range.
+        set.push_bulk_rows(default, vec![city(3, "Amsterdam"), city(4, "Berlin")])
+            .unwrap();
+        set.push_bulk_rows(default, vec![city(5, "Paris")]).unwrap();
+        set.push(
+            default,
+            set_node_property(4, "visits", Value::Int64(19)),
+            Before::Value(None),
+            Created,
+        )
+        .unwrap();
+        assert_eq!(set.len(), 3, "the rows are no entries of their own");
+        assert!(
+            set.approx_bytes() > range_only,
+            "the kept rows count in the set's memory"
+        );
+
+        let ops: Vec<(GraphSlot, Option<Entity>, bool)> = set
+            .ops()
+            .map(|(graph, op, before)| (graph, op.entity(), *before == Before::Absent))
+            .collect();
+        let node = |id: u64| Some(Entity::Node(NodeId::new(id)));
+        assert_eq!(
+            ops,
+            [
+                (default, node(1), true),
+                (default, node(3), true),
+                (default, node(4), true),
+                (default, node(5), true),
+                (default, node(4), false),
+            ],
+            "every op in the order it was applied, the rows at their range's place"
+        );
+        let logged: Vec<Option<Entity>> = read_all(&encoded(&set).concat())
+            .iter()
+            .map(|record| match record {
+                LogRecord::Data { graph: None, op } => op.entity(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(logged, [node(1), node(3), node(4), node(5), node(4)]);
+
+        // Refused: rows outside the range or of the other table, rows of
+        // another graph, and rows when the last entry is not a range.
+        let edge = DataOp::CreateEdge {
+            id: EdgeId::new(4),
+            src: NodeId::new(3),
+            dst: NodeId::new(5),
+            edge_type: "ROUTE".into(),
+            properties: Vec::new(),
+        };
+        let before_refusals = set.approx_bytes();
+        set.push_bulk(BulkRange {
+            graph: default,
+            table: Table::Nodes,
+            ids: 19..22,
+        })
+        .unwrap();
+        for (graph, rows) in [
+            (default, vec![city(19, "Prague"), city(88, "Barcelona")]),
+            (default, vec![edge.clone()]),
+            (trips, vec![city(19, "Prague")]),
+        ] {
+            let error = set.push_bulk_rows(graph, rows).unwrap_err();
+            assert!(matches!(error, Error::Internal(_)), "{error:?}");
+        }
+        assert_eq!(set.split_off(set.mark()).len(), 0);
+        let last = set.split_off(ChangeMark(3));
+        assert_eq!(last.len(), 1);
+        assert_eq!(
+            set.approx_bytes(),
+            before_refusals,
+            "a refused row is not kept"
+        );
+        let error = set
+            .push_bulk_rows(default, vec![city(19, "Prague")])
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal(_)), "{error:?}");
+
+        // A rollback to a savepoint before the range drops its rows.
+        let tail = set.split_off(mark);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(set.approx_bytes(), empty, "the rows left with their range");
+        assert_eq!(set.ops().count(), 1);
+        assert_eq!(set.log_records().count(), 1);
     }
 
     /// `DETACH DELETE` records each edge delete before the node delete: the

@@ -948,6 +948,105 @@ fn bulk_ranges_are_stamped_and_undone_by_range() {
     );
 }
 
+/// A bulk write applies each row as the create it is, at an id of its
+/// range, as the transaction's pending version: committed by the range's
+/// stamp, gone with its undo. The checks of the row are the bulk write's:
+/// the store does not look up an edge's endpoints again (the bulk write's
+/// writer saw them), but a row at an id in use still changes nothing, and
+/// only a transaction's creates are bulk rows.
+#[test]
+fn a_bulk_row_is_a_create_whose_endpoints_the_bulk_write_checked() {
+    let base = base();
+    let store = &base.store;
+    let id = TransactionId::new(3);
+    let writer = transaction(3, store.current_epoch());
+    let (nodes, edges, _) = counters(store);
+    let ids = store.reserve_edge_ids(2).unwrap();
+    let mut set = ChangeSet::new();
+    let slot = default_slot(&mut set);
+    set.push_bulk(BulkRange {
+        graph: slot,
+        table: Table::Edges,
+        ids: ids.clone(),
+    })
+    .unwrap();
+    let edge = |raw: u64, src: NodeId, dst: NodeId| DataOp::CreateEdge {
+        id: EdgeId::new(raw),
+        src,
+        dst,
+        edge_type: ArcStr::from("VISITED"),
+        properties: properties(&[("year", Value::Int64(1988))]),
+    };
+    let before = image(store, None);
+    store
+        .apply_bulk_row(&edge(ids.start, base.alix, base.gus), writer)
+        .unwrap();
+    assert_eq!(
+        store.apply_bulk_row(&edge(base.alix_gus.as_u64(), base.alix, base.mia), writer),
+        Err(ApplyError::Exists(Entity::Edge(base.alix_gus))),
+        "a row at an id in use is refused"
+    );
+    let vincent = NodeId::new(store.reserve_node_ids(1).unwrap().start);
+    for refused in [
+        (
+            DataOp::SetNodeProperty {
+                id: base.alix,
+                key: PropertyKey::new("age"),
+                value: Value::Int64(88),
+            },
+            writer,
+        ),
+        (
+            DataOp::CreateNode {
+                id: vincent,
+                labels: labels(&["Person"]),
+                properties: Vec::new(),
+            },
+            Writer::Replay {
+                epoch: EpochId::new(88),
+            },
+        ),
+    ] {
+        assert!(
+            matches!(
+                store.apply_bulk_row(&refused.0, refused.1),
+                Err(ApplyError::Refused(_))
+            ),
+            "{refused:?}"
+        );
+    }
+    assert!(
+        store.get_node(vincent).is_none(),
+        "a refused row is nothing"
+    );
+    assert_eq!(image(store, None), before, "readers see no pending row");
+    assert_eq!(
+        counters(store),
+        (nodes, edges, counters(store).2),
+        "rows count at commit"
+    );
+
+    // The endpoints are the bulk write's to check: an edge to a node the
+    // writer does not see is applied as given (`apply` would refuse it).
+    let unseen = NodeId::new(store.reserve_node_ids(1).unwrap().start);
+    assert_eq!(
+        store.apply(&edge(ids.start + 1, base.gus, unseen), writer),
+        Err(ApplyError::Missing(Entity::Node(unseen)))
+    );
+    store
+        .apply_bulk_row(&edge(ids.start + 1, base.gus, base.mia), writer)
+        .unwrap();
+
+    let epoch = commit(store, id, &set);
+    for raw in ids {
+        let edge = store
+            .get_edge_at_epoch(EdgeId::new(raw), epoch)
+            .unwrap_or_else(|| panic!("row {raw} is committed"));
+        assert_eq!(edge.get_property("year"), Some(&Value::Int64(1988)));
+    }
+    assert_eq!(counters(store).1, edges + 2, "the rows counted at commit");
+}
+
 /// The before-images a transaction's writes report are what they replaced,
 /// and replay builds none.
 #[test]

@@ -2615,11 +2615,13 @@ impl GrafeoDB {
     /// Holds commits off while an import or an RDF batch insert changes the
     /// store, for as long as the guard lives (see
     /// [`TransactionManager::hold_commits_for_change`](crate::transaction::TransactionManager)):
-    /// they write no WAL record, so only a checkpoint persists them, and a
-    /// checkpoint or `close()` waits and holds all of the change or none of
-    /// it. Meanwhile commits, new transactions, writes outside a transaction
-    /// and checkpoints wait; the input is parsed before, outside the hold,
-    /// once [`check_import_allowed`](Self::check_import_allowed) has passed.
+    /// it writes its WAL records as it goes, through
+    /// [`streaming_changes`](Self::streaming_changes), as one group that
+    /// nothing else may write into, and a checkpoint or `close()` waits and
+    /// holds all of the change or none of it. Meanwhile commits, new
+    /// transactions, writes outside a transaction and checkpoints wait; the
+    /// input is parsed before, outside the hold, once
+    /// [`check_import_allowed`](Self::check_import_allowed) has passed.
     ///
     /// Nothing would persist the change on a read-only database or after
     /// `close()`, so it fails with the read-only error on a read-only
@@ -2639,6 +2641,23 @@ impl GrafeoDB {
         #[cfg(feature = "testing-statement-injection")]
         grafeo_common::testing::commit_hook::run_during_held_change();
         Ok(held)
+    }
+
+    /// The changes of an import or an RDF batch insert that holds commits
+    /// off (`held`), written to the WAL as it goes (see
+    /// [`StreamingChanges`](crate::transaction::StreamingChanges)).
+    #[cfg(any(feature = "lpg", feature = "triple-store"))]
+    fn streaming_changes(
+        &self,
+        held: &crate::transaction::CommitsHeld<'_>,
+    ) -> crate::transaction::StreamingChanges {
+        let changes = crate::transaction::StreamingChanges::new(
+            Arc::clone(&self.transaction_manager),
+            self.transaction_manager.bulk_writer(held),
+        );
+        #[cfg(feature = "wal")]
+        let changes = changes.logged_to(self.wal.clone());
+        changes
     }
 
     /// Returns the typed WAL if available.

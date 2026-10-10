@@ -242,6 +242,25 @@ pub trait ChangeTarget: Send + Sync {
     /// nothing is [`Applied::Unchanged`], replay's is an error.
     fn apply(&self, op: &DataOp, writer: Writer) -> Result<Applied, ApplyError>;
 
+    /// Applies `op`, one row of a bulk write: a create by a transaction
+    /// ([`Writer::Transaction`]) at an id of a range it reserved and
+    /// recorded as one entry ([`BulkRange`](grafeo_common::change::BulkRange)),
+    /// which its commit stamps and its rollback undoes as a range. Builds no
+    /// before-image (the range is the entry), and leaves to the bulk write
+    /// what it checked itself for every row: an edge's endpoints, which its
+    /// writer sees. On `Err` nothing changed.
+    ///
+    /// The default is [`apply`](Self::apply), which checks everything again.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError::Refused`] for an op that is no create or a writer that
+    /// is no transaction; otherwise as [`apply`](Self::apply).
+    fn apply_bulk_row(&self, op: &DataOp, writer: Writer) -> Result<(), ApplyError> {
+        check_bulk_row(op, writer)?;
+        self.apply(op, writer).map(drop)
+    }
+
     /// Commits `transaction`'s entries of this graph at `epoch`: the pending
     /// versions they name get the epoch, and the statistics counters and
     /// dirty marks take the entries. A bulk range costs O(row groups) where
@@ -744,6 +763,28 @@ impl ChangeTarget for ExternalTarget {
     fn undo_support(&self) -> UndoSupport {
         UndoSupport::None
     }
+}
+
+/// Refuses what no bulk write applies as a row (see
+/// [`ChangeTarget::apply_bulk_row`]): an op that is no create, or a writer
+/// that is no transaction.
+///
+/// # Errors
+///
+/// [`ApplyError::Refused`], naming the op's kind or the writer.
+pub(crate) fn check_bulk_row(op: &DataOp, writer: Writer) -> Result<(), ApplyError> {
+    if !matches!(op, DataOp::CreateNode { .. } | DataOp::CreateEdge { .. }) {
+        return Err(ApplyError::Refused(format!(
+            "a bulk write's row is a create, not an op of kind {}",
+            op.kind()
+        )));
+    }
+    if !matches!(writer, Writer::Transaction { .. }) {
+        return Err(ApplyError::Refused(format!(
+            "a bulk write's row is a transaction's pending create, not a write by {writer:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// The error of a write a store refused with `error`.

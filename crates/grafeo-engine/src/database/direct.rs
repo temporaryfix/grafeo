@@ -15,10 +15,12 @@
 //! manager like any other (see
 //! [`TransactionManager::begin_private`](crate::transaction::TransactionManager)).
 //! It writes through the graph's store, recording each write in its change
-//! set, and commits when the call succeeds: its changes are stamped with the
-//! commit epoch, logged and reported to change data capture as a
-//! transaction's are. A call that fails or panics is rolled back through its
-//! change set, also a batch whose later row fails: it leaves nothing. Its
+//! set (a batch as one bulk write: one entry for the ids it reserved per
+//! table, see [`GraphWriter::create_nodes`]), and commits when the call
+//! succeeds: its changes are stamped with the commit epoch, logged and
+//! reported to change data capture as a transaction's are. A call that fails
+//! or panics is rolled back through its change set, also a batch whose later
+//! row fails: it leaves nothing, and its ids are not handed out again. Its
 //! claims make it conflict with an open transaction that wrote the same
 //! node or edge first, and an open transaction conflicts with it the same
 //! way; such calls on different nodes and edges run side by side, from any
@@ -43,7 +45,7 @@ use grafeo_common::change::{
 use grafeo_common::types::{ArcStr, EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
 use grafeo_core::execution::operators::{
-    ChangeRecorder, GraphWriter, OperatorError, Recording, WriteClaim, WriteClaims,
+    ChangeRecorder, GraphWriter, NewEdge, OperatorError, Recording, WriteClaim, WriteClaims,
     WriteInProgress, WriteTarget,
 };
 use grafeo_core::graph::apply::{ChangeTarget, Writer};
@@ -363,19 +365,8 @@ impl GrafeoDB {
         #[cfg(feature = "testing-statement-injection")]
         grafeo_common::testing::commit_hook::run_during_held_change();
 
-        let keep = {
-            #[cfg(feature = "wal")]
-            let wal = self.wal.is_some();
-            #[cfg(not(feature = "wal"))]
-            let wal = false;
-            #[cfg(feature = "cdc")]
-            let cdc = self.cdc_active();
-            #[cfg(not(feature = "cdc"))]
-            let cdc = false;
-            wal || cdc
-        };
         let recorder = self.immediate_recorder();
-        recorder.start(epoch, graph, keep)?;
+        recorder.start(epoch, graph, self.reads_committed_rows())?;
         let writer = self.direct_writer(
             store,
             graph,
@@ -466,6 +457,22 @@ impl GrafeoDB {
             .with_recording(recording)
     }
 
+    /// Whether a commit of the direct API reads what its writes did after
+    /// they are applied: when it logs them to the WAL or reports them to
+    /// change data capture. Without, a call keeps no before-images (one that
+    /// commits at once) and no rows of a batch.
+    fn reads_committed_rows(&self) -> bool {
+        #[cfg(feature = "wal")]
+        let wal = self.wal.is_some();
+        #[cfg(not(feature = "wal"))]
+        let wal = false;
+        #[cfg(feature = "cdc")]
+        let cdc = self.cdc_active();
+        #[cfg(not(feature = "cdc"))]
+        let cdc = false;
+        wal || cdc
+    }
+
     /// The recorder of the direct calls that commit at once.
     fn immediate_recorder(&self) -> &Arc<ImmediateRecorder> {
         self.immediate_writes.get_or_init(|| {
@@ -529,6 +536,9 @@ impl GrafeoDB {
         graph: Option<&str>,
     ) -> Result<(TransactionId, Arc<TransactionChanges>, GraphWriter)> {
         let (transaction, changes) = self.transaction_manager.begin_private()?;
+        // A batch's rows are kept for the commit only when it logs them or
+        // reports them to change data capture.
+        changes.set_keeps_bulk_rows(self.reads_committed_rows());
         let recording = match changes.recording(
             &self.transaction_manager,
             graph,
@@ -852,55 +862,49 @@ pub(crate) fn remove_node_label(
     Ok(writer.remove_labels(id, &[label.to_string()])? == 1)
 }
 
-/// Creates one node with `label` per vector, the vector as `property`.
+/// Creates one node with `label` per vector, the vector as `property`, as
+/// one bulk write (see [`GraphWriter::create_nodes`]).
 pub(crate) fn create_vector_nodes(
     writer: &GraphWriter,
     label: &str,
     property: &str,
     vectors: Vec<Vec<f32>>,
 ) -> std::result::Result<Vec<NodeId>, OperatorError> {
-    let labels = [label.to_string()];
-    vectors
+    let rows = vectors
         .into_iter()
-        .map(|vector| {
-            writer.create_node(
-                &labels,
-                vec![(property.to_string(), Value::Vector(vector.into()))],
-            )
-        })
-        .collect()
+        .map(|vector| vec![(property.to_string(), Value::Vector(vector.into()))])
+        .collect();
+    writer.create_nodes(&[label.to_string()], rows)
 }
 
-/// Creates one node with all of `labels` per property map.
+/// Creates one node with all of `labels` per property map, as one bulk
+/// write (see [`GraphWriter::create_nodes`]).
 pub(crate) fn create_nodes(
     writer: &GraphWriter,
     labels: &[&str],
     properties_list: Vec<HashMap<PropertyKey, Value>>,
 ) -> std::result::Result<Vec<NodeId>, OperatorError> {
     let labels: Vec<String> = labels.iter().map(|label| (*label).to_string()).collect();
-    properties_list
-        .into_iter()
-        .map(|properties| writer.create_node(&labels, direct_properties(properties)))
-        .collect()
+    let rows = properties_list.into_iter().map(direct_properties).collect();
+    writer.create_nodes(&labels, rows)
 }
 
-/// Creates the edges, each between two nodes the writer sees.
+/// Creates the edges, each between two nodes the writer sees, as one bulk
+/// write (see [`GraphWriter::create_edges`]).
 pub(crate) fn create_edges(
     writer: &GraphWriter,
     edges: Vec<BatchEdge>,
 ) -> std::result::Result<Vec<EdgeId>, OperatorError> {
-    edges
+    let edges = edges
         .into_iter()
-        .map(|edge| {
-            create_edge(
-                writer,
-                edge.src,
-                edge.dst,
-                &edge.edge_type,
-                direct_properties(edge.properties),
-            )
+        .map(|edge| NewEdge {
+            src: edge.src,
+            dst: edge.dst,
+            edge_type: edge.edge_type,
+            properties: direct_properties(edge.properties),
         })
-        .collect()
+        .collect();
+    writer.create_edges(edges)
 }
 
 /// The properties of a direct write as `(key, value)` pairs.

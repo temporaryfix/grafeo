@@ -409,6 +409,21 @@ impl Session {
         self.wal.as_ref()
     }
 
+    /// Whether this session's commits read what their writes did after
+    /// they are applied: when they log them to the WAL or report them to
+    /// change data capture.
+    fn reads_committed_rows(&self) -> bool {
+        #[cfg(feature = "wal")]
+        let wal = self.wal.is_some();
+        #[cfg(not(feature = "wal"))]
+        let wal = false;
+        #[cfg(feature = "cdc")]
+        let cdc = self.records_cdc;
+        #[cfg(not(feature = "cdc"))]
+        let cdc = false;
+        wal || cdc
+    }
+
     /// Sets the WAL for this session (shared with the database).
     ///
     /// Each commit writes one group: the records of its change set (see
@@ -3869,7 +3884,13 @@ impl Session {
             self.transaction_manager.begin()
         };
         *current = Some(transaction_id);
-        *self.changes.lock() = self.transaction_manager.changes(transaction_id);
+        let changes = self.transaction_manager.changes(transaction_id);
+        if let Some(changes) = &changes {
+            // The rows of its batch calls are kept for the commit only when
+            // it logs them or reports them to change data capture.
+            changes.set_keeps_bulk_rows(self.reads_committed_rows());
+        }
+        *self.changes.lock() = changes;
         *self.read_only_tx.lock() = read_only || self.db_read_only;
 
         #[cfg(feature = "metrics")]

@@ -20,23 +20,34 @@
 //! and created again under its name meanwhile is never stamped or undone
 //! with ids that mean other entities there.
 //!
+//! A batch call is a bulk write: its ids are one reserved range per table,
+//! one entry however many rows, which the commit stamps and a rollback
+//! undoes as a range; its rows are kept with the range only when the commit
+//! logs them or reports them to change data capture
+//! ([`TransactionChanges::set_keeps_bulk_rows`]). An import holds commits
+//! off for its whole run and writes its rows to the WAL as it goes
+//! ([`StreamingChanges`]), keeping none.
+//!
 //! Graph commands, schema statements and the index API change nothing a
 //! change set holds: each statement or call collects its changes in a
 //! [`StandaloneChange`], which is checked, logged as a group of its own and
 //! applied at once, also inside a transaction, whose rollback keeps it.
 
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "lpg")]
 use grafeo_common::change::StandaloneOp;
 use grafeo_common::change::{
-    Before, Change, ChangeMark, ChangeSet, DataModel, DataOp, Entity, GraphRef, GraphSlot,
-    PendingVersion,
+    Before, BulkRange, Change, ChangeMark, ChangeSet, DataModel, DataOp, Entity, GraphRef,
+    GraphSlot, PendingVersion, Table,
 };
 use grafeo_common::types::{ArcStr, EpochId, TransactionId};
 use grafeo_common::utils::error::{Error, Result, TransactionError};
 use grafeo_core::execution::operators::{
-    ChangeRecorder, OperatorError, Recording, WriteClaim, WriteClaims, WriteInProgress, WriteTarget,
+    BulkRows, ChangeRecorder, OperatorError, Recording, WriteClaim, WriteClaims, WriteInProgress,
+    WriteTarget,
 };
 use grafeo_core::graph::apply::{ApplyError, ChangeTarget, UndoSupport, Writer};
 use parking_lot::Mutex;
@@ -50,6 +61,10 @@ pub(crate) struct TransactionChanges {
     id: TransactionId,
     /// The epoch it reads at.
     snapshot: EpochId,
+    /// Whether the rows of the transaction's bulk writes are kept with
+    /// their ranges, for the commit's log and change data capture (see
+    /// [`set_keeps_bulk_rows`](Self::set_keeps_bulk_rows)).
+    keeps_bulk_rows: AtomicBool,
     /// The set and the stores. Lock order: taken after the write freeze
     /// and the transaction manager's lock, never before them.
     state: Mutex<State>,
@@ -90,6 +105,7 @@ impl TransactionChanges {
         Self {
             id,
             snapshot,
+            keeps_bulk_rows: AtomicBool::new(true),
             state: Mutex::new(State {
                 set,
                 targets: Vec::new(),
@@ -103,6 +119,31 @@ impl TransactionChanges {
     /// The transaction.
     pub(crate) fn id(&self) -> TransactionId {
         self.id
+    }
+
+    /// Sets whether the rows of the transaction's bulk writes (batch calls)
+    /// are kept with their ranges for the commit: they must be when its
+    /// commit writes the WAL or reports change data capture events, which
+    /// read them. Kept until told otherwise, so a commit that reads them
+    /// never misses one.
+    pub(crate) fn set_keeps_bulk_rows(&self, keep: bool) {
+        self.keeps_bulk_rows.store(keep, Ordering::Release);
+    }
+
+    /// Records that a bulk write reserved `ids` in `table` of the graph of
+    /// `slot`: one entry for the range.
+    fn record_bulk(&self, slot: GraphSlot, table: Table, ids: Range<u64>) -> Result<()> {
+        self.state.lock().set.push_bulk(BulkRange {
+            graph: slot,
+            table,
+            ids,
+        })
+    }
+
+    /// Keeps `rows` with the range a bulk write in the graph of `slot`
+    /// recorded last.
+    fn record_bulk_rows(&self, slot: GraphSlot, rows: Vec<DataOp>) -> Result<()> {
+        self.state.lock().set.push_bulk_rows(slot, rows)
     }
 
     /// The epoch the transaction reads at.
@@ -435,23 +476,38 @@ impl TransactionChanges {
     }
 
     /// The nodes and edges the transaction wrote: created, changed or
-    /// deleted, each once.
+    /// deleted, each once. A bulk range counts each of its ids: a bulk write
+    /// that did not create them all failed, and its rollback removed the
+    /// range.
     pub(crate) fn written_entities(&self) -> (u64, u64) {
         let state = self.state.lock();
         let mut seen: grafeo_common::utils::hash::FxHashSet<(GraphSlot, Entity)> =
             grafeo_common::utils::hash::FxHashSet::default();
+        let (mut bulk_nodes, mut bulk_edges) = (0_u64, 0_u64);
         for change in state.set.entries() {
-            if let Change::Data { graph, op, .. } = change
-                && let Some(entity) = op.entity()
-            {
-                seen.insert((*graph, entity));
+            match change {
+                Change::Data { graph, op, .. } => {
+                    if let Some(entity) = op.entity() {
+                        seen.insert((*graph, entity));
+                    }
+                }
+                Change::Bulk(range) => {
+                    let ids = range.ids.end - range.ids.start;
+                    match range.table {
+                        Table::Nodes => bulk_nodes += ids,
+                        Table::Edges => bulk_edges += ids,
+                    }
+                }
             }
         }
         let nodes = seen
             .iter()
             .filter(|(_, entity)| matches!(entity, Entity::Node(_)))
             .count();
-        (nodes as u64, (seen.len() - nodes) as u64)
+        (
+            nodes as u64 + bulk_nodes,
+            (seen.len() - nodes) as u64 + bulk_edges,
+        )
     }
 
     /// Runs `read` on the change set.
@@ -603,6 +659,19 @@ impl WriteClaims for GraphRecorder {
     }
 }
 
+impl GraphRecorder {
+    /// The error of a change the set refused although the store applied
+    /// it (`what`): the store holds a change no undo or log knows of, so
+    /// the database is poisoned.
+    fn refused(&self, what: &str, error: &Error) -> OperatorError {
+        self.claims.manager.poison(&format!(
+            "transaction {:?} could not record {what} it applied: {error}",
+            self.changes.id
+        ));
+        OperatorError::Internal(error.to_string())
+    }
+}
+
 impl ChangeRecorder for GraphRecorder {
     fn writer(&self) -> Writer {
         Writer::Transaction {
@@ -619,14 +688,349 @@ impl ChangeRecorder for GraphRecorder {
     ) -> std::result::Result<(), OperatorError> {
         self.changes
             .record(self.slot, op, before, version)
-            .map_err(|error| {
-                // The store holds a change no undo knows of.
-                self.claims.manager.poison(&format!(
-                    "transaction {:?} could not record a change it applied: {error}",
-                    self.changes.id
+            .map_err(|error| self.refused("a change", &error))
+    }
+
+    fn bulk(&self) -> Option<BulkRows> {
+        Some(if self.changes.keeps_bulk_rows.load(Ordering::Acquire) {
+            BulkRows::Keep
+        } else {
+            BulkRows::Drop
+        })
+    }
+
+    fn record_bulk(&self, table: Table, ids: Range<u64>) -> std::result::Result<(), OperatorError> {
+        // Recorded before any row is applied: a refused range changed
+        // nothing.
+        self.changes
+            .record_bulk(self.slot, table, ids)
+            .map_err(OperatorError::from)
+    }
+
+    fn record_bulk_rows(&self, rows: Vec<DataOp>) -> std::result::Result<(), OperatorError> {
+        self.changes
+            .record_bulk_rows(self.slot, rows)
+            .map_err(|error| self.refused("the rows of a bulk write", &error))
+    }
+}
+
+/// The records a [`StreamingChanges`] writes to the WAL at a time, about
+/// 64 KiB of frames: what it holds of the log however many rows it writes.
+#[cfg(feature = "wal")]
+pub(crate) const STREAMED_RECORDS: usize = 2048;
+
+/// The changes of a bulk write that holds commits off for its whole run (an
+/// import, an RDF batch insert): a streaming change set, whose memory does
+/// not grow with the rows it writes.
+///
+/// Its ids are reserved in ranges ([`reserve`](Self::reserve)), each one
+/// entry of its change set however many rows it creates there; its rows are
+/// applied as pending versions of its own transaction
+/// ([`apply`](Self::apply)) and written to the WAL as they go, a run of
+/// records at a time, without a commit marker. Nothing else writes the WAL
+/// meanwhile, since commits wait, so the records stay one group, which its
+/// commit closes with the marker ([`commit`](Self::commit)) before it
+/// stamps the ranges. Until then a crash leaves records that recovery drops
+/// (no marker closes them), and a failure, or a panic, drops it unfinished,
+/// which undoes the ranges and closes the records with an abort marker.
+/// Records of changes applied after the marker (RDF triples) are written the
+/// same way ([`log`](Self::log)).
+///
+/// A bulk write reports no change data capture events.
+pub(crate) struct StreamingChanges {
+    /// The transaction manager, which it poisons when it cannot undo or
+    /// close what it wrote.
+    manager: Arc<TransactionManager>,
+    /// The writer of its rows: an id no other transaction has (see
+    /// [`TransactionManager::bulk_writer`]).
+    transaction: TransactionId,
+    /// The epoch it reads at.
+    snapshot: EpochId,
+    /// Its ranges: one entry each.
+    set: ChangeSet,
+    /// The store its ranges are in, with the graph's slot, once it reserved
+    /// one.
+    target: Option<(GraphSlot, Arc<dyn ChangeTarget>)>,
+    /// The WAL, with the records not written yet.
+    #[cfg(feature = "wal")]
+    log: Option<StreamedLog>,
+    /// Whether it committed or aborted.
+    finished: bool,
+}
+
+/// The WAL a [`StreamingChanges`] writes, with its pending records.
+#[cfg(feature = "wal")]
+struct StreamedLog {
+    wal: Arc<grafeo_storage::wal::LpgWal>,
+    /// At most [`STREAMED_RECORDS`] records, written next.
+    pending: Vec<grafeo_storage::wal::WalRecord>,
+    /// Whether records were written: an abort closes them.
+    written: bool,
+}
+
+impl StreamingChanges {
+    /// The changes of a bulk write by `transaction`, reading at `snapshot`
+    /// (see [`TransactionManager::bulk_writer`]), not logged. The caller
+    /// holds commits off until it commits or aborts them.
+    pub(crate) fn new(
+        manager: Arc<TransactionManager>,
+        (transaction, snapshot): (TransactionId, EpochId),
+    ) -> Self {
+        Self {
+            manager,
+            transaction,
+            snapshot,
+            set: ChangeSet::new(),
+            target: None,
+            #[cfg(feature = "wal")]
+            log: None,
+            finished: false,
+        }
+    }
+
+    /// The same changes, logged to `wal` when there is one.
+    #[cfg(feature = "wal")]
+    pub(crate) fn logged_to(mut self, wal: Option<Arc<grafeo_storage::wal::LpgWal>>) -> Self {
+        self.log = wal.map(|wal| StreamedLog {
+            wal,
+            pending: Vec::with_capacity(STREAMED_RECORDS),
+            written: false,
+        });
+        self
+    }
+
+    /// Reserves `count` consecutive ids in `table` of `target`, the default
+    /// graph's store, and records them as one entry.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the ids are exhausted, or the write reserved ids in
+    /// another store before.
+    pub(crate) fn reserve(
+        &mut self,
+        target: &Arc<dyn ChangeTarget>,
+        table: Table,
+        count: usize,
+    ) -> Result<Range<u64>> {
+        let slot = match &self.target {
+            Some((slot, bound)) if same_store(bound, target) => *slot,
+            Some(_) => {
+                return Err(Error::Internal(
+                    "a bulk write reserves its ids in one store".to_string(),
                 ));
-                OperatorError::Internal(error.to_string())
-            })
+            }
+            None => {
+                let slot = self.set.slot(GraphRef {
+                    model: DataModel::Lpg,
+                    key: None,
+                })?;
+                self.target = Some((slot, Arc::clone(target)));
+                slot
+            }
+        };
+        let count = u64::try_from(count)
+            .map_err(|_| Error::Internal(format!("{count} rows: more ids than a store has")))?;
+        let ids = match table {
+            Table::Nodes => target.reserve_node_ids(count),
+            Table::Edges => target.reserve_edge_ids(count),
+        }
+        .map_err(|error| Error::Internal(error.to_string()))?;
+        self.set.push_bulk(BulkRange {
+            graph: slot,
+            table,
+            ids: ids.clone(),
+        })?;
+        Ok(ids)
+    }
+
+    /// Applies `op`, a create at an id of a range it reserved, as a pending
+    /// version of its transaction (see
+    /// [`ChangeTarget::apply_bulk_row`]: an edge's endpoints are the
+    /// caller's to have created), and logs it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store refuses the row (nothing of it applied), or
+    /// the WAL write of a run of records fails.
+    pub(crate) fn apply(&mut self, op: DataOp) -> Result<()> {
+        let Some((_, target)) = &self.target else {
+            return Err(Error::Internal(
+                "a bulk write's row before it reserved ids".to_string(),
+            ));
+        };
+        let writer = Writer::Transaction {
+            id: self.transaction,
+            snapshot: self.snapshot,
+        };
+        target
+            .apply_bulk_row(&op, writer)
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        #[cfg(feature = "wal")]
+        if let Some(log) = &mut self.log {
+            super::v1_group::push_v1_records(&op, None, |record| log.pending.push(record));
+            if log.pending.len() >= STREAMED_RECORDS {
+                log.write()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs `record`, of a change applied after the commit marker (an RDF
+    /// triple).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the WAL write of a run of records fails.
+    #[cfg(all(feature = "wal", feature = "triple-store"))]
+    pub(crate) fn log(&mut self, record: grafeo_storage::wal::WalRecord) -> Result<()> {
+        if let Some(log) = &mut self.log {
+            log.pending.push(record);
+            if log.pending.len() >= STREAMED_RECORDS {
+                log.write()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether it changed nothing yet: no range, no record.
+    pub(crate) fn is_empty(&self) -> bool {
+        #[cfg(feature = "wal")]
+        let logged = self
+            .log
+            .as_ref()
+            .is_some_and(|log| log.written || !log.pending.is_empty());
+        #[cfg(not(feature = "wal"))]
+        let logged = false;
+        self.set.is_empty() && !logged
+    }
+
+    /// The memory its change set holds, in bytes: its ranges, whatever
+    /// their size.
+    #[cfg(test)]
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.set.approx_bytes()
+    }
+
+    /// The records not written to the WAL yet: at most a run.
+    #[cfg(all(test, feature = "wal"))]
+    pub(crate) fn pending_records(&self) -> usize {
+        self.log.as_ref().map_or(0, |log| log.pending.len())
+    }
+
+    /// Commits it: writes the rest of its records and the commit marker,
+    /// which closes them, as one group, then stamps its ranges at `epoch`
+    /// (the epoch advance follows the marker). Without an epoch it has no
+    /// ranges (an RDF batch insert, whose triples the caller applies once
+    /// this returns). The caller publishes the epoch.
+    ///
+    /// A WAL write of the marker that fails is reported and the commit goes
+    /// on, as a transaction's commit does.
+    ///
+    /// # Errors
+    ///
+    /// Fails when it has ranges and no epoch, or the store cannot stamp its
+    /// ranges (a broken invariant: the transaction manager is poisoned).
+    pub(crate) fn commit(mut self, epoch: Option<EpochId>) -> Result<()> {
+        self.finished = true;
+        #[cfg(feature = "wal")]
+        if let Some(log) = &mut self.log {
+            use grafeo_storage::wal::WalRecord;
+            log.pending.push(WalRecord::TransactionCommit {
+                transaction_id: self.transaction,
+            });
+            if let Some(epoch) = epoch {
+                log.pending.push(WalRecord::EpochAdvance { epoch });
+            }
+            if let Err(error) = log.write() {
+                grafeo_common::grafeo_warn!("Failed to write a bulk write to the WAL: {}", error);
+            }
+        }
+        if let Some((slot, target)) = &self.target {
+            let Some(epoch) = epoch else {
+                let message = "a bulk write with ranges committed without an epoch".to_string();
+                self.manager.poison(&message);
+                return Err(Error::Internal(message));
+            };
+            target
+                .stamp(self.transaction, &mut self.set.in_graph(*slot), epoch)
+                .map_err(|error| {
+                    let message =
+                        format!("the commit of a bulk write could not stamp its ranges: {error}");
+                    self.manager.poison(&message);
+                    Error::Internal(message)
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Aborts it (when it is dropped before it committed): drops its pending
+    /// records, closes the ones written with an abort marker, so no later
+    /// commit marker commits them, and undoes its ranges.
+    ///
+    /// # Errors
+    ///
+    /// Fails, after poisoning the transaction manager, when the abort marker
+    /// cannot be written (a later commit marker would commit the records
+    /// written) or the store cannot undo a range.
+    fn abort(&mut self) -> Result<()> {
+        self.finished = true;
+        let mut failure = None;
+        #[cfg(feature = "wal")]
+        if let Some(log) = &mut self.log {
+            log.pending.clear();
+            if log.written {
+                log.pending
+                    .push(grafeo_storage::wal::WalRecord::TransactionAbort {
+                        transaction_id: self.transaction,
+                    });
+                if let Err(error) = log.write() {
+                    failure = Some(format!(
+                        "a bulk write that failed could not close its WAL records: {error}"
+                    ));
+                }
+            }
+        }
+        if let Some((slot, target)) = &self.target {
+            let mut entries = self.set.in_graph(*slot);
+            if let Err(error) = target.undo(self.transaction, &mut entries) {
+                failure.get_or_insert(format!(
+                    "a bulk write that failed could not undo its rows: {error}"
+                ));
+            }
+        }
+        match failure {
+            Some(message) => {
+                self.manager.poison(&message);
+                Err(Error::Internal(message))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "wal")]
+impl StreamedLog {
+    /// Writes the pending records, and empties them.
+    fn write(&mut self) -> Result<()> {
+        // Set first: a write that fails may have written some of them.
+        self.written = true;
+        let written = grafeo_common::testing::crash::maybe_fail("streaming_changes:write")
+            .and_then(|()| self.wal.log_batch(&self.pending));
+        self.pending.clear();
+        written?;
+        // Tests crash here: records written, no marker closes them.
+        grafeo_common::testing::crash::maybe_crash("streaming_changes:after_records");
+        Ok(())
+    }
+}
+
+impl Drop for StreamingChanges {
+    /// A bulk write dropped before it committed (an error the caller passed
+    /// on, a panic) is aborted; what cannot be aborted poisons the database.
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.abort();
+        }
     }
 }
 

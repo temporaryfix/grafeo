@@ -889,8 +889,8 @@ fn a_checkpoint_waits_for_a_direct_write_and_counts_it() {
 }
 
 /// Bulk imports, RDF batch inserts and snapshot restores after `close()`
-/// fail with the database-closed error and change nothing (they write no WAL,
-/// so what they changed after the final checkpoint was lost).
+/// fail with the database-closed error and change nothing (what they changed
+/// after the final checkpoint would be lost: the close removes the WAL).
 #[test]
 fn imports_and_restores_after_close_fail() {
     let dir = tempfile::tempdir().unwrap();
@@ -991,7 +991,7 @@ type Import = (
     usize,
 );
 
-/// The bulk imports and the RDF batch insert, which write no WAL record.
+/// The bulk imports and the RDF batch insert.
 fn imports() -> Vec<Import> {
     let imports: Vec<Import> = vec![
         (

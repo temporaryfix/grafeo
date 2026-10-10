@@ -250,6 +250,7 @@ File format release: every database is now a single file in a new format, and 0.
 - **SPARQL `CLEAR NAMED` and `DROP NAMED` also cleared the default graph**: they now reach the named graphs only.
 - **A reopened database started its epochs over** (without the `temporal` feature): after a clean close, a crash, a read-only open, `open_in_memory()` or `to_memory()`, `current_epoch()`, CDC events and backup segments restarted at 0 and repeated earlier epochs, so a restore to an epoch from before the reopen could return later data. An open now continues at the epoch of the file's last checkpoint or of the last commit its WAL logs, whichever is higher, and a restored database opens at the epoch it was restored to. With `temporal`, a checkpoint after `restore_snapshot()` no longer records the snapshot's older epoch.
 - **A database migrated from 0.5.x started at epoch 0**: the migration now continues at the highest epoch the 0.5.x header, catalog and WAL hold, so a 0.5.x backup chain continued after the upgrade does not reuse its epochs.
+- **Imports and RDF batch inserts survive a crash once they return**: `import_tsv`, `import_tsv_str`, `import_mmio`, `import_tsv_rdf` and `batch_insert_rdf` write their rows to the write-ahead log as they go; before, only the next checkpoint saved them. A crash or a failure during one leaves nothing of it.
 
 ### Result changes
 

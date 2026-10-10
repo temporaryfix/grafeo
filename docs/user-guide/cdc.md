@@ -95,6 +95,13 @@ A node or edge created in a transaction has one `Create` event that shows it as
 the transaction left it: property and label changes made later in the same
 transaction are part of that event rather than events of their own.
 
+A batch call (`batch_create_nodes`, `batch_create_nodes_with_props`,
+`batch_create_nodes_with_labels`, `batch_create_edges`) reports one `Create`
+event per node or edge it creates. The bulk loads report none: the imports
+(`import_tsv`, `import_tsv_str`, `import_mmio`, `import_tsv_rdf`) and
+`batch_insert_rdf` write their rows to the store and the WAL as they go,
+without events.
+
 Node and edge IDs repeat across named graphs, so an ID names an entity only
 together with its graph. `history` on the database reads the default graph, and
 on a session the session's current graph; `changes_between` returns the events

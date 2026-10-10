@@ -479,6 +479,21 @@ impl TransactionManager {
         Ok(self.register(IsolationLevel::default(), true))
     }
 
+    /// The writer of a bulk write that holds commits off for its whole run
+    /// (an import, see
+    /// [`StreamingChanges`](crate::transaction::StreamingChanges)): a
+    /// transaction id no other transaction has, reading at the published
+    /// epoch. Not registered: the bulk write creates only new nodes and
+    /// edges, which no other transaction sees before it commits, so none
+    /// conflicts with it; and it commits or rolls back itself while it holds
+    /// commits off (`_commits`), so no checkpoint, copy or other commit sees
+    /// it halfway.
+    pub(crate) fn bulk_writer(&self, _commits: &CommitsHeld<'_>) -> (TransactionId, EpochId) {
+        let transaction_id =
+            TransactionId::new(self.next_transaction_id.fetch_add(1, Ordering::Relaxed));
+        (transaction_id, self.current_epoch())
+    }
+
     /// Registers a new active transaction reading at the published epoch,
     /// with its (empty) change set.
     fn register(

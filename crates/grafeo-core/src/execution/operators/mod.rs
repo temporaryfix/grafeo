@@ -128,9 +128,11 @@ pub use variable_length_expand::{
     DEFAULT_PATH_SEARCH_BUDGET, PathMode as ExecutionPathMode, VariableLengthExpandOperator,
 };
 pub use vector_join::VectorJoinOperator;
-pub use writer::{GraphWriter, Recording, WriteCounter, WriteCounters, WriteTarget};
+pub use writer::{GraphWriter, NewEdge, Recording, WriteCounter, WriteCounters, WriteTarget};
 
-use grafeo_common::change::{Before, DataOp, PendingVersion};
+use std::ops::Range;
+
+use grafeo_common::change::{Before, DataOp, PendingVersion, Table};
 use grafeo_common::types::{EdgeId, NodeId};
 use thiserror::Error;
 
@@ -222,6 +224,59 @@ pub trait ChangeRecorder: WriteClaims {
         before: Before,
         version: PendingVersion,
     ) -> Result<(), OperatorError>;
+
+    /// Whether this recorder takes bulk writes (see
+    /// [`GraphWriter::create_nodes`] and [`GraphWriter::create_edges`]), and
+    /// what it does with their rows. `None`, the default, for one that takes
+    /// none: its writer creates row by row, recording each.
+    fn bulk(&self) -> Option<BulkRows> {
+        None
+    }
+
+    /// Records that a bulk write reserved `ids` in `table` of the recorder's
+    /// graph, before it applies the first row: one entry for the range, which
+    /// a rollback undoes and the commit stamps as a range, whatever its size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the change set refuses the range (a broken
+    /// invariant), and always for a recorder that takes no bulk writes (the
+    /// default).
+    fn record_bulk(&self, table: Table, ids: Range<u64>) -> Result<(), OperatorError> {
+        let _ = (table, ids);
+        Err(OperatorError::Execution(
+            "this change recorder takes no bulk writes".to_string(),
+        ))
+    }
+
+    /// Keeps `rows`, the creates a bulk write applied in the range it
+    /// recorded last, with that range for the commit's log and change data
+    /// capture ([`BulkRows::Keep`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the change set refuses the rows (a broken
+    /// invariant: the store holds rows the log would miss; the recorder
+    /// makes sure no commit follows), and always for a recorder that takes
+    /// no bulk writes (the default).
+    fn record_bulk_rows(&self, rows: Vec<DataOp>) -> Result<(), OperatorError> {
+        let _ = rows;
+        Err(OperatorError::Execution(
+            "this change recorder takes no bulk writes".to_string(),
+        ))
+    }
+}
+
+/// What a [`ChangeRecorder`] that takes bulk writes does with their rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkRows {
+    /// Drops each row once it is applied: neither the log nor change data
+    /// capture reads them (a database in memory without change data
+    /// capture).
+    Drop,
+    /// Keeps the rows for the commit's log and change data capture (see
+    /// [`ChangeRecorder::record_bulk_rows`]).
+    Keep,
 }
 
 /// Result of executing an operator.

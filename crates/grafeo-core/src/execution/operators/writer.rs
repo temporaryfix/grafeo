@@ -23,14 +23,16 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use grafeo_common::change::{DataOp, Labels, Properties};
+use grafeo_common::change::{DataOp, Labels, Properties, Table};
 use grafeo_common::storage::value_codec::{MAX_PROPERTY_VALUE_DEPTH, nests_too_deep};
 use grafeo_common::types::{
     ArcStr, EdgeId, EpochId, NodeId, PropertyKey, PropertyMap, TransactionId, Value,
 };
+use grafeo_common::utils::hash::FxHashSet;
 
 use super::{
-    ChangeRecorder, ConstraintValidator, OperatorError, WriteClaim, WriteClaims, WriteInProgress,
+    BulkRows, ChangeRecorder, ConstraintValidator, OperatorError, WriteClaim, WriteClaims,
+    WriteInProgress,
 };
 use crate::graph::apply::{Applied, ApplyError, ChangeTarget, ExternalTarget, Writer};
 use crate::graph::lpg::{Edge, Node};
@@ -134,6 +136,40 @@ impl std::fmt::Debug for WriteTarget {
             Self::Store(_) => f.write_str("WriteTarget::Store"),
             Self::External(_) => f.write_str("WriteTarget::External"),
         }
+    }
+}
+
+/// An edge for [`GraphWriter::create_edges`] to create.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEdge {
+    /// The node it leaves.
+    pub src: NodeId,
+    /// The node it enters.
+    pub dst: NodeId,
+    /// Its type.
+    pub edge_type: String,
+    /// Its properties; a null value is no property.
+    pub properties: Vec<(String, Value)>,
+}
+
+/// The rows of a bulk create that run as one write in progress (see
+/// [`WriteClaims::write_in_progress`]): a checkpoint waits for at most this
+/// many rows.
+const BULK_RUN: usize = 1024;
+
+/// A bulk create's number of rows, as ids to reserve.
+fn row_count(rows: usize) -> Result<u64, OperatorError> {
+    u64::try_from(rows)
+        .map_err(|_| OperatorError::Execution(format!("{rows} rows: more ids than a store has")))
+}
+
+/// The values a create op writes.
+fn op_values(op: &DataOp) -> usize {
+    match op {
+        DataOp::CreateNode { properties, .. } | DataOp::CreateEdge { properties, .. } => {
+            properties.len()
+        }
+        _ => 0,
     }
 }
 
@@ -859,6 +895,201 @@ impl GraphWriter {
     pub fn delete_edge(&self, id: EdgeId) -> Result<bool, OperatorError> {
         let _writing = self.write_in_progress();
         self.remove_edge(id)
+    }
+
+    // === Bulk creates ===
+
+    /// Creates one node with `labels` per property list of `rows`, in
+    /// order, each checked as [`create_node`](Self::create_node) checks it:
+    /// a row sees the rows before it (a `UNIQUE` value repeated within the
+    /// rows is refused). Returns the ids in row order.
+    ///
+    /// With a recording whose recorder takes bulk writes
+    /// ([`ChangeRecorder::bulk`]) the rows are one bulk write: their ids are
+    /// one range reserved from the store and recorded as one entry before
+    /// the first row is applied, which the commit stamps and a rollback
+    /// undoes as a range; each row is applied without a before-image, and
+    /// kept for the commit only when the recorder asks for the rows. Any
+    /// other writer creates row by row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first row's error. The rows before it stay written, and
+    /// so do their records (the range, or one entry per row): the
+    /// transaction's rollback, or the statement's, takes them back.
+    pub fn create_nodes(
+        &self,
+        labels: &[String],
+        rows: Vec<Vec<(String, Value)>>,
+    ) -> Result<Vec<NodeId>, OperatorError> {
+        let Some((recording, target, keep)) = self.bulk() else {
+            return rows
+                .into_iter()
+                .map(|properties| self.create_node(labels, properties))
+                .collect();
+        };
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = target
+            .reserve_node_ids(row_count(rows.len())?)
+            .map_err(store_refused)?;
+        recording.recorder.record_bulk(Table::Nodes, ids.clone())?;
+        let writer = recording.recorder.writer();
+        let distinct = distinct_labels(labels);
+        let mut kept = (keep == BulkRows::Keep).then(|| Vec::with_capacity(rows.len()));
+        let mut created = Vec::with_capacity(rows.len());
+        let mut writing = None;
+        for (row, (properties, raw)) in rows.into_iter().zip(ids).enumerate() {
+            let properties = self.new_node_properties(labels, properties)?;
+            if let Some(validator) = &self.validator {
+                validator.validate_node_properties_declared(labels, &properties)?;
+                self.check_node_values(validator.as_ref(), labels, &properties, None)?;
+                validator.validate_node_complete(labels, &properties)?;
+                validator.check_unique_node(labels, &properties, None)?;
+            }
+            if row % BULK_RUN == 0 {
+                // Released before it is asked for again: not reentrant.
+                drop(writing.take());
+                writing = self.write_in_progress();
+            }
+            let id = NodeId::new(raw);
+            let op = DataOp::CreateNode {
+                id,
+                labels: distinct.clone(),
+                properties: present_values(&properties),
+            };
+            target.apply_bulk_row(&op, writer).map_err(store_refused)?;
+            self.count(|c| &c.nodes_created, 1);
+            self.count(|c| &c.labels_added, distinct.len());
+            self.count(|c| &c.properties_set, op_values(&op));
+            if let Some(kept) = &mut kept {
+                kept.push(op);
+            }
+            created.push(id);
+        }
+        drop(writing);
+        if let Some(rows) = kept {
+            recording.recorder.record_bulk_rows(rows)?;
+        }
+        Ok(created)
+    }
+
+    /// Creates the edges of `edges`, in order, each checked as
+    /// [`create_edge`](Self::create_edge) checks it. Returns the ids in
+    /// order.
+    ///
+    /// With a recording whose recorder takes bulk writes, the edges are one
+    /// bulk write, as [`create_nodes`](Self::create_nodes) describes. Each
+    /// endpoint is checked and claimed once per call, before the first edge
+    /// that names it is written; the new edges are not claimed: their ids
+    /// are the call's reserved range, which no other transaction can name,
+    /// and a concurrent delete of an endpoint meets the endpoint's claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first edge's error, as
+    /// [`create_nodes`](Self::create_nodes) does.
+    pub fn create_edges(&self, edges: Vec<NewEdge>) -> Result<Vec<EdgeId>, OperatorError> {
+        let Some((recording, target, keep)) = self.bulk() else {
+            return edges
+                .into_iter()
+                .map(|edge| self.create_edge(edge.src, edge.dst, &edge.edge_type, edge.properties))
+                .collect();
+        };
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = target
+            .reserve_edge_ids(row_count(edges.len())?)
+            .map_err(store_refused)?;
+        recording.recorder.record_bulk(Table::Edges, ids.clone())?;
+        let writer = recording.recorder.writer();
+        let mut kept = (keep == BulkRows::Keep).then(|| Vec::with_capacity(edges.len()));
+        let mut created = Vec::with_capacity(edges.len());
+        // The endpoints seen and claimed: the transaction's view of them
+        // holds for the call, which deletes nothing.
+        let mut endpoints: FxHashSet<NodeId> = FxHashSet::default();
+        let mut edge_type: Option<ArcStr> = None;
+        let mut writing = None;
+        for (row, (edge, raw)) in edges.into_iter().zip(ids).enumerate() {
+            let NewEdge {
+                src,
+                dst,
+                edge_type: name,
+                properties,
+            } = edge;
+            let mut properties = self.new_edge_properties(&name, properties)?;
+            let new_src = !endpoints.contains(&src);
+            let new_dst = !endpoints.contains(&dst);
+            // A batch names its endpoints by id: one this transaction does
+            // not see is "not found", as a single create through the direct
+            // API reports it.
+            for (new, endpoint) in [(new_src, src), (new_dst, dst)] {
+                if new && !self.has_node(endpoint) {
+                    return Err(OperatorError::from(
+                        grafeo_common::utils::error::Error::NodeNotFound(endpoint),
+                    ));
+                }
+            }
+            if let Some(validator) = &self.validator {
+                self.check_new_edge(validator.as_ref(), src, dst, &name)?;
+                convert_values(&mut properties, |key, value| {
+                    validator.convert_edge_property(&name, key, value)
+                });
+                validator.validate_edge_properties_declared(&name, &properties)?;
+                for (key, value) in &properties {
+                    validator.validate_edge_property(&name, key, value)?;
+                }
+                validator.validate_edge_complete(&name, &properties)?;
+            }
+            if new_src || new_dst {
+                self.claim(WriteClaim::Endpoints(src, dst))?;
+                endpoints.insert(src);
+                endpoints.insert(dst);
+            }
+            if row % BULK_RUN == 0 {
+                drop(writing.take());
+                writing = self.write_in_progress();
+            }
+            // One name per type, not one per edge.
+            let edge_type = match &edge_type {
+                Some(shared) if shared.as_str() == name => shared.clone(),
+                _ => edge_type.insert(ArcStr::from(name.as_str())).clone(),
+            };
+            let id = EdgeId::new(raw);
+            let op = DataOp::CreateEdge {
+                id,
+                src,
+                dst,
+                edge_type,
+                properties: present_values(&properties),
+            };
+            target.apply_bulk_row(&op, writer).map_err(store_refused)?;
+            self.count(|c| &c.edges_created, 1);
+            self.count(|c| &c.properties_set, op_values(&op));
+            if let Some(kept) = &mut kept {
+                kept.push(op);
+            }
+            created.push(id);
+        }
+        drop(writing);
+        if let Some(rows) = kept {
+            recording.recorder.record_bulk_rows(rows)?;
+        }
+        Ok(created)
+    }
+
+    /// The recording, store and row handling of a bulk write: `Some` when
+    /// the writer records into a recorder that takes bulk writes, through a
+    /// store that creates at ids reserved from it.
+    fn bulk(&self) -> Option<(&Recording, &Arc<dyn ChangeTarget>, BulkRows)> {
+        let recording = self.recording.as_ref()?;
+        let WriteTarget::Store(target) = &recording.target else {
+            return None;
+        };
+        let keep = recording.recorder.bulk()?;
+        Some((recording, target, keep))
     }
 
     /// [`delete_edge`](Self::delete_edge), for a caller whose write is

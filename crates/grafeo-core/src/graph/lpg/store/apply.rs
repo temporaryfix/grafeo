@@ -39,7 +39,9 @@ use grafeo_common::utils::hash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 
 use super::LpgStore;
-use crate::graph::apply::{Applied, ApplyError, ChangeTarget, Writer, refuse_triple, refused};
+use crate::graph::apply::{
+    Applied, ApplyError, ChangeTarget, Writer, check_bulk_row, refuse_triple, refused,
+};
 use crate::graph::lpg::{EdgeRecord, NodeRecord};
 
 /// The versions of a node: a chain of records, or with tiered storage an
@@ -139,6 +141,16 @@ impl Mode {
     }
 }
 
+/// Whether an edge create looks up its endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Endpoints {
+    /// It does: the writer must see both.
+    Check,
+    /// It does not: a bulk write checked them for every row (see
+    /// [`ChangeTarget::apply_bulk_row`]).
+    Checked,
+}
+
 /// The version an entry created, or the transaction's own it replaced.
 fn version_of(own: bool) -> PendingVersion {
     if own {
@@ -197,14 +209,7 @@ impl ChangeTarget for LpgStore {
 
     fn apply(&self, op: &DataOp, writer: Writer) -> Result<Applied, ApplyError> {
         let mode = Mode::of(writer)?;
-        // A writer that resolved the graph before it was dropped: a commit
-        // would log the write under the graph's name, and replay would
-        // create the graph again for it.
-        if self.is_dropped() {
-            return Err(ApplyError::Refused(
-                "the graph was dropped: it takes no more writes".to_string(),
-            ));
-        }
+        self.refuse_if_dropped()?;
         let applied = match op {
             DataOp::CreateNode {
                 id,
@@ -218,7 +223,14 @@ impl ChangeTarget for LpgStore {
                 dst,
                 edge_type,
                 properties,
-            } => self.apply_create_edge(*id, *src, *dst, edge_type, properties, mode),
+            } => self.apply_create_edge(
+                *id,
+                (*src, *dst),
+                edge_type,
+                properties,
+                mode,
+                Endpoints::Check,
+            ),
             DataOp::DeleteEdge { id } => self.apply_delete_edge(*id, mode),
             DataOp::SetNodeProperty { id, key, value } => {
                 self.apply_set_node_value(*id, key, value, mode)
@@ -238,6 +250,41 @@ impl ChangeTarget for LpgStore {
             self.sync_epoch(mode.at);
         }
         Ok(applied)
+    }
+
+    /// A row of a bulk write: the create `apply` makes, without looking up
+    /// an edge's endpoints again (see [`ChangeTarget::apply_bulk_row`]).
+    fn apply_bulk_row(&self, op: &DataOp, writer: Writer) -> Result<(), ApplyError> {
+        check_bulk_row(op, writer)?;
+        let mode = Mode::of(writer)?;
+        self.refuse_if_dropped()?;
+        match op {
+            DataOp::CreateNode {
+                id,
+                labels,
+                properties,
+            } => self.apply_create_node(*id, labels, properties, mode),
+            DataOp::CreateEdge {
+                id,
+                src,
+                dst,
+                edge_type,
+                properties,
+            } => self.apply_create_edge(
+                *id,
+                (*src, *dst),
+                edge_type,
+                properties,
+                mode,
+                Endpoints::Checked,
+            ),
+            // `check_bulk_row` lets creates through only.
+            other => Err(ApplyError::Refused(format!(
+                "a bulk write's row of kind {}",
+                other.kind()
+            ))),
+        }
+        .map(drop)
     }
 
     fn stamp(
@@ -282,6 +329,18 @@ impl ChangeTarget for LpgStore {
 // ── Versions ────────────────────────────────────────────────────────
 
 impl LpgStore {
+    /// Refuses every write once the graph is dropped: a writer that resolved
+    /// the graph before would log its write under the graph's name, and
+    /// replay would create the graph again for it.
+    fn refuse_if_dropped(&self) -> Result<(), ApplyError> {
+        if self.is_dropped() {
+            return Err(ApplyError::Refused(
+                "the graph was dropped: it takes no more writes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The nodes' versions, by id.
     fn node_version_map(&self) -> &RwLock<FxHashMap<NodeId, NodeVersions>> {
         #[cfg(not(feature = "tiered-storage"))]
@@ -780,11 +839,11 @@ impl LpgStore {
     fn apply_create_edge(
         &self,
         id: EdgeId,
-        src: NodeId,
-        dst: NodeId,
+        (src, dst): (NodeId, NodeId),
         edge_type: &ArcStr,
         properties: &Properties,
         mode: Mode,
+        endpoints: Endpoints,
     ) -> Result<Applied, ApplyError> {
         if !id.is_valid() {
             return Err(ApplyError::Refused(
@@ -797,7 +856,7 @@ impl LpgStore {
         if self.edge_version_map().read().contains_key(&id) {
             return Err(ApplyError::Exists(Entity::Edge(id)));
         }
-        {
+        if endpoints == Endpoints::Check {
             let nodes = self.node_version_map().read();
             for end in [src, dst] {
                 if self.seen_node_in(&nodes, end, mode)?.is_none() {

@@ -20,7 +20,7 @@
 
 #[cfg(feature = "lpg")]
 use grafeo_common::change::StandaloneOp;
-use grafeo_common::change::{Change, ChangeSet, DataModel, DataOp};
+use grafeo_common::change::{ChangeSet, DataModel, DataOp};
 #[cfg(feature = "lpg")]
 use grafeo_common::storage::LogRecordRef;
 #[cfg(feature = "lpg")]
@@ -91,18 +91,18 @@ pub(crate) fn build_group(pending: Vec<PendingRecord>, markers: &[WalRecord]) ->
     group
 }
 
-/// The v1 records of `set`'s entries, in recorded order, each with its
-/// graph's storage key. Bulk ranges have none: a bulk write logs its own. A
-/// triple's record names its RDF graph itself and needs no switch, so it
-/// carries the default graph's key.
+/// The v1 records of `set`'s writes, in the order they were applied (see
+/// [`ChangeSet::ops`]: each data entry, and the rows a bulk write kept with
+/// its range), each with its graph's storage key. A triple's record names
+/// its RDF graph itself and needs no switch, so it carries the default
+/// graph's key.
 pub(crate) fn v1_records(set: &ChangeSet) -> Vec<PendingRecord> {
-    let mut records = Vec::with_capacity(set.len());
-    for change in set.entries() {
-        let Change::Data { graph, op, .. } = change else {
-            continue;
-        };
+    // Sized once: a batch is one entry for many rows.
+    let count = set.ops().map(|(_, op, _)| v1_record_count(op)).sum();
+    let mut records = Vec::with_capacity(count);
+    for (graph, op, _) in set.ops() {
         let key = set
-            .graph(*graph)
+            .graph(graph)
             .and_then(|graph| graph.key.as_ref().map(ToString::to_string));
         // A triple's record names its graph itself: it needs no switch.
         let context = if op.model() == DataModel::Rdf {
@@ -110,100 +110,132 @@ pub(crate) fn v1_records(set: &ChangeSet) -> Vec<PendingRecord> {
         } else {
             key.clone()
         };
-        let mut push = |record: WalRecord| records.push((context.clone(), record));
-        match op {
-            DataOp::CreateNode {
-                id,
-                labels,
-                properties,
-            } => {
-                push(WalRecord::CreateNode {
-                    id: *id,
-                    labels: labels.iter().map(ToString::to_string).collect(),
-                });
-                for (property, value) in properties {
-                    push(WalRecord::SetNodeProperty {
-                        id: *id,
-                        key: property.as_str().to_string(),
-                        value: value.clone(),
-                    });
-                }
-            }
-            DataOp::DeleteNode { id } => push(WalRecord::DeleteNode { id: *id }),
-            DataOp::CreateEdge {
-                id,
-                src,
-                dst,
-                edge_type,
-                properties,
-            } => {
-                push(WalRecord::CreateEdge {
-                    id: *id,
-                    src: *src,
-                    dst: *dst,
-                    edge_type: edge_type.to_string(),
-                });
-                for (property, value) in properties {
-                    push(WalRecord::SetEdgeProperty {
-                        id: *id,
-                        key: property.as_str().to_string(),
-                        value: value.clone(),
-                    });
-                }
-            }
-            DataOp::DeleteEdge { id } => push(WalRecord::DeleteEdge { id: *id }),
-            DataOp::SetNodeProperty { id, key, value } => push(WalRecord::SetNodeProperty {
-                id: *id,
-                key: key.as_str().to_string(),
-                value: value.clone(),
-            }),
-            DataOp::RemoveNodeProperty { id, key } => push(WalRecord::RemoveNodeProperty {
-                id: *id,
-                key: key.as_str().to_string(),
-            }),
-            DataOp::SetEdgeProperty { id, key, value } => push(WalRecord::SetEdgeProperty {
-                id: *id,
-                key: key.as_str().to_string(),
-                value: value.clone(),
-            }),
-            DataOp::RemoveEdgeProperty { id, key } => push(WalRecord::RemoveEdgeProperty {
-                id: *id,
-                key: key.as_str().to_string(),
-            }),
-            DataOp::AddNodeLabel { id, label } => push(WalRecord::AddNodeLabel {
-                id: *id,
-                label: label.to_string(),
-            }),
-            DataOp::RemoveNodeLabel { id, label } => push(WalRecord::RemoveNodeLabel {
-                id: *id,
-                label: label.to_string(),
-            }),
-            #[cfg(feature = "triple-store")]
-            DataOp::InsertTriple { triple } => {
-                let (subject, predicate, object) = super::ntriples_terms(triple);
-                push(WalRecord::InsertRdfTriple {
-                    subject,
-                    predicate,
-                    object,
-                    graph: key.clone(),
-                });
-            }
-            #[cfg(feature = "triple-store")]
-            DataOp::DeleteTriple { triple } => {
-                let (subject, predicate, object) = super::ntriples_terms(triple);
-                push(WalRecord::DeleteRdfTriple {
-                    subject,
-                    predicate,
-                    object,
-                    graph: key.clone(),
-                });
-            }
-            // A build without the triple store records no triple.
-            #[cfg(not(feature = "triple-store"))]
-            DataOp::InsertTriple { .. } | DataOp::DeleteTriple { .. } => {}
-        }
+        push_v1_records(op, key.as_deref(), |record| {
+            records.push((context.clone(), record));
+        });
     }
     records
+}
+
+/// How many v1 records [`push_v1_records`] pushes for `op`.
+fn v1_record_count(op: &DataOp) -> usize {
+    match op {
+        DataOp::CreateNode { properties, .. } | DataOp::CreateEdge { properties, .. } => {
+            1 + properties.len()
+        }
+        DataOp::InsertTriple { .. } | DataOp::DeleteTriple { .. } => {
+            usize::from(cfg!(feature = "triple-store"))
+        }
+        DataOp::DeleteNode { .. }
+        | DataOp::DeleteEdge { .. }
+        | DataOp::SetNodeProperty { .. }
+        | DataOp::RemoveNodeProperty { .. }
+        | DataOp::SetEdgeProperty { .. }
+        | DataOp::RemoveEdgeProperty { .. }
+        | DataOp::AddNodeLabel { .. }
+        | DataOp::RemoveNodeLabel { .. } => 1,
+    }
+}
+
+/// Pushes the v1 records of `op`, a write in the graph with the storage key
+/// `graph`, to `push`: a create is one record and a property record per
+/// value it created with, as the store's create and the writes of its
+/// values logged them; every other op is one record, a triple's naming
+/// `graph` as its RDF graph.
+pub(crate) fn push_v1_records(op: &DataOp, graph: Option<&str>, mut push: impl FnMut(WalRecord)) {
+    #[cfg(not(feature = "triple-store"))]
+    let _ = graph;
+    match op {
+        DataOp::CreateNode {
+            id,
+            labels,
+            properties,
+        } => {
+            push(WalRecord::CreateNode {
+                id: *id,
+                labels: labels.iter().map(ToString::to_string).collect(),
+            });
+            for (property, value) in properties {
+                push(WalRecord::SetNodeProperty {
+                    id: *id,
+                    key: property.as_str().to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        DataOp::DeleteNode { id } => push(WalRecord::DeleteNode { id: *id }),
+        DataOp::CreateEdge {
+            id,
+            src,
+            dst,
+            edge_type,
+            properties,
+        } => {
+            push(WalRecord::CreateEdge {
+                id: *id,
+                src: *src,
+                dst: *dst,
+                edge_type: edge_type.to_string(),
+            });
+            for (property, value) in properties {
+                push(WalRecord::SetEdgeProperty {
+                    id: *id,
+                    key: property.as_str().to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        DataOp::DeleteEdge { id } => push(WalRecord::DeleteEdge { id: *id }),
+        DataOp::SetNodeProperty { id, key, value } => push(WalRecord::SetNodeProperty {
+            id: *id,
+            key: key.as_str().to_string(),
+            value: value.clone(),
+        }),
+        DataOp::RemoveNodeProperty { id, key } => push(WalRecord::RemoveNodeProperty {
+            id: *id,
+            key: key.as_str().to_string(),
+        }),
+        DataOp::SetEdgeProperty { id, key, value } => push(WalRecord::SetEdgeProperty {
+            id: *id,
+            key: key.as_str().to_string(),
+            value: value.clone(),
+        }),
+        DataOp::RemoveEdgeProperty { id, key } => push(WalRecord::RemoveEdgeProperty {
+            id: *id,
+            key: key.as_str().to_string(),
+        }),
+        DataOp::AddNodeLabel { id, label } => push(WalRecord::AddNodeLabel {
+            id: *id,
+            label: label.to_string(),
+        }),
+        DataOp::RemoveNodeLabel { id, label } => push(WalRecord::RemoveNodeLabel {
+            id: *id,
+            label: label.to_string(),
+        }),
+        #[cfg(feature = "triple-store")]
+        DataOp::InsertTriple { triple } => {
+            let (subject, predicate, object) = super::ntriples_terms(triple);
+            push(WalRecord::InsertRdfTriple {
+                subject,
+                predicate,
+                object,
+                graph: graph.map(ToString::to_string),
+            });
+        }
+        #[cfg(feature = "triple-store")]
+        DataOp::DeleteTriple { triple } => {
+            let (subject, predicate, object) = super::ntriples_terms(triple);
+            push(WalRecord::DeleteRdfTriple {
+                subject,
+                predicate,
+                object,
+                graph: graph.map(ToString::to_string),
+            });
+        }
+        // A build without the triple store records no triple.
+        #[cfg(not(feature = "triple-store"))]
+        DataOp::InsertTriple { .. } | DataOp::DeleteTriple { .. } => {}
+    }
 }
 
 #[cfg(test)]

@@ -841,20 +841,22 @@ impl CdcLog {
 }
 
 /// The change events of a commit at `epoch` from its change set, one per
-/// entry in recorded order (bulk ranges have none: a bulk write reports its
-/// own), each naming its graph, timestamped by `clock` in that order. A
-/// triple's event names its RDF graph as `triple_graph`, as the RDF bulk
-/// writes report theirs. An event is built from its entry's op and before-image: a
-/// create carries its labels or type and endpoints and the values it was
-/// created with, a delete what the entity held, an update the value or the
-/// labels before and after. The transaction's later changes to an entity it
-/// created are then folded into the create (see [`fold_into_creates`]).
+/// write in the order applied (see [`ChangeSet::ops`](grafeo_common::change::ChangeSet::ops):
+/// each data entry, and each row a bulk write kept with its range; a range
+/// without its rows, a bulk import's, has none), each naming its graph,
+/// timestamped by `clock` in that order. A triple's event names its RDF
+/// graph as `triple_graph`, as the RDF bulk writes report theirs. An event
+/// is built from the write's op and before-image: a create carries its
+/// labels or type and endpoints and the values it was created with, a
+/// delete what the entity held, an update the value or the labels before
+/// and after. The transaction's later changes to an entity it created are
+/// then folded into the create (see [`fold_into_creates`]).
 pub(crate) fn events_for_commit(
     set: &grafeo_common::change::ChangeSet,
     epoch: EpochId,
     clock: &HlcClock,
 ) -> Vec<ChangeEvent> {
-    use grafeo_common::change::{Before, Change, DataOp};
+    use grafeo_common::change::{Before, DataOp};
 
     let values = |properties: &[(grafeo_common::types::PropertyKey, Value)]| {
         (!properties.is_empty()).then(|| {
@@ -870,14 +872,10 @@ pub(crate) fn events_for_commit(
     let names = |labels: &grafeo_common::change::Labels| -> Vec<String> {
         labels.iter().map(ToString::to_string).collect()
     };
-    let mut events = Vec::with_capacity(set.len());
-    for change in set.entries() {
-        let Change::Data {
-            graph, op, before, ..
-        } = change
-        else {
-            continue;
-        };
+    // Sized by the writes, not the entries: a batch is one entry for many
+    // rows.
+    let mut events = Vec::with_capacity(set.ops().count());
+    for (graph, op, before) in set.ops() {
         let (entity_id, kind) = match op {
             DataOp::CreateNode { id, .. } => (EntityId::Node(*id), ChangeKind::Create),
             DataOp::CreateEdge { id, .. } => (EntityId::Edge(*id), ChangeKind::Create),
@@ -894,7 +892,7 @@ pub(crate) fn events_for_commit(
             DataOp::InsertTriple { triple } => {
                 events.push(triple_event(
                     set,
-                    *graph,
+                    graph,
                     triple,
                     ChangeKind::Create,
                     epoch,
@@ -906,7 +904,7 @@ pub(crate) fn events_for_commit(
             DataOp::DeleteTriple { triple } => {
                 events.push(triple_event(
                     set,
-                    *graph,
+                    graph,
                     triple,
                     ChangeKind::Delete,
                     epoch,
@@ -921,7 +919,7 @@ pub(crate) fn events_for_commit(
         let mut event = ChangeEvent {
             entity_id,
             graph: set
-                .graph(*graph)
+                .graph(graph)
                 .and_then(|graph| graph.key.as_ref().map(ToString::to_string)),
             kind,
             epoch,
@@ -1005,7 +1003,8 @@ pub(crate) fn events_for_commit(
                 event.labels = Some(after);
             }
             // The change set checks each entry's before-image against its
-            // op, so no other pair is recorded.
+            // op (and keeps creates only with a bulk range), so no other
+            // pair is recorded.
             _ => {}
         }
         events.push(event);

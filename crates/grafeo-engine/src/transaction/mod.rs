@@ -203,10 +203,13 @@ mod rdf;
 #[cfg(feature = "wal")]
 pub(crate) mod v1_group;
 
+#[cfg(all(test, feature = "wal"))]
+pub(crate) use changes::STREAMED_RECORDS;
 #[cfg(feature = "lpg")]
 pub(crate) use changes::{BuiltIndex, StandaloneChange};
 pub(crate) use changes::{
-    TransactionChanges, UndoFailure, is_kept_by_external_store, kept_by_external_store,
+    StreamingChanges, TransactionChanges, UndoFailure, is_kept_by_external_store,
+    kept_by_external_store,
 };
 pub(crate) use manager::CommitsHeld;
 pub use manager::{

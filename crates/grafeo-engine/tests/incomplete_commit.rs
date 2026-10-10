@@ -353,7 +353,8 @@ fn after_a_commit_that_does_not_complete_imports_refuse_before_reading_their_inp
     assert_eq!(people(&db), [Value::from("Alix")], "nothing was imported");
 }
 
-/// A bulk import or an RDF batch insert, which write no WAL record, by name.
+/// A bulk import or an RDF batch insert, which hold commits off while they
+/// write, by name.
 type Import = (
     &'static str,
     fn(&GrafeoDB) -> grafeo_common::utils::error::Result<()>,
@@ -388,9 +389,10 @@ fn imports() -> Vec<Import> {
 
 /// An import that starts while a commit is in progress waits for it, and
 /// when that commit then fails, the import refuses with the failed commit's
-/// error and adds nothing: it writes no WAL record, and after a commit that
-/// did not complete no checkpoint could persist what it added (before, it
-/// returned `Ok` for data that was lost on reopen).
+/// error and adds nothing: after a commit that did not complete no commit
+/// may follow, and its own would publish the failed commit's stamped
+/// versions with its epoch (before, it returned `Ok` for data that was lost
+/// on reopen).
 #[test]
 fn an_import_waiting_for_a_commit_that_fails_refuses() {
     let mut failures = Vec::new();

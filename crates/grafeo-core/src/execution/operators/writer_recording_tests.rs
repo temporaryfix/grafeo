@@ -2,11 +2,13 @@
 //! target, each one that changed something recorded once in the
 //! transaction's change set, after the claim of what it writes.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use grafeo_common::change::{
-    Before, Change, ChangeSet, DataModel, DataOp, GraphRef, GraphSlot, PendingVersion,
+    Before, BulkRange, Change, ChangeSet, DataModel, DataOp, GraphRef, GraphSlot, PendingVersion,
+    Table,
 };
 use grafeo_common::storage::value_codec::MAX_PROPERTY_VALUE_DEPTH;
 use grafeo_common::types::{ArcStr, EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
@@ -14,8 +16,8 @@ use parking_lot::{Mutex, RwLock};
 
 use super::tests::{BRIEFLY, CustomRules, every_write, labels, nested, pairs, people_store};
 use super::{
-    ChangeRecorder, GraphWriter, OperatorError, Recording, WriteClaim, WriteClaims,
-    WriteInProgress, WriteTarget, node_labels, property_list,
+    BulkRows, ChangeRecorder, GraphWriter, NewEdge, OperatorError, Recording, WriteClaim,
+    WriteClaims, WriteInProgress, WriteTarget, node_labels, property_list,
 };
 use crate::graph::GraphStoreMut;
 use crate::graph::apply::{Applied, ApplyError, ChangeTarget, ExternalTarget, Writer};
@@ -49,11 +51,19 @@ struct Recorder {
     /// Refuses the claims of an edge's endpoints, as another transaction's
     /// delete of one would.
     refuse_endpoints: AtomicBool,
+    /// Whether it takes bulk writes, and what it does with their rows.
+    bulk: Option<BulkRows>,
 }
 
 impl Recorder {
     /// A recorder of transaction [`TRANSACTION`] in `store`'s default graph.
     fn new(store: &Arc<LpgStore>) -> Arc<Self> {
+        Self::with_bulk(store, None)
+    }
+
+    /// A recorder as [`new`](Self::new) makes, which takes bulk writes as
+    /// `bulk` says.
+    fn with_bulk(store: &Arc<LpgStore>, bulk: Option<BulkRows>) -> Arc<Self> {
         let mut set = ChangeSet::new();
         let slot = set
             .slot(GraphRef {
@@ -74,7 +84,30 @@ impl Recorder {
             requests: AtomicUsize::new(0),
             taken_already: AtomicBool::new(false),
             refuse_endpoints: AtomicBool::new(false),
+            bulk,
         })
+    }
+
+    /// The ops the set holds for the commit's log, in order, with their
+    /// before-images (rows kept with a bulk range included).
+    fn ops(&self) -> Vec<(DataOp, Before)> {
+        self.set
+            .lock()
+            .ops()
+            .map(|(_, op, before)| (op.clone(), before.clone()))
+            .collect()
+    }
+
+    /// The claims asked for, in order.
+    fn claims(&self) -> Vec<WriteClaim> {
+        self.events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Claim(claim, _) => Some(*claim),
+                Event::Record(..) => None,
+            })
+            .collect()
     }
 
     /// The entries recorded, in order.
@@ -134,6 +167,28 @@ impl ChangeRecorder for Recorder {
         self.set
             .lock()
             .push(self.slot, op, before, version)
+            .map_err(|error| OperatorError::Execution(error.to_string()))
+    }
+
+    fn bulk(&self) -> Option<BulkRows> {
+        self.bulk
+    }
+
+    fn record_bulk(&self, table: Table, ids: Range<u64>) -> Result<(), OperatorError> {
+        self.set
+            .lock()
+            .push_bulk(BulkRange {
+                graph: self.slot,
+                table,
+                ids,
+            })
+            .map_err(|error| OperatorError::Execution(error.to_string()))
+    }
+
+    fn record_bulk_rows(&self, rows: Vec<DataOp>) -> Result<(), OperatorError> {
+        self.set
+            .lock()
+            .push_bulk_rows(self.slot, rows)
             .map_err(|error| OperatorError::Execution(error.to_string()))
     }
 }
@@ -856,4 +911,207 @@ fn derive_runs_with_no_write_in_progress() {
         "derive runs with no write in progress"
     );
     assert_eq!(recorder.kinds(), ["CreateNode", "SetNodeProperty"]);
+}
+
+// === Bulk creates ===
+
+/// The rows of the bulk creates in [`bulk_writes`]: three cities, then
+/// edges among the people and the cities, some sharing endpoints.
+fn bulk_writes(writer: &GraphWriter, people: &super::tests::People) -> (Vec<NodeId>, Vec<EdgeId>) {
+    let cities = writer
+        .create_nodes(
+            &labels(&["City", "Place"]),
+            vec![
+                pairs("name", &Value::from("Amsterdam")),
+                pairs("name", &Value::from("Berlin")),
+                Vec::new(),
+            ],
+        )
+        .unwrap();
+    let visit = |src: NodeId, dst: NodeId, year: i64| NewEdge {
+        src,
+        dst,
+        edge_type: "VISITED".to_string(),
+        properties: pairs("year", &Value::Int64(year)),
+    };
+    let edges = writer
+        .create_edges(vec![
+            visit(people.alix, cities[0], 1988),
+            visit(people.alix, cities[1], 2019),
+            visit(people.gus, cities[0], 2003),
+            visit(people.alix, cities[0], 2019),
+            NewEdge {
+                src: cities[1],
+                dst: cities[2],
+                edge_type: "ROUTE".to_string(),
+                properties: Vec::new(),
+            },
+        ])
+        .unwrap();
+    (cities, edges)
+}
+
+/// A bulk create writes what one create per row writes, the same nodes and
+/// edges with the same ids and values, but records one entry per call: the
+/// range of ids it reserved, which undo reads to take every row back. The
+/// rows are kept with the range for the commit when the recorder asks for
+/// them, as the very ops one create per row records; otherwise none.
+#[test]
+fn a_bulk_create_writes_what_one_create_per_row_writes_as_one_entry() {
+    for keep in [BulkRows::Keep, BulkRows::Drop] {
+        let (store, people) = people_store();
+        let recorder = Recorder::with_bulk(&store, Some(keep));
+        let writer = recording_writer(&store, &recorder);
+        let before = dump(&store, &writer);
+        let (row_store, _) = people_store();
+        let rows = Recorder::new(&row_store);
+        let row_writer = recording_writer(&row_store, &rows);
+
+        let created = bulk_writes(&writer, &people);
+        assert_eq!(bulk_writes(&row_writer, &people), created, "the same ids");
+        assert_eq!(
+            dump(&store, &writer),
+            dump(&row_store, &row_writer),
+            "{keep:?}: the same graph"
+        );
+        assert_eq!(recorder.kinds(), ["Bulk", "Bulk"], "{keep:?}");
+        assert_eq!(
+            rows.kinds(),
+            [["CreateNode"; 3].as_slice(), ["CreateEdge"; 5].as_slice()].concat()
+        );
+        match keep {
+            BulkRows::Keep => assert_eq!(recorder.ops(), rows.ops(), "the rows kept"),
+            BulkRows::Drop => assert!(recorder.ops().is_empty(), "no row kept"),
+        }
+
+        store
+            .undo(
+                TransactionId::new(TRANSACTION),
+                &mut recorder.entries().iter(),
+            )
+            .unwrap();
+        assert_eq!(
+            dump(&store, &writer),
+            before,
+            "{keep:?}: the ranges undo every row"
+        );
+    }
+}
+
+/// A bulk create of edges claims each endpoint once per call, before the
+/// first edge that names it is written, and none of its new edges: their
+/// ids are the call's reserved range, which no other transaction can name,
+/// and a concurrent delete of an endpoint meets the endpoint's claim. Its
+/// store changes run as writes in progress, the freeze asked for once per
+/// run of rows and never while held.
+#[test]
+fn a_bulk_create_claims_each_endpoint_once_and_no_new_edge() {
+    let (store, people) = people_store();
+    let recorder = Recorder::with_bulk(&store, Some(BulkRows::Drop));
+    let writer = recording_writer(&store, &recorder);
+    let (cities, _) = bulk_writes(&writer, &people);
+    assert_eq!(
+        recorder.claims(),
+        [
+            WriteClaim::Endpoints(people.alix, cities[0]),
+            WriteClaim::Endpoints(people.alix, cities[1]),
+            WriteClaim::Endpoints(people.gus, cities[0]),
+            WriteClaim::Endpoints(cities[1], cities[2]),
+        ]
+    );
+    assert_eq!(
+        recorder.requests.load(Ordering::SeqCst),
+        2,
+        "one write in progress per call of fewer rows than a run"
+    );
+    assert!(!recorder.taken_already.load(Ordering::SeqCst));
+}
+
+/// A bulk create stops at the first row a check refuses (an endpoint the
+/// transaction does not see, a constraint, a claim another transaction
+/// holds), as one create of that row would: the rows before it stay
+/// written, and the range recorded before the first row undoes them.
+#[test]
+fn a_refused_row_stops_a_bulk_create_and_its_range_undoes_the_rows_before_it() {
+    let (store, people) = people_store();
+    let missing = NodeId::new(388);
+    let visit = |src: NodeId, dst: NodeId, edge_type: &str| NewEdge {
+        src,
+        dst,
+        edge_type: edge_type.to_string(),
+        properties: Vec::new(),
+    };
+    type Refusal = (
+        &'static str,
+        fn(&Recorder),
+        Vec<(NodeId, NodeId, &'static str)>,
+    );
+    let refusals: Vec<Refusal> = vec![
+        (
+            "an endpoint that does not exist",
+            |_| {},
+            vec![
+                (people.alix, people.gus, "KNOWS"),
+                (people.alix, missing, "KNOWS"),
+            ],
+        ),
+        (
+            "a constraint",
+            |_| {},
+            vec![
+                (people.alix, people.gus, "KNOWS"),
+                (people.gus, people.vincent, "HATES"),
+            ],
+        ),
+        (
+            "a claim another transaction holds",
+            |recorder| recorder.refuse_endpoints.store(true, Ordering::SeqCst),
+            vec![(people.alix, people.gus, "KNOWS")],
+        ),
+    ];
+    for (what, prepare, edges) in refusals {
+        let recorder = Recorder::with_bulk(&store, Some(BulkRows::Keep));
+        let writer =
+            recording_writer(&store, &recorder).with_validator(Arc::new(super::tests::CustomRules));
+        let before = dump(&store, &writer);
+        prepare(&recorder);
+        let refused = writer.create_edges(
+            edges
+                .iter()
+                .map(|(src, dst, edge_type)| visit(*src, *dst, edge_type))
+                .collect(),
+        );
+        assert!(refused.is_err(), "{what}: {refused:?}");
+        let entries = recorder.entries();
+        assert_eq!(
+            recorder.kinds(),
+            ["Bulk"],
+            "{what}: the range is recorded first"
+        );
+        assert!(
+            recorder.ops().is_empty(),
+            "{what}: a refused call keeps no row"
+        );
+        store
+            .undo(TransactionId::new(TRANSACTION), &mut entries.iter())
+            .unwrap();
+        assert_eq!(dump(&store, &writer), before, "{what}: the range undoes it");
+    }
+}
+
+/// A recorder that takes no bulk writes (an immediate write) gets one
+/// create per row, each recorded as one would be.
+#[test]
+fn a_recorder_without_bulk_writes_gets_one_create_per_row() {
+    let (store, people) = people_store();
+    let recorder = Recorder::new(&store);
+    let writer = recording_writer(&store, &recorder);
+    bulk_writes(&writer, &people);
+    assert!(
+        recorder
+            .kinds()
+            .iter()
+            .all(|kind| kind.starts_with("Create"))
+    );
+    assert_eq!(recorder.kinds().len(), 8);
 }
