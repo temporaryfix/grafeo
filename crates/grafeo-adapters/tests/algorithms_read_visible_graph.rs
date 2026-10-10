@@ -230,19 +230,9 @@ fn algorithms_under_test() -> Vec<(&'static str, Box<dyn GraphAlgorithm>, Parame
     ]
 }
 
-/// The rows of a result, in a fixed order, as text (floats exactly). The
-/// block of stochastic block partition is left out: which of two merges with
-/// the same description length it takes follows hash-set order, so its block
-/// labels change from run to run (the nodes and the description length do
-/// not).
-fn sorted_rows(name: &str, rows: &[Vec<Value>]) -> Vec<String> {
-    let mut rows: Vec<String> = rows
-        .iter()
-        .map(|row| match name {
-            "stochastic_block_partition" => format!("{:?}", [&row[0], &row[2]]),
-            _ => format!("{row:?}"),
-        })
-        .collect();
+/// The rows of a result, in a fixed order, as text (floats exactly).
+fn sorted_rows(rows: &[Vec<Value>]) -> Vec<String> {
+    let mut rows: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
     rows.sort();
     rows
 }
@@ -259,10 +249,8 @@ fn every_algorithm_reads_only_the_visible_graph() {
         }));
         match actual {
             Ok(Ok(actual)) => {
-                let (actual_rows, expected_rows) = (
-                    sorted_rows(name, &actual.rows),
-                    sorted_rows(name, &expected.rows),
-                );
+                let (actual_rows, expected_rows) =
+                    (sorted_rows(&actual.rows), sorted_rows(&expected.rows));
                 if actual.columns != expected.columns || actual_rows != expected_rows {
                     differ.push(format!(
                         "{name}: {actual_rows:?} instead of {expected_rows:?}"
