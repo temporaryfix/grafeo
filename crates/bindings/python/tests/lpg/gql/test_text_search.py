@@ -3,7 +3,7 @@
 import pytest
 
 try:
-    from grafeo import GrafeoDB
+    from grafeo import GrafeoDB, GrafeoError
 
     GRAFEO_AVAILABLE = True
 except ImportError:
@@ -94,10 +94,8 @@ class TestTextIndexOptions:
         assert notes_db.text_search("Note", "body", "柏林", 10) == []
 
     def test_options_out_of_range_raise(self, notes_db):
-        import grafeo
-
         for kwargs in [{"k1": -0.3}, {"b": 1.88}, {"tokenizer": "jieba"}]:
-            with pytest.raises(grafeo.GrafeoError, match="GRAFEO-V001"):
+            with pytest.raises(GrafeoError, match="GRAFEO-V001"):
                 notes_db.create_text_index("Note", "body", **kwargs)
 
     def test_rebuild_keeps_the_options(self, notes_db):

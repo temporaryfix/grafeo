@@ -2564,11 +2564,15 @@ this is not json\n";
         }
     }
 
-    /// Writes a file of `people` nodes, each with 1 KiB of text, and as many
-    /// edges.
+    /// The bytes of text each person of a test file carries: well above what
+    /// a transaction keeps for a node and an edge until it commits.
+    const NOTES: usize = 4096;
+
+    /// Writes a file of `people` nodes, each with [`NOTES`] bytes of text,
+    /// and as many edges.
     fn write_people(path: &Path, people: u64) {
         let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
-        let notes = "x".repeat(1024);
+        let notes = "x".repeat(NOTES);
         for id in 0..people {
             writeln!(
                 out,
@@ -2615,13 +2619,15 @@ this is not json\n";
     /// database grows with the number of nodes (the map of their IDs), not
     /// with the size of the file.
     ///
-    /// Each person of the file is a node with 1 KiB of text and an edge, so a
+    /// Each person of the file is a node with 4 KiB of text and an edge, so a
     /// load that held the file, or its records, would grow by more than
-    /// 1 KiB a person. Measured on Windows from 1,000 to 10,000 people, the
-    /// check's peak grew by 41 bytes a person and the write's by 550 (the
-    /// transaction's own bookkeeping included); a load of the same file into
-    /// a database on disk held about 1.4 KiB a person more until it
-    /// committed, for the log records of its transaction.
+    /// 4 KiB a person. Measured on Windows from 1,000 to 10,000 people, the
+    /// check's peak grew by 41 bytes a person and the write's by 550, or by
+    /// 1,050 in a build with the engine's `temporal` feature: what the
+    /// transaction keeps of each write until it commits, whatever the size
+    /// of the text (the same with 1 KiB of it). With 1 KiB of text, a load of
+    /// the same file into a database on disk held about 1.4 KiB a person
+    /// more until it committed, for the log records of its transaction.
     #[test]
     fn load_holds_the_file_one_line_at_a_time() {
         const PEOPLE: (u64, u64) = (1_000, 10_000);
@@ -2638,7 +2644,7 @@ this is not json\n";
         );
         let write_growth = large.1 - small.1;
         assert!(
-            write_growth < added * 1024,
+            write_growth < added * isize::try_from(NOTES).unwrap(),
             "the write grew by {write_growth} bytes for {added} more people: \
              as much as their text ({small:?} to {large:?})"
         );
