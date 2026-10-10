@@ -148,3 +148,8 @@ harness = false
 [[bench]]
 name = "topk_e2e"
 harness = false
+
+[[bench]]
+name = "write_path_bench"
+harness = false
+required-features = ["cypher", "wal"]
