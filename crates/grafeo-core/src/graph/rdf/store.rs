@@ -1206,10 +1206,14 @@ impl RdfStore {
         self.named_graphs.write().clear();
     }
 
-    /// Copies all triples from source graph to destination graph.
+    /// Copies all triples from source graph to destination graph. A copy of
+    /// a graph onto itself does nothing (SPARQL 1.1 Update, section 3.2.3).
     ///
     /// `None` = default graph, `Some(iri)` = named graph.
     pub fn copy_graph(&self, source: Option<&str>, dest: Option<&str>) {
+        if source == dest {
+            return;
+        }
         let triples = match source {
             None => self.triples(),
             Some(n) => self.graph(n).map(|g| g.triples()).unwrap_or_default(),
@@ -1232,10 +1236,15 @@ impl RdfStore {
         }
     }
 
-    /// Moves all triples from source graph to destination graph.
+    /// Moves all triples from source graph to destination graph. A move of
+    /// a graph onto itself does nothing (SPARQL 1.1 Update, section 3.2.4):
+    /// it used to drop the graph.
     ///
     /// `None` = default graph, `Some(iri)` = named graph.
     pub fn move_graph(&self, source: Option<&str>, dest: Option<&str>) {
+        if source == dest {
+            return;
+        }
         self.copy_graph(source, dest);
         match source {
             None => self.clear(),
@@ -1245,10 +1254,14 @@ impl RdfStore {
         }
     }
 
-    /// Adds all triples from source graph into destination graph (union).
+    /// Adds all triples from source graph into destination graph (union). An
+    /// add of a graph onto itself does nothing.
     ///
     /// `None` = default graph, `Some(iri)` = named graph.
     pub fn add_graph(&self, source: Option<&str>, dest: Option<&str>) {
+        if source == dest {
+            return;
+        }
         let triples = match source {
             None => self.triples(),
             Some(n) => self.graph(n).map(|g| g.triples()).unwrap_or_default(),
@@ -2481,6 +2494,31 @@ mod tests {
             target: target("http://example.org/prague"),
         }));
         assert_eq!(shape(&store), (1, named(&[(berlin, 1), (paris, 1)])));
+    }
+
+    /// A copy, move or add of a graph onto itself keeps the graph as it was:
+    /// a move used to drop it (or clear the default graph).
+    #[test]
+    fn a_graph_onto_itself_is_kept() {
+        let paris = "http://example.org/paris";
+        let store = RdfStore::new();
+        let triple = Triple::new(
+            Term::iri("http://example.org/vincent"),
+            Term::iri("http://example.org/knows"),
+            Term::iri("http://example.org/mia"),
+        );
+        store.insert_into(None, triple.clone());
+        store.insert_into(Some(paris), triple);
+        for graph in [None, Some(paris)] {
+            store.copy_graph(graph, graph);
+            store.move_graph(graph, graph);
+            store.add_graph(graph, graph);
+        }
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.graph(paris).map(|graph| graph.len()), Some(1));
+        let prague = Some("http://example.org/prague");
+        store.move_graph(prague, prague);
+        assert!(store.graph("http://example.org/prague").is_none());
     }
 
     /// A triple applied to a named graph that does not exist creates it on

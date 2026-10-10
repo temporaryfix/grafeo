@@ -30,6 +30,15 @@ const FAILING_UPDATE: &str = "INSERT { <http://example.org/vincent> <http://exam
      <http://example.org/mia> . GRAPH ?g { <http://example.org/jules> \
      <http://example.org/knows> <http://example.org/butch> } } WHERE { BIND(<http://example.org/paris> AS ?g) }";
 
+/// The answer of `ask`, an ASK query, in `session`: its one Boolean.
+fn asks(session: &grafeo_engine::session::Session, ask: &str) -> bool {
+    let result = session.execute_sparql(ask).unwrap();
+    match result.rows() {
+        [row] => row[0] == grafeo_common::types::Value::Bool(true),
+        rows => panic!("ASK answers with one row: {rows:?}"),
+    }
+}
+
 /// The subjects of every triple the default graph holds, sorted.
 fn subjects(db: &GrafeoDB) -> Vec<String> {
     let mut subjects: Vec<String> = db
@@ -88,9 +97,8 @@ fn a_rolled_back_savepoint_drops_the_rdf_changes_after_it() {
     session.rollback_to_savepoint("sp").unwrap();
     let mia =
         "ASK { <http://example.org/mia> <http://example.org/knows> <http://example.org/jules> }";
-    assert_eq!(
-        session.execute_sparql(mia).unwrap().row_count(),
-        0,
+    assert!(
+        !asks(&session, mia),
         "the transaction no longer reads what it undid"
     );
     session.commit().unwrap();
@@ -174,17 +182,11 @@ fn a_transaction_reads_its_own_rdf_writes_and_others_do_not() {
     let mut session = db.session();
     session.begin_transaction().unwrap();
     session.execute_sparql(ALIX_KNOWS_GUS).unwrap();
-    // ASK answers with the first match, so a row means true.
     let ask =
         "ASK { <http://example.org/alix> <http://example.org/knows> <http://example.org/gus> }";
-    assert_eq!(
-        session.execute_sparql(ask).unwrap().row_count(),
-        1,
-        "the transaction reads its own insert"
-    );
-    assert_eq!(
-        db.session().execute_sparql(ask).unwrap().row_count(),
-        0,
+    assert!(asks(&session, ask), "the transaction reads its own insert");
+    assert!(
+        !asks(&db.session(), ask),
         "another session does not see it before the commit"
     );
     session
@@ -192,11 +194,7 @@ fn a_transaction_reads_its_own_rdf_writes_and_others_do_not() {
             "DELETE DATA { <http://example.org/alix> <http://example.org/knows> <http://example.org/gus> }",
         )
         .unwrap();
-    assert_eq!(
-        session.execute_sparql(ask).unwrap().row_count(),
-        0,
-        "the transaction reads its own delete"
-    );
+    assert!(!asks(&session, ask), "the transaction reads its own delete");
     session.commit().unwrap();
     assert_eq!(subjects(&db), Vec::<String>::new());
 }

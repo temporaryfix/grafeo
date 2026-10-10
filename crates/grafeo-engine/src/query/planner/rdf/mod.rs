@@ -84,16 +84,6 @@ fn update_writer(writer: &Option<RdfWriter>) -> std::result::Result<&RdfWriter, 
     })
 }
 
-/// The graphs a `CLEAR` or `DROP` names: `None` for the default graph, the
-/// empty name for `ALL`.
-fn graph_target(graph: &Option<String>) -> RdfGraphTarget {
-    match graph.as_deref() {
-        None => RdfGraphTarget::Default,
-        Some("") => RdfGraphTarget::All,
-        Some(name) => RdfGraphTarget::Named(name.to_string()),
-    }
-}
-
 /// Converts logical plans with RDF operators to physical operators.
 ///
 /// This planner produces push-based operators that process data in chunks
@@ -1454,7 +1444,7 @@ impl RdfPlanner {
         clear: &ClearGraphOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>, Vec<LogicalType>)> {
         let op = RdfGraphOp::Clear {
-            target: graph_target(&clear.graph),
+            target: clear.target.clone(),
         };
         Ok(self.graph_operator("RdfClearGraph", op, GraphCheck::None))
     }
@@ -1479,7 +1469,7 @@ impl RdfPlanner {
         &self,
         drop_op: &DropGraphOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>, Vec<LogicalType>)> {
-        let target = graph_target(&drop_op.graph);
+        let target = drop_op.target.clone();
         let check = match &target {
             RdfGraphTarget::Named(name) => GraphCheck::Present {
                 graph: name.clone(),
@@ -6337,7 +6327,9 @@ mod tests {
         execute_update(
             &store,
             &LogicalPlan::new(LogicalOperator::DropGraph(DropGraphOp {
-                graph: Some("http://example.org/g1".to_string()),
+                target: grafeo_common::storage::log_record::RdfGraphTarget::Named(
+                    "http://example.org/g1".to_string(),
+                ),
                 silent: false,
             })),
         )
@@ -6349,7 +6341,9 @@ mod tests {
     fn test_plan_drop_nonexistent_graph_errors() {
         let store = Arc::new(RdfStore::new());
         let plan = LogicalPlan::new(LogicalOperator::DropGraph(DropGraphOp {
-            graph: Some("http://example.org/nope".to_string()),
+            target: grafeo_common::storage::log_record::RdfGraphTarget::Named(
+                "http://example.org/nope".to_string(),
+            ),
             silent: false,
         }));
         let error = execute_update(&store, &plan).unwrap_err();
@@ -6372,7 +6366,7 @@ mod tests {
         execute_update(
             &store,
             &LogicalPlan::new(LogicalOperator::DropGraph(DropGraphOp {
-                graph: None,
+                target: grafeo_common::storage::log_record::RdfGraphTarget::Default,
                 silent: false,
             })),
         )
@@ -6391,7 +6385,7 @@ mod tests {
         execute_update(
             &store,
             &LogicalPlan::new(LogicalOperator::ClearGraph(ClearGraphOp {
-                graph: None,
+                target: grafeo_common::storage::log_record::RdfGraphTarget::Default,
                 silent: false,
             })),
         )
@@ -6419,7 +6413,7 @@ mod tests {
         execute_update(
             &store,
             &LogicalPlan::new(LogicalOperator::ClearGraph(ClearGraphOp {
-                graph: Some(String::new()),
+                target: grafeo_common::storage::log_record::RdfGraphTarget::All,
                 silent: false,
             })),
         )

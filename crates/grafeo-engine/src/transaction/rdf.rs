@@ -285,6 +285,13 @@ impl RdfWriter {
         op: RdfGraphOp,
         check: impl FnOnce(&RdfStore) -> std::result::Result<bool, OperatorError>,
     ) -> std::result::Result<(), OperatorError> {
+        // A copy, move or add of a graph onto itself changes nothing (SPARQL
+        // 1.1 Update, sections 3.2.3 and 3.2.4): once its source check
+        // passed, it is not held, checked against open changes or logged.
+        if onto_itself(&op) {
+            check(&self.store)?;
+            return Ok(());
+        }
         let held = crate::database::standalone::hold(&self.manager, true)?;
         refuse_graph_op_with_open_changes(&self.manager, &held, &op)?;
         if !check(&self.store)? {
@@ -368,6 +375,16 @@ fn holds(store: &RdfStore, graph: Option<&str>, triple: &Triple) -> bool {
         Some(name) => store
             .graph(name)
             .is_some_and(|graph| graph.contains(triple)),
+    }
+}
+
+/// Whether `op` is a copy, move or add of a graph onto itself.
+fn onto_itself(op: &RdfGraphOp) -> bool {
+    match op {
+        RdfGraphOp::Copy { source, target }
+        | RdfGraphOp::Move { source, target }
+        | RdfGraphOp::Add { source, target } => source == target,
+        RdfGraphOp::Create { .. } | RdfGraphOp::Drop { .. } | RdfGraphOp::Clear { .. } => false,
     }
 }
 

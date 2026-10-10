@@ -246,6 +246,8 @@ File format release: every database is now a single file in a new format, and 0.
 - **SPARQL and GraphQL updates are all or nothing, and a rollback leaves nothing of them** ([#414](https://github.com/GrafeoDB/grafeo/issues/414)): an update that failed part way kept the triples it wrote before the error, in and outside a transaction; a rollback to a savepoint kept the triples written after it; and the change feed reported triples of updates that rolled back, and of inserts and deletes that changed nothing. Triples now change when the transaction commits, and the change feed reports each triple a commit changed, at that commit's epoch.
 - **`COPY`, `MOVE` and `ADD` survive a crash, and `CLEAR ALL` replays as written**: they were not in the write-ahead log, and `CLEAR ALL` cleared nothing on recovery.
 - **An insert into a new named graph that rolls back leaves no empty graph behind.**
+- **SPARQL `MOVE` of a graph onto itself dropped it**: `MOVE <g> TO <g>` deleted the graph and `MOVE DEFAULT TO DEFAULT` emptied the default graph. A `COPY`, `MOVE` or `ADD` of a graph onto itself now leaves it as it is, as SPARQL 1.1 Update specifies; a source that does not exist still fails without `SILENT`.
+- **SPARQL `CLEAR NAMED` and `DROP NAMED` also cleared the default graph**: they now reach the named graphs only.
 
 ### Result changes
 
@@ -259,6 +261,7 @@ File format release: every database is now a single file in a new format, and 0.
 - **Rust (`grafeo-adapters`): `k_truss`, `ktruss_decomposition` and `edge_triangle_support` use the simple graph**: a self-loop was a truss edge (even in the 4-truss of a triangle) and raised its node's edge supports; self-loops are now in no k-truss.
 - **SPARQL `COUNT` in a transaction counts its own writes**: it counted the committed triples only.
 - **SPARQL `DROP ALL` drops every graph**: it failed with `Graph <> does not exist`.
+- **SPARQL `ASK` returns one row with one Boolean**: it returned its first matching row, or no row for false. It now returns `true` or `false` in the column `boolean`, the name the SPARQL 1.1 Query Results JSON Format gives an ASK result.
 
 ### Deprecated
 

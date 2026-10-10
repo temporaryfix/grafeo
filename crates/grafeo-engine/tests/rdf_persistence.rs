@@ -87,6 +87,34 @@ const CLEAR_ALL: &[&str] = &[
     "INSERT DATA { <http://ex.org/butch> <http://ex.org/knows> <http://ex.org/mia> }",
 ];
 
+/// Graph operations onto the graph they read, which change nothing.
+const ONTO_ITSELF: &[&str] = &[
+    "MOVE <http://ex.org/amsterdam> TO <http://ex.org/amsterdam>",
+    "COPY DEFAULT TO DEFAULT",
+    "ADD <http://ex.org/amsterdam> TO <http://ex.org/amsterdam>",
+    "MOVE DEFAULT TO DEFAULT",
+];
+
+/// The graph operations each crash scenario runs after [`FIRST`], and the
+/// triples of the default graph and of the named graphs they leave.
+const GRAPH_SCENARIOS: &[(&str, &[&str], (usize, usize))] = &[
+    ("graph_ops", GRAPH_OPS, (3, 5)),
+    ("clear_all", CLEAR_ALL, (1, 0)),
+    ("onto_itself", ONTO_ITSELF, (3, 1)),
+    ("clear_named", &["CLEAR NAMED"], (3, 0)),
+    ("drop_named", &["DROP NAMED"], (3, 0)),
+    ("clear_default", &["CLEAR DEFAULT"], (0, 1)),
+    ("drop_default", &["DROP DEFAULT"], (0, 1)),
+];
+
+/// The graph operations of the crash scenario `name`, if it is one.
+fn graph_scenario(name: &str) -> Option<&'static [&'static str]> {
+    GRAPH_SCENARIOS
+        .iter()
+        .find(|(scenario, _, _)| *scenario == name)
+        .map(|(_, writes, _)| *writes)
+}
+
 /// The insert of a transaction before its savepoint, which it commits.
 const KEPT: &str =
     "INSERT DATA { <http://ex.org/vincent> <http://ex.org/knows> <http://ex.org/jules> }";
@@ -216,8 +244,7 @@ fn crash_child() {
         // A crash before any checkpoint: the WAL alone holds the triples.
         "first_write" => {}
         // A crash after whole-graph operations, which the WAL alone holds.
-        "graph_ops" => run(&db, GRAPH_OPS),
-        "clear_all" => run(&db, CLEAR_ALL),
+        graph if graph_scenario(graph).is_some() => run(&db, graph_scenario(graph).unwrap()),
         // A crash after a transaction that rolled back to a savepoint and
         // committed: neither the store nor the WAL holds what it undid.
         "savepoint" => {
@@ -375,13 +402,13 @@ fn triples_survive_a_crash_before_any_checkpoint() {
 }
 
 /// Whole-graph operations come back from the WAL as they ran: a copy, an
-/// add and a move, and a `CLEAR ALL`, which clears every graph (#414).
+/// add and a move, a `CLEAR ALL`, which clears every graph (#414), `CLEAR
+/// NAMED` and `DROP NAMED`, which keep the default graph, `CLEAR DEFAULT` and
+/// `DROP DEFAULT`, which keep the named graphs, and operations onto the graph
+/// they read, which change nothing.
 #[test]
 fn whole_graph_operations_survive_a_crash() {
-    for (scenario, writes, shape) in [
-        ("graph_ops", GRAPH_OPS, (3, 5)),
-        ("clear_all", CLEAR_ALL, (1, 0)),
-    ] {
+    for &(scenario, writes, shape) in GRAPH_SCENARIOS {
         let want = expected(&[FIRST_WRITE, writes]);
         assert_eq!(counts(&want), shape, "{scenario}: {want:?}");
         let dir = tempfile::tempdir().unwrap();

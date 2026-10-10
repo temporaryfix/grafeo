@@ -3589,7 +3589,7 @@ mod tests {
         // every arm of the consolidated DDL match block.
         let cases: Vec<LogicalOperator> = vec![
             LogicalOperator::ClearGraph(ClearGraphOp {
-                graph: None,
+                target: grafeo_common::storage::log_record::RdfGraphTarget::Default,
                 silent: false,
             }),
             LogicalOperator::CreateGraph(CreateGraphOp {
@@ -3597,7 +3597,7 @@ mod tests {
                 silent: false,
             }),
             LogicalOperator::DropGraph(DropGraphOp {
-                graph: None,
+                target: grafeo_common::storage::log_record::RdfGraphTarget::Default,
                 silent: true,
             }),
             LogicalOperator::LoadGraph(LoadGraphOp {

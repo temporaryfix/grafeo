@@ -178,6 +178,12 @@ Drop the default graph:
 DROP DEFAULT
 ```
 
+Drop every named graph, and leave the default graph:
+
+```sparql
+DROP NAMED
+```
+
 Drop all graphs:
 
 ```sparql
@@ -202,6 +208,12 @@ Clear the default graph:
 
 ```sparql
 CLEAR DEFAULT
+```
+
+Clear every named graph, and leave the default graph:
+
+```sparql
+CLEAR NAMED
 ```
 
 Clear all graphs:
@@ -251,6 +263,8 @@ Use `SILENT` to suppress errors if the source does not exist:
 ```sparql
 ADD SILENT <http://ex.org/extra> TO <http://ex.org/main>
 ```
+
+A `COPY` or `MOVE` of a graph onto itself (`MOVE <http://ex.org/g> TO <http://ex.org/g>`, `COPY DEFAULT TO DEFAULT`), and an `ADD` onto itself, leave the graph as it is, as SPARQL 1.1 Update specifies; a source that does not exist still fails without `SILENT`.
 
 ### Graph operations and transactions
 

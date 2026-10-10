@@ -535,7 +535,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Named => {
                 self.advance();
-                Ok(GraphTarget::Named(Iri::new(""))) // All named graphs
+                Ok(GraphTarget::AllNamed)
             }
             TokenKind::All => {
                 self.advance();

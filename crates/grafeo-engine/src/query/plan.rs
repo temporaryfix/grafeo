@@ -2611,8 +2611,9 @@ pub struct ConstructOp {
 /// Clear all triples from a graph.
 #[derive(Debug, Clone)]
 pub struct ClearGraphOp {
-    /// Target graph (None = default graph, Some("") = all named, Some(iri) = specific graph).
-    pub graph: Option<String>,
+    /// The graphs to clear: the default graph, one named graph, every named
+    /// graph (`NAMED`) or every graph (`ALL`).
+    pub target: grafeo_common::storage::log_record::RdfGraphTarget,
     /// Whether to silently ignore errors.
     pub silent: bool,
 }
@@ -2629,8 +2630,9 @@ pub struct CreateGraphOp {
 /// Drop (remove) a named graph.
 #[derive(Debug, Clone)]
 pub struct DropGraphOp {
-    /// Target graph (None = default graph).
-    pub graph: Option<String>,
+    /// The graphs to drop: the default graph (which a drop empties), one
+    /// named graph, every named graph (`NAMED`) or every graph (`ALL`).
+    pub target: grafeo_common::storage::log_record::RdfGraphTarget,
     /// Whether to silently ignore errors.
     pub silent: bool,
 }
@@ -3795,7 +3797,7 @@ mod tests {
         assert!(insert_triple.has_mutations());
 
         let clear = LogicalOperator::ClearGraph(ClearGraphOp {
-            graph: None,
+            target: grafeo_common::storage::log_record::RdfGraphTarget::Default,
             silent: false,
         });
         assert!(clear.has_mutations());

@@ -615,10 +615,16 @@ impl QueryProcessor {
             if optimized_plan.profile {
                 let (mut physical_plan, entries) = planner.plan_profiled(&optimized_plan)?;
 
+                // The clock is not there on wasm32 (`Instant::now` panics):
+                // the time is 0 there, as in a session's PROFILE.
+                #[cfg(not(target_arch = "wasm32"))]
                 let start = std::time::Instant::now();
                 let executor = Executor::with_columns(physical_plan.columns.clone());
                 let _result = executor.execute(physical_plan.operator.as_mut())?;
+                #[cfg(not(target_arch = "wasm32"))]
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                #[cfg(target_arch = "wasm32")]
+                let elapsed_ms = 0.0;
 
                 let tree = crate::query::profile::build_profile_tree(
                     &optimized_plan.root,
