@@ -7,7 +7,9 @@
 //! the checkpoint is skipped, so its key is not checked), then that the
 //! segments from the checkpoint on form one chain of log positions.
 //! [`WalScan::next_group`] returns a group only once its LAST frame was
-//! found, so a caller never applies part of a transaction.
+//! found, so a caller never applies part of a transaction. It passes over
+//! the writer's sync markers (empty groups that only record how far the log
+//! was durable), which count as later groups in the table below.
 //! [`WalScan::finish`] says where the log ends and what follows it:
 //!
 //! | Finding | Where | Result |
@@ -470,7 +472,14 @@ impl WalScan {
                     self.reader = None;
                 }
                 FrameRead::Frame(header) if header.flags.is_first() => {
-                    return self.read_group(header, payload);
+                    // A sync marker: one frame holding only its prologue,
+                    // which says how far the log was durable. It is checked
+                    // and passed over like a group, and returned to nobody.
+                    let marker = header.flags.is_last() && payload.len() == FRAME_PROLOGUE_BYTES;
+                    match self.read_group(header, payload)? {
+                        Some(_) if marker => {}
+                        group => return Ok(group),
+                    }
                 }
                 FrameRead::Frame(header) if group_start == self.start_lsn => {
                     // A whole frame, so never a torn write: the image ends
@@ -1371,9 +1380,13 @@ mod tests {
             "a frame per record at a 16-byte target"
         );
         let frames = scan.next_group().unwrap().unwrap();
+        assert!(
+            second.start_lsn > first.end_lsn,
+            "the sync's marker sits between the groups, and the scan passes over it"
+        );
         assert_eq!(
             (frames.start_lsn(), frames.end_lsn()),
-            (first.end_lsn, second.end_lsn)
+            (second.start_lsn, second.end_lsn)
         );
         assert_eq!(frames.synced_lsn(), first.end_lsn);
         assert_eq!(frames.frame_count(), 1);
@@ -1590,14 +1603,18 @@ mod tests {
                 vec![group(1, &["Alix"])]
             };
             assert_eq!(groups, expected, "nothing after the hole is replayed");
-            assert_eq!(end.end_lsn, synced);
+            // The log is kept up to the hole: the synced group and the
+            // marker of its sync.
+            let kept = hole.start_lsn;
+            assert!(kept > synced);
+            assert_eq!(end.end_lsn, kept);
             let tail = end.tail.clone().unwrap();
             assert_eq!(tail.kind, TailKind::Torn, "{tail:?}");
-            assert_eq!((tail.lsn, tail.offset), (synced, offset(first_lsn, synced)));
+            assert_eq!((tail.lsn, tail.offset), (kept, offset(first_lsn, kept)));
             end.cut_torn_tail().unwrap();
             assert_eq!(
                 std::fs::metadata(&path).unwrap().len(),
-                offset(first_lsn, synced)
+                offset(first_lsn, kept)
             );
         }
     }

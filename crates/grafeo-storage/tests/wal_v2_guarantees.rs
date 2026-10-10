@@ -360,6 +360,8 @@ fn sync_until_returns_only_once_its_lsn_is_durable_under_eight_committers() {
             });
         }
     });
+    // Only the marker of the last sync can follow what is durable.
+    wal.sync().unwrap();
     assert_eq!(wal.synced_lsn(), wal.end_lsn());
 }
 
@@ -417,7 +419,8 @@ fn sync_until_past_the_end_of_the_log_is_refused() {
     wal.sync_until(end.end_lsn + 1).unwrap_err();
     wal.sync_until(end.end_lsn).unwrap();
     assert_eq!(wal.synced_lsn(), end.end_lsn, "the end itself is synced");
-    wal.sync_until(end.end_lsn + 1).unwrap_err();
+    // The sync's marker now ends the log.
+    wal.sync_until(wal.end_lsn() + 1).unwrap_err();
 }
 
 /// A stale segment below the checkpoint is skipped by the scan, so only its
@@ -753,4 +756,172 @@ fn reopening_syncs_the_segment_it_appends_to_before_reporting_it_durable() {
     });
     let error = outcome.map(|_| ()).unwrap_err();
     assert!(error.to_string().contains("wal:sync"), "{error}");
+}
+
+/// Flips a byte inside the payload of the frame at `lsn` of the segment that
+/// starts at LSN 0.
+fn damage_frame_at(dir: &Path, lsn: u64) {
+    let path = segment_path(dir, 0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[128 + usize::try_from(lsn).unwrap() + 30] ^= 0x5A;
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+/// One fsync makes every group written before it durable: committers that
+/// wrote with `finish_unsynced` and then ask for their own group share it.
+#[test]
+fn one_fsync_covers_every_group_written_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open(dir.path(), options(0, DurabilityMode::Sync)).unwrap();
+    let before = wal.sync_count();
+    let ends: Vec<GroupEnd> = (1..=8u64)
+        .map(|id| {
+            let mut group = wal.begin_group(TransactionId::new(id)).unwrap();
+            group.push(&record("Vincent in Berlin")).unwrap();
+            group.finish_unsynced().unwrap()
+        })
+        .collect();
+    for end in &ends {
+        wal.sync_until(end.end_lsn).unwrap();
+    }
+    assert_eq!(wal.sync_count() - before, 1, "eight groups, one fsync");
+    assert!(wal.synced_lsn() >= ends[7].end_lsn);
+}
+
+/// The last synced group of the log has no later group to show that it was
+/// durable: the sync marker written after its fsync does, so damage in it
+/// is refused, where it used to be cut as a torn tail (losing a synced,
+/// acknowledged commit without an error). A scan returns the groups and
+/// never the markers.
+#[test]
+fn damage_in_the_last_synced_group_is_refused_not_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open(dir.path(), options(0, DurabilityMode::Sync)).unwrap();
+    write_group(&wal, 1, &["Alix"]);
+    let last = write_group(&wal, 2, &["Gus in Prague"]);
+    drop(wal);
+
+    let (groups, end) = scan_all(dir.path(), ScanOptions::new(DATABASE, 0)).unwrap();
+    let ids: Vec<u64> = groups.iter().map(|group| group.0).collect();
+    assert_eq!(ids, [1, 2], "the markers are no groups of the scan");
+    assert!(end.tail.is_none(), "{:?}", end.tail);
+    assert!(
+        end.end_lsn > last.end_lsn,
+        "the log ends after the last marker"
+    );
+
+    damage_frame_at(dir.path(), last.start_lsn);
+    let error = scan_all(dir.path(), ScanOptions::new(DATABASE, 0)).unwrap_err();
+    assert!(matches!(error, WalError::Damaged { .. }), "{error}");
+}
+
+/// A sync that covers nothing but the last marker writes no marker of its
+/// own: an idle log stops growing.
+#[test]
+fn an_idle_sync_writes_no_further_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open(dir.path(), options(0, DurabilityMode::Sync)).unwrap();
+    write_group(&wal, 1, &["Mia in Paris"]);
+    wal.sync().unwrap();
+    let end = wal.end_lsn();
+    assert_eq!(wal.synced_lsn(), end, "the marker itself is synced");
+    for _ in 0..3 {
+        wal.sync().unwrap();
+    }
+    assert_eq!(wal.end_lsn(), end);
+}
+
+/// A group that began before a sync and finishes after it cannot carry the
+/// sync in its prologue, and the marker cannot be written while the group
+/// holds the writer: it follows the group's LAST frame.
+#[test]
+fn a_marker_follows_a_group_that_was_being_written_during_the_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open(dir.path(), options(0, DurabilityMode::NoSync)).unwrap();
+    let mut first = wal.begin_group(TransactionId::new(1)).unwrap();
+    first.push(&record("Jules in Barcelona")).unwrap();
+    let first = first.finish_unsynced().unwrap();
+    let mut second = wal.begin_group(TransactionId::new(2)).unwrap();
+    second.push(&record("Butch in Amsterdam")).unwrap();
+    wal.sync_until(first.end_lsn).unwrap();
+    let second = second.finish_unsynced().unwrap();
+    assert!(
+        wal.end_lsn() > second.end_lsn,
+        "a marker follows the second group"
+    );
+    drop(wal);
+
+    damage_frame_at(dir.path(), first.start_lsn);
+    let error = scan_all(dir.path(), ScanOptions::new(DATABASE, 0)).unwrap_err();
+    assert!(matches!(error, WalError::Damaged { .. }), "{error}");
+}
+
+/// A writer reopened at the end of a log that ends with a marker appends
+/// after it, and the scan reads the groups on both sides.
+#[test]
+fn a_reopened_writer_appends_after_the_last_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open(dir.path(), options(0, DurabilityMode::Sync)).unwrap();
+    write_group(&wal, 1, &["Django"]);
+    drop(wal);
+    let (_, end) = scan_all(dir.path(), ScanOptions::new(DATABASE, 0)).unwrap();
+    let wal = Wal::open(dir.path(), options(end.end_lsn, DurabilityMode::Sync)).unwrap();
+    write_group(&wal, 2, &["Shosanna"]);
+    drop(wal);
+    let (groups, _) = scan_all(dir.path(), ScanOptions::new(DATABASE, 0)).unwrap();
+    let ids: Vec<u64> = groups.iter().map(|group| group.0).collect();
+    assert_eq!(ids, [1, 2]);
+}
+
+/// A segment key seals a bounded number of frames: once a segment holds
+/// that many, the next group starts a new segment (and so a new key),
+/// whatever the segment size.
+#[test]
+fn a_group_starts_a_new_segment_once_the_key_sealed_its_share_of_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open(
+        dir.path(),
+        WalOptions {
+            frames_per_segment_key: 4,
+            ..options(0, DurabilityMode::NoSync)
+        },
+    )
+    .unwrap();
+    // Two frames per group (16-byte frames, one record each).
+    let texts = ["Hans in Berlin", "Beatrix in Paris"];
+    write_group(&wal, 1, &texts);
+    let second = write_group(&wal, 2, &texts);
+    let third = write_group(&wal, 3, &texts);
+    assert!(segment_path(dir.path(), 0).exists());
+    assert!(
+        !segment_path(dir.path(), second.start_lsn).exists(),
+        "two frames so far: the second group stays in the first segment"
+    );
+    assert!(
+        segment_path(dir.path(), third.start_lsn).exists(),
+        "four frames: the third group starts a segment"
+    );
+    drop(wal);
+    let (groups, _) = scan_all(dir.path(), ScanOptions::new(DATABASE, 0)).unwrap();
+    assert_eq!(groups.len(), 3);
+}
+
+/// A writer reopened on a segment counts the frames it may already hold (at
+/// most one per smallest frame), so the bound holds across reopens.
+#[test]
+fn a_reopened_writer_counts_the_frames_its_segment_may_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let limited = |start_lsn| WalOptions {
+        frames_per_segment_key: 2,
+        ..options(start_lsn, DurabilityMode::NoSync)
+    };
+    let wal = Wal::open(dir.path(), limited(0)).unwrap();
+    let first = write_group(&wal, 1, &["Lucas in Prague", "Marcus in Paris"]);
+    drop(wal);
+    let wal = Wal::open(dir.path(), limited(first.end_lsn)).unwrap();
+    let second = write_group(&wal, 2, &["Harm"]);
+    assert!(
+        segment_path(dir.path(), second.start_lsn).exists(),
+        "the reopened segment already held its share of frames"
+    );
 }

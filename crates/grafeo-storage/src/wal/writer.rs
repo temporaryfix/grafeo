@@ -31,6 +31,20 @@
 //! a caller whose group a concurrent sync already covered returns at once.
 //! [`GroupWriter::finish_unsynced`] and `sync_until` let a commit pipeline
 //! release its commit lock between writing a group and syncing it.
+//!
+//! **Sync markers:** a group's FIRST frame records how far the log was
+//! durable when the group began, which is how a scan tells a hole the disk
+//! never had from damage to synced bytes. A sync says nothing in the groups
+//! it covered (they all began before it), so after an fsync that covered
+//! groups the writer appends a sync marker: an empty group of the system
+//! transaction whose prologue records the sync. It costs no fsync of its
+//! own, a scan does not return it, and a sync that covers nothing but the
+//! last marker writes none.
+//!
+//! **Frames per key:** each segment has a key of its own, and every frame
+//! sealed under it uses a random nonce. A group starts a new segment once
+//! the active one holds [`DEFAULT_FRAMES_PER_SEGMENT_KEY`] frames (frames of
+//! failed groups included), whatever the segment size.
 
 #![deny(clippy::let_underscore_must_use)]
 
@@ -62,6 +76,15 @@ use super::{DurabilityMode, WalCipher};
 /// The segment size the writer rotates at by default.
 pub const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The frames a segment holds before the next group starts a new segment,
+/// by default: with random 96-bit nonces, 2^24 frames under one key keep the
+/// chance of a repeated nonce below 2^-49.
+pub const DEFAULT_FRAMES_PER_SEGMENT_KEY: u64 = 1 << 24;
+
+/// The frames one segment key seals at most: a group that would pass it
+/// fails. One group of this many frames holds terabytes.
+const MAX_FRAMES_PER_SEGMENT_KEY: u64 = 1 << 32;
+
 /// How to open a [`Wal`].
 #[derive(Clone)]
 pub struct WalOptions {
@@ -83,6 +106,10 @@ pub struct WalOptions {
     /// The cipher of a segment from its salt, for an encrypted database;
     /// `None` writes plaintext.
     pub cipher_for_salt: Option<CipherForSalt>,
+    /// The frames a segment holds before the next group starts a new one
+    /// (and with it a new segment key). 2^24 by default
+    /// (`DEFAULT_FRAMES_PER_SEGMENT_KEY`); smaller only in tests.
+    pub frames_per_segment_key: u64,
 }
 
 impl WalOptions {
@@ -98,6 +125,7 @@ impl WalOptions {
             segment_bytes: DEFAULT_SEGMENT_BYTES,
             frame_target_bytes: FRAME_TARGET,
             cipher_for_salt: None,
+            frames_per_segment_key: DEFAULT_FRAMES_PER_SEGMENT_KEY,
         }
     }
 }
@@ -111,6 +139,7 @@ impl std::fmt::Debug for WalOptions {
             .field("segment_bytes", &self.segment_bytes)
             .field("frame_target_bytes", &self.frame_target_bytes)
             .field("encrypted", &self.cipher_for_salt.is_some())
+            .field("frames_per_segment_key", &self.frames_per_segment_key)
             .finish()
     }
 }
@@ -137,6 +166,10 @@ struct WriterState {
     segment: ActiveSegment,
     /// The end of the last complete group.
     end_lsn: u64,
+    /// The frames written to the segment so far, at most (the frames of
+    /// failed groups count, and so does every frame a reopened segment may
+    /// hold).
+    frames: u64,
 }
 
 /// What a sync needs, kept apart from the writer's lock so a sync never
@@ -164,6 +197,15 @@ pub struct Wal {
     active_first_lsn: AtomicU64,
     records_since_sync: AtomicU64,
     last_sync: Mutex<Instant>,
+    frames_per_segment_key: u64,
+    /// Successful fsyncs of [`sync_until`](Self::sync_until).
+    sync_count: AtomicU64,
+    /// A sync covered groups and no group that began after it records it
+    /// yet: the next chance to write a sync marker takes it.
+    marker_due: AtomicBool,
+    /// Where the last sync marker starts and ends (both 0 before the first).
+    marker_start_lsn: AtomicU64,
+    marker_end_lsn: AtomicU64,
     poisoned: AtomicBool,
     poison_reason: Mutex<Option<String>>,
 }
@@ -227,6 +269,9 @@ impl Wal {
             .map_err(|failure| failure.error)?,
         };
         let first_lsn = segment.first_lsn;
+        // A segment the writer appends to holds at most one frame per frame
+        // header of its bytes.
+        let frames = (start - first_lsn) / FRAME_HEADER_BYTES as u64;
         Ok(Self {
             published: Mutex::new(SyncTarget {
                 file: Arc::clone(&segment.file),
@@ -236,6 +281,7 @@ impl Wal {
             state: Mutex::new(WriterState {
                 segment,
                 end_lsn: start,
+                frames,
             }),
             dir,
             database_id: options.database_id,
@@ -249,6 +295,11 @@ impl Wal {
             active_first_lsn: AtomicU64::new(first_lsn),
             records_since_sync: AtomicU64::new(0),
             last_sync: Mutex::new(Instant::now()),
+            frames_per_segment_key: options.frames_per_segment_key.max(1),
+            sync_count: AtomicU64::new(0),
+            marker_due: AtomicBool::new(false),
+            marker_start_lsn: AtomicU64::new(0),
+            marker_end_lsn: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             poison_reason: Mutex::new(None),
         })
@@ -257,8 +308,9 @@ impl Wal {
     /// Begins the group of `transaction_id`. The group holds the writer's
     /// lock until it is finished or dropped, so groups never interleave.
     ///
-    /// A segment that has reached the configured size is rotated first, so
-    /// the group starts the next one.
+    /// A segment that has reached the configured size, or holds the frames
+    /// one segment key may seal, is rotated first, so the group starts the
+    /// next one.
     ///
     /// # Errors
     ///
@@ -272,10 +324,26 @@ impl Wal {
         let mut state = self.state.lock();
         self.check_available().map_err(as_unavailable)?;
         let used = state.end_lsn - state.segment.first_lsn;
-        if used > 0 && (SEGMENT_HEADER_BYTES as u64).saturating_add(used) >= self.segment_bytes {
+        let full = (SEGMENT_HEADER_BYTES as u64).saturating_add(used) >= self.segment_bytes
+            || state.frames >= self.frames_per_segment_key;
+        if used > 0 && full {
             self.rotate_locked(&mut state)
                 .map_err(GroupError::NotWritten)?;
         }
+        // This group's prologue records every sync so far: no marker is due
+        // for them. (Cleared before the prologue reads the synced LSN, so a
+        // sync in between asks for a marker again.)
+        self.marker_due.store(false, Ordering::Release);
+        Ok(self.group_writer(state, transaction_id.as_u64()))
+    }
+
+    /// A group of `transaction_id` at the end of the log, holding the
+    /// writer's lock, its prologue filled in.
+    fn group_writer<'wal>(
+        &'wal self,
+        state: MutexGuard<'wal, WriterState>,
+        transaction_id: u64,
+    ) -> GroupWriter<'wal> {
         let start_lsn = state.end_lsn;
         let mut payload = Vec::with_capacity(
             self.frame_target_bytes
@@ -283,10 +351,10 @@ impl Wal {
                 .saturating_add(FRAME_PROLOGUE_BYTES),
         );
         payload.extend_from_slice(&self.synced_lsn().to_le_bytes());
-        Ok(GroupWriter {
+        GroupWriter {
             wal: self,
             state: Some(state),
-            transaction_id: transaction_id.as_u64(),
+            transaction_id,
             start_lsn,
             next_lsn: start_lsn,
             payload,
@@ -295,8 +363,9 @@ impl Wal {
             records: 0,
             touched_file: false,
             failure: None,
+            marker: false,
             frame: Vec::new(),
-        })
+        }
     }
 
     /// Starts a new segment at the end of the log, after syncing the active
@@ -367,10 +436,33 @@ impl Wal {
             return Err(error);
         }
         maybe_crash("wal:after_sync");
-        self.synced_lsn.fetch_max(target, Ordering::AcqRel);
+        let before = self.synced_lsn.fetch_max(target, Ordering::AcqRel);
+        self.sync_count.fetch_add(1, Ordering::AcqRel);
         self.records_since_sync.fetch_sub(pending, Ordering::AcqRel);
         *self.last_sync.lock() = Instant::now();
+        // The groups this sync covered began before it, so none of them
+        // records it: a marker does, unless the sync covered nothing but
+        // the last marker.
+        let only_the_marker = before >= self.marker_start_lsn.load(Ordering::Acquire)
+            && target <= self.marker_end_lsn.load(Ordering::Acquire);
+        if target > before && !only_the_marker {
+            self.marker_due.store(true, Ordering::Release);
+            // A group being written holds the writer: the marker follows
+            // its LAST frame (see `GroupWriter::finish`).
+            if let Some(state) = self.state.try_lock() {
+                self.group_writer(state, TransactionId::SYSTEM.as_u64())
+                    .write_marker_if_due();
+            }
+        }
         Ok(())
+    }
+
+    /// How many fsyncs [`sync_until`](Self::sync_until) (and with it
+    /// [`sync`](Self::sync) and [`GroupWriter::finish`]) made so far: with a
+    /// group commit, fewer than the groups they made durable.
+    #[must_use]
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count.load(Ordering::Acquire)
     }
 
     /// Deletes the sealed segments that end at or below `lsn`, never the
@@ -515,6 +607,7 @@ impl Wal {
         };
         self.active_first_lsn.store(end_lsn, Ordering::Release);
         state.segment = segment;
+        state.frames = 0;
         Ok(end_lsn)
     }
 }
@@ -542,6 +635,10 @@ pub struct GroupWriter<'wal> {
     touched_file: bool,
     /// The failure that ended the group.
     failure: Option<String>,
+    /// The frame being written is a sync marker's: no injected failure is
+    /// spent on it, so a test's failure count means the same with and
+    /// without markers.
+    marker: bool,
     /// Scratch space for a frame's header and payload.
     frame: Vec<u8>,
 }
@@ -585,6 +682,7 @@ impl GroupWriter<'_> {
         let end = self.write_last()?;
         let sync_due = self.wal.sync_due_after(self.records);
         let wal = self.wal;
+        self.write_marker_if_due();
         self.state = None;
         if sync_due {
             wal.sync_until(end.end_lsn)
@@ -606,8 +704,41 @@ impl GroupWriter<'_> {
         self.wal
             .records_since_sync
             .fetch_add(self.records, Ordering::AcqRel);
+        self.write_marker_if_due();
         self.state = None;
         Ok(end)
+    }
+
+    /// Writes a sync marker at the end of the log when one is due: an empty
+    /// group of the system transaction whose prologue records how far the
+    /// log is durable. Called with the writer's lock and no group in
+    /// progress (a new writer, or right after a LAST frame). A marker that
+    /// cannot be written is cut back and left out: it is evidence for a
+    /// later scan, and no commit waits for it.
+    fn write_marker_if_due(&mut self) {
+        if self.failure.is_some()
+            || self.wal.is_poisoned()
+            || !self.wal.marker_due.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let start_lsn = self.next_lsn;
+        self.marker = true;
+        self.transaction_id = TransactionId::SYSTEM.as_u64();
+        self.start_lsn = start_lsn;
+        self.frames_written = 0;
+        self.pending_records = 0;
+        self.payload.clear();
+        self.payload
+            .extend_from_slice(&self.wal.synced_lsn().to_le_bytes());
+        if self.write_last().is_ok() {
+            self.wal
+                .marker_start_lsn
+                .store(start_lsn, Ordering::Release);
+            self.wal
+                .marker_end_lsn
+                .store(self.next_lsn, Ordering::Release);
+        }
     }
 
     /// The log position of the group's FIRST frame.
@@ -666,8 +797,19 @@ impl GroupWriter<'_> {
         self.wal.check_available()?;
         let state = self
             .state
-            .as_ref()
+            .as_mut()
             .expect("a group being written holds the writer's lock");
+        if state.frames >= MAX_FRAMES_PER_SEGMENT_KEY {
+            return Err(WalError::Encryption {
+                reason: format!(
+                    "the WAL segment {} holds {MAX_FRAMES_PER_SEGMENT_KEY} frames, all its key \
+                     may seal: the group is too large for one segment",
+                    state.segment.path.display()
+                ),
+            });
+        }
+        // Counted before the write: a frame that fails used its nonce too.
+        state.frames += 1;
         let segment = &state.segment;
         let sealed;
         let (header, body): (FrameHeader, &[u8]) = match &segment.cipher {
@@ -700,7 +842,9 @@ impl GroupWriter<'_> {
             .checked_add(header.frame_bytes())
             .ok_or(WalError::LsnOverflow)?;
         self.touched_file = true;
-        maybe_fail("wal:write").map_err(|error| WalError::injected(&segment.path, error))?;
+        if !self.marker {
+            maybe_fail("wal:write").map_err(|error| WalError::injected(&segment.path, error))?;
+        }
         let mut file = &*segment.file;
         let written = if body.len() <= FRAME_TARGET {
             // One write for a frame of the usual size.
@@ -1409,16 +1553,20 @@ mod tests {
         assert_eq!(wal.synced_lsn(), 19, "NoSync syncs nothing by itself");
         write_group(&wal, 2, &["Berlin"]);
         wal.sync_until(first.end_lsn).unwrap();
+        let second_end = wal.synced_lsn();
         let third = write_group(&wal, 3, &["Paris"]);
+        assert!(
+            third.start_lsn > second_end,
+            "the sync's marker sits between the second group and the third"
+        );
         let synced: Vec<u64> = raw_frames(dir.path())
             .iter()
             .map(RawFrame::prologue)
             .collect();
-        let second_end = third.start_lsn;
         assert_eq!(
             synced,
-            [19, 19, second_end],
-            "a sync covers every group before it"
+            [19, 19, second_end, second_end],
+            "a sync covers every group before it, and its marker and the next group say so"
         );
         assert_eq!(wal.synced_lsn(), second_end);
     }
@@ -1721,8 +1869,9 @@ mod tests {
             let groups = raw_groups(&raw_frames(dir.path()));
             assert_eq!(
                 groups.len(),
-                2,
-                "the group is in the log: the next open decides"
+                3,
+                "the first group, its sync marker, and the group whose sync failed are in \
+                 the log: the next open decides"
             );
             let error = wal.begin_group(transaction(3)).map(|_| ()).unwrap_err();
             assert!(matches!(error, GroupError::Unavailable { .. }), "{error}");

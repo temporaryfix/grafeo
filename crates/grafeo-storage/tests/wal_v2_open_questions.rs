@@ -1,7 +1,8 @@
-//! A guarantee of the WAL v2 scanner that waits for a design decision: how
-//! the `synced_lsn` evidence in a group's prologue works with a pipelined
-//! group commit (one fsync acknowledging several groups that all began
-//! before it). The test stays ignored until that is decided.
+//! The `synced_lsn` evidence in a group's prologue with a pipelined group
+//! commit, where one fsync acknowledges several groups that all began before
+//! it: the writer appends a sync marker (an empty group whose prologue
+//! records the sync) after such an fsync, so damage in a group that was
+//! synced is damage, never a torn tail.
 
 #![cfg(feature = "wal")]
 
@@ -67,12 +68,10 @@ fn segment_path(dir: &Path, first_lsn: u64) -> PathBuf {
 
 /// With a pipelined commit, two groups are written, then one fsync makes both
 /// durable and both are acknowledged. Neither prologue can show that sync
-/// (both groups began before it), so damage in the first one later is
-/// classified as a torn tail and the cut drops both acknowledged, synced
-/// groups without an error. Open: how the `synced_lsn` evidence works with a
-/// pipelined group commit is the user's decision.
+/// (both groups began before it): the sync marker after it does, so damage
+/// in the first one is refused instead of cut as a torn tail, which would
+/// drop both acknowledged, synced groups without an error.
 #[test]
-#[ignore = "design question: pipelined group commit vs synced_lsn evidence (finding 4), user decision pending"]
 fn damage_in_a_synced_group_followed_only_by_groups_of_the_same_sync_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let wal = Wal::open(dir.path(), options(0, DurabilityMode::Sync)).unwrap();
