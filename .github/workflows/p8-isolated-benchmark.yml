@@ -1,4 +1,4 @@
-name: P8 isolated memory comparison R4
+name: P8 isolated memory comparison R5
 
 on:
   push:
@@ -20,11 +20,11 @@ jobs:
       CARGO_TERM_COLOR: never
       P8_ACTIONS_BLOCKS: '5'
       P8_PARENT_REF: 387507db16d1ab3f32b85b08d5a62e7539c812b7
-      P8_CANDIDATE_REF: 08f7ca00972ec4ac346c2ebad93126cb129c2076
+      P8_CANDIDATE_REF: 11546670b096ca773e9adc9cc40a901d580421ce
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 08f7ca00972ec4ac346c2ebad93126cb129c2076
+          ref: 11546670b096ca773e9adc9cc40a901d580421ce
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -64,7 +64,7 @@ jobs:
           }
           expected_inventories = {
               'parent': 'bab21437567762c598168283fbbe0228f03900e383793f6aaa742c2846b3c037',
-              'candidate': '954fbda7b39d363b85c5de4136e789234e3dd1f5f2e6d537118b6e6fb832e08a',
+              'candidate': '1c310a5bbe959e4753849e7f73f769523c20b0fa75d13fb8d6e021b537ef19a7',
           }
           families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
           controls = (
