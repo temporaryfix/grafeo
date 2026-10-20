@@ -18,12 +18,12 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
-      P8_PARENT_REF: e7ae7a99d096750024286580bf48afe36abcbe63
-      P8_CANDIDATE_REF: 9a1222b954f966fe6736a16e1e4c0385222b8382
+      P8_PARENT_REF: 72482cb7f47ce90c3b5042c02447f6d30a4acd80
+      P8_CANDIDATE_REF: 5734f1dff7cac311859b6c288afa31516ffa1249
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 9a1222b954f966fe6736a16e1e4c0385222b8382
+          ref: 5734f1dff7cac311859b6c288afa31516ffa1249
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -53,6 +53,7 @@ jobs:
           from pathlib import Path
           import shutil
           import subprocess
+          import time
 
           target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
           target.mkdir(parents=True, exist_ok=True)
@@ -61,8 +62,8 @@ jobs:
               'candidate': os.environ['P8_CANDIDATE_REF'],
           }
           expected_inventories = {
-              'parent': '9bac242bc3232bc3fbc2d07e5a057d8017b7748de2af22a545471ea557bc081c',
-              'candidate': '9708f148579bb8b7ba8ec0ae7353d12961f8be1413ac03caea004dcd789fc873',
+              'parent': '33b4d28331e5de51332ac527b24329e380f416f1c2ce2e3293295b6eba960159',
+              'candidate': 'a3fab609823443eba7ab75aaa8f2e21b19775525a0ba159b1614d784021ea834',
           }
           families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
           controls = (
@@ -180,43 +181,54 @@ jobs:
           for label, binary in binaries.items():
               for family in families:
                   verify_binary(label)
+                  if source_seal() != seals['candidate']:
+                      raise RuntimeError('source changed before preflight')
                   log = target / f'p8-{label}-{family}-preflight.log'
                   with log.open('w') as output:
                       result = subprocess.run([str(binary), family, '--test'],
                                               stdout=output, stderr=subprocess.STDOUT,
                                               preexec_fn=pin_benchmark_child)
                   verify_binary(label)
+                  if source_seal() != seals['candidate']:
+                      raise RuntimeError('preflight changed source bytes')
                   print(log.read_text(), flush=True)
                   if result.returncode:
                       raise RuntimeError(f'{label} {family} preflight failed')
 
-          for phase, label, baseline_option in (
-              ('parent-baseline', 'parent', '--save-baseline'),
-              ('candidate', 'candidate', '--baseline'),
-              ('parent-aa', 'parent', '--baseline'),
-          ):
-              verify_binary(label)
-              phase_dir = target / 'p8-results' / phase
-              phase_dir.mkdir(parents=True, exist_ok=True)
-              for family in families:
-                  for control in controls:
+          for family in families:
+              for control in controls:
+                  for phase, label, baseline_option in (
+                      ('parent-baseline', 'parent', '--save-baseline'),
+                      ('candidate', 'candidate', '--baseline'),
+                      ('parent-aa', 'parent', '--baseline'),
+                  ):
+                      verify_binary(label)
+                      if source_seal() != seals['candidate']:
+                          raise RuntimeError(f'source changed before {phase} {family}/{control}')
+                      phase_dir = target / 'p8-results' / phase
+                      phase_dir.mkdir(parents=True, exist_ok=True)
                       case = target / 'criterion' / family / control
                       for folder in ('new', 'change'):
                           shutil.rmtree(case / folder, ignore_errors=True)
-                  command = [
-                      str(binaries[label]), family, '--bench', '--noplot',
-                      '--sample-size', '50', '--warm-up-time', '3',
-                      '--measurement-time', '10', baseline_option, 'p8-parent',
-                  ]
-                  log = target / f'p8-{phase}-{family}.log'
-                  with log.open('w') as output:
-                      result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
-                                              preexec_fn=pin_benchmark_child)
-                  print(log.read_text(), flush=True)
-                  if result.returncode:
-                      raise RuntimeError(f'{phase} {family} measurement failed')
-                  for control in controls:
-                      case = target / 'criterion' / family / control
+                      command = [
+                          str(binaries[label]), f'{family}/{control}', '--exact', '--bench', '--noplot',
+                          '--sample-size', '50', '--warm-up-time', '3',
+                          '--measurement-time', '10', baseline_option, 'p8-parent',
+                      ]
+                      log = target / f'p8-{phase}-{family}-{control}.log'
+                      print(f'P8_TIMING_START {phase} {family}/{control} epoch={time.time():.6f}', flush=True)
+                      started = time.monotonic()
+                      with log.open('w') as output:
+                          result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
+                                                  preexec_fn=pin_benchmark_child)
+                      elapsed = time.monotonic() - started
+                      print(f'P8_TIMING_END {phase} {family}/{control} elapsed_seconds={elapsed:.6f}', flush=True)
+                      verify_binary(label)
+                      if source_seal() != seals['candidate']:
+                          raise RuntimeError(f'{phase} {family}/{control} changed source bytes')
+                      print(log.read_text(), flush=True)
+                      if result.returncode:
+                          raise RuntimeError(f'{phase} {family}/{control} measurement failed')
                       record = {
                           'phase': phase, 'control': f'{family}/{control}',
                           'ref': refs[label],
@@ -241,9 +253,5 @@ jobs:
                       snapshot = phase_dir / f'{family}--{control}.json'
                       snapshot.write_text(json.dumps(record, sort_keys=True) + '\n')
                       print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
-              verify_binary(label)
-              if source_seal() != seals['candidate']:
-                  raise RuntimeError(f'{phase} changed source bytes')
-
           print('P8_MEASUREMENTS_COMPLETE acceptance pending raw-data and A/A analysis', flush=True)
           PY
