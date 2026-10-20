@@ -1,4 +1,4 @@
-name: P8 isolated memory comparison
+name: P8 isolated memory comparison R3
 
 on:
   push:
@@ -18,12 +18,13 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
+      P8_ACTIONS_BLOCKS: '5'
       P8_PARENT_REF: 72482cb7f47ce90c3b5042c02447f6d30a4acd80
-      P8_CANDIDATE_REF: 5734f1dff7cac311859b6c288afa31516ffa1249
+      P8_CANDIDATE_REF: 762b8f122935b323b43c31ae64a17280d233b3dc
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 5734f1dff7cac311859b6c288afa31516ffa1249
+          ref: 762b8f122935b323b43c31ae64a17280d233b3dc
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -63,7 +64,7 @@ jobs:
           }
           expected_inventories = {
               'parent': '33b4d28331e5de51332ac527b24329e380f416f1c2ce2e3293295b6eba960159',
-              'candidate': 'a3fab609823443eba7ab75aaa8f2e21b19775525a0ba159b1614d784021ea834',
+              'candidate': '729d3da890fba1a2ac39d8680f8e5c2eded7c07c1bfade94252b94708333e422',
           }
           families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
           controls = (
@@ -195,8 +196,13 @@ jobs:
                   if result.returncode:
                       raise RuntimeError(f'{label} {family} preflight failed')
 
-          for family in families:
-              for control in controls:
+          blocks = int(os.environ['P8_ACTIONS_BLOCKS'])
+          if blocks != 5:
+              raise RuntimeError('R3 requires exactly five complete blocks')
+          cases = [(family, control) for family in families for control in controls]
+          for block in range(blocks):
+              ordered_cases = cases if block % 2 == 0 else list(reversed(cases))
+              for family, control in ordered_cases:
                   for phase, label, baseline_option in (
                       ('parent-baseline', 'parent', '--save-baseline'),
                       ('candidate', 'candidate', '--baseline'),
@@ -205,7 +211,7 @@ jobs:
                       verify_binary(label)
                       if source_seal() != seals['candidate']:
                           raise RuntimeError(f'source changed before {phase} {family}/{control}')
-                      phase_dir = target / 'p8-results' / phase
+                      phase_dir = target / 'p8-results' / f'block-{block}' / phase
                       phase_dir.mkdir(parents=True, exist_ok=True)
                       case = target / 'criterion' / family / control
                       for folder in ('new', 'change'):
@@ -213,16 +219,16 @@ jobs:
                       command = [
                           str(binaries[label]), f'{family}/{control}', '--exact', '--bench', '--noplot',
                           '--sample-size', '50', '--warm-up-time', '3',
-                          '--measurement-time', '10', baseline_option, 'p8-parent',
+                          '--measurement-time', '10', baseline_option, f'p8-parent-block-{block}',
                       ]
-                      log = target / f'p8-{phase}-{family}-{control}.log'
-                      print(f'P8_TIMING_START {phase} {family}/{control} epoch={time.time():.6f}', flush=True)
+                      log = target / f'p8-block-{block}-{phase}-{family}-{control}.log'
+                      print(f'P8_TIMING_START block={block} {phase} {family}/{control} epoch={time.time():.6f}', flush=True)
                       started = time.monotonic()
                       with log.open('w') as output:
                           result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
                                                   preexec_fn=pin_benchmark_child)
                       elapsed = time.monotonic() - started
-                      print(f'P8_TIMING_END {phase} {family}/{control} elapsed_seconds={elapsed:.6f}', flush=True)
+                      print(f'P8_TIMING_END block={block} {phase} {family}/{control} elapsed_seconds={elapsed:.6f}', flush=True)
                       verify_binary(label)
                       if source_seal() != seals['candidate']:
                           raise RuntimeError(f'{phase} {family}/{control} changed source bytes')
@@ -230,7 +236,7 @@ jobs:
                       if result.returncode:
                           raise RuntimeError(f'{phase} {family}/{control} measurement failed')
                       record = {
-                          'phase': phase, 'control': f'{family}/{control}',
+                          'block': block, 'phase': phase, 'control': f'{family}/{control}',
                           'ref': refs[label],
                           'binary_sha256': binary_hashes[label],
                       }
