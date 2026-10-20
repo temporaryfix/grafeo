@@ -1,0 +1,249 @@
+name: P8 isolated memory comparison
+
+on:
+  push:
+    branches: [ci/p8-memory-comparison]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'temporaryfix/grafeo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TERM_COLOR: never
+      P8_PARENT_REF: e7ae7a99d096750024286580bf48afe36abcbe63
+      P8_CANDIDATE_REF: 9a1222b954f966fe6736a16e1e4c0385222b8382
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 9a1222b954f966fe6736a16e1e4c0385222b8382
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Free unused hosted SDK space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup "$HOME/.ghcup"
+          df -h .
+      - name: Prepare Rust and record runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.0 --profile minimal
+          rustc +1.99.0 --version --verbose
+          uname -a
+          nproc
+          free -h
+          df -h .
+      - name: Build matching binaries and measure parent, candidate, parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
+          target.mkdir(parents=True, exist_ok=True)
+          refs = {
+              'parent': os.environ['P8_PARENT_REF'],
+              'candidate': os.environ['P8_CANDIDATE_REF'],
+          }
+          expected_inventories = {
+              'parent': '9bac242bc3232bc3fbc2d07e5a057d8017b7748de2af22a545471ea557bc081c',
+              'candidate': '9708f148579bb8b7ba8ec0ae7353d12961f8be1413ac03caea004dcd789fc873',
+          }
+          families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
+          controls = (
+              'groups_1024_rows_4096_ordinary_cold',
+              'groups_1024_rows_4096_cached',
+              'groups_1024_rows_4096_configured_resident',
+              'groups_1024_rows_4096_pressure_90_percent',
+          )
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def inventory_digest(files):
+              return digest(json.dumps(files, sort_keys=True, separators=(',', ':')).encode())
+
+          def source_seal():
+              dirty = subprocess.check_output([
+                  'git', 'status', '--porcelain', '--untracked-files=no',
+              ])
+              if dirty.strip():
+                  raise RuntimeError('tracked source is dirty')
+              paths = subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
+              files = {}
+              for raw in sorted(path for path in paths if path):
+                  path = Path(os.fsdecode(raw))
+                  data = os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes()
+                  files[str(path)] = digest(data)
+              return files
+
+          binaries, binary_hashes, builds, seals = {}, {}, {}, {}
+
+          def verify_binary(label):
+              if digest(binaries[label].read_bytes()) != binary_hashes[label]:
+                  raise RuntimeError(f'{label} retained binary changed')
+
+          for label, ref in refs.items():
+              subprocess.run(['git', 'checkout', '--detach', ref], check=True)
+              if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != ref:
+                  raise RuntimeError('checkout does not match the pinned commit')
+              before = source_seal()
+              inventory_hash = inventory_digest(before)
+              if inventory_hash != expected_inventories[label]:
+                  raise RuntimeError(f'{label} source differs from the audited byte inventory')
+              before_path = target / f'p8-{label}-source-before.json'
+              before_path.write_text(json.dumps(before, sort_keys=True, indent=2) + '\n')
+              messages = target / f'p8-{label}-build.jsonl'
+              log = target / f'p8-{label}-build.log'
+              command = [
+                  'cargo', '+1.99.0', 'test', '--release', '--locked',
+                  '-p', 'grafeo-engine', '--all-features', '--bench',
+                  'regression_bench', '--no-run', '--message-format=json',
+              ]
+              with messages.open('w') as stdout, log.open('w') as stderr:
+                  result = subprocess.run(command, stdout=stdout, stderr=stderr)
+              print(f'P8_BUILD_LOG_BEGIN {label}', flush=True)
+              print(log.read_text(errors='replace'), flush=True)
+              print(messages.read_text(errors='replace'), flush=True)
+              print(f'P8_BUILD_LOG_END {label}', flush=True)
+              if result.returncode:
+                  raise RuntimeError(f'{label} build failed: {result.returncode}')
+              executable, configuration = None, {}
+              for line in messages.read_text().splitlines():
+                  event = json.loads(line)
+                  if event.get('reason') != 'compiler-artifact':
+                      continue
+                  name = event['target']['name']
+                  if name not in ('grafeo_common', 'grafeo_core', 'grafeo_engine', 'regression_bench'):
+                      continue
+                  profile = event['profile']
+                  key = f"{name}:{profile['test']}"
+                  actual = {'features': sorted(event['features']), 'profile': profile}
+                  if key in configuration and configuration[key] != actual:
+                      raise RuntimeError(f'inconsistent compiled configuration: {key}')
+                  configuration[key] = actual
+                  if name == 'regression_bench' and event.get('executable'):
+                      executable = Path(event['executable'])
+              for name in ('grafeo_common', 'grafeo_core', 'grafeo_engine', 'regression_bench'):
+                  if not any(key.startswith(name + ':') for key in configuration):
+                      raise RuntimeError(f'missing actual build configuration: {name}')
+              if executable is None:
+                  raise RuntimeError('benchmark executable missing from compiler artifacts')
+              binary = target / f'p8-{label}-cost-bench'
+              shutil.copy2(executable, binary)
+              after = source_seal()
+              (target / f'p8-{label}-source-after.json').write_text(
+                  json.dumps(after, sort_keys=True, indent=2) + '\n'
+              )
+              if before != after:
+                  raise RuntimeError(f'{label} build changed source bytes')
+              binaries[label], builds[label], seals[label] = binary, configuration, before
+              binary_hashes[label] = digest(binary.read_bytes())
+              print('P8_BUILD_JSON ' + json.dumps({
+                  'label': label, 'ref': ref, 'source_files': len(before),
+                  'source_sha256': inventory_hash,
+                  'binary_sha256': binary_hashes[label],
+                  'binary_bytes': binary.stat().st_size, 'configuration': configuration,
+              }), flush=True)
+
+          if builds['parent'] != builds['candidate']:
+              raise RuntimeError('actual parent/candidate features or profiles differ')
+          print('P8_FEATURE_PROFILE_PARITY verified', flush=True)
+
+          if os.sched_getscheduler(0) != os.SCHED_OTHER or os.getpriority(os.PRIO_PROCESS, 0) != 0:
+              raise RuntimeError('benchmark launcher must run with SCHED_OTHER and nice 0')
+          available_cpus = sorted(os.sched_getaffinity(0))
+          cpu = available_cpus[0]
+          print('P8_SCHEDULING_JSON ' + json.dumps({
+              'cpu': cpu, 'available_cpus': available_cpus,
+              'uid': os.getuid(), 'euid': os.geteuid(),
+              'policy': 'SCHED_OTHER', 'nice': 0,
+          }), flush=True)
+
+          def pin_benchmark_child():
+              os.sched_setaffinity(0, {cpu})
+
+          for label, binary in binaries.items():
+              for family in families:
+                  verify_binary(label)
+                  log = target / f'p8-{label}-{family}-preflight.log'
+                  with log.open('w') as output:
+                      result = subprocess.run([str(binary), family, '--test'],
+                                              stdout=output, stderr=subprocess.STDOUT,
+                                              preexec_fn=pin_benchmark_child)
+                  verify_binary(label)
+                  print(log.read_text(), flush=True)
+                  if result.returncode:
+                      raise RuntimeError(f'{label} {family} preflight failed')
+
+          for phase, label, baseline_option in (
+              ('parent-baseline', 'parent', '--save-baseline'),
+              ('candidate', 'candidate', '--baseline'),
+              ('parent-aa', 'parent', '--baseline'),
+          ):
+              verify_binary(label)
+              phase_dir = target / 'p8-results' / phase
+              phase_dir.mkdir(parents=True, exist_ok=True)
+              for family in families:
+                  for control in controls:
+                      case = target / 'criterion' / family / control
+                      for folder in ('new', 'change'):
+                          shutil.rmtree(case / folder, ignore_errors=True)
+                  command = [
+                      str(binaries[label]), family, '--bench', '--noplot',
+                      '--sample-size', '50', '--warm-up-time', '3',
+                      '--measurement-time', '10', baseline_option, 'p8-parent',
+                  ]
+                  log = target / f'p8-{phase}-{family}.log'
+                  with log.open('w') as output:
+                      result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
+                                              preexec_fn=pin_benchmark_child)
+                  print(log.read_text(), flush=True)
+                  if result.returncode:
+                      raise RuntimeError(f'{phase} {family} measurement failed')
+                  for control in controls:
+                      case = target / 'criterion' / family / control
+                      record = {
+                          'phase': phase, 'control': f'{family}/{control}',
+                          'ref': refs[label],
+                          'binary_sha256': binary_hashes[label],
+                      }
+                      record['raw_files'] = {}
+                      for name in ('benchmark.json', 'estimates.json', 'sample.json', 'tukey.json'):
+                          raw = (case / 'new' / name).read_text()
+                          record[name] = json.loads(raw)
+                          record['raw_files'][name] = raw
+                      change_path = case / 'change' / 'estimates.json'
+                      if baseline_option == '--baseline' and not change_path.is_file():
+                          raise RuntimeError(f'missing baseline comparison: {phase} {control}')
+                      if change_path.is_file():
+                          raw = change_path.read_text()
+                          record['change/estimates.json'] = json.loads(raw)
+                          record['raw_files']['change/estimates.json'] = raw
+                      if phase == 'parent-aa':
+                          interval = record['change/estimates.json']['mean']['confidence_interval']
+                          quiet = interval['lower_bound'] >= -0.02 and interval['upper_bound'] <= 0.02
+                          record['aa_noise_2pct'] = 'WITHIN_BOUND' if quiet else 'INCONCLUSIVE'
+                      snapshot = phase_dir / f'{family}--{control}.json'
+                      snapshot.write_text(json.dumps(record, sort_keys=True) + '\n')
+                      print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
+              verify_binary(label)
+              if source_seal() != seals['candidate']:
+                  raise RuntimeError(f'{phase} changed source bytes')
+
+          print('P8_MEASUREMENTS_COMPLETE acceptance pending raw-data and A/A analysis', flush=True)
+          PY
