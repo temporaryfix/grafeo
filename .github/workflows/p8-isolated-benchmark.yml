@@ -1,4 +1,4 @@
-name: P8 isolated memory comparison R3
+name: P8 isolated memory comparison R4
 
 on:
   push:
@@ -19,12 +19,12 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
       P8_ACTIONS_BLOCKS: '5'
-      P8_PARENT_REF: 72482cb7f47ce90c3b5042c02447f6d30a4acd80
-      P8_CANDIDATE_REF: 762b8f122935b323b43c31ae64a17280d233b3dc
+      P8_PARENT_REF: 387507db16d1ab3f32b85b08d5a62e7539c812b7
+      P8_CANDIDATE_REF: 08f7ca00972ec4ac346c2ebad93126cb129c2076
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 762b8f122935b323b43c31ae64a17280d233b3dc
+          ref: 08f7ca00972ec4ac346c2ebad93126cb129c2076
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -63,8 +63,8 @@ jobs:
               'candidate': os.environ['P8_CANDIDATE_REF'],
           }
           expected_inventories = {
-              'parent': '33b4d28331e5de51332ac527b24329e380f416f1c2ce2e3293295b6eba960159',
-              'candidate': '729d3da890fba1a2ac39d8680f8e5c2eded7c07c1bfade94252b94708333e422',
+              'parent': 'bab21437567762c598168283fbbe0228f03900e383793f6aaa742c2846b3c037',
+              'candidate': '954fbda7b39d363b85c5de4136e789234e3dd1f5f2e6d537118b6e6fb832e08a',
           }
           families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
           controls = (
