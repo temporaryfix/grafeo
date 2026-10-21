@@ -1,5 +1,7 @@
-# Fresh-parent calibration only; no candidate production comparison or PR cost verdict.
-name: P8 crossover fresh-parent calibration
+# Fresh all-eight baseline confirmation: 32 balanced strata of eight triplets per case.
+# Method: stratified-v1; cost acceptance pending raw-data and model/source review.
+# No candidate production comparison, historical reclassification or PR cost verdict.
+name: P8 stratified fresh-parent calibration
 
 on:
   push:
@@ -20,28 +22,28 @@ jobs:
       matrix:
         include:
           - case: native_aggregate_resource/groups_1024_rows_4096_cached
-            blocks: 40
+            blocks: 256
           - case: native_aggregate_resource/groups_1024_rows_4096_configured_resident
-            blocks: 32
+            blocks: 256
           - case: native_aggregate_resource/groups_1024_rows_4096_ordinary_cold
-            blocks: 192
+            blocks: 256
           - case: native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent
-            blocks: 96
+            blocks: 256
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_cached
-            blocks: 128
+            blocks: 256
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident
-            blocks: 48
+            blocks: 256
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold
-            blocks: 120
+            blocks: 256
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent
-            blocks: 32
+            blocks: 256
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
-      P8_ACTIONS_PROTOCOL: crossover-v1
+      P8_ACTIONS_PROTOCOL: stratified-v1
       P8_ACTIONS_SCOPE: fresh-parent-calibration
       P8_ACTIONS_CASE: ${{ matrix.case }}
       P8_ACTIONS_BLOCKS: ${{ matrix.blocks }}
@@ -69,7 +71,7 @@ jobs:
           nproc
           free -h
           df -h .
-      - name: Calibrate the exact short-parent case with balanced follow-up order
+      - name: Calibrate the exact short-parent case across 32 balanced strata
         shell: bash
         run: |
           set -euo pipefail
@@ -85,8 +87,9 @@ jobs:
           import time
 
           print(
-              'P8_CALIBRATION_ONLY crossover-v1 fresh-parent-calibration; all roles '
-              'use the identical short parent, not a production comparison or PR cost verdict',
+              'P8_CALIBRATION_ONLY stratified-v1 fresh-parent-calibration; all roles '
+              'use the identical short parent; 32 balanced eight-triplet strata per case. '
+              'Cost acceptance is pending raw-data/model/source review; no PR cost verdict',
               flush=True,
           )
           target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
@@ -107,24 +110,24 @@ jobs:
               raise RuntimeError('replace the audited short-parent ref placeholder before launch')
           if not re.fullmatch(r'[0-9a-f]{64}', expected_inventories['parent']):
               raise RuntimeError('replace the audited short-parent inventory placeholder before launch')
-          BLOCKS_BY_CASE = {'native_aggregate_resource/groups_1024_rows_4096_cached': 40, 'native_aggregate_resource/groups_1024_rows_4096_configured_resident': 32, 'native_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 192, 'native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 96, 'native_owned_aggregate_resource/groups_1024_rows_4096_cached': 128, 'native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident': 48, 'native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 120, 'native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 32}
-          SEED = 'p8-wall-mean-precision-v1-20261021'
+          BLOCKS_BY_CASE = {'native_aggregate_resource/groups_1024_rows_4096_cached': 256, 'native_aggregate_resource/groups_1024_rows_4096_configured_resident': 256, 'native_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 256, 'native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_cached': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 256}
+          SEED = 'p8-stratified-wall-mean-v1-20261021'
           def digest(data):
               return hashlib.sha256(data).hexdigest()
 
           def inventory_digest(files):
               return digest(json.dumps(files, sort_keys=True, separators=(',', ':')).encode())
 
-          def crossover_phase_order(protocol, scope, case_name, block_text):
-              if protocol != 'crossover-v1' or scope != 'fresh-parent-calibration':
-                  raise RuntimeError('this workflow supports fresh-parent-calibration crossover-v1 only')
+          def stratified_phase_order(protocol, scope, case_name, block_text):
+              if protocol != 'stratified-v1' or scope != 'fresh-parent-calibration':
+                  raise RuntimeError('this workflow supports fresh-parent-calibration stratified-v1 only')
               if case_name not in BLOCKS_BY_CASE:
-                  raise RuntimeError('unknown exact crossover case')
+                  raise RuntimeError('unknown exact stratified case')
               if block_text != str(BLOCKS_BY_CASE[case_name]):
                   raise RuntimeError('matrix block count differs from the frozen planning map')
               blocks = int(block_text)
-              if blocks < 32 or blocks > 256 or blocks % 8:
-                  raise RuntimeError('crossover blocks must be 32..256 and divisible by eight')
+              if blocks != 256:
+                  raise RuntimeError('stratified confirmation requires 32 strata of eight triplets')
               order = []
               for stratum in range(blocks // 8):
                   ranked = sorted(
@@ -142,13 +145,13 @@ jobs:
                       followups = ('candidate', 'parent-aa') if slot in candidate_first else ('parent-aa', 'candidate')
                       order.extend([block, phase, case_name] for phase in ('parent-baseline',) + followups)
               if len(order) != 3 * blocks:
-                  raise RuntimeError('incomplete crossover phase order')
+                  raise RuntimeError('incomplete stratified phase order')
               return order
 
           protocol = os.environ['P8_ACTIONS_PROTOCOL']
           scope = os.environ['P8_ACTIONS_SCOPE']
           case_name = os.environ['P8_ACTIONS_CASE']
-          phase_order = crossover_phase_order(protocol, scope, case_name, os.environ['P8_ACTIONS_BLOCKS'])
+          phase_order = stratified_phase_order(protocol, scope, case_name, os.environ['P8_ACTIONS_BLOCKS'])
           blocks = BLOCKS_BY_CASE[case_name]
           family, control = case_name.split('/', 1)
           phase_order_sha256 = digest(json.dumps(phase_order, separators=(',', ':')).encode('utf-8'))
@@ -202,6 +205,8 @@ jobs:
                   raise RuntimeError('checkout does not match the pinned commit')
               before = source_seal()
               inventory_hash = inventory_digest(before)
+              if len(before) != 1755:
+                  raise RuntimeError(f'{label} short-parent source count must be 1755')
               if inventory_hash != expected_inventories[label]:
                   raise RuntimeError(f'{label} source differs from the audited byte inventory')
               before_path = target / f'p8-{label}-source-before.json'
@@ -341,6 +346,11 @@ jobs:
                   raw = (criterion_case / 'new' / name).read_bytes().decode('utf-8')
                   record[name] = json.loads(raw)
                   record['raw_files'][name] = raw
+                  if name == 'benchmark.json' and (
+                      not isinstance(record[name], dict)
+                      or record[name].get('full_id') != case_name
+                  ):
+                      raise RuntimeError('raw benchmark full_id differs from the exact planned case')
                   if name == 'sample.json':
                       validate_flat_sample(record[name])
               change_path = criterion_case / 'change' / 'estimates.json'
@@ -360,7 +370,7 @@ jobs:
               print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
               completed_order.append([block, phase, case_name])
           if completed_order != phase_order or len(completed_order) != 3 * blocks:
-              raise RuntimeError('crossover requires every planned phase without exclusions')
+              raise RuntimeError('stratified confirmation requires every planned phase without exclusions')
           print(
               f'P8_CALIBRATION_ONLY_COMPLETE protocol={protocol} scope={scope} '
               f'case={case_name} records={len(completed_order)}; no PR cost verdict',
