@@ -383,11 +383,12 @@ fn bench_native_owned_aggregate_resource(c: &mut Criterion) {
 fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
     #[cfg(all(feature = "lpg", feature = "gql", feature = "spill"))]
     {
-        use criterion::{BatchSize, SamplingMode};
+        use criterion::{SamplingMode, Throughput};
         use grafeo_common::memory::buffer::MemoryRegion;
         use grafeo_common::types::Value;
         use grafeo_common::utils::error::Error;
         use grafeo_engine::Config;
+        use std::time::Instant;
 
         const GROUPS: usize = 1024;
         const BUDGET: usize = 32 << 20;
@@ -543,6 +544,20 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
                 ));
             }
 
+            // Fixed work keeps all roles on the same query count. The saved
+            // Flat samples must each use exactly one outer iteration; warmup
+            // may request more and must still execute all requested work.
+            let queries_per_iteration = match name {
+                "groups_1024_rows_4096_ordinary_cold" => 32,
+                "groups_1024_rows_4096_cached" => 64,
+                "groups_1024_rows_4096_configured_resident"
+                | "groups_1024_rows_4096_pressure_90_percent" => 16,
+                _ => unreachable!("fixed benchmark control"),
+            };
+            group.throughput(Throughput::Elements(queries_per_iteration));
+            if exact_selector.is_some() {
+                println!("P8_FIXED_QUERIES_PER_ITERATION={queries_per_iteration}");
+            }
             let mut next_fixture = 0;
             group.bench_function(name, |b| {
                 // Warmup uses this callback too. Any 50 consecutive callbacks
@@ -550,20 +565,27 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
                 let (database, session, ..) = &fixtures[next_fixture];
                 next_fixture = (next_fixture + 1) % FIXTURES;
                 if cold {
-                    // PerIteration prevents Criterion from batching cache clears
-                    // ahead of several queries and accidentally timing warm calls.
-                    b.iter_batched(
-                        || database.query_cache().clear(),
-                        |()| {
-                            let result = session.execute(black_box(QUERY)).unwrap();
-                            consume(result);
-                        },
-                        BatchSize::PerIteration,
-                    );
+                    // Clear before every query and time only execute/consume,
+                    // as in the original PerIteration cold control.
+                    b.iter_custom(|iterations| {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iterations {
+                            for _ in 0..queries_per_iteration {
+                                database.query_cache().clear();
+                                let started = Instant::now();
+                                let result = session.execute(black_box(QUERY)).unwrap();
+                                consume(result);
+                                elapsed += started.elapsed();
+                            }
+                        }
+                        elapsed
+                    });
                 } else {
                     b.iter(|| {
-                        let result = session.execute(black_box(QUERY)).unwrap();
-                        consume(result);
+                        for _ in 0..queries_per_iteration {
+                            let result = session.execute(black_box(QUERY)).unwrap();
+                            consume(result);
+                        }
                     });
                 }
             });
