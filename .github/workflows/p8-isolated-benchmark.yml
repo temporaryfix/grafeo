@@ -1,8 +1,5 @@
-# DIAGNOSTIC_ONLY: identical baseline CPU/service observations, not acceptance.
-# One existing ordinary-cold control, five blocks and three phases: 15 records.
-# Whole-command CPU includes fixture setup, warmup, measurement and analysis.
-# No candidate production comparison, calibration PASS or PR cost verdict.
-name: P8 identical-baseline focused CPU diagnostic
+# Fresh-parent calibration only; no candidate production comparison or PR cost verdict.
+name: P8 crossover fresh-parent calibration
 
 on:
   push:
@@ -14,21 +11,46 @@ permissions:
 jobs:
   compare:
     if: github.repository == 'temporaryfix/grafeo'
+    name: Calibration ${{ matrix.case }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - case: native_aggregate_resource/groups_1024_rows_4096_cached
+            blocks: 40
+          - case: native_aggregate_resource/groups_1024_rows_4096_configured_resident
+            blocks: 32
+          - case: native_aggregate_resource/groups_1024_rows_4096_ordinary_cold
+            blocks: 192
+          - case: native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent
+            blocks: 96
+          - case: native_owned_aggregate_resource/groups_1024_rows_4096_cached
+            blocks: 128
+          - case: native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident
+            blocks: 48
+          - case: native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold
+            blocks: 120
+          - case: native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent
+            blocks: 32
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
-      P8_ACTIONS_BLOCKS: '5'
-      P8_PARENT_REF: 1c8d67e5d224a30d5b5fb7468718a68400a18dd3
-      P8_CANDIDATE_REF: 1c8d67e5d224a30d5b5fb7468718a68400a18dd3
+      P8_ACTIONS_PROTOCOL: crossover-v1
+      P8_ACTIONS_SCOPE: fresh-parent-calibration
+      P8_ACTIONS_CASE: ${{ matrix.case }}
+      P8_ACTIONS_BLOCKS: ${{ matrix.blocks }}
+      P8_PARENT_REF: b0115ff1f5ff5df25442309a257540ac54975591
+      P8_CANDIDATE_REF: b0115ff1f5ff5df25442309a257540ac54975591
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 1c8d67e5d224a30d5b5fb7468718a68400a18dd3
+          ref: b0115ff1f5ff5df25442309a257540ac54975591
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -47,7 +69,7 @@ jobs:
           nproc
           free -h
           df -h .
-      - name: Observe identical baseline ordinary-cold CPU service
+      - name: Calibrate the exact short-parent case with balanced follow-up order
         shell: bash
         run: |
           set -euo pipefail
@@ -56,15 +78,15 @@ jobs:
           import json
           import math
           import os
-          import resource
+          import re
           from pathlib import Path
           import shutil
           import subprocess
           import time
 
           print(
-              'P8_DIAGNOSTIC_ONLY identical baseline ordinary-cold A/A/A; '
-              'whole-command CPU observations, no calibration or PR cost acceptance',
+              'P8_CALIBRATION_ONLY crossover-v1 fresh-parent-calibration; all roles '
+              'use the identical short parent, not a production comparison or PR cost verdict',
               flush=True,
           )
           target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
@@ -74,20 +96,62 @@ jobs:
               'candidate': os.environ['P8_CANDIDATE_REF'],
           }
           expected_inventories = {
-              'parent': '671cc58518c0fe8a8426d823e6138158788066023f375d39a0f76b06980b65a5',
-              'candidate': '671cc58518c0fe8a8426d823e6138158788066023f375d39a0f76b06980b65a5',
+              'parent': '5401cceea568f95aeb77a99656a3bb303b731d4a92962d4469241e513a1403d2',
+              'candidate': '5401cceea568f95aeb77a99656a3bb303b731d4a92962d4469241e513a1403d2',
           }
           if refs['parent'] != refs['candidate']:
               raise RuntimeError('calibration requires identical pinned baseline refs')
           if expected_inventories['parent'] != expected_inventories['candidate']:
               raise RuntimeError('calibration requires identical audited inventory pins')
-          families = ('native_aggregate_resource',)
-          controls = ('groups_1024_rows_4096_ordinary_cold',)
+          if not re.fullmatch(r'[0-9a-f]{40}', refs['parent']):
+              raise RuntimeError('replace the audited short-parent ref placeholder before launch')
+          if not re.fullmatch(r'[0-9a-f]{64}', expected_inventories['parent']):
+              raise RuntimeError('replace the audited short-parent inventory placeholder before launch')
+          BLOCKS_BY_CASE = {'native_aggregate_resource/groups_1024_rows_4096_cached': 40, 'native_aggregate_resource/groups_1024_rows_4096_configured_resident': 32, 'native_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 192, 'native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 96, 'native_owned_aggregate_resource/groups_1024_rows_4096_cached': 128, 'native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident': 48, 'native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 120, 'native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 32}
+          SEED = 'p8-wall-mean-precision-v1-20261021'
           def digest(data):
               return hashlib.sha256(data).hexdigest()
 
           def inventory_digest(files):
               return digest(json.dumps(files, sort_keys=True, separators=(',', ':')).encode())
+
+          def crossover_phase_order(protocol, scope, case_name, block_text):
+              if protocol != 'crossover-v1' or scope != 'fresh-parent-calibration':
+                  raise RuntimeError('this workflow supports fresh-parent-calibration crossover-v1 only')
+              if case_name not in BLOCKS_BY_CASE:
+                  raise RuntimeError('unknown exact crossover case')
+              if block_text != str(BLOCKS_BY_CASE[case_name]):
+                  raise RuntimeError('matrix block count differs from the frozen planning map')
+              blocks = int(block_text)
+              if blocks < 32 or blocks > 256 or blocks % 8:
+                  raise RuntimeError('crossover blocks must be 32..256 and divisible by eight')
+              order = []
+              for stratum in range(blocks // 8):
+                  ranked = sorted(
+                      range(8),
+                      key=lambda slot: (
+                          hashlib.sha256(
+                              f'{SEED}|{scope}|{case_name}|{stratum}|{slot}'.encode('utf-8')
+                          ).digest(),
+                          slot,
+                      ),
+                  )
+                  candidate_first = set(ranked[:4])
+                  for slot in range(8):
+                      block = 8 * stratum + slot
+                      followups = ('candidate', 'parent-aa') if slot in candidate_first else ('parent-aa', 'candidate')
+                      order.extend([block, phase, case_name] for phase in ('parent-baseline',) + followups)
+              if len(order) != 3 * blocks:
+                  raise RuntimeError('incomplete crossover phase order')
+              return order
+
+          protocol = os.environ['P8_ACTIONS_PROTOCOL']
+          scope = os.environ['P8_ACTIONS_SCOPE']
+          case_name = os.environ['P8_ACTIONS_CASE']
+          phase_order = crossover_phase_order(protocol, scope, case_name, os.environ['P8_ACTIONS_BLOCKS'])
+          blocks = BLOCKS_BY_CASE[case_name]
+          family, control = case_name.split('/', 1)
+          phase_order_sha256 = digest(json.dumps(phase_order, separators=(',', ':')).encode('utf-8'))
 
           def validate_flat_sample(sample):
               if not isinstance(sample, dict) or sample.get('sampling_mode') != 'Flat':
@@ -111,68 +175,6 @@ jobs:
                   for value in times
               ):
                   raise RuntimeError('calibration sample times must be finite and positive')
-
-          # These child-usage fields accumulate across waited-for children.
-          # Peak RSS and other nonadditive fields are deliberately not differenced.
-          CHILD_ADDITIVE_FIELDS = (
-              ('user_cpu_seconds', 'ru_utime'),
-              ('system_cpu_seconds', 'ru_stime'),
-              ('voluntary_context_switches', 'ru_nvcsw'),
-              ('involuntary_context_switches', 'ru_nivcsw'),
-              ('minor_page_faults', 'ru_minflt'),
-              ('major_page_faults', 'ru_majflt'),
-              ('block_input_operations', 'ru_inblock'),
-              ('block_output_operations', 'ru_oublock'),
-          )
-
-          def child_usage_delta(before, after, elapsed):
-              usage = {
-                  name: getattr(after, attribute) - getattr(before, attribute)
-                  for name, attribute in CHILD_ADDITIVE_FIELDS
-              }
-              usage['cpu_seconds'] = usage['user_cpu_seconds'] + usage['system_cpu_seconds']
-              usage['elapsed_wall_seconds'] = elapsed
-              usage['cpu_over_wall'] = usage['cpu_seconds'] / elapsed if elapsed > 0 else None
-              return usage
-
-          def optional_read(path, line_prefix=None):
-              # Observability gaps are data, not reasons to fail this diagnostic.
-              try:
-                  value = path.read_text()
-                  if line_prefix is not None:
-                      value = next(
-                          line for line in value.splitlines() if line.startswith(line_prefix)
-                      )
-                  return {'path': str(path), 'value': value.strip()}
-              except (OSError, UnicodeError, StopIteration) as error:
-                  return {'path': str(path), 'error': f'{type(error).__name__}: {error}'}
-
-          def host_metrics(cpu):
-              cgroup_self = optional_read(Path('/proc/self/cgroup'))
-              cgroup_directory = Path('/sys/fs/cgroup')
-              for line in cgroup_self.get('value', '').splitlines():
-                  if line.startswith('0::'):
-                      relative = Path(line.split(':', 2)[2].lstrip('/'))
-                      if '..' not in relative.parts:
-                          cgroup_directory = cgroup_directory / relative
-                      break
-              frequency_directory = Path(f'/sys/devices/system/cpu/cpu{cpu}/cpufreq')
-              return {
-                  'captured_monotonic_seconds': time.monotonic(),
-                  'proc_stat_cpu': optional_read(Path('/proc/stat'), f'cpu{cpu} '),
-                  'loadavg': optional_read(Path('/proc/loadavg')),
-                  'cgroup_self': cgroup_self,
-                  'cgroup_cpu_stat': optional_read(cgroup_directory / 'cpu.stat'),
-                  'cgroup_cpu_max': optional_read(cgroup_directory / 'cpu.max'),
-                  'cpufreq': {
-                      name: optional_read(frequency_directory / name)
-                      for name in (
-                          'scaling_cur_freq', 'cpuinfo_cur_freq',
-                          'scaling_min_freq', 'scaling_max_freq',
-                          'cpuinfo_min_freq', 'cpuinfo_max_freq', 'scaling_governor',
-                      )
-                  },
-              }
 
           def source_seal():
               dirty = subprocess.check_output([
@@ -264,7 +266,7 @@ jobs:
               raise RuntimeError('calibration baseline source inventories differ')
           if binary_hashes['parent'] != binary_hashes['candidate']:
               raise RuntimeError('calibration requires byte-identical baseline binaries')
-          print('P8_DIAGNOSTIC_IDENTITY refs/source/features/profiles/binary verified', flush=True)
+          print('P8_CALIBRATION_IDENTITY refs/source/features/profiles/binary verified', flush=True)
 
           if os.sched_getscheduler(0) != os.SCHED_OTHER or os.getpriority(os.PRIO_PROCESS, 0) != 0:
               raise RuntimeError('benchmark launcher must run with SCHED_OTHER and nice 0')
@@ -274,113 +276,95 @@ jobs:
               'cpu': cpu, 'available_cpus': available_cpus,
               'uid': os.getuid(), 'euid': os.geteuid(),
               'policy': 'SCHED_OTHER', 'nice': 0,
+              'protocol': protocol, 'scope': scope, 'case': case_name,
+              'blocks': blocks, 'seed': SEED, 'phase_order_sha256': phase_order_sha256,
           }), flush=True)
 
           def pin_benchmark_child():
               os.sched_setaffinity(0, {cpu})
 
           for label, binary in binaries.items():
-              for family in families:
-                  verify_binary(label)
-                  if source_seal() != seals['candidate']:
-                      raise RuntimeError('source changed before preflight')
-                  log = target / f'p8-{label}-{family}-preflight.log'
-                  with log.open('w') as output:
-                      result = subprocess.run([str(binary), f'{family}/{controls[0]}', '--exact', '--test'],
-                                              stdout=output, stderr=subprocess.STDOUT,
-                                              preexec_fn=pin_benchmark_child)
-                  verify_binary(label)
-                  if source_seal() != seals['candidate']:
-                      raise RuntimeError('preflight changed source bytes')
-                  print(log.read_text(), flush=True)
-                  if result.returncode:
-                      raise RuntimeError(f'{label} {family} preflight failed')
+              verify_binary(label)
+              if source_seal() != seals['candidate']:
+                  raise RuntimeError('source changed before preflight')
+              log = target / f'p8-{label}-{family}-{control}-preflight.log'
+              with log.open('w') as output:
+                  result = subprocess.run([str(binary), case_name, '--exact', '--test'],
+                                          stdout=output, stderr=subprocess.STDOUT,
+                                          preexec_fn=pin_benchmark_child)
+              verify_binary(label)
+              if source_seal() != seals['candidate']:
+                  raise RuntimeError('preflight changed source bytes')
+              print(log.read_text(), flush=True)
+              if result.returncode:
+                  raise RuntimeError(f'{label} {case_name} preflight failed')
 
-          blocks = int(os.environ['P8_ACTIONS_BLOCKS'])
-          if blocks != 5:
-              raise RuntimeError('diagnostic requires exactly five complete blocks')
-          cases = [(family, control) for family in families for control in controls]
-          records = 0
-          for block in range(blocks):
-              ordered_cases = cases if block % 2 == 0 else list(reversed(cases))
-              for family, control in ordered_cases:
-                  for phase, label, baseline_option in (
-                      ('parent-baseline', 'parent', '--save-baseline'),
-                      ('candidate', 'candidate', '--baseline'),
-                      ('parent-aa', 'parent', '--baseline'),
-                  ):
-                      verify_binary(label)
-                      if source_seal() != seals['candidate']:
-                          raise RuntimeError(f'source changed before {phase} {family}/{control}')
-                      phase_dir = target / 'p8-results' / f'block-{block}' / phase
-                      phase_dir.mkdir(parents=True, exist_ok=True)
-                      case = target / 'criterion' / family / control
-                      for folder in ('new', 'change'):
-                          shutil.rmtree(case / folder, ignore_errors=True)
-                      command = [
-                          str(binaries[label]), f'{family}/{control}', '--exact', '--bench', '--noplot',
-                          '--sample-size', '50', '--warm-up-time', '3',
-                          '--measurement-time', '10', baseline_option, f'p8-parent-block-{block}',
-                      ]
-                      log = target / f'p8-block-{block}-{phase}-{family}-{control}.log'
-                      print(f'P8_TIMING_START block={block} {phase} {family}/{control} epoch={time.time():.6f}', flush=True)
-                      host_before = host_metrics(cpu)
-                      with log.open('w') as output:
-                          # No source, git, hashing or host-reading subprocess
-                          # may enter this child-usage bracket.
-                          child_before = resource.getrusage(resource.RUSAGE_CHILDREN)
-                          started = time.monotonic()
-                          result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
-                                                  preexec_fn=pin_benchmark_child)
-                          elapsed = time.monotonic() - started
-                          child_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-                      host_after = host_metrics(cpu)
-                      usage = child_usage_delta(child_before, child_after, elapsed)
-                      print(f'P8_TIMING_END block={block} {phase} {family}/{control} elapsed_seconds={elapsed:.6f}', flush=True)
-                      verify_binary(label)
-                      if source_seal() != seals['candidate']:
-                          raise RuntimeError(f'{phase} {family}/{control} changed source bytes')
-                      print(log.read_text(), flush=True)
-                      if result.returncode:
-                          raise RuntimeError(f'{phase} {family}/{control} measurement failed')
-                      record = {
-                          'block': block, 'phase': phase, 'control': f'{family}/{control}',
-                          'ref': refs[label],
-                          'binary_sha256': binary_hashes[label],
-                          'diagnostic': {
-                              'diagnostic_only': True,
-                              'scope': (
-                                  'whole benchmark subprocess, including fixture setup, warmup, '
-                                  'measurement and analysis; not per-query CPU'
-                              ),
-                              'child_usage': usage,
-                              'host_before': host_before,
-                              'host_after': host_after,
-                          },
-                      }
-                      record['raw_files'] = {}
-                      for name in ('benchmark.json', 'estimates.json', 'sample.json', 'tukey.json'):
-                          raw = (case / 'new' / name).read_text()
-                          record[name] = json.loads(raw)
-                          record['raw_files'][name] = raw
-                          if name == 'sample.json':
-                              validate_flat_sample(record[name])
-                      change_path = case / 'change' / 'estimates.json'
-                      if baseline_option == '--baseline' and not change_path.is_file():
-                          raise RuntimeError(f'missing baseline comparison: {phase} {control}')
-                      if change_path.is_file():
-                          raw = change_path.read_text()
-                          record['change/estimates.json'] = json.loads(raw)
-                          record['raw_files']['change/estimates.json'] = raw
-                      if phase == 'parent-aa':
-                          interval = record['change/estimates.json']['mean']['confidence_interval']
-                          quiet = interval['lower_bound'] >= -0.02 and interval['upper_bound'] <= 0.02
-                          record['aa_noise_2pct'] = 'WITHIN_BOUND' if quiet else 'INCONCLUSIVE'
-                      snapshot = phase_dir / f'{family}--{control}.json'
-                      snapshot.write_text(json.dumps(record, sort_keys=True) + '\n')
-                      print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
-                      records += 1
-          if records != 15:
-              raise RuntimeError(f'diagnostic requires exactly 15 complete records, found {records}')
-          print('P8_DIAGNOSTIC_COMPLETE DIAGNOSTIC_ONLY no calibration or PR cost acceptance', flush=True)
+          completed_order = []
+          for block, phase, planned_case in phase_order:
+              if planned_case != case_name:
+                  raise RuntimeError('phase order contains a different case')
+              label = 'candidate' if phase == 'candidate' else 'parent'
+              baseline_option = '--save-baseline' if phase == 'parent-baseline' else '--baseline'
+              verify_binary(label)
+              if source_seal() != seals['candidate']:
+                  raise RuntimeError(f'source changed before {phase} {case_name}')
+              phase_dir = target / 'p8-results' / f'block-{block}' / phase
+              phase_dir.mkdir(parents=True, exist_ok=True)
+              criterion_case = target / 'criterion' / family / control
+              for folder in ('new', 'change'):
+                  shutil.rmtree(criterion_case / folder, ignore_errors=True)
+              command = [
+                  str(binaries[label]), case_name, '--exact', '--bench', '--noplot',
+                  '--sample-size', '50', '--warm-up-time', '1',
+                  '--measurement-time', '1', baseline_option, f'p8-parent-block-{block}',
+              ]
+              log = target / f'p8-block-{block}-{phase}-{family}-{control}.log'
+              print(f'P8_TIMING_START block={block} {phase} {case_name} epoch={time.time():.6f}', flush=True)
+              started = time.monotonic()
+              with log.open('w') as output:
+                  result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
+                                          preexec_fn=pin_benchmark_child)
+              elapsed = time.monotonic() - started
+              print(f'P8_TIMING_END block={block} {phase} {case_name} elapsed_seconds={elapsed:.6f}', flush=True)
+              verify_binary(label)
+              if source_seal() != seals['candidate']:
+                  raise RuntimeError(f'{phase} {case_name} changed source bytes')
+              print(log.read_text(), flush=True)
+              if result.returncode:
+                  raise RuntimeError(f'{phase} {case_name} measurement failed')
+              record = {
+                  'block': block, 'phase': phase, 'control': case_name,
+                  'ref': refs[label], 'binary_sha256': binary_hashes[label],
+              }
+              record['raw_files'] = {}
+              for name in ('benchmark.json', 'estimates.json', 'sample.json', 'tukey.json'):
+                  raw = (criterion_case / 'new' / name).read_bytes().decode('utf-8')
+                  record[name] = json.loads(raw)
+                  record['raw_files'][name] = raw
+                  if name == 'sample.json':
+                      validate_flat_sample(record[name])
+              change_path = criterion_case / 'change' / 'estimates.json'
+              if baseline_option == '--baseline' and not change_path.is_file():
+                  raise RuntimeError(f'missing baseline comparison: {phase} {control}')
+              if change_path.is_file():
+                  raw = change_path.read_bytes().decode('utf-8')
+                  record['change/estimates.json'] = json.loads(raw)
+                  record['raw_files']['change/estimates.json'] = raw
+              if phase == 'parent-aa':
+                  # Diagnostic only; no per-record veto, exclusion, retry or acceptance.
+                  interval = record['change/estimates.json']['mean']['confidence_interval']
+                  quiet = interval['lower_bound'] >= -0.02 and interval['upper_bound'] <= 0.02
+                  record['aa_noise_2pct'] = 'WITHIN_BOUND' if quiet else 'INCONCLUSIVE'
+              snapshot = phase_dir / f'{family}--{control}.json'
+              snapshot.write_text(json.dumps(record, sort_keys=True) + '\n')
+              print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
+              completed_order.append([block, phase, case_name])
+          if completed_order != phase_order or len(completed_order) != 3 * blocks:
+              raise RuntimeError('crossover requires every planned phase without exclusions')
+          print(
+              f'P8_CALIBRATION_ONLY_COMPLETE protocol={protocol} scope={scope} '
+              f'case={case_name} records={len(completed_order)}; no PR cost verdict',
+              flush=True,
+          )
+          print('P8_MEASUREMENTS_COMPLETE acceptance pending raw-data and A/A analysis', flush=True)
           PY
