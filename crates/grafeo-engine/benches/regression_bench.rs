@@ -383,7 +383,7 @@ fn bench_native_owned_aggregate_resource(c: &mut Criterion) {
 fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
     #[cfg(all(feature = "lpg", feature = "gql", feature = "spill"))]
     {
-        use criterion::BatchSize;
+        use criterion::{BatchSize, SamplingMode};
         use grafeo_common::memory::buffer::MemoryRegion;
         use grafeo_common::types::Value;
         use grafeo_common::utils::error::Error;
@@ -391,6 +391,7 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
 
         const GROUPS: usize = 1024;
         const BUDGET: usize = 32 << 20;
+        const FIXTURES: usize = 2;
         const QUERY: &str = "MATCH (n:AggregateCost) RETURN n.bucket AS bucket, sum(n.value) AS total, count(*) AS count";
         let validate = |result: &grafeo_engine::database::QueryResult| {
             assert_eq!(result.row_count(), GROUPS);
@@ -421,12 +422,36 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
                 drop(result);
             }
         };
-        let mut group = c.benchmark_group(if owned {
+        // Only a recognized positional selector with --exact can skip setup.
+        // General filters, listing and test mode keep Criterion's selection.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let exact_selector = args
+            .first()
+            .filter(|_| args.iter().any(|arg| arg == "--exact"))
+            .and_then(|selector| selector.split_once('/'))
+            .filter(|(family, control)| {
+                matches!(
+                    *family,
+                    "native_aggregate_resource" | "native_owned_aggregate_resource"
+                ) && matches!(
+                    *control,
+                    "groups_1024_rows_4096_ordinary_cold"
+                        | "groups_1024_rows_4096_cached"
+                        | "groups_1024_rows_4096_configured_resident"
+                        | "groups_1024_rows_4096_pressure_90_percent"
+                )
+            });
+        let family = if owned {
             "native_owned_aggregate_resource"
         } else {
             "native_aggregate_resource"
-        });
+        };
+        if exact_selector.is_some_and(|(selected, _)| selected != family) {
+            return;
+        }
+        let mut group = c.benchmark_group(family);
         group.sample_size(50);
+        group.sampling_mode(SamplingMode::Flat);
         group.measurement_time(Duration::from_secs(10));
         group.warm_up_time(Duration::from_secs(3));
         for (name, configured, pressure, cold) in [
@@ -445,71 +470,85 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
                 false,
             ),
         ] {
-            let directory = tempfile::tempdir().unwrap();
-            let spill_path = directory.path().join("spill");
-            let mut config = Config::in_memory()
-                .with_memory_limit(BUDGET)
-                .without_query_timeout();
-            if configured {
-                config = config.with_spill_path(&spill_path);
+            if exact_selector.is_some_and(|(_, selected)| selected != name) {
+                continue;
             }
-            let database = GrafeoDB::with_config(config).unwrap();
-            for value in 1..=4_i64 {
-                for bucket in 0..GROUPS {
-                    database
-                        .create_node_with_props(
-                            &["AggregateCost"],
-                            [
-                                ("bucket", Value::Int64(i64::try_from(bucket).unwrap())),
-                                ("value", Value::Int64(value)),
-                            ],
-                        )
-                        .expect("insert grouped benchmark fixture");
+            let mut fixtures = Vec::with_capacity(FIXTURES);
+            for _ in 0..FIXTURES {
+                let directory = tempfile::tempdir().unwrap();
+                let spill_path = directory.path().join("spill");
+                let mut config = Config::in_memory()
+                    .with_memory_limit(BUDGET)
+                    .without_query_timeout();
+                if configured {
+                    config = config.with_spill_path(&spill_path);
                 }
-            }
-            let manager = database.buffer_manager();
-            let baseline = manager.allocated();
-            let held = pressure.then(|| {
-                manager
-                    .try_allocate(
-                        (BUDGET * 9 / 10).checked_sub(baseline).unwrap(),
-                        MemoryRegion::ExecutionBuffers,
-                    )
-                    .unwrap()
-            });
-            let held_total = manager.allocated();
-            if pressure {
-                assert_eq!(held_total, BUDGET * 9 / 10);
-            }
-            let session = database.session();
-            if pressure {
-                // Spill directories are lazy. This error proves that this exact
-                // grouped workload reaches a filesystem spill, without a watcher.
-                std::fs::write(&spill_path, b"blocked spill directory").unwrap();
-                let error = session.execute(QUERY).unwrap_err();
-                assert!(matches!(error, Error::Io(_)), "{error}");
+                let database = GrafeoDB::with_config(config).unwrap();
+                for value in 1..=4_i64 {
+                    for bucket in 0..GROUPS {
+                        database
+                            .create_node_with_props(
+                                &["AggregateCost"],
+                                [
+                                    ("bucket", Value::Int64(i64::try_from(bucket).unwrap())),
+                                    ("value", Value::Int64(value)),
+                                ],
+                            )
+                            .expect("insert grouped benchmark fixture");
+                    }
+                }
+                let manager = database.buffer_manager();
+                let baseline = manager.allocated();
+                let held = pressure.then(|| {
+                    manager
+                        .try_allocate(
+                            (BUDGET * 9 / 10).checked_sub(baseline).unwrap(),
+                            MemoryRegion::ExecutionBuffers,
+                        )
+                        .unwrap()
+                });
+                let held_total = manager.allocated();
+                if pressure {
+                    assert_eq!(held_total, BUDGET * 9 / 10);
+                }
+                let session = database.session();
+                if pressure {
+                    // Spill directories are lazy. This error proves that this exact
+                    // grouped workload reaches a filesystem spill, without a watcher.
+                    std::fs::write(&spill_path, b"blocked spill directory").unwrap();
+                    let error = session.execute(QUERY).unwrap_err();
+                    assert!(matches!(error, Error::Io(_)), "{error}");
+                    assert_eq!(manager.allocated(), held_total);
+                    std::fs::remove_file(&spill_path).unwrap();
+                }
+                database.query_cache().clear();
+                let before = database.query_cache().stats();
+                let result = session.execute(QUERY).unwrap();
+                validate(&result);
+                drop(result);
                 assert_eq!(manager.allocated(), held_total);
-                std::fs::remove_file(&spill_path).unwrap();
-            }
-            database.query_cache().clear();
-            let before = database.query_cache().stats();
-            let result = session.execute(QUERY).unwrap();
-            validate(&result);
-            drop(result);
-            assert_eq!(manager.allocated(), held_total);
-            let primed = database.query_cache().stats();
-            assert!(primed.optimized_misses > before.optimized_misses);
-            let result = session.execute(QUERY).unwrap();
-            validate(&result);
-            drop(result);
-            let warmed = database.query_cache().stats();
-            assert!(warmed.optimized_hits > primed.optimized_hits);
-            assert_eq!(manager.allocated(), held_total);
-            if configured && !pressure {
-                assert!(!spill_path.exists(), "resident control must not spill");
+                let primed = database.query_cache().stats();
+                assert!(primed.optimized_misses > before.optimized_misses);
+                let result = session.execute(QUERY).unwrap();
+                validate(&result);
+                drop(result);
+                let warmed = database.query_cache().stats();
+                assert!(warmed.optimized_hits > primed.optimized_hits);
+                assert_eq!(manager.allocated(), held_total);
+                if configured && !pressure {
+                    assert!(!spill_path.exists(), "resident control must not spill");
+                }
+                fixtures.push((
+                    database, session, held, baseline, held_total, directory, spill_path,
+                ));
             }
 
+            let mut next_fixture = 0;
             group.bench_function(name, |b| {
+                // Warmup uses this callback too. Any 50 consecutive callbacks
+                // visit both fixtures 25 times; Flat gives each equal work.
+                let (database, session, ..) = &fixtures[next_fixture];
+                next_fixture = (next_fixture + 1) % FIXTURES;
                 if cold {
                     // PerIteration prevents Criterion from batching cache clears
                     // ahead of several queries and accidentally timing warm calls.
@@ -528,12 +567,16 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
                     });
                 }
             });
-            assert_eq!(manager.allocated(), held_total);
-            if spill_path.exists() {
-                assert_eq!(std::fs::read_dir(&spill_path).unwrap().count(), 0);
+            for (database, _session, held, baseline, held_total, _directory, spill_path) in fixtures
+            {
+                let manager = database.buffer_manager();
+                assert_eq!(manager.allocated(), held_total);
+                if spill_path.exists() {
+                    assert_eq!(std::fs::read_dir(&spill_path).unwrap().count(), 0);
+                }
+                drop(held);
+                assert_eq!(manager.allocated(), baseline);
             }
-            drop(held);
-            assert_eq!(manager.allocated(), baseline);
         }
         group.finish();
     }
