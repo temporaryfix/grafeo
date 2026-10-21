@@ -451,8 +451,8 @@ fn bench_aggregate_resource(c: &mut Criterion, owned: bool) {
         let mut group = c.benchmark_group(family);
         group.sample_size(50);
         group.sampling_mode(SamplingMode::Flat);
-        group.measurement_time(Duration::from_secs(10));
-        group.warm_up_time(Duration::from_secs(3));
+        group.measurement_time(Duration::from_secs(1));
+        group.warm_up_time(Duration::from_secs(1));
         for (name, configured, pressure, cold) in [
             ("groups_1024_rows_4096_ordinary_cold", false, false, true),
             ("groups_1024_rows_4096_cached", false, false, false),
