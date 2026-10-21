@@ -1,5 +1,8 @@
-# Baseline-only A/A/A calibration; no candidate production comparison or PR cost verdict.
-name: P8 balanced-fixture A/A/A calibration
+# DIAGNOSTIC_ONLY: identical baseline CPU/service observations, not acceptance.
+# One existing ordinary-cold control, five blocks and three phases: 15 records.
+# Whole-command CPU includes fixture setup, warmup, measurement and analysis.
+# No candidate production comparison, calibration PASS or PR cost verdict.
+name: P8 identical-baseline focused CPU diagnostic
 
 on:
   push:
@@ -44,7 +47,7 @@ jobs:
           nproc
           free -h
           df -h .
-      - name: Calibrate identical balanced parent across A/A/A phases
+      - name: Observe identical baseline ordinary-cold CPU service
         shell: bash
         run: |
           set -euo pipefail
@@ -53,14 +56,15 @@ jobs:
           import json
           import math
           import os
+          import resource
           from pathlib import Path
           import shutil
           import subprocess
           import time
 
           print(
-              'P8_CALIBRATION_ONLY baseline A/A/A; candidate label is the identical '
-              'baseline, not a production comparison or PR cost verdict',
+              'P8_DIAGNOSTIC_ONLY identical baseline ordinary-cold A/A/A; '
+              'whole-command CPU observations, no calibration or PR cost acceptance',
               flush=True,
           )
           target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
@@ -77,13 +81,8 @@ jobs:
               raise RuntimeError('calibration requires identical pinned baseline refs')
           if expected_inventories['parent'] != expected_inventories['candidate']:
               raise RuntimeError('calibration requires identical audited inventory pins')
-          families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
-          controls = (
-              'groups_1024_rows_4096_ordinary_cold',
-              'groups_1024_rows_4096_cached',
-              'groups_1024_rows_4096_configured_resident',
-              'groups_1024_rows_4096_pressure_90_percent',
-          )
+          families = ('native_aggregate_resource',)
+          controls = ('groups_1024_rows_4096_ordinary_cold',)
           def digest(data):
               return hashlib.sha256(data).hexdigest()
 
@@ -112,6 +111,68 @@ jobs:
                   for value in times
               ):
                   raise RuntimeError('calibration sample times must be finite and positive')
+
+          # These child-usage fields accumulate across waited-for children.
+          # Peak RSS and other nonadditive fields are deliberately not differenced.
+          CHILD_ADDITIVE_FIELDS = (
+              ('user_cpu_seconds', 'ru_utime'),
+              ('system_cpu_seconds', 'ru_stime'),
+              ('voluntary_context_switches', 'ru_nvcsw'),
+              ('involuntary_context_switches', 'ru_nivcsw'),
+              ('minor_page_faults', 'ru_minflt'),
+              ('major_page_faults', 'ru_majflt'),
+              ('block_input_operations', 'ru_inblock'),
+              ('block_output_operations', 'ru_oublock'),
+          )
+
+          def child_usage_delta(before, after, elapsed):
+              usage = {
+                  name: getattr(after, attribute) - getattr(before, attribute)
+                  for name, attribute in CHILD_ADDITIVE_FIELDS
+              }
+              usage['cpu_seconds'] = usage['user_cpu_seconds'] + usage['system_cpu_seconds']
+              usage['elapsed_wall_seconds'] = elapsed
+              usage['cpu_over_wall'] = usage['cpu_seconds'] / elapsed if elapsed > 0 else None
+              return usage
+
+          def optional_read(path, line_prefix=None):
+              # Observability gaps are data, not reasons to fail this diagnostic.
+              try:
+                  value = path.read_text()
+                  if line_prefix is not None:
+                      value = next(
+                          line for line in value.splitlines() if line.startswith(line_prefix)
+                      )
+                  return {'path': str(path), 'value': value.strip()}
+              except (OSError, UnicodeError, StopIteration) as error:
+                  return {'path': str(path), 'error': f'{type(error).__name__}: {error}'}
+
+          def host_metrics(cpu):
+              cgroup_self = optional_read(Path('/proc/self/cgroup'))
+              cgroup_directory = Path('/sys/fs/cgroup')
+              for line in cgroup_self.get('value', '').splitlines():
+                  if line.startswith('0::'):
+                      relative = Path(line.split(':', 2)[2].lstrip('/'))
+                      if '..' not in relative.parts:
+                          cgroup_directory = cgroup_directory / relative
+                      break
+              frequency_directory = Path(f'/sys/devices/system/cpu/cpu{cpu}/cpufreq')
+              return {
+                  'captured_monotonic_seconds': time.monotonic(),
+                  'proc_stat_cpu': optional_read(Path('/proc/stat'), f'cpu{cpu} '),
+                  'loadavg': optional_read(Path('/proc/loadavg')),
+                  'cgroup_self': cgroup_self,
+                  'cgroup_cpu_stat': optional_read(cgroup_directory / 'cpu.stat'),
+                  'cgroup_cpu_max': optional_read(cgroup_directory / 'cpu.max'),
+                  'cpufreq': {
+                      name: optional_read(frequency_directory / name)
+                      for name in (
+                          'scaling_cur_freq', 'cpuinfo_cur_freq',
+                          'scaling_min_freq', 'scaling_max_freq',
+                          'cpuinfo_min_freq', 'cpuinfo_max_freq', 'scaling_governor',
+                      )
+                  },
+              }
 
           def source_seal():
               dirty = subprocess.check_output([
@@ -203,7 +264,7 @@ jobs:
               raise RuntimeError('calibration baseline source inventories differ')
           if binary_hashes['parent'] != binary_hashes['candidate']:
               raise RuntimeError('calibration requires byte-identical baseline binaries')
-          print('P8_CALIBRATION_IDENTITY refs/source/features/profiles/binary verified', flush=True)
+          print('P8_DIAGNOSTIC_IDENTITY refs/source/features/profiles/binary verified', flush=True)
 
           if os.sched_getscheduler(0) != os.SCHED_OTHER or os.getpriority(os.PRIO_PROCESS, 0) != 0:
               raise RuntimeError('benchmark launcher must run with SCHED_OTHER and nice 0')
@@ -225,7 +286,7 @@ jobs:
                       raise RuntimeError('source changed before preflight')
                   log = target / f'p8-{label}-{family}-preflight.log'
                   with log.open('w') as output:
-                      result = subprocess.run([str(binary), family, '--test'],
+                      result = subprocess.run([str(binary), f'{family}/{controls[0]}', '--exact', '--test'],
                                               stdout=output, stderr=subprocess.STDOUT,
                                               preexec_fn=pin_benchmark_child)
                   verify_binary(label)
@@ -237,8 +298,9 @@ jobs:
 
           blocks = int(os.environ['P8_ACTIONS_BLOCKS'])
           if blocks != 5:
-              raise RuntimeError('calibration requires exactly five complete blocks')
+              raise RuntimeError('diagnostic requires exactly five complete blocks')
           cases = [(family, control) for family in families for control in controls]
+          records = 0
           for block in range(blocks):
               ordered_cases = cases if block % 2 == 0 else list(reversed(cases))
               for family, control in ordered_cases:
@@ -262,11 +324,18 @@ jobs:
                       ]
                       log = target / f'p8-block-{block}-{phase}-{family}-{control}.log'
                       print(f'P8_TIMING_START block={block} {phase} {family}/{control} epoch={time.time():.6f}', flush=True)
-                      started = time.monotonic()
+                      host_before = host_metrics(cpu)
                       with log.open('w') as output:
+                          # No source, git, hashing or host-reading subprocess
+                          # may enter this child-usage bracket.
+                          child_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+                          started = time.monotonic()
                           result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
                                                   preexec_fn=pin_benchmark_child)
-                      elapsed = time.monotonic() - started
+                          elapsed = time.monotonic() - started
+                          child_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                      host_after = host_metrics(cpu)
+                      usage = child_usage_delta(child_before, child_after, elapsed)
                       print(f'P8_TIMING_END block={block} {phase} {family}/{control} elapsed_seconds={elapsed:.6f}', flush=True)
                       verify_binary(label)
                       if source_seal() != seals['candidate']:
@@ -278,6 +347,16 @@ jobs:
                           'block': block, 'phase': phase, 'control': f'{family}/{control}',
                           'ref': refs[label],
                           'binary_sha256': binary_hashes[label],
+                          'diagnostic': {
+                              'diagnostic_only': True,
+                              'scope': (
+                                  'whole benchmark subprocess, including fixture setup, warmup, '
+                                  'measurement and analysis; not per-query CPU'
+                              ),
+                              'child_usage': usage,
+                              'host_before': host_before,
+                              'host_after': host_after,
+                          },
                       }
                       record['raw_files'] = {}
                       for name in ('benchmark.json', 'estimates.json', 'sample.json', 'tukey.json'):
@@ -300,5 +379,8 @@ jobs:
                       snapshot = phase_dir / f'{family}--{control}.json'
                       snapshot.write_text(json.dumps(record, sort_keys=True) + '\n')
                       print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
-          print('P8_MEASUREMENTS_COMPLETE acceptance pending raw-data and A/A analysis', flush=True)
+                      records += 1
+          if records != 15:
+              raise RuntimeError(f'diagnostic requires exactly 15 complete records, found {records}')
+          print('P8_DIAGNOSTIC_COMPLETE DIAGNOSTIC_ONLY no calibration or PR cost acceptance', flush=True)
           PY
