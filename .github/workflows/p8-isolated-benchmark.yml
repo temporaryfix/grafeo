@@ -1,7 +1,9 @@
-# Fresh all-eight baseline confirmation: 32 balanced strata of eight triplets per case.
-# Method: stratified-v1; cost acceptance pending raw-data and model/source review.
-# No candidate production comparison, historical reclassification or PR cost verdict.
-name: P8 native fixed-work baseline calibration
+# Baseline calibration only; candidate cost acceptance requires a later qualified comparison.
+# Prospective stratified-v2: 384 triplets / 48 balanced strata; no historical reinterpretation.
+# External collection requires p8-current061-collect-perf.py SHA256 3117d205fd3e9477a406c9b5b10258cea6bd4f17fc836337063dbd152089760f.
+# Critical 2.05 / df47; A/A wholly within +/-2%, width <2pp; cost U95 <=5% ordinary / 8% pressure.
+# All-eight calibration, source/I/O and conditional model review remain required.
+name: P8 current-source 384-triplet baseline calibration
 
 on:
   push:
@@ -15,45 +17,45 @@ jobs:
     if: github.repository == 'temporaryfix/grafeo'
     name: Calibration ${{ matrix.case }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 8
       matrix:
         include:
           - case: native_aggregate_resource/groups_1024_rows_4096_cached
-            blocks: 256
+            blocks: 384
           - case: native_aggregate_resource/groups_1024_rows_4096_configured_resident
-            blocks: 256
+            blocks: 384
           - case: native_aggregate_resource/groups_1024_rows_4096_ordinary_cold
-            blocks: 256
+            blocks: 384
           - case: native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent
-            blocks: 256
+            blocks: 384
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_cached
-            blocks: 256
+            blocks: 384
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident
-            blocks: 256
+            blocks: 384
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold
-            blocks: 256
+            blocks: 384
           - case: native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent
-            blocks: 256
+            blocks: 384
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
-      P8_ACTIONS_PROTOCOL: stratified-v1
+      P8_ACTIONS_PROTOCOL: stratified-v2
       P8_ACTIONS_FIXED_WORK: fixed-work-v1
       P8_ACTIONS_SCOPE: fresh-parent-calibration
       P8_ACTIONS_CASE: ${{ matrix.case }}
       P8_ACTIONS_BLOCKS: ${{ matrix.blocks }}
-      P8_PARENT_REF: e317342409e7613839892f78ced0f49253c1c49a
-      P8_CANDIDATE_REF: e317342409e7613839892f78ced0f49253c1c49a
+      P8_PARENT_REF: b055632f5ed3c33f4f8735534a2923a9c61f6db2
+      P8_CANDIDATE_REF: b055632f5ed3c33f4f8735534a2923a9c61f6db2
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: e317342409e7613839892f78ced0f49253c1c49a
+          ref: b055632f5ed3c33f4f8735534a2923a9c61f6db2
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -72,7 +74,7 @@ jobs:
           nproc
           free -h
           df -h .
-      - name: Calibrate the exact short-parent case across 32 balanced strata
+      - name: Calibrate the exact current-parent case across 48 balanced strata
         shell: bash
         run: |
           set -euo pipefail
@@ -88,8 +90,8 @@ jobs:
           import time
 
           print(
-              'P8_CALIBRATION_ONLY stratified-v1 fresh-parent-calibration; all roles '
-              'use the identical short parent; 32 balanced eight-triplet strata per case. '
+              'P8_CALIBRATION_ONLY stratified-v2 fresh-parent-calibration; all roles '
+              'use the identical current parent; 48 balanced eight-triplet strata per case. '
               'Cost acceptance is pending raw-data/model/source review; no PR cost verdict',
               flush=True,
           )
@@ -100,19 +102,27 @@ jobs:
               'candidate': os.environ['P8_CANDIDATE_REF'],
           }
           expected_inventories = {
-              'parent': 'e47e1d324def1fc600297bca2b0146255606603c751a6167b04b35e1b554e35b',
-              'candidate': 'e47e1d324def1fc600297bca2b0146255606603c751a6167b04b35e1b554e35b',
+              'parent': '3bb6f1c4322bcffa49fd57a01b3b67318cbad9cc8b8ea22b95f05381fd7ef1c7',
+              'candidate': '3bb6f1c4322bcffa49fd57a01b3b67318cbad9cc8b8ea22b95f05381fd7ef1c7',
           }
+          expected_source_files = {
+              'parent': '1801',
+              'candidate': '1801',
+          }
+          for label in ('parent', 'candidate'):
+              if not re.fullmatch(r'[1-9][0-9]*', expected_source_files[label]):
+                  raise RuntimeError(f'replace the audited {label} source-count placeholder before launch')
+              expected_source_files[label] = int(expected_source_files[label])
           if refs['parent'] != refs['candidate']:
               raise RuntimeError('calibration requires identical pinned baseline refs')
           if expected_inventories['parent'] != expected_inventories['candidate']:
               raise RuntimeError('calibration requires identical audited inventory pins')
           if not re.fullmatch(r'[0-9a-f]{40}', refs['parent']):
-              raise RuntimeError('replace the audited short-parent ref placeholder before launch')
+              raise RuntimeError('replace the audited current-parent ref placeholder before launch')
           if not re.fullmatch(r'[0-9a-f]{64}', expected_inventories['parent']):
-              raise RuntimeError('replace the audited short-parent inventory placeholder before launch')
-          BLOCKS_BY_CASE = {'native_aggregate_resource/groups_1024_rows_4096_cached': 256, 'native_aggregate_resource/groups_1024_rows_4096_configured_resident': 256, 'native_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 256, 'native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_cached': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 256, 'native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 256}
-          SEED = 'p8-stratified-wall-mean-v1-20261021'
+              raise RuntimeError('replace the audited current-parent inventory placeholder before launch')
+          BLOCKS_BY_CASE = {'native_aggregate_resource/groups_1024_rows_4096_cached': 384, 'native_aggregate_resource/groups_1024_rows_4096_configured_resident': 384, 'native_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 384, 'native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_cached': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 384}
+          SEED = 'p8-current061-calibration-stratified-wall-mean-v1-20261021'
           def digest(data):
               return hashlib.sha256(data).hexdigest()
 
@@ -120,15 +130,15 @@ jobs:
               return digest(json.dumps(files, sort_keys=True, separators=(',', ':')).encode())
 
           def stratified_phase_order(protocol, scope, case_name, block_text):
-              if protocol != 'stratified-v1' or scope != 'fresh-parent-calibration':
-                  raise RuntimeError('this workflow supports fresh-parent-calibration stratified-v1 only')
+              if protocol != 'stratified-v2' or scope != 'fresh-parent-calibration':
+                  raise RuntimeError('this workflow supports fresh-parent-calibration stratified-v2 only')
               if case_name not in BLOCKS_BY_CASE:
                   raise RuntimeError('unknown exact stratified case')
               if block_text != str(BLOCKS_BY_CASE[case_name]):
                   raise RuntimeError('matrix block count differs from the frozen planning map')
               blocks = int(block_text)
-              if blocks != 256:
-                  raise RuntimeError('stratified confirmation requires 32 strata of eight triplets')
+              if blocks != 384:
+                  raise RuntimeError('stratified confirmation requires 48 strata of eight triplets')
               order = []
               for stratum in range(blocks // 8):
                   ranked = sorted(
@@ -217,8 +227,8 @@ jobs:
                   raise RuntimeError('checkout does not match the pinned commit')
               before = source_seal()
               inventory_hash = inventory_digest(before)
-              if len(before) != 1804:
-                  raise RuntimeError(f'{label} short-parent source count must be 1804')
+              if len(before) != expected_source_files[label]:
+                  raise RuntimeError(f'{label} source count differs from the audited inventory')
               if inventory_hash != expected_inventories[label]:
                   raise RuntimeError(f'{label} source differs from the audited byte inventory')
               before_path = target / f'p8-{label}-source-before.json'
