@@ -1,9 +1,10 @@
-# Baseline calibration only; candidate cost acceptance requires a later qualified comparison.
+# Candidate comparison only; cost acceptance requires external raw-data/source/model review.
 # Prospective stratified-v2: 384 triplets / 48 balanced strata; no historical reinterpretation.
 # External collection requires p8-current061-collect-perf.py SHA256 3117d205fd3e9477a406c9b5b10258cea6bd4f17fc836337063dbd152089760f.
 # Critical 2.05 / df47; A/A wholly within +/-2%, width <2pp; cost U95 <=5% ordinary / 8% pressure.
 # All-eight calibration, source/I/O and conditional model review remain required.
-name: P8 current-source 384-triplet baseline calibration
+# Publication requires all eight fresh current-source calibration cases and source/model checks.
+name: P8 current-source 384-triplet candidate comparison
 
 on:
   push:
@@ -15,7 +16,7 @@ permissions:
 jobs:
   compare:
     if: github.repository == 'temporaryfix/grafeo'
-    name: Calibration ${{ matrix.case }}
+    name: Comparison ${{ matrix.case }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -47,11 +48,11 @@ jobs:
       CARGO_TERM_COLOR: never
       P8_ACTIONS_PROTOCOL: stratified-v2
       P8_ACTIONS_FIXED_WORK: fixed-work-v1
-      P8_ACTIONS_SCOPE: fresh-parent-calibration
+      P8_ACTIONS_SCOPE: fresh-candidate-comparison
       P8_ACTIONS_CASE: ${{ matrix.case }}
       P8_ACTIONS_BLOCKS: ${{ matrix.blocks }}
       P8_PARENT_REF: b055632f5ed3c33f4f8735534a2923a9c61f6db2
-      P8_CANDIDATE_REF: b055632f5ed3c33f4f8735534a2923a9c61f6db2
+      P8_CANDIDATE_REF: 1dfa4e42fd06f211067c952a98c3818142f268bd
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,7 +75,7 @@ jobs:
           nproc
           free -h
           df -h .
-      - name: Calibrate the exact current-parent case across 48 balanced strata
+      - name: Measure the exact comparison case with balanced follow-up order
         shell: bash
         run: |
           set -euo pipefail
@@ -90,9 +91,8 @@ jobs:
           import time
 
           print(
-              'P8_CALIBRATION_ONLY stratified-v2 fresh-parent-calibration; all roles '
-              'use the identical current parent; 48 balanced eight-triplet strata per case. '
-              'Cost acceptance is pending raw-data/model/source review; no PR cost verdict',
+              'P8_COMPARISON_DATA_ONLY stratified-v2 fresh-candidate-comparison; '
+              'acceptance pending all-eight calibration, source/I/O evidence and model review',
               flush=True,
           )
           target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
@@ -103,26 +103,27 @@ jobs:
           }
           expected_inventories = {
               'parent': '3bb6f1c4322bcffa49fd57a01b3b67318cbad9cc8b8ea22b95f05381fd7ef1c7',
-              'candidate': '3bb6f1c4322bcffa49fd57a01b3b67318cbad9cc8b8ea22b95f05381fd7ef1c7',
+              'candidate': 'd59cd4f4beb512716c8e149da98da50031644e377a9ce9868530514f644ebddf',
           }
           expected_source_files = {
               'parent': '1801',
-              'candidate': '1801',
+              'candidate': '1802',
           }
           for label in ('parent', 'candidate'):
               if not re.fullmatch(r'[1-9][0-9]*', expected_source_files[label]):
                   raise RuntimeError(f'replace the audited {label} source-count placeholder before launch')
               expected_source_files[label] = int(expected_source_files[label])
-          if refs['parent'] != refs['candidate']:
-              raise RuntimeError('calibration requires identical pinned baseline refs')
-          if expected_inventories['parent'] != expected_inventories['candidate']:
-              raise RuntimeError('calibration requires identical audited inventory pins')
-          if not re.fullmatch(r'[0-9a-f]{40}', refs['parent']):
-              raise RuntimeError('replace the audited current-parent ref placeholder before launch')
-          if not re.fullmatch(r'[0-9a-f]{64}', expected_inventories['parent']):
-              raise RuntimeError('replace the audited current-parent inventory placeholder before launch')
+          for label in ('parent', 'candidate'):
+              if not re.fullmatch(r'[0-9a-f]{40}', refs[label]):
+                  raise RuntimeError(f'replace the audited {label} ref placeholder before launch')
+              if not re.fullmatch(r'[0-9a-f]{64}', expected_inventories[label]):
+                  raise RuntimeError(f'replace the audited {label} inventory placeholder before launch')
+          if refs['parent'] == refs['candidate']:
+              raise RuntimeError('comparison requires distinct parent/candidate refs')
+          if expected_inventories['parent'] == expected_inventories['candidate']:
+              raise RuntimeError('comparison requires distinct parent/candidate source inventories')
           BLOCKS_BY_CASE = {'native_aggregate_resource/groups_1024_rows_4096_cached': 384, 'native_aggregate_resource/groups_1024_rows_4096_configured_resident': 384, 'native_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 384, 'native_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_cached': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_configured_resident': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_ordinary_cold': 384, 'native_owned_aggregate_resource/groups_1024_rows_4096_pressure_90_percent': 384}
-          SEED = 'p8-current061-calibration-stratified-wall-mean-v1-20261021'
+          SEED = 'p8-current061-comparison-stratified-wall-mean-v1-20261021'
           def digest(data):
               return hashlib.sha256(data).hexdigest()
 
@@ -130,15 +131,15 @@ jobs:
               return digest(json.dumps(files, sort_keys=True, separators=(',', ':')).encode())
 
           def stratified_phase_order(protocol, scope, case_name, block_text):
-              if protocol != 'stratified-v2' or scope != 'fresh-parent-calibration':
-                  raise RuntimeError('this workflow supports fresh-parent-calibration stratified-v2 only')
+              if protocol != 'stratified-v2' or scope != 'fresh-candidate-comparison':
+                  raise RuntimeError('this workflow supports fresh-candidate-comparison stratified-v2 only')
               if case_name not in BLOCKS_BY_CASE:
                   raise RuntimeError('unknown exact stratified case')
               if block_text != str(BLOCKS_BY_CASE[case_name]):
                   raise RuntimeError('matrix block count differs from the frozen planning map')
               blocks = int(block_text)
               if blocks != 384:
-                  raise RuntimeError('stratified confirmation requires 48 strata of eight triplets')
+                  raise RuntimeError('stratified comparison requires 48 strata of eight triplets')
               order = []
               for stratum in range(blocks // 8):
                   ranked = sorted(
@@ -178,13 +179,13 @@ jobs:
 
           def validate_flat_sample(sample):
               if not isinstance(sample, dict) or sample.get('sampling_mode') != 'Flat':
-                  raise RuntimeError('calibration requires actual Flat sampling')
+                  raise RuntimeError('comparison requires actual Flat sampling')
               iterations = sample.get('iters')
               times = sample.get('times')
               if not isinstance(iterations, list) or not isinstance(times, list):
-                  raise RuntimeError('calibration sample arrays are missing')
+                  raise RuntimeError('comparison sample arrays are missing')
               if len(iterations) != 50 or len(times) != 50:
-                  raise RuntimeError('calibration requires exactly 50 measured samples')
+                  raise RuntimeError('comparison requires exactly 50 measured samples')
               if any(
                   isinstance(value, bool) or not isinstance(value, (int, float))
                   or not math.isfinite(value) or value <= 0
@@ -199,7 +200,7 @@ jobs:
                   or not math.isfinite(value) or value <= 0
                   for value in times
               ):
-                  raise RuntimeError('calibration sample times must be finite and positive')
+                  raise RuntimeError('comparison sample times must be finite and positive')
 
           def source_seal():
               dirty = subprocess.check_output([
@@ -289,11 +290,9 @@ jobs:
           if builds['parent'] != builds['candidate']:
               raise RuntimeError('actual parent/candidate features or profiles differ')
           print('P8_FEATURE_PROFILE_PARITY verified', flush=True)
-          if seals['parent'] != seals['candidate']:
-              raise RuntimeError('calibration baseline source inventories differ')
-          if binary_hashes['parent'] != binary_hashes['candidate']:
-              raise RuntimeError('calibration requires byte-identical baseline binaries')
-          print('P8_CALIBRATION_IDENTITY refs/source/features/profiles/binary verified', flush=True)
+          if binary_hashes['parent'] == binary_hashes['candidate']:
+              raise RuntimeError('comparison requires distinct retained parent/candidate binaries')
+          print('P8_COMPARISON_IDENTITIES separately pinned refs/source/binaries and matching features/profiles verified', flush=True)
 
           if os.sched_getscheduler(0) != os.SCHED_OTHER or os.getpriority(os.PRIO_PROCESS, 0) != 0:
               raise RuntimeError('benchmark launcher must run with SCHED_OTHER and nice 0')
@@ -406,10 +405,10 @@ jobs:
               print('P8_RESULT_JSON ' + json.dumps(record, sort_keys=True), flush=True)
               completed_order.append([block, phase, case_name])
           if completed_order != phase_order or len(completed_order) != 3 * blocks:
-              raise RuntimeError('stratified confirmation requires every planned phase without exclusions')
+              raise RuntimeError('stratified requires every planned phase without exclusions')
           print(
-              f'P8_CALIBRATION_ONLY_COMPLETE protocol={protocol} scope={scope} '
-              f'case={case_name} records={len(completed_order)}; no PR cost verdict',
+              f'P8_COMPARISON_DATA_ONLY_COMPLETE protocol={protocol} scope={scope} '
+              f'case={case_name} records={len(completed_order)}; no accepted rows; external review pending',
               flush=True,
           )
           print('P8_MEASUREMENTS_COMPLETE acceptance pending raw-data and A/A analysis', flush=True)
