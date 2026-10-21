@@ -1,4 +1,5 @@
-name: P8 isolated memory comparison R5
+# Baseline-only A/A/A calibration; no candidate production comparison or PR cost verdict.
+name: P8 balanced-fixture A/A/A calibration
 
 on:
   push:
@@ -19,12 +20,12 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_TERM_COLOR: never
       P8_ACTIONS_BLOCKS: '5'
-      P8_PARENT_REF: 387507db16d1ab3f32b85b08d5a62e7539c812b7
-      P8_CANDIDATE_REF: 11546670b096ca773e9adc9cc40a901d580421ce
+      P8_PARENT_REF: 1c8d67e5d224a30d5b5fb7468718a68400a18dd3
+      P8_CANDIDATE_REF: 1c8d67e5d224a30d5b5fb7468718a68400a18dd3
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 11546670b096ca773e9adc9cc40a901d580421ce
+          ref: 1c8d67e5d224a30d5b5fb7468718a68400a18dd3
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -43,19 +44,25 @@ jobs:
           nproc
           free -h
           df -h .
-      - name: Build matching binaries and measure parent, candidate, parent
+      - name: Calibrate identical balanced parent across A/A/A phases
         shell: bash
         run: |
           set -euo pipefail
           python3 -u - <<'PY'
           import hashlib
           import json
+          import math
           import os
           from pathlib import Path
           import shutil
           import subprocess
           import time
 
+          print(
+              'P8_CALIBRATION_ONLY baseline A/A/A; candidate label is the identical '
+              'baseline, not a production comparison or PR cost verdict',
+              flush=True,
+          )
           target = Path(os.environ['CARGO_TARGET_DIR']).resolve()
           target.mkdir(parents=True, exist_ok=True)
           refs = {
@@ -63,9 +70,13 @@ jobs:
               'candidate': os.environ['P8_CANDIDATE_REF'],
           }
           expected_inventories = {
-              'parent': 'bab21437567762c598168283fbbe0228f03900e383793f6aaa742c2846b3c037',
-              'candidate': '1c310a5bbe959e4753849e7f73f769523c20b0fa75d13fb8d6e021b537ef19a7',
+              'parent': '671cc58518c0fe8a8426d823e6138158788066023f375d39a0f76b06980b65a5',
+              'candidate': '671cc58518c0fe8a8426d823e6138158788066023f375d39a0f76b06980b65a5',
           }
+          if refs['parent'] != refs['candidate']:
+              raise RuntimeError('calibration requires identical pinned baseline refs')
+          if expected_inventories['parent'] != expected_inventories['candidate']:
+              raise RuntimeError('calibration requires identical audited inventory pins')
           families = ('native_aggregate_resource', 'native_owned_aggregate_resource')
           controls = (
               'groups_1024_rows_4096_ordinary_cold',
@@ -78,6 +89,29 @@ jobs:
 
           def inventory_digest(files):
               return digest(json.dumps(files, sort_keys=True, separators=(',', ':')).encode())
+
+          def validate_flat_sample(sample):
+              if not isinstance(sample, dict) or sample.get('sampling_mode') != 'Flat':
+                  raise RuntimeError('calibration requires actual Flat sampling')
+              iterations = sample.get('iters')
+              times = sample.get('times')
+              if not isinstance(iterations, list) or not isinstance(times, list):
+                  raise RuntimeError('calibration sample arrays are missing')
+              if len(iterations) != 50 or len(times) != 50:
+                  raise RuntimeError('calibration requires exactly 50 measured samples')
+              if any(
+                  isinstance(value, bool) or not isinstance(value, (int, float))
+                  or not math.isfinite(value) or value <= 0
+                  or value != iterations[0] or value != int(value)
+                  for value in iterations
+              ):
+                  raise RuntimeError('Flat sample iteration counts must be positive equal integers')
+              if any(
+                  isinstance(value, bool) or not isinstance(value, (int, float))
+                  or not math.isfinite(value) or value <= 0
+                  for value in times
+              ):
+                  raise RuntimeError('calibration sample times must be finite and positive')
 
           def source_seal():
               dirty = subprocess.check_output([
@@ -165,6 +199,11 @@ jobs:
           if builds['parent'] != builds['candidate']:
               raise RuntimeError('actual parent/candidate features or profiles differ')
           print('P8_FEATURE_PROFILE_PARITY verified', flush=True)
+          if seals['parent'] != seals['candidate']:
+              raise RuntimeError('calibration baseline source inventories differ')
+          if binary_hashes['parent'] != binary_hashes['candidate']:
+              raise RuntimeError('calibration requires byte-identical baseline binaries')
+          print('P8_CALIBRATION_IDENTITY refs/source/features/profiles/binary verified', flush=True)
 
           if os.sched_getscheduler(0) != os.SCHED_OTHER or os.getpriority(os.PRIO_PROCESS, 0) != 0:
               raise RuntimeError('benchmark launcher must run with SCHED_OTHER and nice 0')
@@ -198,7 +237,7 @@ jobs:
 
           blocks = int(os.environ['P8_ACTIONS_BLOCKS'])
           if blocks != 5:
-              raise RuntimeError('R3 requires exactly five complete blocks')
+              raise RuntimeError('calibration requires exactly five complete blocks')
           cases = [(family, control) for family in families for control in controls]
           for block in range(blocks):
               ordered_cases = cases if block % 2 == 0 else list(reversed(cases))
@@ -245,6 +284,8 @@ jobs:
                           raw = (case / 'new' / name).read_text()
                           record[name] = json.loads(raw)
                           record['raw_files'][name] = raw
+                          if name == 'sample.json':
+                              validate_flat_sample(record[name])
                       change_path = case / 'change' / 'estimates.json'
                       if baseline_option == '--baseline' and not change_path.is_file():
                           raise RuntimeError(f'missing baseline comparison: {phase} {control}')
