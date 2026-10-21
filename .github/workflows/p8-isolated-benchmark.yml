@@ -47,7 +47,7 @@ jobs:
       P8_ACTIONS_CASE: ${{ matrix.case }}
       P8_ACTIONS_BLOCKS: ${{ matrix.blocks }}
       P8_PARENT_REF: b0115ff1f5ff5df25442309a257540ac54975591
-      P8_CANDIDATE_REF: e726721c5035a0bc0fef067710feaa3059591f0a
+      P8_CANDIDATE_REF: 94eb5c45b683b2a2f8934cc4ebbd61112ecff57b
     steps:
       - uses: actions/checkout@v7
         with:
@@ -98,7 +98,7 @@ jobs:
           }
           expected_inventories = {
               'parent': '5401cceea568f95aeb77a99656a3bb303b731d4a92962d4469241e513a1403d2',
-              'candidate': '4755896e9f2d2f06e8a859d509cf523307d55e6dfd868700ce1722b43b6db7a1',
+              'candidate': '5f64657512c30ad51d07a5e6145a2c13f0e9a17920e07d165b055dbf4a4ac677',
           }
           expected_source_files = {'parent': 1755, 'candidate': 1756}
           for label in ('parent', 'candidate'):
