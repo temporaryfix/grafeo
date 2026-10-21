@@ -148,6 +148,15 @@ impl AggregateState {
         match state {
             AggregateState::Min(min) if expr.rdf_literals => AggregateState::MinOfRdfLiterals(min),
             AggregateState::Max(max) if expr.rdf_literals => AggregateState::MaxOfRdfLiterals(max),
+            // SPARQL's AVG divides by XPath's rules: the average of integers
+            // and decimals is a decimal (a double operand makes it a double).
+            AggregateState::Avg(..) if expr.rdf_literals => {
+                AggregateState::AvgDecimal(Some(Decimal::from_i64(0)), 0)
+            }
+            AggregateState::AvgDistinct(..) if expr.rdf_literals => AggregateState::Distinct {
+                seen: HashSet::new(),
+                inner: Box::new(AggregateState::AvgDecimal(Some(Decimal::from_i64(0)), 0)),
+            },
             state => state,
         }
     }
@@ -619,6 +628,44 @@ impl AggregateState {
         }
     }
 
+    /// The result of the aggregate `expr` this state computed, as
+    /// [`finalize`](Self::finalize) gives it, except that SPARQL's `SUM` and
+    /// `AVG` of a group without values are `0` (SPARQL 1.1, 18.5.1.3 and
+    /// 18.5.1.4), where GQL and Cypher give null.
+    ///
+    /// # Errors
+    ///
+    /// As [`finalize`](Self::finalize).
+    pub fn finalize_for(&self, expr: &AggregateExpr) -> Result<Value, OperatorError> {
+        if expr.rdf_literals
+            && matches!(
+                expr.function,
+                AggregateFunction::Sum | AggregateFunction::Avg
+            )
+            && self.value_count() == Some(0)
+        {
+            return Ok(Value::Int64(0));
+        }
+        self.finalize()
+    }
+
+    /// How many values a sum or average state has taken in; `None` for the
+    /// other aggregates.
+    fn value_count(&self) -> Option<i64> {
+        match self {
+            AggregateState::SumInt(_, count)
+            | AggregateState::SumIntDistinct(_, count, _)
+            | AggregateState::SumFloat(_, _, count)
+            | AggregateState::SumFloatDistinct(_, _, count, _)
+            | AggregateState::SumDecimal(_, count)
+            | AggregateState::Avg(_, count)
+            | AggregateState::AvgDecimal(_, count)
+            | AggregateState::AvgDistinct(_, count, _) => Some(*count),
+            AggregateState::Distinct { inner, .. } => inner.value_count(),
+            _ => None,
+        }
+    }
+
     /// Finalizes the state and returns the result value.
     ///
     /// # Errors
@@ -902,6 +949,7 @@ pub(crate) struct GroupedOutput {
     pub(crate) cursor: crate::execution::spill::OwnedPartitionDrainCursor<AdmittedGroupState>,
     pub(crate) types: Vec<LogicalType>,
     pub(crate) group_columns: usize,
+    pub(crate) rdf_aggregates: Vec<(usize, AggregateExpr)>,
     // The schema is destroyed before the reservation that owns it.
     pub(crate) schema_owner: crate::execution::memory::GroupedMemoryOwner,
 }
@@ -1213,7 +1261,7 @@ impl Operator for HashAggregateOperator {
             let mut builder = DataChunkBuilder::with_capacity(&self.output_schema, 1);
 
             for agg in &self.aggregates {
-                let value = AggregateState::for_expr(agg).finalize()?;
+                let value = AggregateState::for_expr(agg).finalize_for(agg)?;
                 if let Some(col) = builder.column_mut(self.group_columns.len()) {
                     col.push_value(value);
                 }
@@ -1240,10 +1288,10 @@ impl Operator for HashAggregateOperator {
             }
 
             // Output aggregate results
-            for (i, state) in group.states.iter().enumerate() {
+            for (i, (state, expr)) in group.states.iter().zip(&self.aggregates).enumerate() {
                 let col_idx = self.group_columns.len() + i;
                 if let Some(col) = builder.column_mut(col_idx) {
-                    col.push_value(state.finalize()?);
+                    col.push_value(state.finalize_for(expr)?);
                 }
             }
 
@@ -1375,9 +1423,9 @@ impl Operator for SimpleAggregateOperator {
         // Output single result row
         let mut builder = DataChunkBuilder::with_capacity(&self.output_schema, 1);
 
-        for (i, state) in self.states.iter().enumerate() {
+        for (i, (state, expr)) in self.states.iter().zip(&self.aggregates).enumerate() {
             if let Some(col) = builder.column_mut(i) {
-                col.push_value(state.finalize()?);
+                col.push_value(state.finalize_for(expr)?);
             }
         }
         builder.advance_row();
@@ -1495,6 +1543,55 @@ mod tests {
 
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
             self
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn accounted_pull_preserves_rdf_empty_value_sum_and_average() {
+        for rdf_literals in [false, true] {
+            let (_directory, manager, spill, context) = accounted_pull_fixture();
+            let mut builder =
+                DataChunkBuilder::with_capacity(&[LogicalType::Int64, LogicalType::Any], 1);
+            builder.column_mut(0).unwrap().push_int64(7);
+            builder.column_mut(1).unwrap().push_value(Value::Null);
+            builder.advance_row();
+            let mut expressions = vec![
+                AggregateExpr::sum(1),
+                AggregateExpr::avg(1),
+                AggregateExpr::sum(1).with_distinct(),
+                AggregateExpr::avg(1).with_distinct(),
+            ];
+            for expr in &mut expressions {
+                expr.rdf_literals = rdf_literals;
+            }
+            let mut aggregate = HashAggregateOperator::new(
+                Box::new(MockOperator::new(vec![builder.finish()])),
+                vec![0],
+                expressions,
+                vec![LogicalType::Any; 5],
+            )
+            .with_memory_context(context, None);
+            let chunk = aggregate.next().unwrap().unwrap();
+            assert_eq!(chunk.len(), 1);
+            assert_eq!(chunk.column(0).unwrap().get_value(0), Some(Value::Int64(7)));
+            let expected = if rdf_literals {
+                Value::Int64(0)
+            } else {
+                Value::Null
+            };
+            for column in 1..5 {
+                assert_eq!(
+                    chunk.column(column).unwrap().get_value(0),
+                    Some(expected.clone())
+                );
+            }
+            assert!(manager.allocated() > 0);
+            drop(chunk);
+            drop(aggregate);
+            assert_eq!(manager.allocated(), 0);
+            assert_eq!(manager.stats().consumer_count, 0);
+            assert_eq!(spill.active_file_count(), 0);
         }
     }
 
@@ -2774,6 +2871,55 @@ mod tests {
                 (Value::List(vec![Value::Int64(3)].into()), Value::Int64(2)),
             ]
         );
+    }
+
+    /// The `[sum, avg]` of `values`, through the aggregate states and
+    /// `finalize_for`, also with DISTINCT.
+    fn sum_and_avg(values: &[Option<Value>], rdf_literals: bool, distinct: bool) -> [Value; 2] {
+        [AggregateExpr::sum(0), AggregateExpr::avg(0)].map(|mut expr| {
+            expr.rdf_literals = rdf_literals;
+            expr.distinct = distinct;
+            let mut state = AggregateState::for_expr(&expr);
+            for value in values {
+                state.update(value.clone());
+            }
+            state.finalize_for(&expr).unwrap()
+        })
+    }
+
+    /// SPARQL's SUM and AVG of no values are 0 (SPARQL 1.1, 18.5.1.3 and
+    /// 18.5.1.4), also when the only operands are unbound; GQL and Cypher give
+    /// null. With values, both finish as before.
+    #[test]
+    fn sum_and_avg_of_no_values() {
+        for distinct in [false, true] {
+            let zero = Value::Int64(0);
+            assert_eq!(
+                sum_and_avg(&[], true, distinct),
+                [zero.clone(), zero.clone()]
+            );
+            assert_eq!(
+                sum_and_avg(&[None, None], true, distinct),
+                [zero.clone(), zero]
+            );
+            assert_eq!(
+                sum_and_avg(&[], false, distinct),
+                [Value::Null, Value::Null]
+            );
+            assert_eq!(
+                sum_and_avg(&[None], false, distinct),
+                [Value::Null, Value::Null]
+            );
+            let [sum, avg] = sum_and_avg(
+                &[Some(Value::Int64(1)), Some(Value::Int64(2))],
+                true,
+                distinct,
+            );
+            assert_eq!(sum, Value::Int64(3));
+            assert_eq!(avg, Value::Decimal(Decimal::parse("1.5").unwrap()));
+            let [sum, _] = sum_and_avg(&[Some(Value::Float64(0.5))], true, distinct);
+            assert_eq!(sum, Value::Float64(0.5));
+        }
     }
 
     /// The `[min, max]` of `values`, through the aggregate states.
