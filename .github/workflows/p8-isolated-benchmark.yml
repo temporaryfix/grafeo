@@ -48,12 +48,12 @@ jobs:
       P8_ACTIONS_SCOPE: fresh-parent-calibration
       P8_ACTIONS_CASE: ${{ matrix.case }}
       P8_ACTIONS_BLOCKS: ${{ matrix.blocks }}
-      P8_PARENT_REF: 0a7bafec2e5067c7bb05629d448d40a562542056
-      P8_CANDIDATE_REF: 0a7bafec2e5067c7bb05629d448d40a562542056
+      P8_PARENT_REF: e317342409e7613839892f78ced0f49253c1c49a
+      P8_CANDIDATE_REF: e317342409e7613839892f78ced0f49253c1c49a
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 0a7bafec2e5067c7bb05629d448d40a562542056
+          ref: e317342409e7613839892f78ced0f49253c1c49a
           fetch-depth: 0
           persist-credentials: false
       - name: Free unused hosted SDK space
@@ -100,8 +100,8 @@ jobs:
               'candidate': os.environ['P8_CANDIDATE_REF'],
           }
           expected_inventories = {
-              'parent': 'a271c7d5a9750503a6d191dc90f191c3cee3b4986060c112aaa1cbc6e1ed402e',
-              'candidate': 'a271c7d5a9750503a6d191dc90f191c3cee3b4986060c112aaa1cbc6e1ed402e',
+              'parent': 'e47e1d324def1fc600297bca2b0146255606603c751a6167b04b35e1b554e35b',
+              'candidate': 'e47e1d324def1fc600297bca2b0146255606603c751a6167b04b35e1b554e35b',
           }
           if refs['parent'] != refs['candidate']:
               raise RuntimeError('calibration requires identical pinned baseline refs')
@@ -297,6 +297,7 @@ jobs:
               'blocks': blocks, 'seed': SEED, 'phase_order_sha256': phase_order_sha256,
               'fixed_work_protocol': fixed_work_protocol,
               'fixed_queries_per_iteration': queries_per_iteration,
+              'measurement_target_ns': 1,
           }), flush=True)
 
           def pin_benchmark_child():
@@ -335,7 +336,7 @@ jobs:
               command = [
                   str(binaries[label]), case_name, '--exact', '--bench', '--noplot',
                   '--sample-size', '50', '--warm-up-time', '1',
-                  '--measurement-time', '1', baseline_option, f'p8-parent-block-{block}',
+                  '--measurement-time', '0.000000001', baseline_option, f'p8-parent-block-{block}',
               ]
               log = target / f'p8-block-{block}-{phase}-{family}-{control}.log'
               print(f'P8_TIMING_START block={block} {phase} {case_name} epoch={time.time():.6f}', flush=True)
